@@ -1,0 +1,9 @@
+out/
+__pycache__/
+.vscode/
+*.egg-info/
+*.npz
+*.ipynb
+*.json
+.DS_Store
+tests/
