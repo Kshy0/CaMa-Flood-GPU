@@ -49,10 +49,10 @@ Please follow the official [PyTorch installation guide](https://pytorch.org/get-
 For CUDA 12.6, you may use:
 
 ```shell
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip3 install torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
-> **Note:** By default, `triton` will be installed automatically when you install PyTorch 2.6+.
+> **Note:** By default, `triton` will be installed automatically when you install PyTorch.
 
 ### 3. Install other dependencies
 
@@ -70,6 +70,7 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
 
   - CaMa-Flood-GPU is fully compatible with CaMa-Flood input data (river maps, runoff, etc.).
   - Download the required datasets from the [official CaMa-Flood site](https://hydro.iis.u-tokyo.ac.jp/~yamadai/cama-flood/) or follow the instructions in the original CaMa-Flood documentation.
+  - Typically, you will download a folder named `cmf_v420_pkg` from the official site and place it somewhere on your local machine.
 
   ### 2. Configure your run
 
@@ -90,7 +91,7 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
 
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  python CMF_GPU/main.py --config ./inp/test1-glb_15min/config.yaml
+  python CMF_GPU/main.py ./inp/test1-glb_15min/config.yaml
   ```
 
   - [Optional] For multi-GPU or distributed runs, please refer to upcoming documentation and code samples.

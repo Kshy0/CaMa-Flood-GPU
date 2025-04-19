@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 from collections import OrderedDict
 from netCDF4 import Dataset as NcHandler
-import matplotlib.pyplot as plt
 
 class RunoffDataset(ABC):
     """
@@ -262,10 +261,10 @@ class DataLoader:
         self.pool.join()
 
 if __name__ == "__main__":
-    # 假设要加载 2000 年 1 月 1 日 ~ 10 日的资料
+    import matplotlib.pyplot as plt
     time_starts = [datetime(2000, 1, i + 1) for i in range(10)]
 
-    # 1) 使用 DailyBinDataset
+    # 1) DailyBinDataset test
     daily_bin_ds = DailyBinDataset(
         base_dir=r"/home/eat/cmf_v420_pkg/inp/test_1deg/runoff",
         shape=(180, 360),
@@ -287,7 +286,7 @@ if __name__ == "__main__":
     plt.show()
     loader_bin.close()
 
-    # 2) 使用 YearlyNcDataset
+    # 2) YearlyNcDataset test
     yearly_nc_ds = YearlyNetCDFDataset(
         base_dir=r"/home/eat/cmf_v420_pkg/inp/test_15min_nc",
         var_name="Runoff",
