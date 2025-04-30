@@ -35,6 +35,8 @@ MODULES_CONFIG = {
             "flood_storage": 0.0,
             "total_storage": 0.0,
             "outgoing_storage": 0.0, #
+            "water_surface_elevation": 0.0, #
+            "limit_rate": 0.0, #
             "river_depth": 0.0,
             "river_inflow": 0.0, #
             "river_outflow": 0.0,
@@ -315,20 +317,16 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
         else river_storage.shape[0]
     )
 
-    # NumPy → 校验 & 转换
     final_params_np = check_and_convert_inputs(user_params, enabled_modules, precision, "param", num_catchments)
     final_states_np = check_and_convert_inputs(user_states, enabled_modules, precision, "state", num_catchments)
 
-    # 切分
     final_params_np_list = split_dict_arrays(final_params_np, split_indices)
     final_states_np_list = split_dict_arrays(final_states_np, split_indices)
 
-    # 设备 indices 列表化
     if isinstance(device_indices, int):
         device_indices = [device_indices]
     assert len(device_indices) == len(split_indices), "device_indices 和 split_indices 长度需匹配"
 
-    # NumPy → Torch 张量
     final_params_list = []
     final_states_list = []
     for i, dev_idx in enumerate(device_indices):
@@ -351,7 +349,6 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
         final_params_list.append(params_t)
         final_states_list.append(states_t)
 
-    # 并行执行函数
     def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT):
         num_devices = len(params_list)
         if device_type == "gpu":
@@ -360,7 +357,6 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
             for dev, stream in zip(device_indices, streams):
                 with torch.cuda.stream(stream):
                     aggregator[dev] = step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT)
-            # 同步所有流
             for s in streams:
                 s.synchronize()
         else:
@@ -440,7 +436,6 @@ if __name__ == "__main__":
     }
     
     def dummy_step_fn(runtime_flags, params, states, forcing, dT):
-        # 所有张量都在对应设备上
         new_states = {
             k: (v + 1.0 if isinstance(v, torch.Tensor) else v)
             for k, v in states.items()
@@ -454,7 +449,6 @@ if __name__ == "__main__":
         user_params, user_states, dummy_step_fn, user_runtime_flags
     )
 
-    # 构造 forcing 列表
     forcing_array = np.array([0.5,0.2,1.0,0.1,0.3,1.2], dtype=np.float32)
     spl = final_rt["split_indices"]
     forcing_np_list = np.split(forcing_array, spl[:-1])

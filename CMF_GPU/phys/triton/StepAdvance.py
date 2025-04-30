@@ -1,9 +1,8 @@
 import torch
 from triton import cdiv
-from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
-from CMF_GPU.phys.Outflow import compute_outflow_kernel
-from CMF_GPU.phys.Inflow import compute_outgoing_storage_kernel, apply_storage_limits_kernel
-from CMF_GPU.phys.Storage import compute_flood_stage_kernel, accumulate_inflows_kernel, update_storage_kernel
+from CMF_GPU.phys.triton.AdaptTime import compute_adaptive_time_step
+from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
+from CMF_GPU.phys.triton.Storage import compute_flood_stage_kernel
 from CMF_GPU.utils.Aggregator import update_stats_aggregator
 
 def do_one_substep(
@@ -24,10 +23,11 @@ def do_one_substep(
     states["river_inflow"].zero_()
     states["flood_inflow"].zero_()
     states["outgoing_storage"].zero_()
+    grid = lambda meta: (cdiv(num_catchments, meta['BLOCK_SIZE']),)
     # ---------------------------
     # 1) Compute river and flood outflows
     # ---------------------------
-    grid = lambda meta: (cdiv(num_catchments, meta['BLOCK_SIZE']),)
+    # atomic
     compute_outflow_kernel[grid](
         is_river_mouth_ptr=params["is_river_mouth"],
         downstream_idx_ptr=params["downstream_idx"],
@@ -39,6 +39,7 @@ def do_one_substep(
         river_width_ptr=params["river_width"],
         river_length_ptr=params["river_length"],
         river_elevation_ptr=params["river_elevation"],
+        river_storage_ptr=states["river_storage"],
         catchment_elevation_ptr=params["catchment_elevation"],
         downstream_distance_ptr=params["downstream_distance"],
         flood_depth_ptr=states["flood_depth"],
@@ -46,76 +47,42 @@ def do_one_substep(
         river_cross_section_depth_prev_ptr=states["river_cross_section_depth"],
         flood_cross_section_depth_prev_ptr=states["flood_cross_section_depth"],
         flood_cross_section_area_prev_ptr=states["flood_cross_section_area"],
+        outgoing_storage_ptr=states["outgoing_storage"],  
+        water_surface_elevation_ptr=states["water_surface_elevation"],
         gravity=params["gravity"],
         time_step=dT,
         num_catchments=num_catchments,
         BLOCK_SIZE=BLOCK_SIZE
     )
-
     # ---------------------------
-    # 2) Compute outgoing storage and apply limits
+    # 2) Accumulate inflows
     # ---------------------------
     # atomic
-    compute_outgoing_storage_kernel[grid](
+    compute_inflow_kernel[grid](
         is_river_mouth_ptr=params["is_river_mouth"],
-        downstream_idx_ptr=params["downstream_idx"],
-        river_outflow_ptr=states["river_outflow"],
-        flood_outflow_ptr=states["flood_outflow"],
-        outgoing_storage_ptr=states["outgoing_storage"],
-        time_step=dT,
-        num_catchments=num_catchments,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-
-    # Apply inflow limits
-    apply_storage_limits_kernel[grid](
         downstream_idx_ptr=params["downstream_idx"],
         river_outflow_ptr=states["river_outflow"],
         flood_outflow_ptr=states["flood_outflow"],
         total_storage_ptr=states["total_storage"],
         outgoing_storage_ptr=states["outgoing_storage"],
-        num_catchments=num_catchments,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-
-    # ---------------------------
-    # 3) Accumulate inflows
-    # ---------------------------
-
-    # atomic
-    accumulate_inflows_kernel[grid](
-        is_river_mouth_ptr=params["is_river_mouth"],
-        river_outflow_ptr=states["river_outflow"],
-        flood_outflow_ptr=states["flood_outflow"],
-        downstream_idx_ptr=params["downstream_idx"],
         river_inflow_ptr=states["river_inflow"],
         flood_inflow_ptr=states["flood_inflow"],
+        limit_rate_ptr=states["limit_rate"],
         num_catchments=num_catchments,
         BLOCK_SIZE=BLOCK_SIZE
     )
 
     # ---------------------------
-    # 4) Update storage values
+    # 3) Compute flood stage and update water levels
     # ---------------------------
-    update_storage_kernel[grid](
-        river_storage_ptr=states["river_storage"],
-        flood_storage_ptr=states["flood_storage"],
-        total_storage_ptr=states["total_storage"],
+    
+    compute_flood_stage_kernel[grid](
         river_inflow_ptr=states["river_inflow"],
         flood_inflow_ptr=states["flood_inflow"],
         river_outflow_ptr=states["river_outflow"],
         flood_outflow_ptr=states["flood_outflow"],
         runoff_ptr=runoff,
         time_step=dT,
-        num_catchments=num_catchments,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    # ---------------------------
-    # 5) Compute flood stage and update water levels
-    # ---------------------------
-
-    compute_flood_stage_kernel[grid](
         total_storage_ptr=states["total_storage"],
         river_storage_ptr=states["river_storage"],
         flood_storage_ptr=states["flood_storage"],
@@ -134,12 +101,12 @@ def do_one_substep(
         river_width_ptr=params["river_width"],
         river_length_ptr=params["river_length"],
         num_catchments=num_catchments,
-        num_flood_levels=10, 
+        num_flood_levels=10,
         BLOCK_SIZE=BLOCK_SIZE
     )
 
     # ---------------------------
-    # 7) Update statistics aggregator
+    # 4) Update statistics aggregator
     # ---------------------------
     update_stats_aggregator[grid](
         river_outflow=states["river_outflow"],
@@ -165,7 +132,6 @@ def advance_step(runtime_flags, params, states, runoff, dT_def, BLOCK_SIZE=1024)
             runtime_flags["time_step"],
             params["adaptation_factor"],
             params["gravity"],
-            BLOCK_SIZE=BLOCK_SIZE
         )
         print(f"Adaptive time step: {dT:.4f}, Number of sub-steps: {num_sub_steps}")
         num_sub_steps_gpu = torch.tensor(num_sub_steps, device=params["is_river_mouth"].device)

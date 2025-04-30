@@ -1,7 +1,7 @@
 import pickle
 import os
 import shutil
-from CMF_GPU.phys.StepAdvance import advance_step
+from CMF_GPU.phys.triton.StepAdvance import advance_step
 from CMF_GPU.utils.Preprocesser import load_csr_list_from_pkl
 from CMF_GPU.utils.Checker import prepare_model_and_function, gather_device_dicts
 from CMF_GPU.utils.Dataloader import DataLoader, DailyBinDataset
@@ -39,7 +39,7 @@ def main(config_file):
         time_starts=time_starts,
         dataset=ds,  
         unit_factor=runtime_flags["unit_factor"],
-        num_workers=3,
+        num_workers=1,
         max_cache_steps=100,
         precision="float32",
         runoff_mask=runoff_mask
@@ -51,7 +51,7 @@ def main(config_file):
         base_dir=config["out_dir"],
         stats_config=default_statistics,
         file_format="nc",
-        num_workers=3
+        num_workers=1
     )
     default_sub_iters = runtime_flags["default_sub_iters"]
     
