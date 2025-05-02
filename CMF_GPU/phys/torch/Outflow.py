@@ -33,7 +33,7 @@ def compute_outflow_torch(
 ):
     # Create output tensor for outgoing storage
     outgoing_storage = torch.zeros_like(river_outflow)
-
+    total_storage = river_storage + flood_storage
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
     #----------------------------------------------------------------------
@@ -161,7 +161,7 @@ def compute_outflow_torch(
     neg_values = -neg_flow[non_river_mouth] * time_step
     outgoing_storage.scatter_add_(0, ds_idx, neg_values)
 
-    return updated_river_outflow, updated_flood_outflow, outgoing_storage, water_surface_elevation, river_cross_section_depth, flood_cross_section_depth, flood_cross_section_area
+    return updated_river_outflow, updated_flood_outflow, total_storage, outgoing_storage, water_surface_elevation, river_cross_section_depth, flood_cross_section_depth, flood_cross_section_area
 
 
 def compute_inflow_torch(

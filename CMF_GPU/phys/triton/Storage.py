@@ -51,18 +51,10 @@ def compute_flood_stage_kernel(
     flood_outflow = tl.load(flood_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
 
-    river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
-    river_storage_clamped = tl.maximum(river_storage_updated, 0.0)
+    river_storage_updated = tl.maximum(river_storage + (river_inflow - river_outflow) * time_step, 0.0)
+    flood_storage_updated = tl.maximum(flood_storage + (flood_inflow - flood_outflow) * time_step, 0.0)
 
-    flood_storage_updated = flood_storage + (flood_inflow - flood_outflow) * time_step
-    flood_storage_clamped = tl.maximum(flood_storage_updated, 0.0)
-
-    total_storage = tl.maximum(river_storage_clamped + flood_storage_clamped + runoff * time_step, 0.0)
-
-    # Optionally, write back updated values (depends if you want in-place update before flood computation)
-    tl.store(river_storage_ptr + offs, river_storage_clamped, mask=mask)
-    tl.store(flood_storage_ptr + offs, flood_storage_clamped, mask=mask)
-    tl.store(total_storage_ptr + offs, total_storage, mask=mask)
+    total_storage = tl.maximum(river_storage_updated + flood_storage_updated + runoff * time_step, 0.0)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
     river_max_storage   = tl.load(river_max_storage_ptr   + offs, mask=mask)
@@ -105,19 +97,18 @@ def compute_flood_stage_kernel(
     )
     river_depth = river_storage_final / river_area
 
-    flood_fraction_mid = (prev_total_width + diff_width - river_width) * river_length / catchment_area
-    flood_fraction_mid = tl.maximum(0.0, tl.minimum(1.0, flood_fraction_mid))
+    flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
     flood_fraction = tl.where(
         level == 0, 0.0,
         tl.where(level == level_max - 1, 1.0, flood_fraction_mid)
     )
 
     flood_area    = flood_fraction * catchment_area
-    flood_storage = tl.maximum(total_storage - river_storage_final, 0.0)
+    flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
 
     # Store outputs (in-place update)
     tl.store(river_storage_ptr    + offs, river_storage_final, mask=mask)
-    tl.store(flood_storage_ptr    + offs, flood_storage, mask=mask)
+    tl.store(flood_storage_ptr    + offs, flood_storage_final, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)

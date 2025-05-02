@@ -6,6 +6,7 @@ from CMF_GPU.utils.Preprocesser import load_csr_list_from_pkl
 from CMF_GPU.utils.Checker import prepare_model_and_function, gather_device_dicts
 from CMF_GPU.utils.Dataloader import DataLoader, DailyBinDataset
 from CMF_GPU.utils.Datadumper import DataDumper
+from CMF_GPU.utils.Logger import Logger
 from CMF_GPU.utils.Aggregator import default_statistics
 from datetime import datetime, timedelta
 from omegaconf import OmegaConf
@@ -39,7 +40,7 @@ def main(config_file):
         time_starts=time_starts,
         dataset=ds,  
         unit_factor=runtime_flags["unit_factor"],
-        num_workers=1,
+        num_workers=3,
         max_cache_steps=100,
         precision="float32",
         runoff_mask=runoff_mask
@@ -51,10 +52,13 @@ def main(config_file):
         base_dir=config["out_dir"],
         stats_config=default_statistics,
         file_format="nc",
-        num_workers=1
+        num_workers=3
     )
+    logger = Logger(base_dir=config["out_dir"])
+    logger.set_current_time(start_date)
+    # TODO: multi-GPU
+    logger.write_header(states[0])
     default_sub_iters = runtime_flags["default_sub_iters"]
-    
     for time_start in time_starts:
         runoff_t, time_length = loader.get_data(time_start)
         current_time = time_start
@@ -67,20 +71,16 @@ def main(config_file):
         dT_def = time_step / default_sub_iters
         # print("total_storage:", f"{states["total_storage"].sum():.4e}")
         for _ in range(iters_per_runoff_step):
-            print("time:", current_time)
+            logger.set_current_time(current_time)
             aggregator = parallel_step_fn(
-                runtime_flags, params, states, runoff_t, runoff_matrix, dT_def
+                runtime_flags, params, states, runoff_t, runoff_matrix, dT_def, logger
             )
             aggregator_cpu = gather_device_dicts(aggregator)
             dumper.submit_data(current_time, aggregator_cpu)
-            print("river_outflow (sum):", f"{states[0]['river_outflow'].sum():.4e}")
-            print("total_storage (sum):", f"{states[0]['total_storage'].sum():.4e}")
-            print("river_depth (sum):", f"{states[0]['river_depth'].sum():.4e}")
-
-            
             current_time += timedelta(seconds=time_step)
         
     dumper.close()
+    logger.close()
 
 if __name__ == "__main__":
     import argparse

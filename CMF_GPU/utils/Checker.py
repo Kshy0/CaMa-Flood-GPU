@@ -28,31 +28,37 @@ MODULES_CONFIG = {
             "river_manning": 0.03,
             "flood_manning": 0.1,
         },
+        "hidden_params": {},
+        "scalar_params": {
+            "gravity": 9.81,
+            "adaptation_factor": 0.7,
+        },
         "required_states": [
             "river_storage",
         ],
         "optional_states": {
             "flood_storage": 0.0,
-            "total_storage": 0.0,
-            "outgoing_storage": 0.0, #
-            "water_surface_elevation": 0.0, #
-            "limit_rate": 0.0, #
             "river_depth": 0.0,
-            "river_inflow": 0.0, #
             "river_outflow": 0.0,
             "flood_depth": 0.0,
-            "flood_area": 0.0, #
-            "flood_fraction": 0.0, #
-            "flood_inflow": 0.0, #
+            "flood_area": 0.0,
             "flood_outflow": 0.0,
             "river_cross_section_depth": 0.0,
             "flood_cross_section_depth": 0.0,
             "flood_cross_section_area": 0.0,
         },
-        "scalar_params": {
-            "gravity": 9.81,
-            "adaptation_factor": 0.7,
-        }
+        "hidden_states": [
+            "total_storage",
+            "outgoing_storage",
+            "water_surface_elevation",
+            "limit_rate",
+            "river_inflow",
+            "flood_area",
+            "flood_fraction",
+            "flood_inflow",
+            "flood_outflow",
+        ],
+        "scalar_states": {},
     },
     "foo_module": {
         "required_params": [],
@@ -60,17 +66,21 @@ MODULES_CONFIG = {
             "foo_param": 0.0,
             "bar_param": 0.0,
         },
+        "hidden_params": {},
+        "scalar_params": {
+            "foo_a": 0.85,
+            "foo_b": 0.05
+        },
         "required_states": [],
         "optional_states": {
             "foo_state": 0.0,
             "bar_state": 0.0,
         },
-        "scalar_params": {
-            "foo": 0.85,
-            "minimum_release_rate": 0.05
-        }
+        "hidden_states": [],
+        "scalar_states": {},
     },
 }
+
 
 ###############################################################################
 # Global required runtime flags keys
@@ -90,13 +100,31 @@ RUNTIME_FLAGS_REQUIRED_KEYS = [
 def gather_all_keys_and_defaults(input_type="param"):
     all_required = set()
     all_optional = set()
+    all_hidden = set()
     all_defaults = {}
-    required_key = "required_params" if input_type == "param" else "required_states"
-    optional_key = "optional_params" if input_type == "param" else "optional_states"
+    all_scalar = {}
+    
+    # Determine which keys to use based on input_type
+    if input_type == "param":
+        required_key = "required_params"
+        optional_key = "optional_params"
+        hidden_key = "hidden_params"
+        scalar_key = "scalar_params"
+    else:  # state
+        required_key = "required_states"
+        optional_key = "optional_states"
+        hidden_key = "hidden_states"
+        scalar_key = "scalar_states"
+    
     default_sources = {}
+    scalar_sources = {}
+    
     for mod_name, mod_cfg in MODULES_CONFIG.items():
+        # Process required keys
         for rk in mod_cfg.get(required_key, []):
             all_required.add(rk)
+        
+        # Process optional keys with defaults
         for ok, default_val in mod_cfg.get(optional_key, {}).items():
             all_optional.add(ok)
             if ok in all_defaults and all_defaults[ok] != default_val:
@@ -107,30 +135,45 @@ def gather_all_keys_and_defaults(input_type="param"):
                 )
             all_defaults[ok] = default_val
             default_sources[ok] = mod_name
-    return all_required, all_optional, all_defaults
-
-def gather_all_scalar_params():
-    merged_scalar_params = {}
-    param_sources = {}
-    for mod_name, mod_cfg in MODULES_CONFIG.items():
-        for k, v in mod_cfg.get("scalar_params", {}).items():
-            if k in merged_scalar_params and merged_scalar_params[k] != v:
+        
+        # Process hidden keys - now just collecting the names without defaults
+        for hk in mod_cfg.get(hidden_key, []):
+            all_hidden.add(hk)
+        
+        # Process scalar values
+        for sk, default_val in mod_cfg.get(scalar_key, {}).items():
+            if sk in all_scalar and all_scalar[sk] != default_val:
                 raise ValueError(
-                    f"Conflicting scalar parameter '{k}': "
-                    f"{merged_scalar_params[k]} from '{param_sources[k]}' and "
-                    f"{v} from '{mod_name}'"
+                    f"Conflicting scalar {input_type} '{sk}': "
+                    f"{all_scalar[sk]} from '{scalar_sources[sk]}' and "
+                    f"{default_val} from '{mod_name}'"
                 )
-            merged_scalar_params[k] = v
-            param_sources[k] = mod_name
-    return merged_scalar_params
+            all_scalar[sk] = default_val
+            scalar_sources[sk] = mod_name
+    
+    return all_required, all_optional, all_hidden, all_defaults, all_scalar
 
 def get_modules_using_key(key, key_type="param"):
     used_by = []
-    required_key = "required_params" if key_type == "param" else "required_states"
-    optional_key = "optional_params" if key_type == "param" else "optional_states"
+    
+    if key_type == "param":
+        required_key = "required_params"
+        optional_key = "optional_params"
+        hidden_key = "hidden_params"
+        scalar_key = "scalar_params"
+    else:  # state
+        required_key = "required_states"
+        optional_key = "optional_states"
+        hidden_key = "hidden_states"
+        scalar_key = "scalar_states"
+    
     for mod_name, mod_cfg in MODULES_CONFIG.items():
-        if key in mod_cfg.get(required_key, []) or key in mod_cfg.get(optional_key, {}):
+        if (key in mod_cfg.get(required_key, []) or 
+            key in mod_cfg.get(optional_key, {}) or
+            key in mod_cfg.get(hidden_key, []) or 
+            key in mod_cfg.get(scalar_key, {})):
             used_by.append(mod_name)
+    
     return used_by
 
 ###############################################################################
@@ -198,23 +241,25 @@ def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type
         "is_river_mouth": np.bool,
         "downstream_idx": np.int32,
     }
+    
     if input_type == "param":
-        all_required_keys, all_optional_keys, all_optional_defaults = gather_all_keys_and_defaults("param")
-        all_scalar_params = gather_all_scalar_params()
+        all_required_keys, all_optional_keys, all_hidden_keys, all_defaults, all_scalar = gather_all_keys_and_defaults("param")
         recognized_keys = (
             all_required_keys
             | all_optional_keys
-            | set(all_scalar_params.keys())
+            | all_hidden_keys
+            | set(all_scalar.keys())
         )
         if num_catchments is None:
             raise ValueError("num_catchments must be provided when checking parameters")
     else:
-        all_required_keys, all_optional_keys, all_optional_defaults = gather_all_keys_and_defaults("state")
-        all_scalar_params = {}
-        recognized_keys = all_required_keys | all_optional_keys
+        all_required_keys, all_optional_keys, all_hidden_keys, all_defaults, all_scalar = gather_all_keys_and_defaults("state")
+        recognized_keys = all_required_keys | all_optional_keys | all_hidden_keys | set(all_scalar.keys())
+    
     for k in user_inputs.keys():
         if k not in recognized_keys:
             raise ValueError(f"Unrecognized {input_type} key: {k}")
+    
     def is_truly_required(key):
         required_by = []
         for mod_name in enabled_modules:
@@ -229,10 +274,13 @@ def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type
 
     dtype = np.float32 if precision == "float32" else np.float64
     final_outputs = {}
-    if input_type == "param":
-        for sk, default_val in gather_all_scalar_params().items():
-            final_outputs[sk] = user_inputs.get(sk, default_val)
-    array_keys = (all_required_keys | all_optional_keys) - set(gather_all_scalar_params().keys())
+    
+    # Process scalar values first
+    for sk, default_val in all_scalar.items():
+        final_outputs[sk] = user_inputs.get(sk, default_val)
+    
+    # Process array values
+    array_keys = (all_required_keys | all_optional_keys | all_hidden_keys) - set(all_scalar.keys())
     for key in array_keys:
         if key in user_inputs:
             arr = user_inputs[key]
@@ -252,11 +300,20 @@ def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type
         else:
             if is_truly_required(key):
                 raise ValueError(f"Missing required {input_type}: {key}")
-            default_val = all_optional_defaults.get(key, 0.0)
+            
+            # For hidden states, always initialize to 0.0 regardless of defaults
+            if key in all_hidden_keys:
+                default_val = 0.0
+            else:
+                default_val = all_defaults.get(key, 0.0)
+                
             final_outputs[key] = np.full((num_catchments,), default_val, dtype=dtype)
+    
+    # Handle special computed states
     if input_type == "state":
         if "river_storage" in final_outputs and "flood_storage" in final_outputs:
             final_outputs["total_storage"] = final_outputs["river_storage"] + final_outputs["flood_storage"]
+    
     return final_outputs
 
 ###############################################################################
@@ -325,7 +382,7 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
 
     if isinstance(device_indices, int):
         device_indices = [device_indices]
-    assert len(device_indices) == len(split_indices), "device_indices 和 split_indices 长度需匹配"
+    assert len(device_indices) == len(split_indices), "The lengths of device_indices and split_indices need to match."
 
     final_params_list = []
     final_states_list = []
@@ -349,14 +406,14 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
         final_params_list.append(params_t)
         final_states_list.append(states_t)
 
-    def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT):
+    def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT, logger):
         num_devices = len(params_list)
         if device_type == "gpu":
             streams = [torch.cuda.Stream(device=f"cuda:{dev}") for dev in device_indices]
             aggregator = [None] * num_devices
             for dev, stream in zip(device_indices, streams):
                 with torch.cuda.stream(stream):
-                    aggregator[dev] = step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT)
+                    aggregator[dev] = step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT, logger)
             for s in streams:
                 s.synchronize()
         else:
@@ -442,8 +499,8 @@ if __name__ == "__main__":
         }
         scaling = dT / 3600.0
         new_states["river_storage"] = new_states["river_storage"] + forcing * scaling
-        stats_out = {"river_storage_mean": states["river_storage"]}
-        return new_states, stats_out
+        agg_out = {"river_storage_mean": states["river_storage"]}
+        return agg_out
 
     final_rt, final_ps, final_ss, parallel_step = prepare_model_and_function(
         user_params, user_states, dummy_step_fn, user_runtime_flags
@@ -458,9 +515,7 @@ if __name__ == "__main__":
         forcing_list.append(torch.as_tensor(forcing_np_list[i], dtype=torch.float32, device=dev_t))
 
     dT = 3600.0
-    new_states_list, stats_list = parallel_step(final_rt, final_ps, final_ss, forcing_list, dT)
+    aggregator_list = parallel_step(final_rt, final_ps, final_ss, forcing_list, torch.rand(6, 6).to(device="cuda:0"), dT)
+    aggregator_list_cpu = gather_device_dicts(aggregator_list)
 
-    new_states_cpu = gather_device_dicts(new_states_list)
-    stats_cpu = gather_device_dicts(stats_list)
-    print("New States CPU:", {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in new_states_cpu.items()})
-    print("Stats Out CPU:", {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in stats_cpu.items()})
+    print("Stats Out CPU:", aggregator_list_cpu)

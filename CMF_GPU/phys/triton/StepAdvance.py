@@ -1,6 +1,6 @@
 import torch
 from triton import cdiv
-from CMF_GPU.phys.triton.AdaptTime import compute_adaptive_time_step
+from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
 from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
 from CMF_GPU.phys.triton.Storage import compute_flood_stage_kernel
 from CMF_GPU.utils.Aggregator import update_stats_aggregator
@@ -47,6 +47,7 @@ def do_one_substep(
         river_cross_section_depth_prev_ptr=states["river_cross_section_depth"],
         flood_cross_section_depth_prev_ptr=states["flood_cross_section_depth"],
         flood_cross_section_area_prev_ptr=states["flood_cross_section_area"],
+        total_storage_ptr=states["total_storage"],   
         outgoing_storage_ptr=states["outgoing_storage"],  
         water_surface_elevation_ptr=states["water_surface_elevation"],
         gravity=params["gravity"],
@@ -120,7 +121,7 @@ def do_one_substep(
     pass
 
 
-def advance_step(runtime_flags, params, states, runoff, dT_def, BLOCK_SIZE=1024):
+def advance_step(runtime_flags, params, states, runoff, dT_def, logger, BLOCK_SIZE=1024):
     """
     Advance the step using either adaptive or fixed time step.
     """
@@ -139,7 +140,8 @@ def advance_step(runtime_flags, params, states, runoff, dT_def, BLOCK_SIZE=1024)
         dT = dT_def
         num_sub_steps = runtime_flags["default_sub_iters"]
         num_sub_steps_gpu = torch.tensor(runtime_flags["default_sub_iters"], device=params["is_river_mouth"].device)
-    
+    logger.set_time_step(dT)
+    logger.set_forcing(runoff)
     num_catchments = len(states["river_outflow"])
     dtype = torch.float32 if runtime_flags["precision"] == "float32" else torch.float64
     aggregator = {"river_outflow_mean": torch.zeros(num_catchments, dtype=dtype, device=params["is_river_mouth"].device),
@@ -156,6 +158,7 @@ def advance_step(runtime_flags, params, states, runoff, dT_def, BLOCK_SIZE=1024)
             num_sub_steps_gpu,
             BLOCK_SIZE
         )
+        logger.write_step(states)
     return aggregator
 
 

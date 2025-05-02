@@ -29,6 +29,7 @@ def compute_outflow_kernel(
     flood_cross_section_area_prev_ptr,      # *f32 previous flood cross-section area
 
     # other 
+    total_storage_ptr,
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     gravity,                                # f32 scalar gravity acceleration
@@ -71,7 +72,7 @@ def compute_outflow_kernel(
     # (2) Compute current river water surface elevation & downstream water surface elevation
     #----------------------------------------------------------------------
     water_surface_elevation = river_depth + river_elevation
-    
+    total_storage = river_storage + flood_storage
     # Downstream water surface elevation
     downstream_river_depth = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
     downstream_river_elevation = tl.load(river_elevation_ptr + downstream_idx, mask=mask, other=0.0)
@@ -162,7 +163,7 @@ def compute_outflow_kernel(
                                    (-updated_river_outflow - updated_flood_outflow) * time_step, 
                                    1.0)
     limit_rate = tl.minimum(tl.where(is_negative_flow,
-                   0.05 * (river_storage + flood_storage) / total_negative_flow,
+                   0.05 * total_storage / total_negative_flow,
                    1.0), 1.0)
     updated_river_outflow = tl.where(is_negative_flow, updated_river_outflow * limit_rate, updated_river_outflow)
     updated_flood_outflow = tl.where(is_negative_flow, updated_flood_outflow * limit_rate, updated_flood_outflow)
@@ -176,6 +177,7 @@ def compute_outflow_kernel(
     tl.store(river_cross_section_depth_prev_ptr + offs, river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_prev_ptr + offs, flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_prev_ptr + offs, flood_cross_section_area, mask=mask)
+    tl.store(total_storage_ptr + offs, total_storage, mask=mask)
     
     #----------------------------------------------------------------------
     # (11) Fused outgoing storage computation (was compute_outgoing_storage_kernel)
