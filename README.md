@@ -22,8 +22,8 @@
 ## Prerequisites
 
 - Python == 3.13.3  
-- PyTorch (with CUDA support) == 2.6.0+cu126
-- Triton == 3.2.0
+- PyTorch (with CUDA support) == 2.7.0+cu128
+- Triton == 3.3.0
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - `netCDF4`
   - `omegaconf`
@@ -46,10 +46,10 @@ cd CaMa-Flood-GPU
 It is recommended to use a virtual environment (`venv` or `conda`).
 
 Please follow the official [PyTorch installation guide](https://pytorch.org/get-started/locally/) for your environment. 
-For CUDA 12.6, you may use:
+For CUDA 12.8, you may use:
 
 ```shell
-pip3 install torch --index-url https://download.pytorch.org/whl/cu126
+pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 > **Note:** By default, `triton` will be installed automatically when you install PyTorch.

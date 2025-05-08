@@ -21,8 +21,7 @@ runtime_flags:
   time_step: 86400 # seconds
   unit_factor: 86400000 # mm/day divided by unit_factor to get m/s
   default_sub_iters: 360
-  enable_adaptive_time_step: True
   precision: float32
-  modules: [base]
+  modules: [base, adaptive_time_step, log, aggregator]
   device: gpu
   device_indices: [0]

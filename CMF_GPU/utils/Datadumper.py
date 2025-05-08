@@ -7,6 +7,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from netCDF4 import Dataset
 from typing import Dict, List, Tuple
+from CMF_GPU.utils.Variables import MODULES_CONFIG
+from CMF_GPU.utils.utils import check_enabled, gather_device_dicts
 
 
 def open_file(file_path: Path, file_format: str, var_name: str, data: np.ndarray):
@@ -44,7 +46,7 @@ def write_data(handler, file_format: str, var_name: str, data: np.ndarray, times
     if file_format == "bin":
         handler.seek(0, os.SEEK_END)
         data.tofile(handler)
-        handler.flush()  # 强制刷新文件缓冲区
+        handler.flush()  
     elif file_format == "nc":
         var = handler.variables[var_name]
         idx = var.shape[0]
@@ -58,7 +60,7 @@ def write_data(handler, file_format: str, var_name: str, data: np.ndarray, times
             delta_days = (timestamp - base).total_seconds() / 86400.0
             handler.variables['time'][idx] = delta_days
 
-        handler.sync()  # netCDF 数据写入磁盘
+        handler.sync() 
     else:
         raise ValueError(f"Unsupported file format: {file_format}")
 
@@ -139,46 +141,35 @@ def worker_multi_key(
 
 
 class DataDumper:
-    """
-    Modified DataDumper that:
-    1) Does not require var_names.
-    2) Accepts an aggregator dict (e.g., from update_stats_aggregator).
-    3) Creates separate files & worker processes for each aggregator.
-    4) Supports netCDF or binary output modes, saving by year or month.
-    5) Additional param num_workers that distributes aggregator keys to avoid handle conflicts.
-    """
-
     def __init__(
         self,
         base_dir: str,
-        stats_config: Dict[str, list],
+        stats_name: List[str] = MODULES_CONFIG["aggregator"]["hidden_states"],
         file_format: str = "nc",
         save_by: str = "year",
         max_queue_size: int = 100,
-        num_workers: int = 1
+        num_workers: int = 1,
+        disabled=False
     ):
+        self.disabled = disabled
+        if self.disabled:
+            return
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.file_format = file_format
         self.save_by = save_by
-        self.stats_config = stats_config
+        self.stats_name = stats_name
         self.num_workers = max(num_workers, 1)
 
         # Use spawn method with torch.multiprocessing
         mp.set_start_method('spawn', force=True)
 
         # Build aggregator keys (e.g., "river_storage_mean")
-        all_aggregator_keys = []
-        for var_name, stat_list in stats_config.items():
-            for stat_type in stat_list:
-                all_aggregator_keys.append(f"{var_name}_{stat_type}")
-
         # If we have fewer aggregator keys than requested workers, reduce worker count
-        num_workers_actual = min(self.num_workers, len(all_aggregator_keys)) if all_aggregator_keys else 0
-        self.aggregator_keys = all_aggregator_keys
+        num_workers_actual = min(self.num_workers, len(stats_name))
         # Prepare queues for each aggregator key
         self.task_queues = {
-            agg_key: mp.Queue(maxsize=max_queue_size) for agg_key in all_aggregator_keys
+            agg_key: mp.Queue(maxsize=max_queue_size) for agg_key in stats_name
         }
 
         # Partition aggregator keys among workers
@@ -187,7 +178,7 @@ class DataDumper:
             # Create subsets
             for i in range(num_workers_actual):
                 # Slice aggregator keys in a round-robin or simple step
-                subset_keys = all_aggregator_keys[i::num_workers_actual]
+                subset_keys = stats_name[i::num_workers_actual]
                 if not subset_keys:
                     continue
                 worker = mp.Process(
@@ -199,31 +190,34 @@ class DataDumper:
         for worker in self._workers:
             worker.start()
 
+    @check_enabled
+    def gather_stats(self, states: Dict[str, np.ndarray]) -> Dict[str, Dict[str, np.ndarray]]:
+        return gather_device_dicts(states, keys=self.stats_name)
+
+    @check_enabled
     def submit_data(self, timestamp: datetime, aggregator: Dict[str, Dict[str, np.ndarray]]):
         for agg_key, array_data in aggregator.items():
             self.task_queues[agg_key].put((timestamp, array_data))
 
+    @check_enabled
     def close(self):
         """
         Wait for writers to finish and close all resources.
         """
         SENTINEL = (None, None)
-        for agg_key in self.aggregator_keys:
-            self.task_queues[agg_key].put(SENTINEL)  # 向每个队列发哨兵
+        for agg_key in self.stats_name:
+            self.task_queues[agg_key].put(SENTINEL)
 
         for worker in self._workers:
             worker.join()
 
 
 def test_data_dumper_nc():
-    stats_config = {
-        "river_storage": ["mean", "max"],
-        "soil_moisture": ["min", "mean"]
-    }
+    stats_name = ["river_storage_mean","river_storage_max","soil_moisture_min","soil_moisture_mean"]
     base_dir = "./test_nc_output_mod"
     dumper = DataDumper(
         base_dir=base_dir,
-        stats_config=stats_config,
+        stats_name=stats_name,
         file_format="nc",
         save_by="month",
         max_queue_size=10,
@@ -259,14 +253,11 @@ def test_data_dumper_nc():
 
 
 def test_data_dumper_bin():
-    stats_config = {
-        "river_storage": ["mean", "max"],
-        "soil_moisture": ["min", "mean"]
-    }
+    stats_name = ["river_storage_mean","river_storage_max","soil_moisture_min","soil_moisture_mean"]
     base_dir = "./test_bin_output_mod"
     dumper = DataDumper(
         base_dir=base_dir,
-        stats_config=stats_config,
+        stats_name=stats_name,
         file_format="bin",
         save_by="month",
         max_queue_size=10,

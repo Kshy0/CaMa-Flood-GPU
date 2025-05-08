@@ -1,183 +1,10 @@
 import torch
 import numpy as np
+from CMF_GPU.utils.Variables import MODULES, MODULES_CONFIG, RUNTIME_FLAGS_REQUIRED_KEYS, SCALAR_TYPES, SPECIAL_ARRAY_SHAPES, SPECIAL_ARRAY_TYPES, SPECIAL_HIDDEN_PARAMS
+from CMF_GPU.utils.utils import gather_all_keys_and_defaults, split_dict_arrays
 
 ###############################################################################
-# 0. Module Configurations (unchanged)
-###############################################################################
-MODULES_CONFIG = {
-    "base": {
-        "required_params": [
-            "is_river_mouth",
-            "downstream_idx",
-            "river_width",
-            "river_length",
-            "river_height",
-            "river_elevation",
-            "catchment_elevation",
-            "downstream_distance",
-            "river_max_storage",
-            "river_area",
-            "max_flood_area",
-            "total_storage_table",
-            "flood_depth_table",
-            "total_width_table",
-            "flood_gradient_table",
-            "catchment_area",
-        ],
-        "optional_params": {
-            "river_manning": 0.03,
-            "flood_manning": 0.1,
-        },
-        "hidden_params": {},
-        "scalar_params": {
-            "gravity": 9.81,
-            "adaptation_factor": 0.7,
-        },
-        "required_states": [
-            "river_storage",
-        ],
-        "optional_states": {
-            "flood_storage": 0.0,
-            "river_depth": 0.0,
-            "river_outflow": 0.0,
-            "flood_depth": 0.0,
-            "flood_area": 0.0,
-            "flood_outflow": 0.0,
-            "river_cross_section_depth": 0.0,
-            "flood_cross_section_depth": 0.0,
-            "flood_cross_section_area": 0.0,
-        },
-        "hidden_states": [
-            "total_storage",
-            "outgoing_storage",
-            "water_surface_elevation",
-            "limit_rate",
-            "river_inflow",
-            "flood_area",
-            "flood_fraction",
-            "flood_inflow",
-            "flood_outflow",
-        ],
-        "scalar_states": {},
-    },
-    "foo_module": {
-        "required_params": [],
-        "optional_params": {
-            "foo_param": 0.0,
-            "bar_param": 0.0,
-        },
-        "hidden_params": {},
-        "scalar_params": {
-            "foo_a": 0.85,
-            "foo_b": 0.05
-        },
-        "required_states": [],
-        "optional_states": {
-            "foo_state": 0.0,
-            "bar_state": 0.0,
-        },
-        "hidden_states": [],
-        "scalar_states": {},
-    },
-}
-
-
-###############################################################################
-# Global required runtime flags keys
-###############################################################################
-RUNTIME_FLAGS_REQUIRED_KEYS = [
-    "precision",
-    "modules",
-    "time_step",
-    "unit_factor", # mm/day divided by unit_factor to get m/s
-    "default_sub_iters",
-    "enable_adaptive_time_step",
-    "device",
-    "device_indices",
-    "split_indices",
-]
-
-def gather_all_keys_and_defaults(input_type="param"):
-    all_required = set()
-    all_optional = set()
-    all_hidden = set()
-    all_defaults = {}
-    all_scalar = {}
-    
-    # Determine which keys to use based on input_type
-    if input_type == "param":
-        required_key = "required_params"
-        optional_key = "optional_params"
-        hidden_key = "hidden_params"
-        scalar_key = "scalar_params"
-    else:  # state
-        required_key = "required_states"
-        optional_key = "optional_states"
-        hidden_key = "hidden_states"
-        scalar_key = "scalar_states"
-    
-    default_sources = {}
-    scalar_sources = {}
-    
-    for mod_name, mod_cfg in MODULES_CONFIG.items():
-        # Process required keys
-        for rk in mod_cfg.get(required_key, []):
-            all_required.add(rk)
-        
-        # Process optional keys with defaults
-        for ok, default_val in mod_cfg.get(optional_key, {}).items():
-            all_optional.add(ok)
-            if ok in all_defaults and all_defaults[ok] != default_val:
-                raise ValueError(
-                    f"Conflicting default values for {input_type} '{ok}': "
-                    f"{all_defaults[ok]} from '{default_sources[ok]}' and "
-                    f"{default_val} from '{mod_name}'"
-                )
-            all_defaults[ok] = default_val
-            default_sources[ok] = mod_name
-        
-        # Process hidden keys - now just collecting the names without defaults
-        for hk in mod_cfg.get(hidden_key, []):
-            all_hidden.add(hk)
-        
-        # Process scalar values
-        for sk, default_val in mod_cfg.get(scalar_key, {}).items():
-            if sk in all_scalar and all_scalar[sk] != default_val:
-                raise ValueError(
-                    f"Conflicting scalar {input_type} '{sk}': "
-                    f"{all_scalar[sk]} from '{scalar_sources[sk]}' and "
-                    f"{default_val} from '{mod_name}'"
-                )
-            all_scalar[sk] = default_val
-            scalar_sources[sk] = mod_name
-    
-    return all_required, all_optional, all_hidden, all_defaults, all_scalar
-
-def get_modules_using_key(key, key_type="param"):
-    used_by = []
-    
-    if key_type == "param":
-        required_key = "required_params"
-        optional_key = "optional_params"
-        hidden_key = "hidden_params"
-        scalar_key = "scalar_params"
-    else:  # state
-        required_key = "required_states"
-        optional_key = "optional_states"
-        hidden_key = "hidden_states"
-        scalar_key = "scalar_states"
-    
-    for mod_name, mod_cfg in MODULES_CONFIG.items():
-        if (key in mod_cfg.get(required_key, []) or 
-            key in mod_cfg.get(optional_key, {}) or
-            key in mod_cfg.get(hidden_key, []) or 
-            key in mod_cfg.get(scalar_key, {})):
-            used_by.append(mod_name)
-    
-    return used_by
-
-###############################################################################
-# 3. Runtime Flags Validation
+# Runtime Flags Validation
 ###############################################################################
 def validate_runtime_flags(runtime_flags):
     # Check for unexpected keys
@@ -188,6 +15,10 @@ def validate_runtime_flags(runtime_flags):
     for rk in RUNTIME_FLAGS_REQUIRED_KEYS:
         if rk not in runtime_flags:
             raise ValueError(f"Missing required runtime flag: {rk}")
+
+    for md in runtime_flags["modules"]:
+        if md not in MODULES:
+            raise ValueError(f"Unknown module '{md}' in runtime_flags['modules']")
 
     if "base" not in runtime_flags["modules"]:
         raise ValueError("'base' module is required and must be included in modules")
@@ -234,127 +65,105 @@ def validate_runtime_flags(runtime_flags):
     runtime_flags["split_indices"] = si
 
 ###############################################################################
-# 4. check_and_convert_inputs (unchanged, still produces NumPy arrays)
+# check_and_convert_inputs
 ###############################################################################
-def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, num_catchments=None):
-    special_types = {
-        "is_river_mouth": np.bool,
-        "downstream_idx": np.int32,
-    }
-    
-    if input_type == "param":
-        all_required_keys, all_optional_keys, all_hidden_keys, all_defaults, all_scalar = gather_all_keys_and_defaults("param")
-        recognized_keys = (
-            all_required_keys
-            | all_optional_keys
-            | all_hidden_keys
-            | set(all_scalar.keys())
-        )
-        if num_catchments is None:
-            raise ValueError("num_catchments must be provided when checking parameters")
-    else:
-        all_required_keys, all_optional_keys, all_hidden_keys, all_defaults, all_scalar = gather_all_keys_and_defaults("state")
-        recognized_keys = all_required_keys | all_optional_keys | all_hidden_keys | set(all_scalar.keys())
-    
+def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, shape_info = None):
+
+    all_params_or_states, all_hidden_keys, all_scalar_keys = gather_all_keys_and_defaults(input_type, MODULES)
+
+    recognized_keys = all_params_or_states + all_hidden_keys + all_scalar_keys
+
+    params_or_states, hidden_keys, scalar_keys = gather_all_keys_and_defaults(input_type, enabled_modules)
+
+
     for k in user_inputs.keys():
-        if k not in recognized_keys:
-            raise ValueError(f"Unrecognized {input_type} key: {k}")
+        if k in hidden_keys:
+            print(f"Warning: {input_type} key '{k}' is hidden and will be ignored.")
+        else:
+            if k not in params_or_states and k not in scalar_keys:
+                if k not in recognized_keys:
+                    raise ValueError(f"Unrecognized {input_type} key: {k}")
+                else:
+                    print(f"Warning: {input_type} key '{k}' is not used in the model.")
     
-    def is_truly_required(key):
-        required_by = []
-        for mod_name in enabled_modules:
-            mod_cfg = MODULES_CONFIG.get(mod_name, {})
-            if input_type == "param":
-                if key in mod_cfg.get("required_params", []):
-                    required_by.append(mod_name)
-            else:
-                if key in mod_cfg.get("required_states", []):
-                    required_by.append(mod_name)
-        return len(required_by) > 0
+    # Check for missing keys that are required for enabled modules
+    for mod_name in enabled_modules:
+        mod_cfg = MODULES_CONFIG.get(mod_name, {})
+        if input_type == "param":
+            required_keys = set(mod_cfg.get("params", [])) | set(mod_cfg.get("scalar_params", []))
+            for key in required_keys:
+                if key not in user_inputs and key not in hidden_keys:
+                    raise ValueError(f"Missing required {input_type} '{key}' for module '{mod_name}'")
+        else:  # state
+            required_keys = set(mod_cfg.get("states", []))
+            for key in required_keys:
+                if key not in user_inputs and key not in hidden_keys:
+                    raise ValueError(f"Missing required {input_type} '{key}' for module '{mod_name}'")
 
     dtype = np.float32 if precision == "float32" else np.float64
     final_outputs = {}
-    
-    # Process scalar values first
-    for sk, default_val in all_scalar.items():
-        final_outputs[sk] = user_inputs.get(sk, default_val)
-    
-    # Process array values
-    array_keys = (all_required_keys | all_optional_keys | all_hidden_keys) - set(all_scalar.keys())
-    for key in array_keys:
-        if key in user_inputs:
-            arr = user_inputs[key]
-            if key in special_types:
-                arr = np.array(arr, dtype=special_types[key])
-            else:
-                if isinstance(arr, (list, tuple)):
-                    arr = np.array(arr)
-                if not isinstance(arr, (np.ndarray,)):
-                    raise TypeError(f"{input_type.capitalize()} {key} must be array-like.")
-                arr = np.array(arr, dtype=dtype)
-            if arr.shape[0] != num_catchments:
+
+    # Process scalar values
+    for key in scalar_keys:
+        val = user_inputs[key]
+        if not isinstance(val, (int, float)):
+            raise TypeError(f"Expected a scalar value for '{key}', but got {type(val).__name__}.")
+        final_outputs[key] = SCALAR_TYPES[key](val)
+
+    if input_type == "param":
+        shape_info = final_outputs
+
+    def check_array_shape(key, val):
+        if key in SPECIAL_ARRAY_SHAPES:
+            expected_shape = SPECIAL_ARRAY_SHAPES[key](shape_info)
+            if val.shape != expected_shape:
                 raise ValueError(
-                    f"{input_type.capitalize()} {key} leading dimension {arr.shape[0]} != {num_catchments}."
+                    f"{input_type.capitalize()} '{key}': expected shape {expected_shape}, but got shape {val.shape}."
                 )
-            final_outputs[key] = arr
         else:
-            if is_truly_required(key):
-                raise ValueError(f"Missing required {input_type}: {key}")
-            
-            # For hidden states, always initialize to 0.0 regardless of defaults
-            if key in all_hidden_keys:
-                default_val = 0.0
-            else:
-                default_val = all_defaults.get(key, 0.0)
-                
-            final_outputs[key] = np.full((num_catchments,), default_val, dtype=dtype)
+            if not (val.shape[0] == shape_info["num_catchments"] and len(val.shape) == 1):
+                raise ValueError(
+                    f"{input_type.capitalize()} '{key}': expected leading dimension = {shape_info['num_catchments']} "
+                    f"and array to be 1D, but got shape {val.shape}."
+                )
     
-    # Handle special computed states
-    if input_type == "state":
-        if "river_storage" in final_outputs and "flood_storage" in final_outputs:
-            final_outputs["total_storage"] = final_outputs["river_storage"] + final_outputs["flood_storage"]
+    def convert_array_type(key, val):
+        if key in SPECIAL_ARRAY_TYPES:
+            if val.dtype != SPECIAL_ARRAY_TYPES[key]:
+                raise TypeError(
+                    f"'{key}': Expected a NumPy array of type {SPECIAL_ARRAY_TYPES[key]}, but got {val.dtype}."
+                )
+        else:
+            val = val.astype(dtype)
+
+        return val
+
+    # Process array values
+    for key in params_or_states:
+        val = user_inputs[key]
+        if not isinstance(val, np.ndarray):
+            raise TypeError(f"Expected a NumPy array, but got {type(val).__name__}.")  
+             
+        check_array_shape(key, val)
+        final_outputs[key] = convert_array_type(key, val)
+
+    # Init hidden values
+    for key in hidden_keys:
+        if key in SPECIAL_HIDDEN_PARAMS:
+            final_outputs[key] = SPECIAL_HIDDEN_PARAMS[key](final_outputs)
+        else:
+            final_outputs[key] = np.zeros((shape_info["num_catchments"],), dtype=dtype)
+        
+        check_array_shape(key, final_outputs[key])
+        final_outputs[key] = convert_array_type(key, final_outputs[key])
+
     
     return final_outputs
 
-###############################################################################
-# 5. split_dict_arrays (unchanged)
-###############################################################################
-def split_dict_arrays(d, split_indices):
-    splits = {}
-    for k, v in d.items():
-        if isinstance(v, np.ndarray):
-            splits[k] = np.split(v, split_indices[:-1])
-        else:
-            splits[k] = [v] * len(split_indices)
-    out = []
-    for i in range(len(split_indices)):
-        this_dict = {k: splits[k][i] for k in d}
-        out.append(this_dict)
-    return out
+
 
 ###############################################################################
-# 6. gather_device_dicts 
-###############################################################################
-
-def gather_device_dicts(list_of_dicts):
-    merged = {}
-    for k in list_of_dicts[0].keys():
-        vals = []
-        for d in list_of_dicts:
-            v = d[k]
-            if isinstance(v, torch.Tensor):
-                vals.append(v.cpu().numpy())  # Convert tensor to numpy array
-            else:
-                vals.append(v)
-        first = vals[0]
-        if isinstance(first, torch.Tensor) and first.numel() > 1:
-            merged[k] = np.concatenate(vals, axis=0)  # Use numpy concatenate instead of torch.cat
-        else:
-            merged[k] = first
-    return merged
-
-###############################################################################
-# 7. Model Preparation & Function Construction
+# Model Preparation & Function Construction
 ###############################################################################
 def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_flags):
     validate_runtime_flags(user_runtime_flags)
@@ -365,24 +174,17 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
     enabled_modules = final_runtime_flags["modules"]
     precision = final_runtime_flags["precision"]
 
-    if "river_storage" not in user_states:
-        raise ValueError("river_storage is required in user_states")
-    river_storage = user_states["river_storage"]
-    num_catchments = (
-        len(river_storage)
-        if isinstance(river_storage, (list, tuple, np.ndarray))
-        else river_storage.shape[0]
-    )
-
-    final_params_np = check_and_convert_inputs(user_params, enabled_modules, precision, "param", num_catchments)
-    final_states_np = check_and_convert_inputs(user_states, enabled_modules, precision, "state", num_catchments)
+    final_params_np = check_and_convert_inputs(user_params, enabled_modules, precision, "param")
+    final_states_np = check_and_convert_inputs(user_states, enabled_modules, precision, "state", shape_info=final_params_np)
 
     final_params_np_list = split_dict_arrays(final_params_np, split_indices)
     final_states_np_list = split_dict_arrays(final_states_np, split_indices)
 
     if isinstance(device_indices, int):
         device_indices = [device_indices]
-    assert len(device_indices) == len(split_indices), "The lengths of device_indices and split_indices need to match."
+
+    if len(device_indices) != len(split_indices):
+        raise ValueError("The lengths of device_indices and split_indices need to match.")
 
     final_params_list = []
     final_states_list = []
@@ -407,13 +209,11 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
         final_states_list.append(states_t)
 
     def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT, logger):
-        num_devices = len(params_list)
         if device_type == "gpu":
             streams = [torch.cuda.Stream(device=f"cuda:{dev}") for dev in device_indices]
-            aggregator = [None] * num_devices
             for dev, stream in zip(device_indices, streams):
                 with torch.cuda.stream(stream):
-                    aggregator[dev] = step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT, logger)
+                    step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT, logger)
             for s in streams:
                 s.synchronize()
         else:
@@ -421,26 +221,28 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
             # new_s, stats = step_fn(runtime_flags, params_list[0], states_list[0], forcing_list[0], dT)
             # outs_new_states[0] = new_s
             # outs_stats[0] = stats
-        return aggregator
 
     return final_runtime_flags, final_params_list, final_states_list, parallel_fn
 
 ###############################################################################
-# 8. Example Usage
+# Example Usage
 ###############################################################################
 if __name__ == "__main__":
+    from CMF_GPU.utils.Variables import gather_device_dicts
     user_runtime_flags = {
         "time_step": 86400,
         "unit_factor": 1000.0,
-        "enable_adaptive_time_step": False,
+        "enable_logging": False,
         "precision": "float32",
-        "modules": ["base", "foo_module"],
+        "modules": ["base", "adaptive_time_step"],
         "default_sub_iters": 24,
         "device": "gpu",
         "device_indices": [0],
         "split_indices": [6],  # means 2 devices, each gets 3
     }
     user_params = {
+        "num_catchments": 6,
+        "num_flood_levels": 1,
         "is_river_mouth": [True, False, True, False, True, False],
         "downstream_idx": [1, 2, 0, 4, 5, 3],
         "river_width": [100.0, 80.0, 60.0, 70.0, 65.0, 62.0],
@@ -477,22 +279,38 @@ if __name__ == "__main__":
             [14, 24, 34, 44],
         ],
         "flood_gradient_table": [
-            [0.01, 0.02, 0.03, 0.04],
-            [0.02, 0.03, 0.04, 0.05],
-            [0.03, 0.04, 0.05, 0.06],
-            [0.04, 0.05, 0.06, 0.07],
-            [0.05, 0.06, 0.07, 0.08],
-            [0.06, 0.07, 0.08, 0.09],
+            [0.01, 0.02, 0.03],
+            [0.02, 0.03, 0.04],
+            [0.03, 0.04, 0.05],
+            [0.04, 0.05, 0.06],
+            [0.05, 0.06, 0.07],
+            [0.06, 0.07, 0.08],
         ],
         "catchment_area": [100, 90, 80, 120, 105, 95],
-        "foo_param": [1.0, 2.0, 3.0, 4.0, 2.0, 1.0],
+        "river_manning": [0.03, 0.03, 0.03, 0.03, 0.03, 0.03],
+        "flood_manning": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+        "gravity": 9.81,              
+        "adaptation_factor": 0.7,              
     }
     user_states = {
         "river_storage": [10.0, 5.0, 2.0, 8.0, 7.0, 3.0],
-        "foo_state": [999, 888, 777, 555, 444, 333],
+        "flood_storage": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "river_depth": [1.0, 0.8, 0.5, 0.9, 0.7, 0.6],
+        "river_outflow": [0.5, 0.4, 0.2, 0.6, 0.5, 0.3],
+        "flood_depth": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "flood_area": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "flood_outflow": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "river_cross_section_depth": [0.8, 0.7, 0.4, 0.8, 0.6, 0.5],
+        "flood_cross_section_depth": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "flood_cross_section_area": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     }
-    
-    def dummy_step_fn(runtime_flags, params, states, forcing, dT):
+    for key, value in user_params.items():
+        if not isinstance(value, (int, float)):
+            user_params[key] = np.array(value)
+    for key, value in user_states.items():
+        if not isinstance(value, (int, float)):
+            user_states[key] = np.array(value)            
+    def dummy_step_fn(runtime_flags, params, states, forcing, dT, logger):
         new_states = {
             k: (v + 1.0 if isinstance(v, torch.Tensor) else v)
             for k, v in states.items()
@@ -515,7 +333,7 @@ if __name__ == "__main__":
         forcing_list.append(torch.as_tensor(forcing_np_list[i], dtype=torch.float32, device=dev_t))
 
     dT = 3600.0
-    aggregator_list = parallel_step(final_rt, final_ps, final_ss, forcing_list, torch.rand(6, 6).to(device="cuda:0"), dT)
-    aggregator_list_cpu = gather_device_dicts(aggregator_list)
+    parallel_step(final_rt, final_ps, final_ss, forcing_list, torch.rand(6, 6).to(device="cuda:0"), dT, 0)
+    states_cpu = gather_device_dicts(final_ss)
 
-    print("Stats Out CPU:", aggregator_list_cpu)
+    print("Stats Out CPU:", final_ss)
