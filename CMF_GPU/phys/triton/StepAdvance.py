@@ -2,6 +2,7 @@ import torch
 from triton import cdiv
 from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
 from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
+from CMF_GPU.phys.triton.Bifurcation import compute_bifurcation_outflow_kernel
 from CMF_GPU.phys.triton.Storage import compute_flood_stage_kernel, compute_flood_stage_log_kernel
 from CMF_GPU.utils.Aggregator import update_stats_aggregator
 
@@ -50,6 +51,28 @@ def do_one_substep(
         num_catchments=params["num_catchments"],
         BLOCK_SIZE=BLOCK_SIZE
     )
+
+    if "bifurcation" in runtime_flags["modules"]:
+        bifurcation_grid = lambda meta: (cdiv(params["num_bifurcation_paths"], meta['BLOCK_SIZE']),)
+        compute_bifurcation_outflow_kernel[bifurcation_grid](
+            catchment_idx_ptr=params["bifurcation_catchment_idx"],
+            downstream_idx_ptr=params["bifurcation_downstream_idx"],
+            bifurcation_manning_ptr=params["bifurcation_manning"],
+            bifurcation_outflow_ptr=states["bifurcation_outflow"],
+            bifurcation_width_ptr=params["bifurcation_width"],
+            bifurcation_length_ptr=params["bifurcation_length"],
+            bifurcation_elevation_ptr=params["bifurcation_elevation"],
+            bifurcation_cross_section_depth_prev_ptr=states["bifurcation_cross_section_depth"],
+            water_surface_elevation_ptr=states["water_surface_elevation"],
+            total_storage_ptr=states["total_storage"],
+            outgoing_storage_ptr=states["outgoing_storage"],
+            gravity=params["gravity"],
+            time_step=dT,
+            num_paths=params["num_bifurcation_paths"],
+            num_bifurcation_levels=params["num_bifurcation_levels"],
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+
     # ---------------------------
     # 2) Accumulate inflows
     # ---------------------------
@@ -155,7 +178,6 @@ def do_one_substep(
         num_catchments=params["num_catchments"],
         BLOCK_SIZE=BLOCK_SIZE
     )
-    pass
 
 
 def advance_step(runtime_flags, params, states, runoff, dT_def, logger, BLOCK_SIZE=1024):

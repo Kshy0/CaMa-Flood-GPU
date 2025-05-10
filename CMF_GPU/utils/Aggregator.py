@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+# TODO: flexible aggregator for variables
 @triton.jit
 def update_stats_aggregator(
     river_outflow_ptr,         # *f32 [N]

@@ -67,38 +67,45 @@ def validate_runtime_flags(runtime_flags):
 ###############################################################################
 # check_and_convert_inputs
 ###############################################################################
-def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, shape_info = None):
-
+def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, shape_info=None):
     all_params_or_states, all_hidden_keys, all_scalar_keys = gather_all_keys_and_defaults(input_type, MODULES)
-
     recognized_keys = all_params_or_states + all_hidden_keys + all_scalar_keys
 
     params_or_states, hidden_keys, scalar_keys = gather_all_keys_and_defaults(input_type, enabled_modules)
-
+    hidden_keys_list = []
+    unused_keys_list = []
 
     for k in user_inputs.keys():
         if k in hidden_keys:
-            print(f"Warning: {input_type} key '{k}' is hidden and will be ignored.")
+            hidden_keys_list.append(k)
         else:
             if k not in params_or_states and k not in scalar_keys:
                 if k not in recognized_keys:
                     raise ValueError(f"Unrecognized {input_type} key: {k}")
                 else:
-                    print(f"Warning: {input_type} key '{k}' is not used in the model.")
-    
-    # Check for missing keys that are required for enabled modules
+                    unused_keys_list.append(k)
+
+    if hidden_keys_list:
+        print(f"Warning: The following {input_type} keys are hidden and will be ignored: {', '.join(hidden_keys_list)}")
+    if unused_keys_list:
+        print(f"Warning: The following {input_type} keys are recognized but not used in the model: {', '.join(unused_keys_list)}")
+
+    # Collect missing required keys
+    missing_keys = []
     for mod_name in enabled_modules:
         mod_cfg = MODULES_CONFIG.get(mod_name, {})
         if input_type == "param":
             required_keys = set(mod_cfg.get("params", [])) | set(mod_cfg.get("scalar_params", []))
-            for key in required_keys:
-                if key not in user_inputs and key not in hidden_keys:
-                    raise ValueError(f"Missing required {input_type} '{key}' for module '{mod_name}'")
-        else:  # state
+        else:
             required_keys = set(mod_cfg.get("states", []))
-            for key in required_keys:
-                if key not in user_inputs and key not in hidden_keys:
-                    raise ValueError(f"Missing required {input_type} '{key}' for module '{mod_name}'")
+
+        for key in required_keys:
+            if key not in user_inputs and key not in hidden_keys:
+                missing_keys.append((mod_name, key))
+
+    if missing_keys:
+        missing_desc = "\n".join([f"  - {key} (required by module '{mod_name}')" for mod_name, key in missing_keys])
+        raise ValueError(f"Missing required {input_type} keys:\n{missing_desc}")
 
     dtype = np.float32 if precision == "float32" else np.float64
     final_outputs = {}

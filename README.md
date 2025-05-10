@@ -83,17 +83,20 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
 
   ### 3. Generate parameters
 
-  Run all cells in `CMF_GPU/generate_parameters.ipynb`.  
-
-  If your `test1-glb_15min.yaml` is set up correctly, you should not need to modify the notebook—simply execute all cells. This process will generate a refined `config.yaml` in the `inp/test1-glb_15min/` folder, ready for model execution.
-
-  ### 4. Run the model
-
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  python CMF_GPU/main.py ./inp/test1-glb_15min/config.yaml
+  python ./CMF_GPU/generate_parameters.py ./configs/test1-glb_15min.yaml
   ```
-
+  
+  If your `test1-glb_15min.yaml` is set up correctly, you should not need to modify the notebook—simply execute all cells. This process will generate a refined `config.yaml` in the `inp/test1-glb_15min/` folder, ready for model execution.
+  
+  ### 4. Run the model
+  
+  ```shell
+  cd /path/to/CaMa-Flood-GPU
+  python ./CMF_GPU/main.py ./inp/test1-glb_15min/config.yaml
+  ```
+  
   - [Optional] For multi-GPU or distributed runs, please refer to upcoming documentation and code samples.
 
 
@@ -102,7 +105,7 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
 ## Features
 
 - **Ultra-fast computation:** Even with the standard CPython interpreter, CaMa-Flood-GPU achieves superior performance.  
-  **Benchmark:** `test1-glb_15min`, simulation from 2000-01-01 to 2000-12-31 with `enable_adaptive_time_step` enabled runs in ~32 seconds (single 4070Ti GPU + i7-13700 CPU)—even faster than the MATLAB version.
+  **Benchmark:** `test1-glb_15min`, simulation from 2000-01-01 to 2000-12-31 with `adaptive_time_step` enabled runs in ~32 seconds (single 4070Ti GPU + i7-13700 CPU)—even faster than the MATLAB version.
 
 - **Asynchronous I/O:** The model supports asynchronous data loading and dumping via `Dataloader.py` and `Datadumper.py`, ensuring that I/O does not bottleneck simulation speed.
 

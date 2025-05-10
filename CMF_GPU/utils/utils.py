@@ -10,6 +10,7 @@ def check_enabled(func):
         return func(self, *args, **kwargs)
     return wrapper
 
+
 def gather_all_keys_and_defaults(input_type, modules):
     assert input_type in ["param", "state"], "input_type must be 'param' or 'state'"
     all_params_or_states = []
@@ -55,7 +56,6 @@ def split_dict_arrays(d, split_indices):
         out.append(this_dict)
     return out
 
-
 def gather_device_dicts(list_of_dicts, keys=None):
     merged = {}
     for k in list_of_dicts[0].keys():
@@ -67,6 +67,36 @@ def gather_device_dicts(list_of_dicts, keys=None):
             merged[k] = list_of_dicts[0][k]
             
     return merged
+
+def load_csr_list_from_pkl(filename, device_indices):
+    """
+    Load sparse tensors from a pickle file as COO format and convert them to CSR format.
+    
+    Args:
+        filename: Input pickle filename
+        device_indices: List of device indices to place tensors on
+    
+    Returns:
+        List of CSR sparse tensors
+    """
+    with open(filename, 'rb') as f:
+        serializable_list = pickle.load(f)
+    
+    csr_list = []
+    for data, device in zip(serializable_list, device_indices):
+        # First load as COO tensor
+        coo = torch.sparse_coo_tensor(
+            data['indices'], 
+            data['values'], 
+            data['shape'], 
+            dtype=data['dtype'], 
+            device=f"cuda:{device}"
+        )
+        # Convert to CSR format
+        csr = coo.to_sparse_csr()
+        csr_list.append(csr)
+    
+    return csr_list
 
 def snapshot_to_pkl(data_dict, input_type, modules, filename, omit_hidden=True):
     """

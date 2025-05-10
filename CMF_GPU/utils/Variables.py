@@ -161,7 +161,7 @@ SPECIAL_ARRAY_SHAPES = {
     "flood_gradient_table": lambda p: (p["num_catchments"], p["num_flood_levels"] + 2),
     "bifurcation_catchment_idx": lambda p: (p["num_bifurcation_paths"],),
     "bifurcation_downstream_idx": lambda p: (p["num_bifurcation_paths"],),
-    "bifurcation_manning": lambda p: (p["num_bifurcation_paths"],),
+    "bifurcation_manning": lambda p: (p["num_bifurcation_paths"], p["num_bifurcation_levels"]),
     "bifurcation_width": lambda p: (p["num_bifurcation_paths"], p["num_bifurcation_levels"]),
     "bifurcation_length": lambda p: (p["num_bifurcation_paths"],),
     "bifurcation_elevation": lambda p: (p["num_bifurcation_paths"], p["num_bifurcation_levels"]),

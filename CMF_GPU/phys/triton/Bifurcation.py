@@ -17,8 +17,8 @@ def compute_bifurcation_outflow_kernel(
     outgoing_storage_ptr,                       # *f32: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
     time_step,                                  # f32: Time step
-    num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     num_paths: tl.constexpr,                    # Total number of bifurcation paths
+    num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     BLOCK_SIZE: tl.constexpr                    # Block size
 ):
     pid = tl.program_id(0)
@@ -30,7 +30,7 @@ def compute_bifurcation_outflow_kernel(
     downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
     
     # Load bifurcation properties
-    bifurcation_manning = tl.load(bifurcation_manning_ptr + offs, mask=mask, other=0.0)
+    
     bifurcation_length = tl.load(bifurcation_length_ptr + offs, mask=mask, other=0.0)
     
     # Load river properties for catchment and downstream
@@ -45,10 +45,12 @@ def compute_bifurcation_outflow_kernel(
     # Storage change limiter calculation
     bifurcation_total_storage = tl.load(total_storage_ptr + catchment_idx, mask=mask, other=0.0)
     bifurcation_total_storage_downstream = tl.load(total_storage_ptr + downstream_idx, mask=mask, other=0.0)
-    bifurcation_outflow_sum = tl.zeros_like(bifurcation_manning)
+    bifurcation_outflow_sum = tl.zeros_like(bifurcation_length)
 
     for level in range(num_bifurcation_levels):
+        
         level_idx = offs * num_bifurcation_levels + level
+        bifurcation_manning = tl.load(bifurcation_manning_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_cross_section_depth_prev = tl.load(bifurcation_cross_section_depth_prev_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_elevation = tl.load(bifurcation_elevation_ptr + level_idx, mask=mask, other=0.0)
         # Calculate bifurcation cross-section depth
