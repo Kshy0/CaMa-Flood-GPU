@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from CMF_GPU.utils.Variables import MODULES, MODULES_CONFIG, RUNTIME_FLAGS_REQUIRED_KEYS, SCALAR_TYPES, SPECIAL_ARRAY_SHAPES, SPECIAL_ARRAY_TYPES, SPECIAL_HIDDEN_PARAMS
 from CMF_GPU.utils.utils import gather_all_keys_and_defaults, split_dict_arrays
-
 ###############################################################################
 # Runtime Flags Validation
 ###############################################################################
@@ -67,7 +66,7 @@ def validate_runtime_flags(runtime_flags):
 ###############################################################################
 # check_and_convert_inputs
 ###############################################################################
-def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, shape_info=None):
+def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, params=None, agg_keys=None):
     all_params_or_states, all_hidden_keys, all_scalar_keys = gather_all_keys_and_defaults(input_type, MODULES)
     recognized_keys = all_params_or_states + all_hidden_keys + all_scalar_keys
 
@@ -118,19 +117,19 @@ def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type
         final_outputs[key] = SCALAR_TYPES[key](val)
 
     if input_type == "param":
-        shape_info = final_outputs
+        params = final_outputs
 
     def check_array_shape(key, val):
         if key in SPECIAL_ARRAY_SHAPES:
-            expected_shape = SPECIAL_ARRAY_SHAPES[key](shape_info)
+            expected_shape = SPECIAL_ARRAY_SHAPES[key](params)
             if val.shape != expected_shape:
                 raise ValueError(
                     f"{input_type.capitalize()} '{key}': expected shape {expected_shape}, but got shape {val.shape}."
                 )
         else:
-            if not (val.shape[0] == shape_info["num_catchments"] and len(val.shape) == 1):
+            if not (val.shape[0] == params["num_catchments"] and len(val.shape) == 1):
                 raise ValueError(
-                    f"{input_type.capitalize()} '{key}': expected leading dimension = {shape_info['num_catchments']} "
+                    f"{input_type.capitalize()} '{key}': expected leading dimension = {params['num_catchments']} "
                     f"and array to be 1D, but got shape {val.shape}."
                 )
     
@@ -159,10 +158,23 @@ def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type
         if key in SPECIAL_HIDDEN_PARAMS:
             final_outputs[key] = SPECIAL_HIDDEN_PARAMS[key](final_outputs)
         else:
-            final_outputs[key] = np.zeros((shape_info["num_catchments"],), dtype=dtype)
+            final_outputs[key] = np.zeros((params["num_catchments"],), dtype=dtype)
         
         check_array_shape(key, final_outputs[key])
         final_outputs[key] = convert_array_type(key, final_outputs[key])
+
+    # Init statistic values (Second call)
+    if input_type == "state":
+        allowed_aggs = {"min", "max", "mean"}
+        if agg_keys is not None:
+            for agg_type, keys in agg_keys.items():
+                if agg_type not in allowed_aggs:
+                    raise ValueError(f"Unsupported aggregation type: {agg_type}. Only 'min', 'max', and 'mean' are allowed.")
+                for key in keys:
+                    if (key not in final_outputs) and (key not in params):
+                        raise ValueError(f"Aggregation key '{key}' not found in final outputs.")
+                    agg_key_name = f"{key}_{agg_type}"
+                    final_outputs[agg_key_name] = np.zeros_like(final_outputs[key], dtype=dtype)
 
     
     return final_outputs
@@ -182,8 +194,7 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
     precision = final_runtime_flags["precision"]
 
     final_params_np = check_and_convert_inputs(user_params, enabled_modules, precision, "param")
-    final_states_np = check_and_convert_inputs(user_states, enabled_modules, precision, "state", shape_info=final_params_np)
-
+    final_states_np = check_and_convert_inputs(user_states, enabled_modules, precision, "state", params=final_params_np, agg_keys=user_runtime_flags["statistics"])
     final_params_np_list = split_dict_arrays(final_params_np, split_indices)
     final_states_np_list = split_dict_arrays(final_states_np, split_indices)
 
@@ -215,12 +226,12 @@ def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_f
         final_params_list.append(params_t)
         final_states_list.append(states_t)
 
-    def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT, logger):
+    def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT, logger, agg_fn):
         if device_type == "gpu":
             streams = [torch.cuda.Stream(device=f"cuda:{dev}") for dev in device_indices]
             for dev, stream in zip(device_indices, streams):
                 with torch.cuda.stream(stream):
-                    step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT, logger)
+                    step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT, logger, agg_fn)
             for s in streams:
                 s.synchronize()
         else:

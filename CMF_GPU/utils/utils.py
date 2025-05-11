@@ -62,7 +62,7 @@ def gather_device_dicts(list_of_dicts, keys=None):
         if keys is not None and k not in keys:
             continue
         if isinstance(list_of_dicts[0][k], torch.Tensor):
-            merged[k] = np.concatenate([d[k].cpu().detach().numpy() for d in list_of_dicts], axis=0)
+            merged[k] = np.concatenate([d[k].detach().cpu().numpy() for d in list_of_dicts], axis=0)
         else:
             merged[k] = list_of_dicts[0][k]
             
@@ -108,7 +108,6 @@ def snapshot_to_pkl(data_dict, input_type, modules, filename, omit_hidden=True):
         modules (list): Enabled modules, used to determine hidden keys.
         filename (str): Output .pkl file path.
     """
-    
     # Get hidden keys to exclude
     params_or_states, hidden_keys, scalar_keys = gather_all_keys_and_defaults(input_type, modules)
 
@@ -123,6 +122,8 @@ def snapshot_to_pkl(data_dict, input_type, modules, filename, omit_hidden=True):
         if k in scalar_keys or k in params_or_states or (k in hidden_keys and not omit_hidden):
             snapshot[k] = data_dict[k]
             saved_keys.append(k)
+        elif (k.endswith('_min') or k.endswith('_max') or k.endswith('_mean')):
+             continue
         else:
             raise ValueError(f"Key '{k}' not found in params or states.")
         

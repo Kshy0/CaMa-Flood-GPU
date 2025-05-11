@@ -47,7 +47,7 @@ def compute_bifurcation_outflow_kernel(
     bifurcation_total_storage_downstream = tl.load(total_storage_ptr + downstream_idx, mask=mask, other=0.0)
     bifurcation_outflow_sum = tl.zeros_like(bifurcation_length)
 
-    for level in range(num_bifurcation_levels):
+    for level in tl.static_range(num_bifurcation_levels):
         
         level_idx = offs * num_bifurcation_levels + level
         bifurcation_manning = tl.load(bifurcation_manning_ptr + level_idx, mask=mask, other=0.0)
@@ -80,7 +80,7 @@ def compute_bifurcation_outflow_kernel(
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
     limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(bifurcation_outflow_sum) * time_step), 1.0)
     bifurcation_outflow_sum *= limit_rate
-    for level in range(num_bifurcation_levels):
+    for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
         updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask)
         updated_bifurcation_outflow *= limit_rate

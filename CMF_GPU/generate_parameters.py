@@ -7,7 +7,7 @@ def generate_parameters(config_file):
     
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Run CMF_GPU simulation.")
+    parser = argparse.ArgumentParser(description="Generate parameters for CMF_GPU simulation.")
     parser.add_argument("config_file", type=str, help="Path to the config.yaml file")
     args = parser.parse_args()
     generate_parameters(args.config_file)

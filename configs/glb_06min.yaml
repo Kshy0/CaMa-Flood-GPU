@@ -1,9 +1,9 @@
 working_dir: /home/eat/CaMa-Flood-GPU
-experiment_name: test1-glb_15min
+experiment_name: glb_06min
 out_dir: ${working_dir}/out/${experiment_name}/
 inp_dir: ${working_dir}/inp/${experiment_name}/
-map_dir: /home/eat/cmf_v420_pkg/map/glb_15min
-hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_15min/1min
+map_dir: /home/eat/cmf_v420_pkg/map/glb_06min
+hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_06min/1min
 states_file: None
 start_date: 2000-01-01
 end_date: 2000-12-31

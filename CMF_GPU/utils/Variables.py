@@ -64,13 +64,6 @@ MODULES_CONFIG = {
     "adaptive_time_step": {
         "scalar_params": ["adaptation_factor"],  
     },
-    "aggregator": {
-        "hidden_states": [
-            "river_outflow_min",
-            "river_outflow_mean",
-            "river_outflow_max",
-        ],
-    },
     "log": {
         "scalar_params": ["log_buffer_size"],
         "hidden_states": [
@@ -178,4 +171,33 @@ RUNTIME_FLAGS_REQUIRED_KEYS = [
     "device",
     "device_indices",
     "split_indices",
+    "statistics"
 ]
+
+
+LEGAL_AGG_ARRAYS = {
+    ("num_catchments",): [
+        "river_storage",
+        "flood_storage",
+        "river_depth",
+        "river_outflow",
+        "flood_depth",
+        "flood_outflow",
+        "river_cross_section_depth",
+        "flood_cross_section_depth",
+        "flood_cross_section_area",
+        "total_storage",
+        "water_surface_elevation",
+        "limit_rate",
+        "flood_area",
+        "flood_fraction",
+    ],
+    ("num_bifurcation_paths", "num_bifurcation_levels"): [
+        "bifurcation_outflow",
+        "bifurcation_cross_section_depth",
+    ],
+    # ("num_bifurcation_paths",): [
+    #     "bifurcation_outflow_sum",
+    # ],
+}
+

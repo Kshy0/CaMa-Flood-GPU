@@ -7,7 +7,6 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from netCDF4 import Dataset
 from typing import Dict, List, Tuple
-from CMF_GPU.utils.Variables import MODULES_CONFIG
 from CMF_GPU.utils.utils import check_enabled, gather_device_dicts
 
 
@@ -144,7 +143,7 @@ class DataDumper:
     def __init__(
         self,
         base_dir: str,
-        stats_name: List[str] = MODULES_CONFIG["aggregator"]["hidden_states"],
+        statistics: Dict[str, List[str]],
         file_format: str = "nc",
         save_by: str = "year",
         max_queue_size: int = 100,
@@ -158,18 +157,19 @@ class DataDumper:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.file_format = file_format
         self.save_by = save_by
-        self.stats_name = stats_name
         self.num_workers = max(num_workers, 1)
 
-        # Use spawn method with torch.multiprocessing
-        mp.set_start_method('spawn', force=True)
+        all_aggregator_keys = []
+        for stat_name, var_list in statistics.items():
+            for var_name in var_list:
+                all_aggregator_keys.append(f"{var_name}_{stat_name}")
 
-        # Build aggregator keys (e.g., "river_storage_mean")
         # If we have fewer aggregator keys than requested workers, reduce worker count
-        num_workers_actual = min(self.num_workers, len(stats_name))
+        num_workers_actual = min(self.num_workers, len(all_aggregator_keys)) if all_aggregator_keys else 0
+        self.aggregator_keys = all_aggregator_keys
         # Prepare queues for each aggregator key
         self.task_queues = {
-            agg_key: mp.Queue(maxsize=max_queue_size) for agg_key in stats_name
+            agg_key: mp.Queue(maxsize=max_queue_size) for agg_key in all_aggregator_keys
         }
 
         # Partition aggregator keys among workers
@@ -178,7 +178,7 @@ class DataDumper:
             # Create subsets
             for i in range(num_workers_actual):
                 # Slice aggregator keys in a round-robin or simple step
-                subset_keys = stats_name[i::num_workers_actual]
+                subset_keys = all_aggregator_keys[i::num_workers_actual]
                 if not subset_keys:
                     continue
                 worker = mp.Process(
@@ -186,13 +186,16 @@ class DataDumper:
                     args=(self.base_dir, self.file_format, self.save_by, self.task_queues, subset_keys),
                 )
                 self._workers.append(worker)
+        else:
+            self.disabled = True
+            print("No workers created. No data will be dumped.")
 
         for worker in self._workers:
             worker.start()
 
     @check_enabled
     def gather_stats(self, states: Dict[str, np.ndarray]) -> Dict[str, Dict[str, np.ndarray]]:
-        return gather_device_dicts(states, keys=self.stats_name)
+        return gather_device_dicts(states, keys=self.aggregator_keys)
 
     @check_enabled
     def submit_data(self, timestamp: datetime, aggregator: Dict[str, Dict[str, np.ndarray]]):
@@ -205,9 +208,8 @@ class DataDumper:
         Wait for writers to finish and close all resources.
         """
         SENTINEL = (None, None)
-        for agg_key in self.stats_name:
+        for agg_key in self.aggregator_keys:
             self.task_queues[agg_key].put(SENTINEL)
-
         for worker in self._workers:
             worker.join()
 

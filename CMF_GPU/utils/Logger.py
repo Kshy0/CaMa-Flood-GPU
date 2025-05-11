@@ -70,38 +70,34 @@ class Logger:
         num_steps = self.num_steps
         time_strs = np.array([t.strftime('%Y-%m-%d %H:%M') for t in self.times[:num_steps]], dtype=str)
 
-        total_storage_pre = log_data["total_storage_pre_sum"].cpu().numpy()[:num_steps]
-        total_storage_next = log_data["total_storage_next_sum"].cpu().numpy()[:num_steps]
-        total_storage_new = log_data["total_storage_new"].cpu().numpy()[:num_steps]
-        total_river_storage = log_data["total_river_storage"].cpu().numpy()[:num_steps]
-        total_flood_storage = log_data["total_flood_storage"].cpu().numpy()[:num_steps]
-        total_outflow = log_data["total_outflow"].cpu().numpy()[:num_steps]
-        total_inflow = log_data["total_inflow"].cpu().numpy()[:num_steps]
-        total_storage_stage_new = log_data["total_storage_stage_new"].cpu().numpy()[:num_steps]
-        total_flood_area = log_data["total_flood_area"].cpu().numpy()[:num_steps]
-        inflow_error = log_data["total_inflow_error"].cpu().numpy()[:num_steps]
-        stage_error = log_data["total_stage_error"].cpu().numpy()[:num_steps]
+        fields = [
+            "total_storage_pre_sum",
+            "total_storage_next_sum",
+            "total_storage_new",
+            "total_inflow_error",
+            "total_inflow",
+            "total_outflow",
+            "total_storage_stage_new",
+            "total_stage_error",
+            "total_river_storage",
+            "total_flood_storage",
+            "total_flood_area",
+        ]
 
-        fmt = ['%-18s', '%16.6g', '%16.6g', '%16.6g', '%16.3e', '%16.6g', '%16.6g', '%16.6g', '%16.3e', '%16.6g', '%16.6g', '%16.6g']
+        data_arrays = {
+            field: log_data[field].detach().cpu().numpy()[:num_steps]
+            for field in fields
+        }
+
+        fmt = ['%-18s'] + ['%16.6g'] * 3 + ['%16.3e'] + ['%16.6g'] * 3 + ['%16.3e'] + ['%16.6g'] * 3
 
         with open(self.log_path, 'a') as f:
             for i in range(num_steps):
-                row_data = (
-                    time_strs[i],
-                    total_storage_pre[i],
-                    total_storage_next[i],
-                    total_storage_new[i],
-                    inflow_error[i],
-                    total_inflow[i],
-                    total_outflow[i],
-                    total_storage_stage_new[i],
-                    stage_error[i],
-                    total_river_storage[i],
-                    total_flood_storage[i],
-                    total_flood_area[i]
-                )
-                line = ''.join(fmt_str % val for fmt_str, val in zip(fmt, row_data))
+                row = [time_strs[i]] + [data_arrays[field][i] for field in fields]
+                line = ''.join(f % v for f, v in zip(fmt, row))
                 f.write(line + '\n')
+        for field in fields:
+            log_data[field].zero_()
 
     @check_enabled
     def close(self):

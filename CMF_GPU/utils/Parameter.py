@@ -2,6 +2,7 @@ import numpy as np
 from collections import defaultdict, Counter
 from CMF_GPU.utils.Variables import MODULES_CONFIG
 from CMF_GPU.utils.utils import snapshot_to_pkl, gather_all_keys_and_defaults
+from CMF_GPU.utils.Aggregator import generate_triton_aggregator_script
 from pathlib import Path
 from omegaconf import OmegaConf
 import torch
@@ -266,7 +267,7 @@ def read_bifparam(filename):
             pth_wth.append(pth_wth_row)
             pth_elv.append(pth_elv_row)
 
-    return pth_upst, pth_down, pth_dst, pth_wth, pth_elv
+    return num_levels, pth_upst, pth_down, pth_dst, pth_wth, pth_elv
 
 def find_indices_in(a, b):
     """
@@ -335,18 +336,17 @@ def save_coo_list_to_pkl(coo_list, filename):
         pickle.dump(serializable_list, f)
 
 class DefaultGlobalCatchment:
-    nx, ny = 1440, 720
     num_flood_levels = 10
-    num_bifurcation_levels = 5
+    
     gravity = 9.81
     river_manning = 0.03 # not used, load from rivman.bin (may be same?)
     flood_manning = 0.1
     river_mouth_distance = 10000.0
-    log_buffer_size = 500
+    log_buffer_size = 800
     adaptation_factor = 0.7
     missing_value = -9999
     possible_modules = ["base", "adaptive_time_step", "log", "bifurcation"]
-    bifurcation_manning = [river_manning] + [flood_manning] * (num_bifurcation_levels - 1)
+    
     var_maps = {
     "river_length": "rivlen.bin",
     "river_width": "rivwth_gwdlr.bin",
@@ -366,6 +366,7 @@ class DefaultGlobalCatchment:
     "flood_cross_section_depth",
     "flood_cross_section_area",
     ]
+    map_info = "mapinfo.txt"
     bif_info = "bifprm.txt"
 
     idx_precision = "<i4"
@@ -384,6 +385,26 @@ class DefaultGlobalCatchment:
         self.states = {}
         self.reindexed = False
         self.parameters_loaded = False
+    
+    def _load_map_info(self):
+        """
+        Loads map dimensions (nx, ny) from the basin.ctl file.
+        """
+        mapinfo_path = self.map_dir / "basin.ctl"
+        with open(mapinfo_path, "r") as f:
+            lines = f.readlines()
+
+        # Example assumes nx, ny are on line 3, like in many .ctl files
+        for line in lines:
+            if line.strip().startswith("xdef"):
+                parts = line.strip().split()
+                self.nx = int(parts[1])
+            elif line.strip().startswith("ydef"):
+                parts = line.strip().split()
+                self.ny = int(parts[1])
+        
+        print(f"Loaded map dimensions: nx={self.nx}, ny={self.ny}")
+
 
     def _load_catchment_id(self):
         """
@@ -483,7 +504,8 @@ class DefaultGlobalCatchment:
             self.states[state] = np.zeros(self.num_catchments, dtype=self.numpy_precision)
     
     def _load_bifurcation_parameters(self):
-        pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifparam(self.map_dir / self.bif_info)
+        num_bifurcation_levels, pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifparam(self.map_dir / self.bif_info)
+        bifurcation_manning = [self.river_manning] + [self.flood_manning] * (num_bifurcation_levels - 1)
         pth_upst = np.array(pth_upst, dtype=np.int64)
         pth_down = np.array(pth_down, dtype=np.int64)
         bifurcation_catchment_id = np.ravel_multi_index((pth_upst[:, 0] - 1, pth_upst[:, 1] - 1), self.map_shape)
@@ -494,15 +516,15 @@ class DefaultGlobalCatchment:
         assert (bifurcation_downstream_idx != -1).all(), "Error: Some bifurcation downstream IDs are not found in the main catchment IDs."
         num_bifurcation_paths = len(bifurcation_catchment_id)
         self.params["num_bifurcation_paths"] = num_bifurcation_paths
-        self.params["num_bifurcation_levels"] = self.num_bifurcation_levels
+        self.params["num_bifurcation_levels"] = num_bifurcation_levels
         self.params["bifurcation_catchment_idx"] = bifurcation_catchment_idx
         self.params["bifurcation_downstream_idx"] = bifurcation_downstream_idx
-        self.params["bifurcation_manning"] = np.tile(np.array(self.bifurcation_manning, dtype=self.numpy_precision), (num_bifurcation_paths, 1))
+        self.params["bifurcation_manning"] = np.tile(np.array(bifurcation_manning, dtype=self.numpy_precision), (num_bifurcation_paths, 1))
         self.params["bifurcation_width"] = np.array(pth_wth, dtype=self.numpy_precision)
         self.params["bifurcation_length"] = np.array(pth_dst, dtype=self.numpy_precision)
         self.params["bifurcation_elevation"] = np.array(pth_elv, dtype=self.numpy_precision)
-        self.states["bifurcation_outflow"] = np.zeros((num_bifurcation_paths, self.num_bifurcation_levels), dtype=self.numpy_precision)
-        self.states["bifurcation_cross_section_depth"] = np.zeros((num_bifurcation_paths, self.num_bifurcation_levels), dtype=self.numpy_precision)
+        self.states["bifurcation_outflow"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)
+        self.states["bifurcation_cross_section_depth"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)
 
     def _create_input_matrix(self):
 
@@ -564,7 +586,14 @@ class DefaultGlobalCatchment:
             runoff_matrix_list[i] = torch.sparse_coo_tensor(np.vstack((row_indices[row_mask], remapped_runoff_ids)), valid_areas[row_mask], (self.num_catchments, len(unique_ids))).coalesce()
             valid_count += len(np.unique(row_indices[row_mask]))
             total_count += len(np.unique(row_indices[row_indices != -1]))
-        assert total_count == len(self.gpu_basin_ids), "total count mismatch!"
+        if total_count != len(self.gpu_basin_ids):
+            print(
+                f"Warning: {len(self.gpu_basin_ids) - total_count} catchment(s) could not be mapped to any valid grid cells in the high-resolution map. "
+                "These catchments will not receive any runoff input (will always be 0). "
+                "If there are many such catchments, this may indicate a mismatch or issue with the input data or mapping logic."
+            )
+        
+
         if total_count != valid_count:
             print(
                 f"Warning: {total_count - valid_count} catchment(s) will never receive valid runoff data "
@@ -593,6 +622,10 @@ class DefaultGlobalCatchment:
         # self.config.runtime_flags.update(self.runtime_flags)
         OmegaConf.save(config=self.config, f=inp_dir / "config.yaml")
 
+    def _generate_triton_aggregator_script(self):
+        script_path = Path(self.config.inp_dir) / "Aggregate.py"
+        agg_keys = self.config["runtime_flags"]["statistics"]
+        generate_triton_aggregator_script(script_path, agg_keys)
 
     def _summary(self):
         # ---------- basic stats ----------
@@ -653,6 +686,7 @@ class DefaultGlobalCatchment:
         """
         Main pipeline to load and process catchment data.
         """
+        self._load_map_info()
         self._load_catchment_id()
         self._order_basins()
         self._reindex_catchments()
@@ -661,13 +695,14 @@ class DefaultGlobalCatchment:
         self._simple_init_other_states()
         self._load_bifurcation_parameters()
         self._create_input_matrix()
-        self._summary()
         self._create_files()
+        self._generate_triton_aggregator_script()
+        self._summary()
         print("Model input pipeline built successfully.")
         
         
 if __name__ == "__main__":
     from omegaconf import OmegaConf
-    config = OmegaConf.load("./configs/test1-glb_15min.yaml")
+    config = OmegaConf.load("./configs/glb_06min.yaml")
     default_global_catchment = DefaultGlobalCatchment(config)
     default_global_catchment.build_model_input_pipeline()

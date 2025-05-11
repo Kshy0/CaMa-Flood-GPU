@@ -4,7 +4,6 @@ from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
 from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
 from CMF_GPU.phys.triton.Bifurcation import compute_bifurcation_outflow_kernel
 from CMF_GPU.phys.triton.Storage import compute_flood_stage_kernel, compute_flood_stage_log_kernel
-from CMF_GPU.utils.Aggregator import update_stats_aggregator
 
 def do_one_substep(
     runtime_flags: dict,
@@ -12,6 +11,7 @@ def do_one_substep(
     states: dict,
     runoff: torch.Tensor,
     dT: float,
+    update_statistics: callable,
     current_step: int,
     num_sub_steps: int,
     BLOCK_SIZE: int = 1024
@@ -135,6 +135,7 @@ def do_one_substep(
             num_flood_levels=params["num_flood_levels"],
             BLOCK_SIZE=BLOCK_SIZE
         )
+        
     else:
         compute_flood_stage_kernel[grid](
             river_inflow_ptr=states["river_inflow"],
@@ -168,19 +169,16 @@ def do_one_substep(
     # ---------------------------
     # 4) Update statistics aggregator
     # ---------------------------
-    update_stats_aggregator[grid](
-        river_outflow_ptr=states["river_outflow"],
-        river_outflow_mean_ptr=states["river_outflow_mean"],
-        river_outflow_max_ptr=states["river_outflow_max"],
-        river_outflow_min_ptr=states["river_outflow_min"],
+    update_statistics(
+        params,
+        states,
         current_step=current_step,
         num_sub_steps=num_sub_steps,
-        num_catchments=params["num_catchments"],
         BLOCK_SIZE=BLOCK_SIZE
     )
 
 
-def advance_step(runtime_flags, params, states, runoff, dT_def, logger, BLOCK_SIZE=1024):
+def advance_step(runtime_flags, params, states, runoff, dT_def, logger, update_statistics, BLOCK_SIZE=1024):
     """
     Advance the step using either adaptive or fixed time step.
     """
@@ -205,6 +203,7 @@ def advance_step(runtime_flags, params, states, runoff, dT_def, logger, BLOCK_SI
             states,
             runoff,
             dT,
+            update_statistics,
             current_step,
             num_sub_steps,
             BLOCK_SIZE

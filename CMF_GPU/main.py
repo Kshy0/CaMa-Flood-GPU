@@ -1,6 +1,7 @@
 import pickle
 import os
 import shutil
+import runpy
 from CMF_GPU.phys.triton.StepAdvance import advance_step
 from CMF_GPU.utils.Checker import prepare_model_and_function
 from CMF_GPU.utils.Dataloader import DataLoader
@@ -21,13 +22,15 @@ def main(config_file):
     with open(os.path.join(config["inp_dir"], "init_states.pkl"), "rb") as f:
         states = pickle.load(f)
     with open(os.path.join(config["inp_dir"], "runoff_mask.pkl"), "rb") as f:
-        runoff_mask = pickle.load(f)    
+        runoff_mask = pickle.load(f)
     
+    ns = runpy.run_path(os.path.join(config["inp_dir"], "Aggregate.py"))
+    agg_fn = ns["update_statistics"]
     runtime_flags, params, states, parallel_step_fn = prepare_model_and_function(
         params,
         states,
         advance_step,
-        config["runtime_flags"],
+        config["runtime_flags"]
     )
     runoff_matrix = load_csr_list_from_pkl(os.path.join(config["inp_dir"], "runoff_input_matrix.pkl"), device_indices=runtime_flags["device_indices"])
     start_date = datetime.strptime(config["start_date"], "%Y-%m-%d")
@@ -50,9 +53,9 @@ def main(config_file):
     os.makedirs(config["out_dir"])
     dumper = DataDumper(
         base_dir=config["out_dir"],
+        statistics=runtime_flags["statistics"],
         file_format="nc",
         num_workers=1,
-        disabled=False if "aggregator" in runtime_flags["modules"] else True
     )
     logger = Logger(base_dir=config["out_dir"],
         buffer_size=params[0].get("log_buffer_size", None), 
@@ -74,7 +77,7 @@ def main(config_file):
         for _ in range(iters_per_runoff_step):
             logger.set_current_time(current_time)
             parallel_step_fn(
-                runtime_flags, params, states, runoff_t, runoff_matrix, dT_def, logger
+                runtime_flags, params, states, runoff_t, runoff_matrix, dT_def, logger, agg_fn
             )
             aggregator_cpu = dumper.gather_stats(states)
             dumper.submit_data(current_time, aggregator_cpu)
