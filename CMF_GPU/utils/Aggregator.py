@@ -19,6 +19,10 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
     """
 
     # ---------- 1. Map variable to shape key ----------
+    default_lines = [
+        "def update_statistics(params, states, current_step, num_sub_steps, BLOCK_SIZE):",
+        "    pass"
+    ]
     var_to_shape = {}
     for shape_key, vars_ in LEGAL_AGG_ARRAYS.items():
         for v in vars_:
@@ -26,14 +30,20 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
 
     # ---------- 2. Group by dim0 and record agg types for each variable ----------
     grouped = {}  # dim0 → dict(var → set(agg_types))
+    if agg_keys is None:
+        script_path.write_text("\n".join(default_lines), encoding="utf-8")
+        return
     for agg, vars_ in agg_keys.items():
-        for v in vars_:
-            if v not in var_to_shape:
-                raise ValueError(
-                    f"Variable '{v}' not in LEGAL_AGG_ARRAYS")
-            dim0 = var_to_shape[v][0]
-            grouped.setdefault(dim0, {}).setdefault(v, set()).add(agg)
-
+        if vars_ is not None:
+            for v in vars_:
+                if v not in var_to_shape:
+                    raise ValueError(
+                        f"Variable '{v}' not in LEGAL_AGG_ARRAYS")
+                dim0 = var_to_shape[v][0]
+                grouped.setdefault(dim0, {}).setdefault(v, set()).add(agg)
+    if not grouped:
+        script_path.write_text("\n".join(default_lines), encoding="utf-8")
+        return
     # ---------- 3. Code buffer ----------
     lines: list[str] = [
         "import triton",
@@ -234,7 +244,7 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
 
 if __name__ == "__main__":
     agg_keys = {
-        'min':  ['river_storage'],
+        'min':  None,
         'max':  ['river_storage'],
         'mean': ['river_storage', 'bifurcation_outflow'],
     }

@@ -161,8 +161,9 @@ class DataDumper:
 
         all_aggregator_keys = []
         for stat_name, var_list in statistics.items():
-            for var_name in var_list:
-                all_aggregator_keys.append(f"{var_name}_{stat_name}")
+            if var_list is not None:
+                for var_name in var_list:
+                    all_aggregator_keys.append(f"{var_name}_{stat_name}")
 
         # If we have fewer aggregator keys than requested workers, reduce worker count
         num_workers_actual = min(self.num_workers, len(all_aggregator_keys)) if all_aggregator_keys else 0

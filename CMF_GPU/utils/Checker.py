@@ -61,6 +61,10 @@ def validate_runtime_flags(runtime_flags):
     elif not isinstance(si, (list, np.ndarray)):
         raise ValueError("split_indices must be array-like (list or np.ndarray)")
     
+    if runtime_flags["statistics"] is None:
+        runtime_flags["statistics"] = {"min": None, "max": None, "mean": None}
+        
+    
     runtime_flags["split_indices"] = si
 
 ###############################################################################
@@ -170,11 +174,12 @@ def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type
             for agg_type, keys in agg_keys.items():
                 if agg_type not in allowed_aggs:
                     raise ValueError(f"Unsupported aggregation type: {agg_type}. Only 'min', 'max', and 'mean' are allowed.")
-                for key in keys:
-                    if (key not in final_outputs) and (key not in params):
-                        raise ValueError(f"Aggregation key '{key}' not found in final outputs.")
-                    agg_key_name = f"{key}_{agg_type}"
-                    final_outputs[agg_key_name] = np.zeros_like(final_outputs[key], dtype=dtype)
+                if keys is not None:
+                    for key in keys:
+                        if (key not in final_outputs) and (key not in params):
+                            raise ValueError(f"Aggregation key '{key}' not found in final outputs.")
+                        agg_key_name = f"{key}_{agg_type}"
+                        final_outputs[agg_key_name] = np.zeros_like(final_outputs[key], dtype=dtype)
 
     
     return final_outputs
