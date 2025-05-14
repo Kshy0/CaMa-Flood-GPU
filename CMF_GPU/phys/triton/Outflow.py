@@ -4,6 +4,7 @@ import triton.language as tl
 @triton.jit
 def compute_outflow_kernel(
     is_river_mouth_ptr,                     # *bool mask: 1 means river mouth 
+    is_reservoir_ptr,                       # *bool mask: 1 means reservoir
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
@@ -46,6 +47,10 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     is_river_mouth = tl.load(is_river_mouth_ptr + offs, mask=mask, other=0)
     downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
+    is_reservoir = tl.load(is_reservoir_ptr + offs, mask=mask, other=0)
+    is_reservoir_downstream = tl.load(is_reservoir_ptr + downstream_idx, mask=mask, other=0)
+    # omit reservoirs grids (reservoir or upstream of reservoir) 
+    mask = ~(is_reservoir_downstream | is_reservoir) & mask 
 
     # river variables
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
@@ -190,7 +195,7 @@ def compute_outflow_kernel(
 
     # Scatter-add negative flow to downstream
     # Only non-river-mouth applies negative flow
-    to_add    = tl.where(mask & (~is_river_mouth), -neg * time_step, 0.0)
+    to_add    = tl.where(~is_river_mouth, -neg * time_step, 0.0)
     tl.atomic_add(outgoing_storage_ptr + downstream_idx, to_add, mask=mask)
     
 
@@ -239,9 +244,5 @@ def compute_inflow_kernel(
 
     # -------- Accumulate inflows --------
     is_river_mouth = tl.load(is_river_mouth_ptr + offs, mask=mask, other=0)
-    updated_river_outflow = tl.where(~is_river_mouth, updated_river_outflow, 0.0)
-    updated_flood_outflow = tl.where(~is_river_mouth, updated_flood_outflow, 0.0)
-
-    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=mask)
-    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=mask)
-    
+    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=mask&(~is_river_mouth))
+    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=mask&(~is_river_mouth))

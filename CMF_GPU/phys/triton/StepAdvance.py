@@ -4,6 +4,7 @@ from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
 from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
 from CMF_GPU.phys.triton.Bifurcation import compute_bifurcation_outflow_kernel
 from CMF_GPU.phys.triton.Storage import compute_flood_stage_kernel, compute_flood_stage_log_kernel
+from CMF_GPU.phys.triton.Reservoir import compute_reservoir_outflow
 
 def do_one_substep(
     runtime_flags: dict,
@@ -26,6 +27,7 @@ def do_one_substep(
     # atomic
     compute_outflow_kernel[grid](
         is_river_mouth_ptr=params["is_river_mouth"],
+        is_reservoir_ptr=params["is_reservoir"],
         downstream_idx_ptr=params["downstream_idx"],
         river_outflow_ptr=states["river_outflow"],
         flood_outflow_ptr=states["flood_outflow"],
@@ -70,6 +72,39 @@ def do_one_substep(
             time_step=dT,
             num_paths=params["num_bifurcation_paths"],
             num_bifurcation_levels=params["num_bifurcation_levels"],
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+    
+    if "reservoir" in runtime_flags["modules"]:
+        compute_reservoir_outflow(
+            reservoir_catchment_idx_ptr=params["reservoir_catchment_idx"],
+            reservoir_upstream_idx_ptr=params["reservoir_upstream_idx"],
+            river_inflow_ptr=states["river_inflow"],
+            river_outflow_ptr=states["river_outflow"],
+            river_storage_ptr=states["river_storage"],
+            flood_inflow_ptr=states["flood_inflow"],
+            flood_storage_ptr=states["flood_storage"],
+            conservation_volume_ptr=params["conservation_volume"],
+            emergency_volume_ptr=params["emergency_volume"],
+            adjustment_volume_ptr=params["adjustment_volume"],
+            normal_outflow_ptr=params["normal_outflow"],
+            adjustment_outflow_ptr=params["adjustment_outflow"],
+            flood_control_outflow_ptr=params["flood_control_outflow"],
+            river_manning_ptr=params["river_manning"],
+            river_depth_ptr=params["river_depth"],
+            river_width_ptr=params["river_width"],
+            river_length_ptr=params["river_length"],
+            flood_manning_ptr=params["flood_manning"],
+            flood_depth_ptr=params["flood_depth"],
+            catchment_elevation_ptr=params["catchment_elevation"],
+            downstream_distance_ptr=params["downstream_distance"],
+            runoff_ptr=runoff,
+            total_storage_ptr=params["total_storage_ptr"],
+            outgoing_storage_ptr=params["outgoing_storage_ptr"],
+            time_step=dT,
+            num_reservoirs=params["num_reservoirs"],
+            num_upstreams=params["num_upstreams"],
+            min_slope=params["min_slope"],
             BLOCK_SIZE=BLOCK_SIZE
         )
 

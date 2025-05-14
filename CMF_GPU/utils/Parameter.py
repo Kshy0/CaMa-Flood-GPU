@@ -425,6 +425,7 @@ class DefaultGlobalCatchment:
         self.catchment_y = catchment_y
         self.catchment_id = catchment_id
         self.next_catchment_id = next_catchment_id
+        self.is_reservoir = np.zeros_like(catchment_id, dtype=bool)
         self.num_catchments = len(np.where(next_catchment_x != self.missing_value)[0])
         self.is_river_mouth = next_catchment_id < 0
 
@@ -470,6 +471,7 @@ class DefaultGlobalCatchment:
         
         self.params["gravity"] = self.gravity
         self.params["is_river_mouth"] = self.is_river_mouth
+        self.params["is_reservoir"] = self.is_reservoir
         self.params["downstream_idx"] = self.downstream_idx
         self.params["flood_manning"] = 0.1 * np.ones(self.num_catchments, dtype=self.numpy_precision)
         self.params["log_buffer_size"] = self.log_buffer_size

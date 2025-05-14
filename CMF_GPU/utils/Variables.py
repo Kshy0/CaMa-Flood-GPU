@@ -7,12 +7,14 @@ MODULES = [
     "aggregator",
     "log",
     "bifurcation",
+#    "reservoir",
 ]
 
 MODULES_CONFIG = {
     "base": {
         "params": [
             "is_river_mouth",
+            "is_reservoir",
             "downstream_idx",
             "river_width",
             "river_length",
@@ -100,6 +102,26 @@ MODULES_CONFIG = {
         ],
         "hidden_states": [],
     },
+    "reservoir": {
+        "params": [
+            "reservoir_catchment_idx",
+            "conservation_volume",
+            "emergency_volume",
+            "normal_outflow",
+            "flood_control_outflow",
+        ],
+        "hidden_params": [
+            "is_reservoir",
+            "reservoir_upstream_idx",
+            "adjustment_volume",
+            "adjustment_outflow",
+        ],
+        "scalar_params": [
+            "num_reservoirs",
+            "num_upstreams",
+            "min_slope",
+        ],
+    },
 }
 
 
@@ -111,10 +133,14 @@ SCALAR_TYPES = {
     "log_buffer_size": int,
     "num_bifurcation_paths": int,
     "num_bifurcation_levels": int,
+    "num_reservoirs": int,
+    "num_upstreams": int,
+    "min_slope": float,
 }
 
 SPECIAL_ARRAY_TYPES = {
     "is_river_mouth": np.bool,
+    "is_reservoir": np.bool,
     "downstream_idx": np.int64,
     "bifurcation_catchment_idx": np.int64,
     "bifurcation_downstream_idx": np.int64,
@@ -145,6 +171,13 @@ SPECIAL_HIDDEN_PARAMS = {
         (p["total_width_table"][:, 1:] - p["total_width_table"][:, :-1]),
         0
     ),
+    "adjustment_volume": lambda p: p["conservation_volume"] + p["emergency_volume"] * 0.1,
+    "adjustment_outflow": lambda p: (
+        np.minimum(p["normal_outflow"], (
+            (p["conservation_volume"] * 0.7 + p["normal_outflow"] * (365. * 24 * 60 * 60) / 4)
+            / (180. * 24 * 60 * 60)
+        )) * 1.5 + p["flood_control_outflow"]
+    ) * 0.5,
 }
 
 SPECIAL_ARRAY_SHAPES = {
@@ -160,6 +193,13 @@ SPECIAL_ARRAY_SHAPES = {
     "bifurcation_elevation": lambda p: (p["num_bifurcation_paths"], p["num_bifurcation_levels"]),
     "bifurcation_outflow": lambda p: (p["num_bifurcation_paths"], p["num_bifurcation_levels"]),
     "bifurcation_cross_section_depth": lambda p: (p["num_bifurcation_paths"], p["num_bifurcation_levels"]),
+    "reservoir_catchment_idx": lambda p: (p["num_reservoirs"],),
+    "conservation_volume": lambda p: (p["num_reservoirs"],),
+    "emergency_volume": lambda p: (p["num_reservoirs"],),
+    "normal_outflow": lambda p: (p["num_reservoirs"],),
+    "flood_control_outflow": lambda p: (p["num_reservoirs"],),
+    "adjustment_volume": lambda p: (p["num_reservoirs"],),
+    "adjustment_outflow": lambda p: (p["num_reservoirs"],),
 }
 
 RUNTIME_FLAGS_REQUIRED_KEYS = [
