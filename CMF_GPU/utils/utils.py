@@ -1,7 +1,6 @@
 import numpy as np
 import torch
-import pickle
-from CMF_GPU.utils.Variables import MODULES_CONFIG
+from CMF_GPU.utils.Variables import MODULES_INFO, SCALAR_TYPES
 
 def check_enabled(func):
     def wrapper(self, *args, **kwargs):
@@ -11,7 +10,7 @@ def check_enabled(func):
     return wrapper
 
 
-def gather_all_keys_and_defaults(input_type, modules):
+def gather_all_keys(input_type, modules):
     assert input_type in ["param", "state"], "input_type must be 'param' or 'state'"
     all_params_or_states = []
     all_hidden = []
@@ -26,7 +25,7 @@ def gather_all_keys_and_defaults(input_type, modules):
         params_or_states_key = "states"
         hidden_key = "hidden_states"
     
-    for mod_name, mod_cfg in MODULES_CONFIG.items():
+    for mod_name, mod_cfg in MODULES_INFO.items():
         # Process params or states
         if mod_name in modules:
             for k in mod_cfg.get(params_or_states_key, []):
@@ -42,94 +41,93 @@ def gather_all_keys_and_defaults(input_type, modules):
     
     return all_params_or_states, all_hidden, all_scalar
 
-
-def split_dict_arrays(d, split_indices):
-    splits = {}
-    for k, v in d.items():
-        if isinstance(v, np.ndarray):
-            splits[k] = np.split(v, split_indices[:-1])
-        else:
-            splits[k] = [v] * len(split_indices)
-    out = []
-    for i in range(len(split_indices)):
-        this_dict = {k: splits[k][i] for k in d}
-        out.append(this_dict)
-    return out
-
 def gather_device_dicts(list_of_dicts, keys=None):
     merged = {}
-    for k in list_of_dicts[0].keys():
+    all_keys = list_of_dicts[0].keys()
+
+    for k in all_keys:
         if keys is not None and k not in keys:
             continue
-        if isinstance(list_of_dicts[0][k], torch.Tensor):
-            merged[k] = np.concatenate([d[k].detach().cpu().numpy() for d in list_of_dicts], axis=0)
+        values = [d[k] for d in list_of_dicts]
+
+        if isinstance(values[0], torch.Tensor):
+            if len(values) == 1:
+                merged[k] = values[0].detach().cpu().numpy()
+            else:
+                merged[k] = torch.cat([v.detach().cpu() for v in values], dim=0).numpy()
         else:
-            merged[k] = list_of_dicts[0][k]
-            
+            merged[k] = values[0]
+
     return merged
 
-def load_csr_list_from_pkl(filename, device_indices):
+def snapshot_to_npz(filename, data_dict, input_type, modules, omit_hidden=True):
     """
-    Load sparse tensors from a pickle file as COO format and convert them to CSR format.
-    
-    Args:
-        filename: Input pickle filename
-        device_indices: List of device indices to place tensors on
-    
-    Returns:
-        List of CSR sparse tensors
-    """
-    with open(filename, 'rb') as f:
-        serializable_list = pickle.load(f)
-    
-    csr_list = []
-    for data, device in zip(serializable_list, device_indices):
-        # First load as COO tensor
-        coo = torch.sparse_coo_tensor(
-            data['indices'], 
-            data['values'], 
-            data['shape'], 
-            dtype=data['dtype'], 
-            device=f"cuda:{device}"
-        )
-        # Convert to CSR format
-        csr = coo.to_sparse_csr()
-        csr_list.append(csr)
-    
-    return csr_list
-
-def snapshot_to_pkl(data_dict, input_type, modules, filename, omit_hidden=True):
-    """
-    Save a snapshot of params or states to a .pkl file, excluding hidden entries.
+    Save a snapshot of params or states to a .npz file, excluding hidden entries.
 
     Args:
         data_dict (dict): The params or states dictionary to snapshot. (numpy arrays)
         input_type (str): Either "param" or "state".
         modules (list): Enabled modules, used to determine hidden keys.
-        filename (str): Output .pkl file path.
+        filename (str): Output .npz file path.
     """
     # Get hidden keys to exclude
-    params_or_states, hidden_keys, scalar_keys = gather_all_keys_and_defaults(input_type, modules)
+    params_or_states, hidden_keys, scalar_keys = gather_all_keys(input_type, modules)
 
     snapshot = {}
     saved_keys = []
-    ignored_keys = []
 
-    for k in data_dict.keys():
-        if k in hidden_keys and omit_hidden:
-            ignored_keys.append(k)
-            continue
-        if k in scalar_keys or k in params_or_states or (k in hidden_keys and not omit_hidden):
+    for k in params_or_states:
+        if k in data_dict:
             snapshot[k] = data_dict[k]
             saved_keys.append(k)
-        elif (k.endswith('_min') or k.endswith('_max') or k.endswith('_mean')):
-             continue
         else:
-            raise ValueError(f"Key '{k}' not found in params or states.")
-        
-    with open(filename, "wb") as f:
-        pickle.dump(snapshot, f)
+            raise ValueError(f"Key '{k}' not found in data_dict.")
+    if not omit_hidden:
+        for k in hidden_keys:
+            if k in data_dict:
+                snapshot[k] = data_dict[k]
+                saved_keys.append(k)
+            else:
+                raise ValueError(f"Key '{k}' not found in data_dict.")
+    for k in scalar_keys:
+        if k in data_dict:
+            snapshot[k] = data_dict[k]
+            saved_keys.append(k)
+        else:
+            raise ValueError(f"Key '{k}' not found in data_dict.")
+    np.savez(filename, **snapshot)
 
     print(f"Saved keys ({len(saved_keys)}): {saved_keys}")
-    if omit_hidden:
-        print(f"Ignored hidden keys ({len(ignored_keys)}): {ignored_keys}")
+    
+def load_from_npz(filename, input_type, modules, omit_hidden=True):
+    """
+    Load a snapshot from a .npz file.
+
+    Args:
+        filename (str): Input .npz file path.
+
+    Returns:
+        dict: Loaded data.
+    """
+    params_or_states, hidden_keys, scalar_keys = gather_all_keys(input_type, modules)
+    loaded_data = {}
+    with np.load(filename, allow_pickle=True) as data:
+        for k in params_or_states:
+            if k in data:
+                loaded_data[k] = data[k]
+            else:
+                raise ValueError(f"Key '{k}' not found in data.")
+        if not omit_hidden:
+            for k in hidden_keys:
+                if k in data and not omit_hidden:
+                    loaded_data[k] = data[k]
+                else:
+                    raise ValueError(f"Key '{k}' not found in data.")
+        for k in scalar_keys:
+            if k in data:
+                loaded_data[k] = SCALAR_TYPES[k](data[k])
+            else:
+                raise ValueError(f"Key '{k}' not found in data.")
+    print(f"Loaded keys ({len(loaded_data)}): {list(loaded_data.keys())}")
+
+    return loaded_data

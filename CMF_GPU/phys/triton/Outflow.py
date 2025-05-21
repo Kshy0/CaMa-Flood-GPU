@@ -25,9 +25,9 @@ def compute_outflow_kernel(
     flood_storage_ptr,                      # *f32 flood storage
 
     # previous time step variables
-    river_cross_section_depth_prev_ptr,     # *f32 previous river cross-section depth
-    flood_cross_section_depth_prev_ptr,     # *f32 previous flood cross-section depth
-    flood_cross_section_area_prev_ptr,      # *f32 previous flood cross-section area
+    river_cross_section_depth_ptr,     # *f32 previous river cross-section depth
+    flood_cross_section_depth_ptr,     # *f32 previous flood cross-section depth
+    flood_cross_section_area_ptr,      # *f32 previous flood cross-section area
 
     # other 
     total_storage_ptr,
@@ -43,7 +43,7 @@ def compute_outflow_kernel(
     mask = offs < num_catchments
 
     #----------------------------------------------------------------------
-    # (1) Load input variables
+    # (1) Load previous time step input variables
     #----------------------------------------------------------------------
     is_river_mouth = tl.load(is_river_mouth_ptr + offs, mask=mask, other=0)
     downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
@@ -69,10 +69,10 @@ def compute_outflow_kernel(
     downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=1.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
 
-    # previous time step variables
-    river_cross_section_depth_prev = tl.load(river_cross_section_depth_prev_ptr + offs, mask=mask, other=0.0)
-    flood_cross_section_depth_prev = tl.load(flood_cross_section_depth_prev_ptr + offs, mask=mask, other=0.0)
-    flood_cross_section_area_prev = tl.load(flood_cross_section_area_prev_ptr + offs, mask=mask, other=0.0)
+    # cross section variables
+    river_cross_section_depth = tl.load(river_cross_section_depth_ptr + offs, mask=mask, other=0.0)
+    flood_cross_section_depth = tl.load(flood_cross_section_depth_ptr + offs, mask=mask, other=0.0)
+    flood_cross_section_area = tl.load(flood_cross_section_area_ptr + offs, mask=mask, other=0.0)
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
     #----------------------------------------------------------------------
@@ -98,35 +98,35 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
-    river_cross_section_depth = max_water_surface_elevation - river_elevation
+    updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
     river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
-        river_cross_section_depth * river_cross_section_depth_prev
+        updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
-    flood_cross_section_depth = tl.maximum(
+    updated_flood_cross_section_depth = tl.maximum(
         max_water_surface_elevation - catchment_elevation,
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(
-        tl.sqrt(flood_cross_section_depth * flood_cross_section_depth_prev), 
+        tl.sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
         1e-6
     )
 
     #----------------------------------------------------------------------
     # (6) Current flood area (approximate) & semi-implicit effective area
     #----------------------------------------------------------------------
-    flood_cross_section_area = tl.maximum(
+    updated_flood_cross_section_area = tl.maximum(
         flood_storage / river_length - flood_depth * river_width,
         0.0
     )
     flood_implicit_area = tl.maximum(tl.sqrt(
-        flood_cross_section_area * flood_cross_section_area_prev
+        updated_flood_cross_section_area * flood_cross_section_area
     ), 1e-6)
 
     #----------------------------------------------------------------------
     # (7) Update river outflow
     #----------------------------------------------------------------------
-    river_cross_section_area = river_cross_section_depth * river_width
+    river_cross_section_area = updated_river_cross_section_depth * river_width
     river_condition = (river_semi_implicit_flow_depth > 1e-5) & (river_cross_section_area > 1e-5)
 
     # Original river outflow (per unit width)
@@ -179,9 +179,9 @@ def compute_outflow_kernel(
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
     tl.store(water_surface_elevation_ptr + offs, water_surface_elevation, mask=mask)
-    tl.store(river_cross_section_depth_prev_ptr + offs, river_cross_section_depth, mask=mask)
-    tl.store(flood_cross_section_depth_prev_ptr + offs, flood_cross_section_depth, mask=mask)
-    tl.store(flood_cross_section_area_prev_ptr + offs, flood_cross_section_area, mask=mask)
+    tl.store(river_cross_section_depth_ptr + offs, updated_river_cross_section_depth, mask=mask)
+    tl.store(flood_cross_section_depth_ptr + offs, updated_flood_cross_section_depth, mask=mask)
+    tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)
     tl.store(total_storage_ptr + offs, total_storage, mask=mask)
     
     #----------------------------------------------------------------------

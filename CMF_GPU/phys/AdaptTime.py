@@ -1,52 +1,74 @@
 import torch
+import torch.distributed as dist
+import triton
+import triton.language as tl
+
+@triton.jit
+def compute_adaptive_time_step_kernel(
+    is_reservoir_ptr,                       # *bool mask: 1 means reservoir
+    downstream_idx_ptr,                     # *i32 downstream index
+    river_depth_ptr,                        # *f32 river depth
+    downstream_distance_ptr,                # *f32 distance to downstream unit
+    min_time_step_ptr,
+    adaptation_factor: tl.constexpr ,
+    gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
+    default_time_step: tl.constexpr,                             # f32 scalar time step
+    num_catchments: tl.constexpr,           # total number of elements
+    BLOCK_SIZE: tl.constexpr                # block size
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_catchments
+
+    #----------------------------------------------------------------------
+    # (1) Load input variables
+    #----------------------------------------------------------------------
+    downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
+    is_reservoir = tl.load(is_reservoir_ptr + offs, mask=mask, other=0)
+    is_reservoir_downstream = tl.load(is_reservoir_ptr + downstream_idx, mask=mask, other=0)
+    # omit reservoirs grids (reservoir or upstream of reservoir) 
+    mask = ~(is_reservoir_downstream | is_reservoir) & mask 
+    downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=float('inf'))
+    # Clamp river depth to minimum 0.01 for stability
+    river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
+    depth = tl.maximum(river_depth, 0.01)
+    dt = adaptation_factor * downstream_distance / tl.sqrt(gravity * depth)
+    dt_clamped = tl.minimum(dt, default_time_step)
+    
+    min_time_step = tl.min(dt_clamped)
+    tl.atomic_min(min_time_step_ptr, min_time_step)
+
 
 def compute_adaptive_time_step(
+    is_reservoir: torch.Tensor,
+    downstream_idx: torch.Tensor,
     river_depth: torch.Tensor,
     downstream_distance: torch.Tensor,
+    min_time_step: torch.Tensor,
     default_time_step: float,
     adaptation_factor: float,
     gravity: float,
+    num_catchments:int,
+    block_size: int
 ):
-    """
-    Computes an adaptive time step for flood simulation (no Triton kernel).
 
-    Args:
-        river_depth (torch.Tensor): 1D CUDA tensor of river depths.
-        downstream_distance (torch.Tensor): 1D CUDA tensor of downstream distances.
-        default_time_step (float): Default simulation time step.
-        adaptation_factor (float): Factor controlling time step adaptation.
-        gravity (float): Gravitational acceleration.
-
-    Returns:
-        tuple: (adaptive_time_step, num_sub_steps)
-            - adaptive_time_step (float): Adjusted time step.
-            - num_sub_steps (int): Number of sub-steps for the simulation.
-    """
-
-    # Clamp river depth to minimum 0.01 for stability
-    depth = torch.clamp(river_depth, min=0.01)
-    # Compute per-element time step and clip to default
-    dt_min = min((adaptation_factor * downstream_distance / torch.sqrt(gravity * depth)).min().item(), default_time_step)
-
-    # Compute number of sub-steps and final time step``
-    num_sub_steps = int(round(default_time_step / dt_min - 0.01) + 1)
+    grid = lambda meta: (triton.cdiv(num_catchments, meta['BLOCK_SIZE']),)
+    min_time_step.fill_(float('inf'))
+    compute_adaptive_time_step_kernel[grid](
+        is_reservoir_ptr=is_reservoir,
+        downstream_idx_ptr=downstream_idx,
+        river_depth_ptr=river_depth,
+        downstream_distance_ptr=downstream_distance,
+        min_time_step_ptr=min_time_step,
+        adaptation_factor=adaptation_factor,
+        gravity=gravity,
+        default_time_step=default_time_step,
+        num_catchments=num_catchments,
+        BLOCK_SIZE=block_size
+    )
+    # dist.all_reduce(min_time_step, op=dist.ReduceOp.MIN)
+    num_sub_steps = int(round(default_time_step / min_time_step.item() - 0.01) + 1)
+    
     adaptive_time_step = default_time_step / num_sub_steps
 
     return adaptive_time_step, num_sub_steps
-
-if __name__ == "__main__":
-    # A simple test case
-    device = 'cuda'
-    # Some example depths (one value is below 0.01 to test the clamp)
-    river_depth = torch.tensor([0.005, 0.1, 0.2, 0.05], dtype=torch.float32, device=device)
-    downstream_distance = torch.tensor([10.0, 20.0, 5.0, 15.0], dtype=torch.float32, device=device)
-
-    default_dt = 1.0
-    adapt_factor = 0.5
-    gravity = 9.81
-
-    adaptive_dt, steps = compute_adaptive_time_step(
-        river_depth, downstream_distance, default_dt, adapt_factor, gravity
-    )
-    print(f"Adaptive time step: {adaptive_dt}")
-    print(f"Number of sub-steps: {steps}")

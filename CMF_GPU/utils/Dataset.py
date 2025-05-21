@@ -37,11 +37,13 @@ class DailyBinDataset(RunoffDataset):
     def __init__(self,
                  base_dir: str,
                  shape: List[int],
+                 unit_factor: float = 1.0,
                  dtype: str = 'float32',
                  prefix: str = "Roff____",
                  suffix: str = ".one"):
         self.base_dir = base_dir
         self.shape = tuple(shape)
+        self.unit_factor = unit_factor
         self.dtype = dtype
         self.prefix = prefix
         self.suffix = suffix
@@ -58,17 +60,19 @@ class DailyBinDataset(RunoffDataset):
         data = np.fromfile(file_path, dtype=self.dtype)
         data = data.reshape(self.shape, order='C')
         data[~(data > 0)] = 0.0
-        return data, 86400
+        return data / self.unit_factor, 86400
 
 class YearlyNetCDFDataset(RunoffDataset):
     # lat = np.arange(89.875, -59.875 - 0.25, -0.25)    
     # lon = np.arange(-179.875, 179.875 + 0.25, 0.25)
     def __init__(self,
                  base_dir: str,
+                 unit_factor: float = 1.0,
                  var_name: str = "Runoff",
                  prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
                  suffix: str = ".nc"):
         self.base_dir = base_dir
+        self.unit_factor = unit_factor
         self.var_name = var_name
         self.prefix = prefix
         self.suffix = suffix
@@ -142,7 +146,7 @@ class YearlyNetCDFDataset(RunoffDataset):
         time_index = time_start.timetuple().tm_yday - 1
         var = self._cached_dataset.variables[self.var_name]
         data = self._read_and_process_var(var, time_index, fill_missing)
-        return data, 86400
+        return data / self.unit_factor, 86400
     
     def get_mask(self):
         example_data, _ = self.get_data(datetime(2000, 1, 1), False)

@@ -42,9 +42,9 @@ def do_one_substep(
         downstream_distance_ptr=params["downstream_distance"],
         flood_depth_ptr=states["flood_depth"],
         flood_storage_ptr=states["flood_storage"],
-        river_cross_section_depth_prev_ptr=states["river_cross_section_depth"],
-        flood_cross_section_depth_prev_ptr=states["flood_cross_section_depth"],
-        flood_cross_section_area_prev_ptr=states["flood_cross_section_area"],
+        river_cross_section_depth_ptr=states["river_cross_section_depth"],
+        flood_cross_section_depth_ptr=states["flood_cross_section_depth"],
+        flood_cross_section_area_ptr=states["flood_cross_section_area"],
         total_storage_ptr=states["total_storage"],   
         outgoing_storage_ptr=states["outgoing_storage"],  
         water_surface_elevation_ptr=states["water_surface_elevation"],
@@ -64,7 +64,7 @@ def do_one_substep(
             bifurcation_width_ptr=params["bifurcation_width"],
             bifurcation_length_ptr=params["bifurcation_length"],
             bifurcation_elevation_ptr=params["bifurcation_elevation"],
-            bifurcation_cross_section_depth_prev_ptr=states["bifurcation_cross_section_depth"],
+            bifurcation_cross_section_depth_ptr=states["bifurcation_cross_section_depth"],
             water_surface_elevation_ptr=states["water_surface_elevation"],
             total_storage_ptr=states["total_storage"],
             outgoing_storage_ptr=states["outgoing_storage"],
@@ -220,16 +220,21 @@ def advance_step(runtime_flags, params, states, runoff, dT_def, logger, update_s
 
     if "adaptive_time_step" in runtime_flags["modules"]:
         dT, num_sub_steps = compute_adaptive_time_step(
+            params["is_reservoir"],
+            params["downstream_idx"],
             states["river_depth"],
             params["downstream_distance"],
+            states["min_time_step"],
             runtime_flags["time_step"],
             params["adaptation_factor"],
             params["gravity"],
+            params["num_catchments"],
+            BLOCK_SIZE
         )
         print(f"Adaptive time step: {dT:.4f}, Number of sub-steps: {num_sub_steps}")
     else:
         dT = dT_def
-        num_sub_steps = runtime_flags["default_sub_iters"]
+        num_sub_steps = runtime_flags["default_num_sub_steps"]
     logger.set_time_step(dT, num_sub_steps, states)
     for current_step in range(num_sub_steps):
         do_one_substep(

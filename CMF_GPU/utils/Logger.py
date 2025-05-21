@@ -1,9 +1,10 @@
 import numpy as np
 import torch
+import torch.distributed as dist
 from datetime import datetime, timedelta
 from pathlib import Path
 from CMF_GPU.utils.utils import check_enabled
-from CMF_GPU.utils.Variables import MODULES_CONFIG
+from CMF_GPU.utils.Variables import MODULES_INFO
 
 class Logger:
     def __init__(self, base_dir, buffer_size = 400, disabled=False):
@@ -12,7 +13,7 @@ class Logger:
             return
         self.start_time = datetime.now()
         self.log_path = Path(base_dir) / "log_CaMa_GPU.txt"
-        self.log_vars = MODULES_CONFIG["log"]["hidden_states"]
+        self.log_vars = MODULES_INFO["log"]["hidden_states"]
         self.buffer_size = buffer_size
         self.times = None
         self.write_header()
@@ -83,7 +84,8 @@ class Logger:
             "total_flood_storage",
             "total_flood_area",
         ]
-
+        # for field in fields:
+        #     dist.all_reduce(log_data[field], op=dist.ReduceOp.SUM)
         data_arrays = {
             field: log_data[field].detach().cpu().numpy()[:num_steps]
             for field in fields

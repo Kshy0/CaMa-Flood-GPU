@@ -106,7 +106,6 @@ def compute_reservoir_outflow_kernel(
     )
 
     reservoir_outflow = tl.clamp(reservoir_outflow, 0.0, total_storage / time_step)
-    tl.store(reservoir_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask)
     tl.store(river_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask)
     tl.store(total_storage_ptr + catchment_idx, total_storage, mask=mask)
     tl.atomic_add(outgoing_storage_ptr + offs, reservoir_outflow * time_step, mask=mask)

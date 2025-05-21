@@ -1,30 +1,35 @@
-working_dir: /home/eat/CaMa-Flood-GPU
-experiment_name: glb_06min
-out_dir: ${working_dir}/out/${experiment_name}/
-inp_dir: ${working_dir}/inp/${experiment_name}/
-map_dir: /home/eat/cmf_v420_pkg/map/glb_06min
-hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_06min/1min
-states_file: None
-start_date: 2000-01-01
-end_date: 2000-12-31
+parameter_config:
+  experiment_name: glb_06min
+  map_dir: /home/eat/cmf_v420_pkg/map/glb_06min
+  hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_06min/1min
+  working_dir: /home/eat/CaMa-Flood-GPU
+  inp_dir: ${parameter_config.working_dir}/inp/${parameter_config.experiment_name}/
+  precision: float32
 
-runoff_dataset:
+runoff_config:
   class_name: DailyBinDataset
   params:
     shape: [180, 360]
+    unit_factor: 86400000 # mm/day divided by unit_factor to get m/s
     base_dir: /home/eat/cmf_v420_pkg/inp/test_1deg/runoff
     dtype: float32
     prefix: Roff____
     suffix: .one
 
-runtime_flags:
-  time_step: 86400 # seconds
-  unit_factor: 86400000 # mm/day divided by unit_factor to get m/s
-  default_sub_iters: 360
+simulation_config:
+  experiment_name: glb_06min
+  working_dir: /home/eat/CaMa-Flood-GPU
+  out_dir: ${simulation_config.working_dir}/out/${simulation_config.experiment_name}/
+  inp_dir: ${simulation_config.working_dir}/inp/${simulation_config.experiment_name}/
+  states_file: None
   precision: float32
-  modules: [base, adaptive_time_step, log]
+  start_date: 2000-01-01
+  end_date: 2000-12-31
   device: gpu
   device_indices: [0]
+  modules: [base, adaptive_time_step, log]
+  time_step: 86400 # seconds
+  default_num_sub_steps: 360
   statistics: 
     min: [river_outflow]
     max: [river_outflow]

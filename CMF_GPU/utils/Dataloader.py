@@ -7,7 +7,7 @@ from typing import List, Tuple
 from collections import OrderedDict
 
 
-def _worker_read_data_wrapper(idx, t, dataset, precision, unit_factor, runoff_mask_list=None):
+def _worker_read_data_wrapper(idx, t, dataset, precision):
     """Modified worker function to include the index for ordering"""
     try:
         data, seconds = dataset.get_data(t)
@@ -15,17 +15,13 @@ def _worker_read_data_wrapper(idx, t, dataset, precision, unit_factor, runoff_ma
             data = data.astype(np.float64)
         else:
             data = data.astype(np.float32)
-        data = data / unit_factor
-        if runoff_mask_list is not None:
-            data = data.ravel(order='C')
-            splits = [torch.tensor(data[mask]) for mask in runoff_mask_list]
-        else:
-            splits = torch.tensor(data)
+        data = torch.tensor(data.ravel(order='C'))
+
     except Exception as e:
         import traceback; traceback.print_exc()
         raise 
 
-    return idx, t, splits, seconds
+    return idx, t, data, seconds
 
 class DataLoader:
     """
@@ -35,18 +31,14 @@ class DataLoader:
     def __init__(self,
                  time_starts: List[datetime],
                  dataset,
-                 unit_factor: float,
                  precision: str,
                  num_workers: int = 1,
-                 max_cache_steps: int = 5,
-                 runoff_mask: List[np.ndarray] = None):
+                 max_cache_steps: int = 5):
         mp.set_start_method("spawn", force=True)
         self.time_list = sorted(time_starts)
         self.dataset = dataset
-        self.unit_factor = unit_factor
         self.precision = precision
         self.max_cache_steps = max_cache_steps
-        self.runoff_mask = runoff_mask
         self.num_workers = num_workers
 
         # Use an ordered dictionary to store processed results by index
@@ -66,9 +58,7 @@ class DataLoader:
             t = self.time_list[idx]
             args = (idx, t,
                     self.dataset,
-                    self.precision,
-                    self.unit_factor,
-                    self.runoff_mask)
+                    self.precision,)
             self.pool.apply_async(
                 _worker_read_data_wrapper,
                 args=args,
@@ -143,7 +133,6 @@ if __name__ == "__main__":
     loader_bin = DataLoader(
         time_starts,
         daily_bin_ds,
-        unit_factor=1,
         precision="float32",
         num_workers=1,
     )
@@ -165,7 +154,6 @@ if __name__ == "__main__":
     loader_nc = DataLoader(
         time_starts,
         yearly_nc_ds,
-        unit_factor=1,
         precision="float32",
         num_workers=1,
     )

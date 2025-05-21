@@ -10,9 +10,9 @@ def compute_bifurcation_outflow_kernel(
     bifurcation_outflow_ptr,                    # *f32: Bifurcation outflow (in/out)
     bifurcation_width_ptr,                      # *f32: Bifurcation width
     bifurcation_length_ptr,                     # *f32: Bifurcation length
-    bifurcation_elevation_ptr,                     # *f32: Bifurcation length
-    bifurcation_cross_section_depth_prev_ptr,   # *f32: Previous bifurcation cross-section depth
-    water_surface_elevation_ptr,                            # *f32: River depth
+    bifurcation_elevation_ptr,                  # *f32: Bifurcation length
+    bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
+    water_surface_elevation_ptr,                # *f32: River depth
     total_storage_ptr,                          # *f32: Total storage (in/out)
     outgoing_storage_ptr,                       # *f32: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
@@ -51,14 +51,14 @@ def compute_bifurcation_outflow_kernel(
         
         level_idx = offs * num_bifurcation_levels + level
         bifurcation_manning = tl.load(bifurcation_manning_ptr + level_idx, mask=mask, other=0.0)
-        bifurcation_cross_section_depth_prev = tl.load(bifurcation_cross_section_depth_prev_ptr + level_idx, mask=mask, other=0.0)
+        bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_elevation = tl.load(bifurcation_elevation_ptr + level_idx, mask=mask, other=0.0)
         # Calculate bifurcation cross-section depth
-        bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
+        updated_bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
         # Calculate semi-implicit flow depth for bifurcation
         bifurcation_semi_implicit_flow_depth = tl.maximum(
-            tl.sqrt(bifurcation_cross_section_depth * bifurcation_cross_section_depth_prev),
-            tl.sqrt(bifurcation_cross_section_depth * 0.01)
+            tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
+            tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
         )
         bifurcation_width = tl.load(bifurcation_width_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask, other=0.0)
@@ -76,7 +76,7 @@ def compute_bifurcation_outflow_kernel(
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
         updated_bifurcation_outflow = tl.where(bifurcation_condition, updated_bifurcation_outflow, 0.0)
         bifurcation_outflow_sum += updated_bifurcation_outflow
-        tl.store(bifurcation_cross_section_depth_prev_ptr + level_idx, bifurcation_cross_section_depth, mask=mask)
+        tl.store(bifurcation_cross_section_depth_ptr + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
     limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(bifurcation_outflow_sum) * time_step), 1.0)
     bifurcation_outflow_sum *= limit_rate

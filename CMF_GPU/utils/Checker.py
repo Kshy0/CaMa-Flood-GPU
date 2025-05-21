@@ -1,362 +1,173 @@
 import torch
 import numpy as np
-from CMF_GPU.utils.Variables import MODULES, MODULES_CONFIG, RUNTIME_FLAGS_REQUIRED_KEYS, SCALAR_TYPES, SPECIAL_ARRAY_SHAPES, SPECIAL_ARRAY_TYPES, SPECIAL_HIDDEN_PARAMS
-from CMF_GPU.utils.utils import gather_all_keys_and_defaults, split_dict_arrays
-###############################################################################
-# Runtime Flags Validation
-###############################################################################
-def validate_runtime_flags(runtime_flags):
-    # Check for unexpected keys
-    unexpected_keys = set(runtime_flags.keys()) - set(RUNTIME_FLAGS_REQUIRED_KEYS)
-    if unexpected_keys:
-        raise ValueError(f"Unexpected runtime flag(s): {unexpected_keys}")
-    
-    for rk in RUNTIME_FLAGS_REQUIRED_KEYS:
-        if rk not in runtime_flags:
-            raise ValueError(f"Missing required runtime flag: {rk}")
+from scipy.sparse import csr_matrix
+from CMF_GPU.utils.Variables import MODULES_INFO, SCALAR_TYPES, SPECIAL_INPUT_SHAPES, SPECIAL_ARRAY_TYPES, MODULE_DEPENDENT_ARRAYS, HIDDEN_PARAMS, SPECIAL_HIDDEN_STATES, ORDERS, SPECIAL_SPLIT_ARRAYS, SPECIAL_SPLIT_SCALARS, LEGAL_AGG_ARRAYS
+from CMF_GPU.utils.Variables import default_array_split, default_scalar_split, default_shape
+from CMF_GPU.utils.utils import gather_all_keys
 
-    for md in runtime_flags["modules"]:
-        if md not in MODULES:
-            raise ValueError(f"Unknown module '{md}' in runtime_flags['modules']")
-
-    if "base" not in runtime_flags["modules"]:
-        raise ValueError("'base' module is required and must be included in modules")
-
-    if runtime_flags["precision"] not in ["float32", "float64"]:
-        raise ValueError("precision must be 'float32' or 'float64'")
-
-    for m in runtime_flags["modules"]:
-        if m not in MODULES_CONFIG:
-            raise ValueError(f"Unknown module '{m}' in runtime_flags['modules']")
-
-    # Check types of time_step, unit_factor, default_sub_iters
-    for key in ["time_step", "unit_factor", "default_sub_iters"]:
-        if key not in runtime_flags:
-            raise ValueError(f"Missing required runtime flag: {key}")
-        if isinstance(runtime_flags[key], np.generic):
-            raise ValueError(f"{key} must be a native Python object, not a NumPy type")
-
-    if not isinstance(runtime_flags["default_sub_iters"], int):
-        raise ValueError("default_sub_iters must be an integer")
-
-    if runtime_flags["device"] != "gpu":
-        raise NotImplementedError("Only 'gpu' device is supported")
-
-    di = runtime_flags["device_indices"]
-    if not (isinstance(di, int) or (isinstance(di, list) and all(isinstance(x, int) for x in di))):
-        raise ValueError("device_indices must be an int or a list of int")
-    
-    if isinstance(di, list):
-        for device_id in di:
-            if device_id >= torch.cuda.device_count() or device_id < 0:
-                raise ValueError(f"Invalid GPU index {device_id}. Available GPUs: {torch.cuda.device_count()}")
-    else:
-        # If it's a single int, check if it's valid
-        if di >= torch.cuda.device_count() or di < 0:
-            raise ValueError(f"Invalid GPU index {di}. Available GPUs: {torch.cuda.device_count()}") 
-           
-    si = runtime_flags["split_indices"]
-    if np.isscalar(si):
-        si = [int(si)]  # Convert scalar to list with one integer
-    elif not isinstance(si, (list, np.ndarray)):
-        raise ValueError("split_indices must be array-like (list or np.ndarray)")
-    
-    if runtime_flags["statistics"] is None:
-        runtime_flags["statistics"] = {"min": None, "max": None, "mean": None}
-        
-    
-    runtime_flags["split_indices"] = si
-
-###############################################################################
-# check_and_convert_inputs
-###############################################################################
-def check_and_convert_inputs(user_inputs, enabled_modules, precision, input_type, params=None, agg_keys=None):
-    all_params_or_states, all_hidden_keys, all_scalar_keys = gather_all_keys_and_defaults(input_type, MODULES)
-    recognized_keys = all_params_or_states + all_hidden_keys + all_scalar_keys
-
-    params_or_states, hidden_keys, scalar_keys = gather_all_keys_and_defaults(input_type, enabled_modules)
-    hidden_keys_list = []
-    unused_keys_list = []
-
-    for k in user_inputs.keys():
-        if k in hidden_keys:
-            hidden_keys_list.append(k)
-        else:
-            if k not in params_or_states and k not in scalar_keys:
-                if k not in recognized_keys:
-                    raise ValueError(f"Unrecognized {input_type} key: {k}")
-                else:
-                    unused_keys_list.append(k)
-
-    if hidden_keys_list:
-        print(f"Warning: The following {input_type} keys are hidden and will be ignored: {', '.join(hidden_keys_list)}")
-    if unused_keys_list:
-        print(f"Warning: The following {input_type} keys are recognized but not used in the model: {', '.join(unused_keys_list)}")
-
-    # Collect missing required keys
-    missing_keys = []
-    for mod_name in enabled_modules:
-        mod_cfg = MODULES_CONFIG.get(mod_name, {})
-        if input_type == "param":
-            required_keys = set(mod_cfg.get("params", [])) | set(mod_cfg.get("scalar_params", []))
-        else:
-            required_keys = set(mod_cfg.get("states", []))
-
-        for key in required_keys:
-            if key not in user_inputs and key not in hidden_keys:
-                missing_keys.append((mod_name, key))
-
-    if missing_keys:
-        missing_desc = "\n".join([f"  - {key} (required by module '{mod_name}')" for mod_name, key in missing_keys])
-        raise ValueError(f"Missing required {input_type} keys:\n{missing_desc}")
-
+def check_input(user_params, user_states, enabled_modules, precision):
     dtype = np.float32 if precision == "float32" else np.float64
-    final_outputs = {}
+    # 1. check modules
+    for user_inputs, input_type in [(user_params, "param"), (user_states, "state")]:
+        all_keys, all_hidden_keys, all_scalar_keys = gather_all_keys(input_type, MODULES_INFO.keys())
+        used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, enabled_modules)
 
-    # Process scalar values
-    for key in scalar_keys:
-        val = user_inputs[key]
-        if not isinstance(val, (int, float)):
-            raise TypeError(f"Expected a scalar value for '{key}', but got {type(val).__name__}.")
-        final_outputs[key] = SCALAR_TYPES[key](val)
+        recognized_keys = set(all_keys + all_hidden_keys + all_scalar_keys)
 
-    if input_type == "param":
-        params = final_outputs
+        hidden_keys_list = [k for k in user_inputs if k in hidden_keys]
+        unused_keys_list = [
+            k for k in user_inputs
+            if (k not in hidden_keys) and (k not in used_keys) and (k not in scalar_keys) and (k in recognized_keys)
+        ]
+        unrecognized_keys = [
+            k for k in user_inputs
+            if (k not in hidden_keys) and (k not in used_keys) and (k not in scalar_keys) and (k not in recognized_keys)
+        ]
+        if unrecognized_keys:
+            raise ValueError(f"Unrecognized {input_type} key(s): {', '.join(unrecognized_keys)}")
 
-    def check_array_shape(key, val):
-        if key in SPECIAL_ARRAY_SHAPES:
-            expected_shape = SPECIAL_ARRAY_SHAPES[key](params)
+        missing_keys = []
+        for mod_name in enabled_modules:
+            mod_cfg = MODULES_INFO[mod_name]
+            if input_type == "param":
+                required_keys = mod_cfg.get("params", []) + mod_cfg.get("scalar_params", [])
+            else:
+                required_keys = mod_cfg.get("states", [])
+
+            for key in required_keys:
+                if key not in user_inputs and key not in hidden_keys:
+                    missing_keys.append((mod_name, key))
+        
+        if hidden_keys_list:
+            print(f"Warning: The following {input_type} keys are hidden and will be ignored: {', '.join(hidden_keys_list)}")
+            for key in hidden_keys_list:
+                del user_inputs[key]
+        if unused_keys_list:
+            print(f"Warning: The following {input_type} keys are recognized but not used in the model: {', '.join(unused_keys_list)}")
+            for key in unused_keys_list:
+                del user_inputs[key]
+        
+        if missing_keys:
+            missing_desc = "\n".join([f"  - {key} (required by module '{mod_name}')" for mod_name, key in missing_keys])
+            raise ValueError(f"Missing required {input_type} keys:\n{missing_desc}")
+
+        
+    # 2. check types
+    for user_inputs, input_type in [(user_params, "param"), (user_states, "state")]:
+        used_keys, _, scalar_keys = gather_all_keys(input_type, enabled_modules)
+
+        for key in scalar_keys:
+            val = user_inputs[key]
+            if not isinstance(val, (int, float)):
+                raise TypeError(f"Expected a scalar value for '{key}', but got {type(val).__name__}.")
+            user_inputs[key] = SCALAR_TYPES[key](val)
+
+        for key in used_keys:
+            val = user_inputs[key]
+            if not isinstance(val, (np.ndarray, csr_matrix)):
+                raise TypeError(f"Expected a NumPy array or CSR matrix, but got {type(val).__name__}.")
+
+            if key in SPECIAL_INPUT_SHAPES:
+                expected_shape = SPECIAL_INPUT_SHAPES[key](user_params)
+            else:
+                expected_shape = default_shape(user_params)
+
             if val.shape != expected_shape:
                 raise ValueError(
                     f"{input_type.capitalize()} '{key}': expected shape {expected_shape}, but got shape {val.shape}."
                 )
+
+        expected_dtype = SPECIAL_ARRAY_TYPES.get(key, dtype)
+        if val.dtype != expected_dtype:
+            raise TypeError(
+                f"'{key}': Expected a NumPy array of type {expected_dtype}, but got {val.dtype}."
+            )
+        for key in used_keys:
+            if key in MODULE_DEPENDENT_ARRAYS:
+                user_inputs[key] = MODULE_DEPENDENT_ARRAYS[key](user_params, enabled_modules)
+
+def split_and_generate_hidden_arrays(user_params, user_states, enabled_modules, statistics, precision, devices):
+    dtype = torch.float32 if precision == "float32" else torch.float64
+    num_gpu = len(devices)
+
+    orders = {}
+    for key, func in ORDERS.items():
+        if isinstance(key, tuple):
+            results = func(user_params, orders)
+            if all(r is not None for r in results):
+                orders.update(dict(zip(key, results)))
         else:
-            if not (val.shape[0] == params["num_catchments"] and len(val.shape) == 1):
-                raise ValueError(
-                    f"{input_type.capitalize()} '{key}': expected leading dimension = {params['num_catchments']} "
-                    f"and array to be 1D, but got shape {val.shape}."
-                )
-    
-    def convert_array_type(key, val):
-        if key in SPECIAL_ARRAY_TYPES:
-            if val.dtype != SPECIAL_ARRAY_TYPES[key]:
-                raise TypeError(
-                    f"'{key}': Expected a NumPy array of type {SPECIAL_ARRAY_TYPES[key]}, but got {val.dtype}."
-                )
-        else:
-            val = val.astype(dtype)
+            result = func(user_params, orders)
+            if result is not None:
+                orders[key] = result
 
-        return val
+    def process_input(input_data, input_type, ref_params_list=None):
+        final_list = [dict() for _ in range(num_gpu)]
+        used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, enabled_modules)
 
-    # Process array values
-    for key in params_or_states:
-        val = user_inputs[key]
-        if not isinstance(val, np.ndarray):
-            raise TypeError(f"Expected a NumPy array, but got {type(val).__name__}.")  
-             
-        check_array_shape(key, val)
-        final_outputs[key] = convert_array_type(key, val)
+        for key in used_keys:
+            splitter = SPECIAL_SPLIT_ARRAYS.get(key, default_array_split)
+            pieces = splitter(input_data[key], orders, devices)
+            for i in range(num_gpu):
+                final_list[i][key] = pieces[i]
+        for key in scalar_keys:
+            splitter = SPECIAL_SPLIT_SCALARS.get(key, default_scalar_split)
+            pieces = splitter(input_data[key], orders, devices)
+            for i in range(num_gpu):
+                final_list[i][key] = pieces[i]
 
-    # Init hidden values
-    for key in hidden_keys:
-        if key in SPECIAL_HIDDEN_PARAMS:
-            final_outputs[key] = SPECIAL_HIDDEN_PARAMS[key](final_outputs)
-        else:
-            final_outputs[key] = np.zeros((params["num_catchments"],), dtype=dtype)
-        
-        check_array_shape(key, final_outputs[key])
-        final_outputs[key] = convert_array_type(key, final_outputs[key])
+        for i in range(num_gpu):
+            for key in hidden_keys:
+                if input_type == "param":
+                    final_list[i][key] = HIDDEN_PARAMS[key](final_list[i])
+                else:
+                    ref_params = ref_params_list[i] if ref_params_list else {}
+                    size = SPECIAL_HIDDEN_STATES[key](ref_params) if key in SPECIAL_HIDDEN_STATES else ref_params.get("num_catchments", 0)
+                    final_list[i][key] = torch.zeros(size, dtype=dtype, device=devices[i])
 
-    # Init statistic values (Second call)
-    if input_type == "state":
-        allowed_aggs = {"min", "max", "mean"}
-        if agg_keys is not None:
-            for agg_type, keys in agg_keys.items():
-                if agg_type not in allowed_aggs:
-                    raise ValueError(f"Unsupported aggregation type: {agg_type}. Only 'min', 'max', and 'mean' are allowed.")
-                if keys is not None:
-                    for key in keys:
-                        if (key not in final_outputs) and (key not in params):
-                            raise ValueError(f"Aggregation key '{key}' not found in final outputs.")
-                        agg_key_name = f"{key}_{agg_type}"
-                        final_outputs[agg_key_name] = np.zeros_like(final_outputs[key], dtype=dtype)
-
-    
-    return final_outputs
+        if input_type == "state" and statistics:
+            for stat_type, keys in statistics.items():
+                for key in keys:
+                    full_key = f"{key}_{stat_type}"
+                    shape_keys = LEGAL_AGG_ARRAYS.get((key,), ("num_catchments",))
+                    size = [ref_params.get(k, 0) for k in shape_keys]
+                    for i in range(num_gpu):
+                        final_list[i][full_key] = torch.zeros(size, dtype=dtype, device=devices[i])
 
 
+        return final_list
 
-###############################################################################
-# Model Preparation & Function Construction
-###############################################################################
-def prepare_model_and_function(user_params, user_states, step_fn, user_runtime_flags):
-    validate_runtime_flags(user_runtime_flags)
-    final_runtime_flags = user_runtime_flags
-    device_type = final_runtime_flags["device"]
-    device_indices = final_runtime_flags["device_indices"]
-    split_indices = final_runtime_flags["split_indices"]
-    enabled_modules = final_runtime_flags["modules"]
-    precision = final_runtime_flags["precision"]
+    final_params_list = process_input(user_params, "param")
+    final_states_list = process_input(user_states, "state", ref_params_list=final_params_list)
 
-    final_params_np = check_and_convert_inputs(user_params, enabled_modules, precision, "param")
-    final_states_np = check_and_convert_inputs(user_states, enabled_modules, precision, "state", params=final_params_np, agg_keys=user_runtime_flags["statistics"])
-    final_params_np_list = split_dict_arrays(final_params_np, split_indices)
-    final_states_np_list = split_dict_arrays(final_states_np, split_indices)
+    return final_params_list, final_states_list
 
+def prepare_model_and_function(user_params, user_states, step_fn, simulation_config):
+
+    device_type = simulation_config["device"]
+    device_indices = simulation_config["device_indices"]
+    precision = simulation_config["precision"]
+    enabled_modules = simulation_config["modules"]
+    statistics = simulation_config["statistics"]
+    user_params["num_gpus"] = len(device_indices)
+    devices = []
     if isinstance(device_indices, int):
         device_indices = [device_indices]
+    for i in device_indices:
+        devices.append(torch.device(f"cuda:{i}"))
 
-    if len(device_indices) != len(split_indices):
-        raise ValueError("The lengths of device_indices and split_indices need to match.")
-
-    final_params_list = []
-    final_states_list = []
-    for i, dev_idx in enumerate(device_indices):
+    check_input(user_params, user_states, enabled_modules, precision)
+    user_params, user_states = split_and_generate_hidden_arrays(user_params, user_states, enabled_modules, statistics, precision, devices)
+    streams = [torch.cuda.Stream(device=dev) for dev in devices]
+    def parallel_fn(simulation_config, params_list, states_list, forcing, dT, logger, agg_fn):
         if device_type == "gpu":
-            dev = torch.device(f"cuda:{dev_idx}")
-        else:
-            dev = torch.device("cpu")
-        params_t = {}
-        states_t = {}
-        for k, v in final_params_np_list[i].items():
-            if isinstance(v, np.ndarray):
-                params_t[k] = torch.as_tensor(v, device=dev)
-            else:
-                params_t[k] = v
-        for k, v in final_states_np_list[i].items():
-            if isinstance(v, np.ndarray):
-                states_t[k] = torch.as_tensor(v, device=dev)
-            else:
-                states_t[k] = v
-        final_params_list.append(params_t)
-        final_states_list.append(states_t)
-
-    def parallel_fn(runtime_flags, params_list, init_states_list, forcing_list, input_matrix_list, dT, logger, agg_fn):
-        if device_type == "gpu":
-            streams = [torch.cuda.Stream(device=f"cuda:{dev}") for dev in device_indices]
-            for dev, stream in zip(device_indices, streams):
+            for dev, stream, params, states in zip(devices, streams, params_list, states_list):
                 with torch.cuda.stream(stream):
-                    step_fn(runtime_flags, params_list[dev], init_states_list[dev], input_matrix_list[dev] @ forcing_list[dev].to(device=f"cuda:{dev}"), dT, logger, agg_fn)
+                    runoff = params["runoff_input_matrix"] @ forcing.to(device=dev)
+                    step_fn(simulation_config, params, states, runoff, dT, logger, agg_fn)
             for s in streams:
                 s.synchronize()
         else:
-            raise NotImplementedError("Only GPU device is supported")
-            # new_s, stats = step_fn(runtime_flags, params_list[0], states_list[0], forcing_list[0], dT)
-            # outs_new_states[0] = new_s
-            # outs_stats[0] = stats
+            raise NotImplementedError("Currently, only GPU device is supported")
 
-    return final_runtime_flags, final_params_list, final_states_list, parallel_fn
-
-###############################################################################
-# Example Usage
-###############################################################################
-if __name__ == "__main__":
-    from CMF_GPU.utils.Variables import gather_device_dicts
-    user_runtime_flags = {
-        "time_step": 86400,
-        "unit_factor": 1000.0,
-        "enable_logging": False,
-        "precision": "float32",
-        "modules": ["base", "adaptive_time_step"],
-        "default_sub_iters": 24,
-        "device": "gpu",
-        "device_indices": [0],
-        "split_indices": [6],  # means 2 devices, each gets 3
-    }
-    user_params = {
-        "num_catchments": 6,
-        "num_flood_levels": 1,
-        "is_river_mouth": [True, False, True, False, True, False],
-        "downstream_idx": [1, 2, 0, 4, 5, 3],
-        "river_width": [100.0, 80.0, 60.0, 70.0, 65.0, 62.0],
-        "river_length": [5000, 4000, 3000, 6000, 3200, 4500],
-        "river_height": [15, 12, 10, 16, 13, 9],
-        "river_elevation": [10, 9, 8, 11, 9.5, 8.2],
-        "catchment_elevation": [12, 10, 9, 14, 11, 10],
-        "downstream_distance": [1000, 1000, 0, 1100, 950, 1200],
-        "river_max_storage": [10000, 8000, 6000, 9000, 8500, 9100],
-        "river_area": [200, 180, 150, 170, 165, 168],
-        "max_flood_area": [300, 250, 200, 350, 210, 215],
-        "total_storage_table": [
-            [0.0, 0.1, 0.2, 0.3],
-            [0.0, 0.2, 0.4, 0.6],
-            [0.0, 0.3, 0.6, 0.9],
-            [0.0, 0.15, 0.3, 0.45],
-            [0.0, 0.12, 0.24, 0.36],
-            [0.0, 0.18, 0.36, 0.54],
-        ],
-        "flood_depth_table": [
-            [0.0, 0.5, 1.0, 1.5],
-            [0.0, 0.4, 0.8, 1.2],
-            [0.0, 0.3, 0.6, 0.9],
-            [0.0, 0.35, 0.7, 1.05],
-            [0.0, 0.25, 0.5, 0.75],
-            [0.0, 0.28, 0.56, 0.84],
-        ],
-        "total_width_table": [
-            [10, 20, 30, 40],
-            [15, 25, 35, 45],
-            [20, 30, 40, 50],
-            [12, 22, 32, 42],
-            [13, 23, 33, 43],
-            [14, 24, 34, 44],
-        ],
-        "flood_gradient_table": [
-            [0.01, 0.02, 0.03],
-            [0.02, 0.03, 0.04],
-            [0.03, 0.04, 0.05],
-            [0.04, 0.05, 0.06],
-            [0.05, 0.06, 0.07],
-            [0.06, 0.07, 0.08],
-        ],
-        "catchment_area": [100, 90, 80, 120, 105, 95],
-        "river_manning": [0.03, 0.03, 0.03, 0.03, 0.03, 0.03],
-        "flood_manning": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
-        "gravity": 9.81,              
-        "adaptation_factor": 0.7,              
-    }
-    user_states = {
-        "river_storage": [10.0, 5.0, 2.0, 8.0, 7.0, 3.0],
-        "flood_storage": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "river_depth": [1.0, 0.8, 0.5, 0.9, 0.7, 0.6],
-        "river_outflow": [0.5, 0.4, 0.2, 0.6, 0.5, 0.3],
-        "flood_depth": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "flood_area": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "flood_outflow": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "river_cross_section_depth": [0.8, 0.7, 0.4, 0.8, 0.6, 0.5],
-        "flood_cross_section_depth": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "flood_cross_section_area": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    }
-    for key, value in user_params.items():
-        if not isinstance(value, (int, float)):
-            user_params[key] = np.array(value)
-    for key, value in user_states.items():
-        if not isinstance(value, (int, float)):
-            user_states[key] = np.array(value)            
-    def dummy_step_fn(runtime_flags, params, states, forcing, dT, logger):
-        new_states = {
-            k: (v + 1.0 if isinstance(v, torch.Tensor) else v)
-            for k, v in states.items()
-        }
-        scaling = dT / 3600.0
-        new_states["river_storage"] = new_states["river_storage"] + forcing * scaling
-        agg_out = {"river_storage_mean": states["river_storage"]}
-        return agg_out
-
-    final_rt, final_ps, final_ss, parallel_step = prepare_model_and_function(
-        user_params, user_states, dummy_step_fn, user_runtime_flags
-    )
-
-    forcing_array = np.array([0.5,0.2,1.0,0.1,0.3,1.2], dtype=np.float32)
-    spl = final_rt["split_indices"]
-    forcing_np_list = np.split(forcing_array, spl[:-1])
-    forcing_list = []
-    for i, dev in enumerate(final_rt["device_indices"]):
-        dev_t = torch.device(f"cuda:{dev}" if final_rt["device"]=="gpu" else "cpu")
-        forcing_list.append(torch.as_tensor(forcing_np_list[i], dtype=torch.float32, device=dev_t))
-
-    dT = 3600.0
-    parallel_step(final_rt, final_ps, final_ss, forcing_list, torch.rand(6, 6).to(device="cuda:0"), dT, 0)
-    states_cpu = gather_device_dicts(final_ss)
-
-    print("Stats Out CPU:", final_ss)
+    return user_params, user_states, parallel_fn
