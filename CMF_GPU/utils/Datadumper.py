@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from netCDF4 import Dataset
 from typing import Dict, List, Tuple
-from CMF_GPU.utils.utils import check_enabled, gather_device_dicts
+from CMF_GPU.utils.utils import check_enabled, get_global_rank, gather_device_dicts
 
 
 def open_file(file_path: Path, file_format: str, var_name: str, data: np.ndarray):
@@ -107,7 +107,7 @@ def worker_multi_key(
                 if handlers[agg_key]:
                     handlers[agg_key].close()
                 current_periods[agg_key] = period
-                file_name = f"{agg_key}_{period[0]}"
+                file_name = f"{agg_key}_{period[0]}_rank{get_global_rank()}"
                 if period[1]:
                     file_name += f"-{period[1]:02d}"
                 file_name += f".{file_format}"
@@ -160,6 +160,10 @@ class DataDumper:
         self.num_workers = max(num_workers, 1)
 
         all_aggregator_keys = []
+        if statistics is None:
+            self.disabled = True
+            print("No statistics provided. No data will be dumped.")
+            return
         for stat_name, var_list in statistics.items():
             if var_list is not None:
                 for var_name in var_list:

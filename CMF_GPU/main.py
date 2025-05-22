@@ -1,97 +1,112 @@
-import os
 import shutil
 import runpy
+import os
+import torch
+import torch.distributed as dist
 from CMF_GPU.phys.triton.StepAdvance import advance_step
-from CMF_GPU.utils.Checker import prepare_model_and_function
-from CMF_GPU.utils.Dataloader import DataLoader
 from CMF_GPU.utils.Dataset import DailyBinDataset
-from CMF_GPU.utils.Datadumper import DataDumper
 from CMF_GPU.utils.Aggregator import generate_triton_aggregator_script
 from CMF_GPU.utils.Logger import Logger
-from CMF_GPU.utils.utils import snapshot_to_npz, gather_device_dicts, load_from_npz
-from scipy.sparse import load_npz
+from CMF_GPU.utils.Datadumper import DataDumper
+from CMF_GPU.utils.Spliter import split_runoff_input_matrix
+from CMF_GPU.utils.Preprocesser import check_input_h5, load_input_h5, make_order
+from torch.utils.data import DataLoader
+from pathlib import Path
 from datetime import datetime, timedelta
 from omegaconf import OmegaConf
 
+def setup_distributed():
+    torch.multiprocessing.set_start_method("spawn", force=True)
+    dist.init_process_group(backend="nccl", init_method="env://")     
+    local_rank = int(os.environ["LOCAL_RANK"])      
+    rank        = int(os.environ["RANK"])
+    world_size  = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    torch.set_default_device(rank)
+    return local_rank, rank, world_size
 
-def main(config_file):
+def broadcast_orders(inp_dir, simulation_config, rank, world_size):
+    """Compute on rank 0, send to others."""
+    statistics = simulation_config.get("statistics", [])
+    modules = simulation_config["modules"]
+    precision = simulation_config["precision"]
+    if rank == 0:
+        generate_triton_aggregator_script(inp_dir / "Aggregate.py", statistics)
+        check_input_h5(inp_dir / "parameters.h5", inp_dir / "init_states.h5", modules, precision)
+        orders = make_order(inp_dir / "parameters.h5",
+                            ["base","adaptive_time_step","log"],
+                            statistics, world_size)
+    else:
+        orders = None
+    obj_list = [orders]
+    dist.broadcast_object_list(obj_list, src=0)     # ③ broadcast
+    return obj_list[0]
 
-    config = OmegaConf.load(config_file)
-    # config = OmegaConf.to_container(config, resolve=True)
-    runoff_config = config["runoff_config"]
-    simulation_config = config["simulation_config"]
-    params = load_from_npz(os.path.join(simulation_config["inp_dir"], "parameters.npz"), "param", simulation_config["modules"], omit_hidden=True)
-    states = load_from_npz(os.path.join(simulation_config["inp_dir"], "init_states.npz"), "state", simulation_config["modules"], omit_hidden=True)
-    generate_triton_aggregator_script(os.path.join(simulation_config["inp_dir"], "Aggregate.py"), simulation_config["statistics"])
-    ns = runpy.run_path(os.path.join(simulation_config["inp_dir"], "Aggregate.py"))
+
+def main(config):
+    local_rank, rank, world_size = setup_distributed()
+    
+    # ---------- load config -----------
+    cfg = OmegaConf.load(config)
+    simulation_config      = cfg.simulation_config
+    runoff_config   = cfg.runoff_config
+    statistics   = simulation_config.get("statistics", [])
+    inp_dir = Path(simulation_config["inp_dir"])
+    out_dir = Path(simulation_config["out_dir"])
+    orders = broadcast_orders(Path(simulation_config["inp_dir"]), simulation_config, rank, world_size)
+
+    params, states = load_input_h5(inp_dir / "parameters.h5", inp_dir / "init_states.h5", orders, rank)
+    runoff_input_matrix = split_runoff_input_matrix(inp_dir / "runoff_input_matrix.npz", orders, rank)
+    ns = runpy.run_path(inp_dir / "Aggregate.py")
     agg_fn = ns["update_statistics"]
-    params, states, parallel_step_fn = prepare_model_and_function(
-        params,
-        states,
-        advance_step,
-        simulation_config,
-        simulation_config,
-    )
-    params["runoff_input_matrix"] = load_npz(os.path.join(simulation_config["inp_dir"], "runoff_input_matrix.pkl"))
     start_date = datetime.strptime(simulation_config["start_date"], "%Y-%m-%d")
-    end_date = datetime.strptime(simulation_config["end_date"], "%Y-%m-%d")
-    time_starts = [start_date + timedelta(seconds=simulation_config["time_step"]) * i for i in range((end_date - start_date).days + 1)]
 
     ds = DailyBinDataset(**runoff_config["params"])
-
     loader = DataLoader(
-        time_starts=time_starts,
         dataset=ds,
-        unit_factor=simulation_config["unit_factor"],
-        num_workers=3,
-        max_cache_steps=100,
-        precision="float32",
-        runoff_mask=ds.get_mask(),
+        batch_size=1,
+        num_workers=1,
     )
-    if os.path.exists(simulation_config["out_dir"]):
-        shutil.rmtree(simulation_config["out_dir"])
-    os.makedirs(simulation_config["out_dir"])
     dumper = DataDumper(
-        base_dir=simulation_config["out_dir"],
-        statistics=simulation_config["statistics"],
+        base_dir=out_dir,
+        statistics=statistics,
         file_format="nc",
-        num_workers=3,
+        num_workers=1,
     )
-    logger = Logger(base_dir=simulation_config["out_dir"],
-        buffer_size=params[0].get("log_buffer_size", None), 
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
+    logger = Logger(base_dir=out_dir,
         disabled=False if "log" in simulation_config["modules"] else True
     )
     # TODO: multi-GPU support
     default_num_sub_steps = simulation_config["default_num_sub_steps"]
-    for time_start in time_starts:
-        runoff_t, time_length = loader.get_data(time_start)
+    current_time = start_date
+    for (runoff_data, runoff_time_step) in loader:
         # TODO: tranfer runoff_t to GPU here
-        current_time = time_start
         time_step = simulation_config["time_step"]
-        if time_length % time_step != 0:
+        runoff_data = runoff_input_matrix @ runoff_data[0].to(f"cuda:{local_rank}")
+        if runoff_time_step % time_step != 0:
             raise ValueError(
-                f"Runoff step length {time_length} cannot be evenly divided by time_step={time_step}, please check your data or configuration."
+                f"Runoff step length {runoff_time_step} cannot be evenly divided by time_step={time_step}, please check your data or configuration."
             )
-        iters_per_runoff_step = int(time_length // time_step)
+        iters_per_runoff_step = int(runoff_time_step // time_step)
         dT_def = time_step / default_num_sub_steps
-        # print("total_storage:", f"{states["total_storage"].sum():.4e}")
         for _ in range(iters_per_runoff_step):
             logger.set_current_time(current_time)
-            parallel_step_fn(
-                simulation_config, params, states, runoff_t, dT_def, logger, agg_fn
+            advance_step(
+                simulation_config, params, states, runoff_data, dT_def, logger, agg_fn
             )
             aggregator_cpu = dumper.gather_stats(states)
             dumper.submit_data(current_time, aggregator_cpu)
             current_time += timedelta(seconds=time_step)
-
-    states_cpu = gather_device_dicts(states)
-    snapshot_to_npz(states_cpu, "state", simulation_config["modules"], os.path.join(simulation_config["out_dir"], "final_states.npz"))
     dumper.close()
     logger.close()
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Run CMF_GPU simulation.")
-    parser.add_argument("config_file", type=str, help="Path to the config.yaml file")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
     args = parser.parse_args()
-    main(args.config_file)
+    main(args.config)

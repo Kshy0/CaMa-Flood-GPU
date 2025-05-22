@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+import os
 
 @triton.jit
 def compute_adaptive_time_step_kernel(
@@ -66,7 +67,8 @@ def compute_adaptive_time_step(
         num_catchments=num_catchments,
         BLOCK_SIZE=block_size
     )
-    # dist.all_reduce(min_time_step, op=dist.ReduceOp.MIN)
+    if int(os.getenv('WORLD_SIZE', 1)) > 1:
+        dist.all_reduce(min_time_step, op=dist.ReduceOp.MIN)
     num_sub_steps = int(round(default_time_step / min_time_step.item() - 0.01) + 1)
     
     adaptive_time_step = default_time_step / num_sub_steps

@@ -3,14 +3,15 @@ import importlib
 import os
 import sys
 from collections import defaultdict
-from CMF_GPU.utils.Variables import MODULES_INFO, CONFIG_REQUIRED_KEYS
-from CMF_GPU.utils.utils import snapshot_to_npz, gather_all_keys
 from pathlib import Path
 from omegaconf import OmegaConf
 from numba import njit
 from scipy.sparse import csr_matrix, save_npz
+from CMF_GPU.utils.Variables import MODULES_INFO
+from CMF_GPU.utils.Checker import CONFIG_REQUIRED_KEYS
+from CMF_GPU.utils.utils import snapshot_to_h5, gather_all_keys
 
-sys.setrecursionlimit(10000) 
+sys.setrecursionlimit(100000) 
 
 def binread(filename, shape, dtype_str):
     """
@@ -325,7 +326,6 @@ class DefaultGlobalCatchment:
         bif_river_mouth_id = self.river_mouth_id[temp_idx]
         id2idx = {id_: idx for idx, id_ in enumerate(self.unique_river_mouth_id)}
 
-        # 初始化并查集数组
         parent = np.arange(len(self.unique_river_mouth_id))
         def find(x):
             while parent[x] != x:
@@ -338,37 +338,34 @@ class DefaultGlobalCatchment:
             if ra != rb:
                 parent[rb] = ra
         
-        # union 操作（将原始 ID 转换为索引）
         for a, b in zip(ori_river_mouth_id, bif_river_mouth_id):
             union(id2idx[a], id2idx[b])
 
-        # 生成 root_mouth：先找索引，再映射回原始 mouth id
         root_mouth = np.array([self.unique_river_mouth_id[find(id2idx[m])] for m in self.river_mouth_id])
 
-        # 统计每个并集的行号、size
         integrated_basins = defaultdict(list)
         for idx, rm in enumerate(root_mouth):
             integrated_basins[rm].append(idx)
 
-        # 若需要按并集 size 降序重排
         sorted_roots = sorted(integrated_basins.keys(),
                             key=lambda r: len(integrated_basins[r]),
                             reverse=True)
 
         new_order = np.concatenate([integrated_basins[r] for r in sorted_roots])
 
-        # ---------- 4. 用新顺序重排各张表 ----------
         self.catchment_id      = self.catchment_id[new_order]
         self.next_catchment_id = self.next_catchment_id[new_order]
         self.catchment_x       = self.catchment_x[new_order]
         self.catchment_y       = self.catchment_y[new_order]
         self.is_river_mouth   = self.is_river_mouth[new_order]
-        self.downstream_idx    = self.downstream_idx[new_order]
+        self.downstream_idx = find_indices_in(self.next_catchment_id, self.catchment_id)
+        self.is_river_mouth = (self.downstream_idx == -1)
+        self.downstream_idx[self.is_river_mouth] = np.flatnonzero(self.is_river_mouth)
         root_mouth = root_mouth[new_order]
 
         self.num_basins = len(sorted_roots)
         self.num_catchments_per_basin = np.array([len(integrated_basins[r]) for r in sorted_roots], dtype=np.int64)
-        # ---------- 4. 统计每个 integrated-basin 的分流数量 ----------
+
         bifurcation_catchment_idx = find_indices_in(bifurcation_catchment_id, self.catchment_id)
         bifurcation_downstream_idx = find_indices_in(bifurcation_next_catchment_id, self.catchment_id)
         sort_idx  = np.argsort(bifurcation_catchment_idx)
@@ -384,6 +381,10 @@ class DefaultGlobalCatchment:
         self.states["bifurcation_outflow"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[sort_idx]
         self.states["bifurcation_cross_section_depth"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[sort_idx]
 
+    def _check_flow_direction(self):
+        assert (self.downstream_idx[~self.is_river_mouth] > np.flatnonzero(~self.is_river_mouth)).all(), "Flow direction is not correct! Downstream catchment ID should be greater than upstream catchment ID."
+        assert (self.downstream_idx[self.is_river_mouth] == np.flatnonzero(self.is_river_mouth)).all(), "Flow direction is not correct! Downstream catchment ID should be equal to the river mouth catchment ID."
+        
     def _load_parameters(self):
         for param_name, filename in self.var_maps.items():
             file_path = self.map_dir / filename
@@ -412,8 +413,6 @@ class DefaultGlobalCatchment:
         self.params["downstream_distance"][self.is_river_mouth] = self.river_mouth_distance
         self.params["num_basins"] = self.num_basins
         self.params["num_catchments_per_basin"] = self.num_catchments_per_basin
-        self.params["num_gpus"] = 0 # will be set in the main function
-        self.params["runoff_input_matrix"] = None
         self.parameters_loaded = True
     
     def _init_river_depth(self):
@@ -507,8 +506,8 @@ class DefaultGlobalCatchment:
         
         os.makedirs(self.inp_dir, exist_ok=True)
         save_npz(self.inp_dir / "runoff_input_matrix.npz", self.runoff_matrix, compressed=True)
-        snapshot_to_npz(self.inp_dir / "parameters.npz", self.params, "param", self.modules, omit_hidden=True)
-        snapshot_to_npz(self.inp_dir / "init_states.npz", self.states, "state", self.modules, omit_hidden=True)
+        snapshot_to_h5(self.inp_dir / "parameters.h5", self.params, "param", self.modules, omit_hidden=True)
+        snapshot_to_h5(self.inp_dir / "init_states.h5", self.states, "state", self.modules, omit_hidden=True)
 
     def _summary(self):
         # ---------- basic stats ----------
@@ -563,8 +562,9 @@ class DefaultGlobalCatchment:
         """
         self._load_map_info()
         self._load_catchment_id()
-        self._load_parameters()
         self._load_bifurcation_parameters()
+        self._load_parameters()
+        self._check_flow_direction()
         self._init_river_depth()
         self._simple_init_other_states()
         self._create_input_matrix()
@@ -575,6 +575,6 @@ class DefaultGlobalCatchment:
         
 if __name__ == "__main__":
     from omegaconf import OmegaConf
-    config = OmegaConf.load("./configs/glb_06min.yaml")
+    config = OmegaConf.load("./configs/glb_01min.yaml")
     default_global_catchment = DefaultGlobalCatchment(config)
     default_global_catchment.build_model_input_pipeline()

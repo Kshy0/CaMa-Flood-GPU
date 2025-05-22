@@ -3,19 +3,57 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional
 import numpy as np
+import torch
 from netCDF4 import Dataset as NcHandler
+from datetime import timedelta
 
-class RunoffDataset(ABC):
+# TODO: add rank for multiple GPUs
+class RunoffDataset(torch.utils.data.Dataset, ABC):
     """
-    Custom abstract class, defines a common interface for accessing data.
+    Custom abstract class that inherits from PyTorch Dataset.
+    Defines a common interface for accessing data.
     """
+    def __init__(self, start_date: str, end_date: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        self.end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        self.num_samples = self.calculate_num_samples()
 
+    def calculate_num_samples(self) -> int:
+        """
+        Calculate the number of samples based on start_date and end_date.
+        Assuming data is daily, this will return the number of days in the range.
+        """
+        return (self.end_date - self.start_date).days + 1
+
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset based on the time range.
+        """
+        return self.num_samples
+    
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, int]:
+        """
+        Fetches data for a given index.
+        """
+        current_time = self.get_time_by_index(idx)
+        data, seconds = self.get_data(current_time)
+        return data, seconds
+    
     @abstractmethod
-    def get_data(self, time_start: datetime) -> Tuple[np.ndarray, int]:
+    def get_data(self, current_time: datetime) -> Tuple[np.ndarray, int]:
         """
         To be implemented by subclasses, reads data of the specified date and time point from storage and returns (data, seconds).
         """
         pass
+    
+    @abstractmethod
+    def get_mask(self) -> np.ndarray:
+        """
+        Returns the mask of the dataset.
+        """
+        pass
+
     @abstractmethod
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -23,11 +61,19 @@ class RunoffDataset(ABC):
         """
         pass
 
-    def get_mask(self) -> Optional[np.ndarray]:
+    @abstractmethod
+    def get_time_by_index(self, idx: int) -> datetime:
         """
-        Optional method, returns mask data.
+        Returns the datetime corresponding to the given index.
         """
-        return None
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """
+        Closes any open resources or files.
+        """
+        pass
 
 class DailyBinDataset(RunoffDataset):
     """
@@ -37,10 +83,13 @@ class DailyBinDataset(RunoffDataset):
     def __init__(self,
                  base_dir: str,
                  shape: List[int],
+                 start_date: str,
+                 end_date: str,
                  unit_factor: float = 1.0,
                  dtype: str = 'float32',
                  prefix: str = "Roff____",
                  suffix: str = ".one"):
+        super().__init__(start_date, end_date)
         self.base_dir = base_dir
         self.shape = tuple(shape)
         self.unit_factor = unit_factor
@@ -53,24 +102,37 @@ class DailyBinDataset(RunoffDataset):
         lon = np.arange(-179.5, 179.5 + 1, 1)
         return lon, lat
 
-    def get_data(self, time_start: datetime) -> Tuple[np.ndarray, int]:
-        filename = f"{self.prefix}{time_start:%Y%m%d}{self.suffix}"
+    def get_data(self, current_time: datetime) -> Tuple[np.ndarray, int]:
+        filename = f"{self.prefix}{current_time:%Y%m%d}{self.suffix}"
         file_path = Path(self.base_dir) / filename
 
         data = np.fromfile(file_path, dtype=self.dtype)
-        data = data.reshape(self.shape, order='C')
+        # data = data.reshape(self.shape, order='C')
         data[~(data > 0)] = 0.0
         return data / self.unit_factor, 86400
+    
+    def get_mask(self) -> np.ndarray:
+        return None
+    
+    def get_time_by_index(self, idx: int) -> datetime:
+        """
+        Returns the datetime corresponding to the given index.
+        """
+        return self.start_date + timedelta(days=idx)
+    
+    def close(self):
+        pass
 
 class YearlyNetCDFDataset(RunoffDataset):
-    # lat = np.arange(89.875, -59.875 - 0.25, -0.25)    
-    # lon = np.arange(-179.875, 179.875 + 0.25, 0.25)
     def __init__(self,
                  base_dir: str,
+                 start_date: str,
+                 end_date: str,
                  unit_factor: float = 1.0,
                  var_name: str = "Runoff",
                  prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
                  suffix: str = ".nc"):
+        super().__init__(start_date, end_date)
         self.base_dir = base_dir
         self.unit_factor = unit_factor
         self.var_name = var_name
@@ -133,17 +195,17 @@ class YearlyNetCDFDataset(RunoffDataset):
 
         return data
 
-    def get_data(self, time_start: datetime, fill_missing:bool = True) -> Tuple[np.ndarray, int]:
-        year = time_start.year
+    def get_data(self, current_time: datetime, fill_missing:bool = True) -> Tuple[np.ndarray, int]:
+        year = current_time.year
         if year != self._cached_year:
             self._close_dataset()
-            year_str = time_start.strftime("%Y")
+            year_str = current_time.strftime("%Y")
             filename = f"{self.prefix}{year_str}{self.suffix}"
             file_path = Path(self.base_dir) / filename
             self._cached_dataset = NcHandler(file_path, 'r')
             self._cached_year = year
 
-        time_index = time_start.timetuple().tm_yday - 1
+        time_index = current_time.timetuple().tm_yday - 1
         var = self._cached_dataset.variables[self.var_name]
         data = self._read_and_process_var(var, time_index, fill_missing)
         return data / self.unit_factor, 86400
@@ -152,6 +214,12 @@ class YearlyNetCDFDataset(RunoffDataset):
         example_data, _ = self.get_data(datetime(2000, 1, 1), False)
         return ~example_data.mask
     
+    def get_time_by_index(self, idx: int) -> datetime:
+        """
+        Returns the datetime corresponding to the given index.
+        """
+        return self.start_date + timedelta(days=idx)
+
     def _close_dataset(self) -> None:
         if self._cached_dataset is not None:
             self._cached_dataset.close()
@@ -161,3 +229,27 @@ class YearlyNetCDFDataset(RunoffDataset):
 
     def close(self) -> None:
         self._close_dataset()
+
+if __name__ == "__main__":
+    # Example usage
+    from torch.utils.data import DataLoader
+    dataset = DailyBinDataset(
+        base_dir="/home/eat/cmf_v420_pkg/inp/test_1deg/runoff",
+        shape=[180, 360],
+        start_date=datetime(2000, 1, 1),
+        end_date=datetime(2000, 1, 31)
+    )
+    
+    lon, lat = dataset.get_coordinates()
+    print("Coordinates:", lon.shape, lat.shape)
+    
+    data, seconds = dataset.get_data(datetime(2000, 1, 1))
+    print("Data shape:", data.shape, "Seconds:", seconds)
+    dataset.close()
+    batch_size = 1  
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    for i, (data_batch, _) in enumerate(data_loader):
+        print(f"Batch {i + 1} data shape:", data_batch.shape)
+
+    dataset.close()

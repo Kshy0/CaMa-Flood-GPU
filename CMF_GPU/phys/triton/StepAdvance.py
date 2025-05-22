@@ -1,5 +1,6 @@
 import torch
 from triton import cdiv
+from CMF_GPU.utils.utils import is_rank_zero
 from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
 from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
 from CMF_GPU.phys.triton.Bifurcation import compute_bifurcation_outflow_kernel
@@ -213,32 +214,33 @@ def do_one_substep(
     )
 
 
-def advance_step(runtime_flags, params, states, runoff, dT_def, logger, update_statistics, BLOCK_SIZE=1024):
+def advance_step(simulation_config, params, states, runoff, dT_def, logger, update_statistics, BLOCK_SIZE=1024):
     """
     Advance the step using either adaptive or fixed time step.
     """
 
-    if "adaptive_time_step" in runtime_flags["modules"]:
+    if "adaptive_time_step" in simulation_config["modules"]:
         dT, num_sub_steps = compute_adaptive_time_step(
             params["is_reservoir"],
             params["downstream_idx"],
             states["river_depth"],
             params["downstream_distance"],
             states["min_time_step"],
-            runtime_flags["time_step"],
+            simulation_config["time_step"],
             params["adaptation_factor"],
             params["gravity"],
             params["num_catchments"],
             BLOCK_SIZE
         )
-        print(f"Adaptive time step: {dT:.4f}, Number of sub-steps: {num_sub_steps}")
+        if is_rank_zero():
+            print(f"Adaptive time step: {dT:.4f}, Number of sub-steps: {num_sub_steps}")
     else:
         dT = dT_def
-        num_sub_steps = runtime_flags["default_num_sub_steps"]
+        num_sub_steps = simulation_config["default_num_sub_steps"]
     logger.set_time_step(dT, num_sub_steps, states)
     for current_step in range(num_sub_steps):
         do_one_substep(
-            runtime_flags,
+            simulation_config,
             params,
             states,
             runoff,

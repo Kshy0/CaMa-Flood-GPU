@@ -1,13 +1,13 @@
 parameter_config:
-  experiment_name: glb_06min
-  map_dir: /home/eat/cmf_v420_pkg/map/glb_06min
-  hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_06min/1min
+  experiment_name: glb_01min
+  map_dir: /home/eat/cmf_v420_pkg/map/glb_01min
+  hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_01min/1min
   working_dir: /home/eat/CaMa-Flood-GPU
   inp_dir: ${parameter_config.working_dir}/inp/${parameter_config.experiment_name}/
   precision: float32
 
 simulation_config:
-  experiment_name: glb_06min
+  experiment_name: glb_01min
   working_dir: /home/eat/CaMa-Flood-GPU
   out_dir: ${simulation_config.working_dir}/out/${simulation_config.experiment_name}/
   inp_dir: ${simulation_config.working_dir}/inp/${simulation_config.experiment_name}/

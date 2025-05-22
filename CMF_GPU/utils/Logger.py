@@ -1,13 +1,25 @@
 import numpy as np
-import torch
 import torch.distributed as dist
 from datetime import datetime, timedelta
 from pathlib import Path
-from CMF_GPU.utils.utils import check_enabled
+from CMF_GPU.utils.utils import check_enabled, only_rank_zero, is_rank_zero, get_world_size
 from CMF_GPU.utils.Variables import MODULES_INFO
 
 class Logger:
-    def __init__(self, base_dir, buffer_size = 400, disabled=False):
+    fields = [
+        "total_storage_pre_sum",
+        "total_storage_next_sum",
+        "total_storage_new",
+        "total_inflow_error",
+        "total_inflow",
+        "total_outflow",
+        "total_storage_stage_new",
+        "total_stage_error",
+        "total_river_storage",
+        "total_flood_storage",
+        "total_flood_area",
+    ]
+    def __init__(self, base_dir, buffer_size=400, disabled=False):
         self.disabled = disabled
         if self.disabled:
             return
@@ -19,6 +31,7 @@ class Logger:
         self.write_header()
         
     @check_enabled
+    @only_rank_zero
     def write_header(self):
         with open(self.log_path, 'w') as f:
             f.write("Program Start Time: ")
@@ -53,55 +66,47 @@ class Logger:
         self.current_time = current_time
 
     @check_enabled
+    @only_rank_zero
+    def write_time_step(self):
+        with open(self.log_path, 'a') as f:
+            f.write(f"Time Step: {self.time_step:.4f} seconds    Number of Steps: {self.num_steps}\n")
+
+    @check_enabled
     def set_time_step(self, time_step, num_steps, states):
         self.time_step = time_step
         self.num_steps = num_steps
-        with open(self.log_path, 'a') as f:
-            f.write(f"Time Step: {time_step:.4f} seconds    Number of Steps: {num_steps}\n")
-            
+        self.write_time_step()
         # Create time vector
         self.times = [self.current_time + timedelta(seconds=time_step * i) for i in range(num_steps)]
         if num_steps > self.buffer_size:
             self.buffer_size = num_steps + 20
             for k in self.log_vars:
-                states[k] = torch.zeros((self.buffer_size,), device=states[k].device, dtype=states[k].dtype)
+                states[k].resize_(self.buffer_size).zero_()
     
     @check_enabled
     def write_step(self, log_data):
-        num_steps = self.num_steps
-        time_strs = np.array([t.strftime('%Y-%m-%d %H:%M') for t in self.times[:num_steps]], dtype=str)
+        if get_world_size() > 1:
+            for field in self.fields:
+                dist.all_reduce(log_data[field], op=dist.ReduceOp.SUM)
+        if is_rank_zero():
+            num_steps = self.num_steps
+            time_strs = np.array([t.strftime('%Y-%m-%d %H:%M') for t in self.times[:num_steps]], dtype=str)
+            data_arrays = {
+                field: log_data[field].detach().cpu().numpy()[:num_steps]
+                for field in self.fields
+            }
 
-        fields = [
-            "total_storage_pre_sum",
-            "total_storage_next_sum",
-            "total_storage_new",
-            "total_inflow_error",
-            "total_inflow",
-            "total_outflow",
-            "total_storage_stage_new",
-            "total_stage_error",
-            "total_river_storage",
-            "total_flood_storage",
-            "total_flood_area",
-        ]
-        # for field in fields:
-        #     dist.all_reduce(log_data[field], op=dist.ReduceOp.SUM)
-        data_arrays = {
-            field: log_data[field].detach().cpu().numpy()[:num_steps]
-            for field in fields
-        }
-
-        fmt = ['%-18s'] + ['%16.6g'] * 3 + ['%16.3e'] + ['%16.6g'] * 3 + ['%16.3e'] + ['%16.6g'] * 3
-
-        with open(self.log_path, 'a') as f:
-            for i in range(num_steps):
-                row = [time_strs[i]] + [data_arrays[field][i] for field in fields]
-                line = ''.join(f % v for f, v in zip(fmt, row))
-                f.write(line + '\n')
-        for field in fields:
+            fmt = ['%-18s'] + ['%16.6g'] * 3 + ['%16.3e'] + ['%16.6g'] * 3 + ['%16.3e'] + ['%16.6g'] * 3
+            with open(self.log_path, 'a') as f:
+                for i in range(num_steps):
+                    row = [time_strs[i]] + [data_arrays[field][i] for field in self.fields]
+                    line = ''.join(f % v for f, v in zip(fmt, row))
+                    f.write(line + '\n')
+        for field in self.fields:
             log_data[field].zero_()
 
     @check_enabled
+    @only_rank_zero
     def close(self):
         end_time = datetime.now()
         duration = (end_time - self.start_time).total_seconds()

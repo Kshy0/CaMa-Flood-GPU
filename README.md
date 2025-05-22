@@ -27,7 +27,7 @@
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - `netCDF4`
   - `omegaconf`
-  - `ipykernel` (for Jupyter support)
+  - `h5py` 
   - and other utility packages as needed
 
 ---
@@ -60,7 +60,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
 
-This command installs the `CMF_GPU` package in editable mode, along with its required dependencies such as `netCDF4`, `omegaconf`, `ipykernel`, and others.
+This command installs the `CMF_GPU` package in editable mode, along with its required dependencies such as `netCDF4`, `omegaconf`, `h5py`, and others.
 
 ---
 
@@ -85,7 +85,7 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
 
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  python ./CMF_GPU/generate_parameters.py ./configs/test1-glb_15min.yaml
+  python ./CMF_GPU/generate_parameters.py ./configs/glb_15min.yaml
   ```
   
   If your `test1-glb_15min.yaml` is set up correctly, you should not need to modify the notebook—simply execute all cells. This process will generate a refined `config.yaml` in the `inp/test1-glb_15min/` folder, ready for model execution.
@@ -94,10 +94,10 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
   
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  python ./CMF_GPU/main.py ./inp/test1-glb_15min/config.yaml
+  torchrun --nproc_per_node=4 CMF_GPU/main.py --config ./configs/glb_15min.yaml
   ```
   
-  - [Optional] For multi-GPU or distributed runs, please refer to upcoming documentation and code samples.
+  - [Optional] For distributed runs, please refer to upcoming documentation and code samples.
 
 
 ---

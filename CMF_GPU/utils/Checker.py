@@ -1,173 +1,189 @@
 import torch
-import numpy as np
-from scipy.sparse import csr_matrix
-from CMF_GPU.utils.Variables import MODULES_INFO, SCALAR_TYPES, SPECIAL_INPUT_SHAPES, SPECIAL_ARRAY_TYPES, MODULE_DEPENDENT_ARRAYS, HIDDEN_PARAMS, SPECIAL_HIDDEN_STATES, ORDERS, SPECIAL_SPLIT_ARRAYS, SPECIAL_SPLIT_SCALARS, LEGAL_AGG_ARRAYS
-from CMF_GPU.utils.Variables import default_array_split, default_scalar_split, default_shape
-from CMF_GPU.utils.utils import gather_all_keys
+import os
+from datetime import datetime
+from CMF_GPU.utils.Variables import MODULES_INFO
+from CMF_GPU.utils.Aggregator import LEGAL_AGG_ARRAYS, LEGAL_STATS
+from omegaconf import DictConfig, ListConfig
+from pathlib import Path
 
-def check_input(user_params, user_states, enabled_modules, precision):
-    dtype = np.float32 if precision == "float32" else np.float64
-    # 1. check modules
-    for user_inputs, input_type in [(user_params, "param"), (user_states, "state")]:
-        all_keys, all_hidden_keys, all_scalar_keys = gather_all_keys(input_type, MODULES_INFO.keys())
-        used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, enabled_modules)
 
-        recognized_keys = set(all_keys + all_hidden_keys + all_scalar_keys)
+def _check_statistics(stats):
+    if stats is None:
+        return True
+    if not isinstance(stats, (dict, DictConfig)):
+        raise ValueError(f"CONFIG ERROR: statistics must be a dict or DictConfig: {stats}")
 
-        hidden_keys_list = [k for k in user_inputs if k in hidden_keys]
-        unused_keys_list = [
-            k for k in user_inputs
-            if (k not in hidden_keys) and (k not in used_keys) and (k not in scalar_keys) and (k in recognized_keys)
-        ]
-        unrecognized_keys = [
-            k for k in user_inputs
-            if (k not in hidden_keys) and (k not in used_keys) and (k not in scalar_keys) and (k not in recognized_keys)
-        ]
-        if unrecognized_keys:
-            raise ValueError(f"Unrecognized {input_type} key(s): {', '.join(unrecognized_keys)}")
+    legal_vars = []
+    for _, variables in LEGAL_AGG_ARRAYS.items():
+        legal_vars.extend(variables)
 
-        missing_keys = []
-        for mod_name in enabled_modules:
-            mod_cfg = MODULES_INFO[mod_name]
-            if input_type == "param":
-                required_keys = mod_cfg.get("params", []) + mod_cfg.get("scalar_params", [])
-            else:
-                required_keys = mod_cfg.get("states", [])
+    for stat_type, variables in stats.items():
+        if stat_type not in LEGAL_STATS:
+            raise ValueError(f"CONFIG ERROR: Invalid statistic type: {stat_type}")
+        if variables is not None:
+            for var in variables:
+                if var not in legal_vars:
+                    raise ValueError(f"CONFIG ERROR: Invalid variable '{var}' in statistics[{stat_type}]")
+    return True
 
-            for key in required_keys:
-                if key not in user_inputs and key not in hidden_keys:
-                    missing_keys.append((mod_name, key))
+def _check_parameter_config(cfg):
+    if not isinstance(cfg, (dict, DictConfig)):
+        raise ValueError(f"CONFIG ERROR: parameter_config must be a dict or DictConfig: {cfg}")
+
+    required = [
+        "experiment_name", "map_dir", "hires_map_dir",
+        "working_dir", "inp_dir", "precision"
+    ]
+    for key in required:
+        if key not in cfg:
+            raise ValueError(f"CONFIG ERROR: parameter_config missing required key '{key}'")
+
+    if not isinstance(cfg["experiment_name"], str) or not cfg["experiment_name"]:
+        raise ValueError(f"CONFIG ERROR: Invalid experiment_name: {cfg['experiment_name']}")
+
+    for key in ["map_dir", "hires_map_dir", "working_dir"]:
+        if not isinstance(cfg[key], str):
+            raise ValueError(f"CONFIG ERROR: {key} must be a string path, got {type(cfg[key])}")
+        if not Path(cfg[key]).is_dir():
+            raise ValueError(f"CONFIG ERROR: {key} does not exist or is not a directory: {cfg[key]}")
+
+    inp_dir_parent = Path(cfg["inp_dir"]).parent
+    if not inp_dir_parent.is_dir():
+        raise ValueError(f"CONFIG ERROR: inp_dir parent does not exist or is not a directory: {inp_dir_parent}")
+
+    if cfg["precision"] not in ["float32", "float64"]:
+        raise ValueError(f"CONFIG ERROR: Invalid precision: {cfg['precision']}")
+    
+    return True
+
+def _check_runoff_config(cfg):
+    if not isinstance(cfg, (dict, DictConfig)):
+        raise ValueError(f"CONFIG ERROR: runoff_config must be a dict or DictConfig: {cfg}")
+    if "class_name" not in cfg:
+        raise ValueError("CONFIG ERROR: runoff_config must contain class_name")
+    if "params" not in cfg:
+        raise ValueError("CONFIG ERROR: runoff_config must contain params")
+    return True
+
+def _check_simulation_config(cfg):
+    if not isinstance(cfg, (dict, DictConfig)):
+        raise ValueError(f"CONFIG ERROR: simulation_config must be a dict or DictConfig: {cfg}")
+    modules = cfg.get("modules", None)
+    if not isinstance(modules, (ListConfig, list)):
+        raise ValueError(f"CONFIG ERROR: simulation_config must contain a list of modules: {cfg}")
+    for module in modules:
+        if module not in MODULES_INFO:
+            raise ValueError(f"CONFIG ERROR: Invalid module in simulation_config: {module}")
+    required = [
+        "experiment_name", "working_dir", "out_dir", "inp_dir", "states_file", "precision",
+        "start_date", "end_date", "time_step", "default_num_sub_steps",
+    ]
+    for key in required:
+        if key not in cfg:
+            raise ValueError(f"CONFIG ERROR: simulation_config missing required key '{key}'")
         
-        if hidden_keys_list:
-            print(f"Warning: The following {input_type} keys are hidden and will be ignored: {', '.join(hidden_keys_list)}")
-            for key in hidden_keys_list:
-                del user_inputs[key]
-        if unused_keys_list:
-            print(f"Warning: The following {input_type} keys are recognized but not used in the model: {', '.join(unused_keys_list)}")
-            for key in unused_keys_list:
-                del user_inputs[key]
+    if cfg["precision"] not in ["float32", "float64"]:
+        raise ValueError(f"CONFIG ERROR: Invalid precision: {cfg['precision']}")
+    
+    if not isinstance(cfg["experiment_name"], str) or not cfg["experiment_name"]:
+        raise ValueError(f"CONFIG ERROR: Invalid experiment_name: {cfg['experiment_name']}")
+    
+    for key in ["working_dir"]:
+        if not isinstance(cfg[key], str):
+            raise ValueError(f"CONFIG ERROR: {key} must be a string path, got {type(cfg[key])}")
+        if not Path(cfg[key]).is_dir():
+            raise ValueError(f"CONFIG ERROR: {key} does not exist or is not a directory: {cfg[key]}")
         
-        if missing_keys:
-            missing_desc = "\n".join([f"  - {key} (required by module '{mod_name}')" for mod_name, key in missing_keys])
-            raise ValueError(f"Missing required {input_type} keys:\n{missing_desc}")
+    for key in ["out_dir", "inp_dir"]:
+        parent_dir = Path(cfg[key]).parent
+        if not parent_dir.is_dir():
+            raise ValueError(f"CONFIG ERROR: {key} parent does not exist or is not a directory: {parent_dir}")
 
-        
-    # 2. check types
-    for user_inputs, input_type in [(user_params, "param"), (user_states, "state")]:
-        used_keys, _, scalar_keys = gather_all_keys(input_type, enabled_modules)
+    try:
+        datetime.strptime(cfg["start_date"], "%Y-%m-%d")
+        datetime.strptime(cfg["end_date"], "%Y-%m-%d")
+    except Exception:
+        raise ValueError("CONFIG ERROR: start_date and end_date must be in YYYY-MM-DD format")
 
-        for key in scalar_keys:
-            val = user_inputs[key]
-            if not isinstance(val, (int, float)):
-                raise TypeError(f"Expected a scalar value for '{key}', but got {type(val).__name__}.")
-            user_inputs[key] = SCALAR_TYPES[key](val)
+    if not isinstance(cfg["time_step"], (int, float)) or cfg["time_step"] <= 0:
+        raise ValueError(f"CONFIG ERROR: runtime_config time_step must be positive number")
+    if not isinstance(cfg["default_num_sub_steps"], int) or cfg["default_num_sub_steps"] <= 0:
+        raise ValueError(f"CONFIG ERROR: runtime_config default_num_sub_steps must be positive integer")
+    _check_statistics(cfg["statistics"])
+    return True
 
-        for key in used_keys:
-            val = user_inputs[key]
-            if not isinstance(val, (np.ndarray, csr_matrix)):
-                raise TypeError(f"Expected a NumPy array or CSR matrix, but got {type(val).__name__}.")
+CONFIG_REQUIRED_KEYS = {
+    "parameter_config": _check_parameter_config,
+    "runoff_config": _check_runoff_config,
+    "simulation_config": _check_simulation_config,
+}
 
-            if key in SPECIAL_INPUT_SHAPES:
-                expected_shape = SPECIAL_INPUT_SHAPES[key](user_params)
-            else:
-                expected_shape = default_shape(user_params)
+def default_shape(params):
+    if isinstance(params["num_catchments"], int):
+        return (params["num_catchments"],)
+    else :
+        return (params["num_catchments"][()],)
 
-            if val.shape != expected_shape:
-                raise ValueError(
-                    f"{input_type.capitalize()} '{key}': expected shape {expected_shape}, but got shape {val.shape}."
-                )
+def _log_shape(params):
+    if isinstance(params["log_buffer_size"], int):
+        return (params["log_buffer_size"],)
+    else:
+        return (params["log_buffer_size"][()],)
 
-        expected_dtype = SPECIAL_ARRAY_TYPES.get(key, dtype)
-        if val.dtype != expected_dtype:
-            raise TypeError(
-                f"'{key}': Expected a NumPy array of type {expected_dtype}, but got {val.dtype}."
-            )
-        for key in used_keys:
-            if key in MODULE_DEPENDENT_ARRAYS:
-                user_inputs[key] = MODULE_DEPENDENT_ARRAYS[key](user_params, enabled_modules)
+def _bifurcation_1D_shape(params):
+    if isinstance(params["num_bifurcation_paths"], int):
+        return (params["num_bifurcation_paths"],)
+    else:
+        return (params["num_bifurcation_paths"][()],)
 
-def split_and_generate_hidden_arrays(user_params, user_states, enabled_modules, statistics, precision, devices):
-    dtype = torch.float32 if precision == "float32" else torch.float64
-    num_gpu = len(devices)
+def _bifurcation_2D_shape(params):
+    if isinstance(params["num_bifurcation_paths"], int):
+        return (params["num_bifurcation_paths"], params["num_bifurcation_levels"])
+    else:
+        return (params["num_bifurcation_paths"][()], params["num_bifurcation_levels"][()])
 
-    orders = {}
-    for key, func in ORDERS.items():
-        if isinstance(key, tuple):
-            results = func(user_params, orders)
-            if all(r is not None for r in results):
-                orders.update(dict(zip(key, results)))
-        else:
-            result = func(user_params, orders)
-            if result is not None:
-                orders[key] = result
+def _reservoir_shape(params):
+    if isinstance(params["num_reservoirs"], int):
+        return (params["num_reservoirs"],)
+    else:
+        return (params["num_reservoirs"][()],)
 
-    def process_input(input_data, input_type, ref_params_list=None):
-        final_list = [dict() for _ in range(num_gpu)]
-        used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, enabled_modules)
-
-        for key in used_keys:
-            splitter = SPECIAL_SPLIT_ARRAYS.get(key, default_array_split)
-            pieces = splitter(input_data[key], orders, devices)
-            for i in range(num_gpu):
-                final_list[i][key] = pieces[i]
-        for key in scalar_keys:
-            splitter = SPECIAL_SPLIT_SCALARS.get(key, default_scalar_split)
-            pieces = splitter(input_data[key], orders, devices)
-            for i in range(num_gpu):
-                final_list[i][key] = pieces[i]
-
-        for i in range(num_gpu):
-            for key in hidden_keys:
-                if input_type == "param":
-                    final_list[i][key] = HIDDEN_PARAMS[key](final_list[i])
-                else:
-                    ref_params = ref_params_list[i] if ref_params_list else {}
-                    size = SPECIAL_HIDDEN_STATES[key](ref_params) if key in SPECIAL_HIDDEN_STATES else ref_params.get("num_catchments", 0)
-                    final_list[i][key] = torch.zeros(size, dtype=dtype, device=devices[i])
-
-        if input_type == "state" and statistics:
-            for stat_type, keys in statistics.items():
-                for key in keys:
-                    full_key = f"{key}_{stat_type}"
-                    shape_keys = LEGAL_AGG_ARRAYS.get((key,), ("num_catchments",))
-                    size = [ref_params.get(k, 0) for k in shape_keys]
-                    for i in range(num_gpu):
-                        final_list[i][full_key] = torch.zeros(size, dtype=dtype, device=devices[i])
-
-
-        return final_list
-
-    final_params_list = process_input(user_params, "param")
-    final_states_list = process_input(user_states, "state", ref_params_list=final_params_list)
-
-    return final_params_list, final_states_list
-
-def prepare_model_and_function(user_params, user_states, step_fn, simulation_config):
-
-    device_type = simulation_config["device"]
-    device_indices = simulation_config["device_indices"]
-    precision = simulation_config["precision"]
-    enabled_modules = simulation_config["modules"]
-    statistics = simulation_config["statistics"]
-    user_params["num_gpus"] = len(device_indices)
-    devices = []
-    if isinstance(device_indices, int):
-        device_indices = [device_indices]
-    for i in device_indices:
-        devices.append(torch.device(f"cuda:{i}"))
-
-    check_input(user_params, user_states, enabled_modules, precision)
-    user_params, user_states = split_and_generate_hidden_arrays(user_params, user_states, enabled_modules, statistics, precision, devices)
-    streams = [torch.cuda.Stream(device=dev) for dev in devices]
-    def parallel_fn(simulation_config, params_list, states_list, forcing, dT, logger, agg_fn):
-        if device_type == "gpu":
-            for dev, stream, params, states in zip(devices, streams, params_list, states_list):
-                with torch.cuda.stream(stream):
-                    runoff = params["runoff_input_matrix"] @ forcing.to(device=dev)
-                    step_fn(simulation_config, params, states, runoff, dT, logger, agg_fn)
-            for s in streams:
-                s.synchronize()
-        else:
-            raise NotImplementedError("Currently, only GPU device is supported")
-
-    return user_params, user_states, parallel_fn
+# all zeros
+SPECIAL_HIDDEN_STATE_SHAPES = {
+    # adaptive_time_step
+    "min_time_step": lambda p: (1,),
+    # log
+    "total_storage_pre_sum": _log_shape,
+    "total_storage_next_sum": _log_shape,
+    "total_storage_new": _log_shape,
+    "total_inflow": _log_shape,
+    "total_outflow": _log_shape,
+    "total_storage_stage_new": _log_shape,
+    "total_river_storage": _log_shape,
+    "total_flood_storage": _log_shape,
+    "total_flood_area": _log_shape,
+    "total_inflow_error": _log_shape,
+    "total_stage_error": _log_shape,
+    # bifurcation
+}
+    
+SPECIAL_INPUT_SHAPES = {
+    # base
+    "runoff_input_matrix": lambda p: p["runoff_input_matrix"][()].shape, # not check, TODO: trim the second dimension by the mask
+    "flood_depth_table": lambda p: (p["num_catchments"][()], p["num_flood_levels"][()] + 3),
+    "num_catchments_per_basin": lambda p: (p["num_basins"][()],),
+    # bifurcation
+    "bifurcation_catchment_id": _bifurcation_1D_shape,
+    "bifurcation_downstream_id": _bifurcation_1D_shape,
+    "bifurcation_length": _bifurcation_1D_shape,
+    "bifurcation_manning": _bifurcation_2D_shape,
+    "bifurcation_width": _bifurcation_2D_shape,
+    "bifurcation_elevation": _bifurcation_2D_shape,
+    "bifurcation_outflow": _bifurcation_2D_shape,
+    # reservoir
+    "reservoir_catchment_idx": _reservoir_shape,
+    "conservation_volume": _reservoir_shape,
+    "emergency_volume": _reservoir_shape,
+    "normal_outflow": _reservoir_shape,
+    "flood_control_outflow": _reservoir_shape,
+}

@@ -1,10 +1,36 @@
 from pathlib import Path
-from CMF_GPU.utils.Variables import LEGAL_AGG_ARRAYS
 
-# ----------------------------- config tables ----------------------------- #
+LEGAL_STATS = [
+    "min",
+    "max",
+    "mean",
+]
 
-
-# ------------------------ code-gen main function ------------------------- #
+LEGAL_AGG_ARRAYS = {
+    ("num_catchments",): [
+        "river_storage",
+        "flood_storage",
+        "river_depth",
+        "river_outflow",
+        "flood_depth",
+        "flood_outflow",
+        "river_cross_section_depth",
+        "flood_cross_section_depth",
+        "flood_cross_section_area",
+        "total_storage",
+        "water_surface_elevation",
+        "limit_rate",
+        "flood_area",
+        "flood_fraction",
+    ],
+    ("num_bifurcation_paths", "num_bifurcation_levels"): [
+        "bifurcation_outflow",
+        "bifurcation_cross_section_depth",
+    ],
+    # ("num_bifurcation_paths",): [
+    #     "bifurcation_outflow_sum",
+    # ],
+}
 
 def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
     """
