@@ -162,7 +162,8 @@ class DataDumper:
         all_aggregator_keys = []
         if statistics is None:
             self.disabled = True
-            print("No statistics provided. No data will be dumped.")
+            if get_global_rank() == 0:
+                print("No statistics provided. No data will be dumped.")
             return
         for stat_name, var_list in statistics.items():
             if var_list is not None:

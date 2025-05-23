@@ -152,15 +152,7 @@ def split_runoff_input_matrix(file, orders, rank):
     start_idx = split_indices[rank]
     end_idx = split_indices[rank + 1]
     sliced_data = x[orders["catchment_order"][start_idx:end_idx]]
-
-    dtype = torch.float32 if x.dtype == np.float32 else torch.float64
-
-    crow = torch.tensor(sliced_data.indptr, dtype=torch.int64)
-    cols = torch.tensor(sliced_data.indices, dtype=torch.int64)
-    vals = torch.tensor(sliced_data.data, dtype=dtype)
-    shape = sliced_data.shape
-
-    torch_sparse = torch.sparse_csr_tensor(crow, cols, vals, size=shape)
+    torch_sparse = torch.sparse_csr_tensor(sliced_data.indptr, sliced_data.indices, sliced_data.data, size=sliced_data.shape)
 
     return torch_sparse
 

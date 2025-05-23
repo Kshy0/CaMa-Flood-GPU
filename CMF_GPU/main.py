@@ -10,19 +10,30 @@ from CMF_GPU.utils.Logger import Logger
 from CMF_GPU.utils.Datadumper import DataDumper
 from CMF_GPU.utils.Spliter import split_runoff_input_matrix
 from CMF_GPU.utils.Preprocesser import check_input_h5, load_input_h5, make_order
+from CMF_GPU.utils.utils import get_local_rank
+from functools import partial
 from torch.utils.data import DataLoader
 from pathlib import Path
 from datetime import datetime, timedelta
 from omegaconf import OmegaConf
 
+
 def setup_distributed():
     torch.multiprocessing.set_start_method("spawn", force=True)
-    dist.init_process_group(backend="nccl", init_method="env://")     
-    local_rank = int(os.environ["LOCAL_RANK"])      
-    rank        = int(os.environ["RANK"])
-    world_size  = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-    torch.set_default_device(rank)
+    if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = get_local_rank()
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        torch.set_default_device(local_rank)
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        torch.cuda.set_device(local_rank)
+        torch.set_default_device(local_rank)
+    
     return local_rank, rank, world_size
 
 def broadcast_orders(inp_dir, simulation_config, rank, world_size):
@@ -39,7 +50,8 @@ def broadcast_orders(inp_dir, simulation_config, rank, world_size):
     else:
         orders = None
     obj_list = [orders]
-    dist.broadcast_object_list(obj_list, src=0)     # ③ broadcast
+    if world_size > 1:
+        dist.broadcast_object_list(obj_list, src=0)
     return obj_list[0]
 
 
@@ -54,18 +66,20 @@ def main(config):
     inp_dir = Path(simulation_config["inp_dir"])
     out_dir = Path(simulation_config["out_dir"])
     orders = broadcast_orders(Path(simulation_config["inp_dir"]), simulation_config, rank, world_size)
-
     params, states = load_input_h5(inp_dir / "parameters.h5", inp_dir / "init_states.h5", orders, rank)
     runoff_input_matrix = split_runoff_input_matrix(inp_dir / "runoff_input_matrix.npz", orders, rank)
     ns = runpy.run_path(inp_dir / "Aggregate.py")
     agg_fn = ns["update_statistics"]
     start_date = datetime.strptime(simulation_config["start_date"], "%Y-%m-%d")
-
+    device = torch.device(f"cuda:{local_rank}")
     ds = DailyBinDataset(**runoff_config["params"])
     loader = DataLoader(
         dataset=ds,
-        batch_size=1,
-        num_workers=1,
+        batch_size=32,
+        num_workers=3,
+        persistent_workers=True,
+        pin_memory=True,
+        prefetch_factor=1,
     )
     dumper = DataDumper(
         base_dir=out_dir,
@@ -73,36 +87,45 @@ def main(config):
         file_format="nc",
         num_workers=1,
     )
-    if os.path.exists(out_dir):
-        shutil.rmtree(out_dir)
-    os.makedirs(out_dir)
+    if rank == 0:
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir)
+        os.makedirs(out_dir)
     logger = Logger(base_dir=out_dir,
         disabled=False if "log" in simulation_config["modules"] else True
     )
-    # TODO: multi-GPU support
     default_num_sub_steps = simulation_config["default_num_sub_steps"]
     current_time = start_date
-    for (runoff_data, runoff_time_step) in loader:
-        # TODO: tranfer runoff_t to GPU here
-        time_step = simulation_config["time_step"]
-        runoff_data = runoff_input_matrix @ runoff_data[0].to(f"cuda:{local_rank}")
-        if runoff_time_step % time_step != 0:
-            raise ValueError(
-                f"Runoff step length {runoff_time_step} cannot be evenly divided by time_step={time_step}, please check your data or configuration."
-            )
-        iters_per_runoff_step = int(runoff_time_step // time_step)
-        dT_def = time_step / default_num_sub_steps
-        for _ in range(iters_per_runoff_step):
-            logger.set_current_time(current_time)
-            advance_step(
-                simulation_config, params, states, runoff_data, dT_def, logger, agg_fn
-            )
-            aggregator_cpu = dumper.gather_stats(states)
-            dumper.submit_data(current_time, aggregator_cpu)
-            current_time += timedelta(seconds=time_step)
+    for batch in loader:
+        runoff_datas, runoff_time_steps = batch
+        runoff_datas = runoff_datas.to(device)
+        # TODO: move matrix multiplication to here
+        for i in range(runoff_datas.shape[0]):
+            runoff_data =  runoff_input_matrix @ runoff_datas[i]
+            runoff_time_step = runoff_time_steps[i]
+
+            time_step = simulation_config["time_step"]
+            if runoff_time_step % time_step != 0:
+                raise ValueError(
+                    f"Runoff step length {runoff_time_step} cannot be evenly divided by time_step={time_step}, please check your data or configuration."
+                )
+
+            iters_per_runoff_step = int(runoff_time_step // time_step)
+            dT_def = time_step / default_num_sub_steps
+
+            for _ in range(iters_per_runoff_step):
+                logger.set_current_time(current_time)
+                advance_step(
+                    simulation_config, params, states, runoff_data, dT_def, logger, agg_fn
+                )
+                aggregator_cpu = dumper.gather_stats(states)
+                dumper.submit_data(current_time, aggregator_cpu)
+                current_time += timedelta(seconds=time_step)
     dumper.close()
     logger.close()
-    dist.destroy_process_group()
+    if world_size > 1:
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     import argparse

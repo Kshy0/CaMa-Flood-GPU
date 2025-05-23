@@ -74,21 +74,24 @@ This command installs the `CMF_GPU` package in editable mode, along with its req
 
   ### 2. Configure your run
 
-  **You only need to modify the following 4 paths in `configs/test1-glb_15min.yaml`:**
+  **You only need to modify the following paths in `configs/glb_15min.yaml`:**
 
-  - `working_dir`: Set this to the path of this project (i.e., the directory where you cloned CaMa-Flood-GPU).
-  - `map_dir`, `hires_map_dir`, `base_dir`: These three paths are easy to modify once you have downloaded `cmf_v420_pkg` (available on the CaMa-Flood official website). Just point them to the corresponding folders on your machine.
-
+  - `parameter_config`: 
+    1. `working_dir`: Set this to the path of this project (i.e., the directory where you cloned CaMa-Flood-GPU).
+    2. `map_dir`, `hires_map_dir`: These three paths are easy to modify once you have downloaded `cmf_v420_pkg` (available on the CaMa-Flood official website). Just point them to the corresponding folders on your machine.
+  - `runoff_config`: 
+    1. `base_dir`: The location where the "test_1deg" runoff data is stored.
+  
   Other parameters usually do not require changes unless you have specific needs.
-
+  
   ### 3. Generate parameters
-
+  
   ```shell
   cd /path/to/CaMa-Flood-GPU
   python ./CMF_GPU/generate_parameters.py ./configs/glb_15min.yaml
   ```
   
-  If your `test1-glb_15min.yaml` is set up correctly, you should not need to modify the notebook—simply execute all cells. This process will generate a refined `config.yaml` in the `inp/test1-glb_15min/` folder, ready for model execution.
+  If your `glb_15min.yaml` is set up correctly, you should not need to modify the notebook—simply execute all cells. This process will generate a refined `config.yaml` in the `inp/test1-glb_15min/` folder, ready for model execution.
   
   ### 4. Run the model
   

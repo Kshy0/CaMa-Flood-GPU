@@ -1,12 +1,19 @@
 import torch
 import h5py
 import functools
+import os
 from torch import distributed as dist
 from CMF_GPU.utils.Variables import MODULES_INFO, SCALAR_TYPES
 
 def get_global_rank():
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank()
+    else:
+        return 0
+
+def get_local_rank():
+    if dist.is_available() and dist.is_initialized():
+        return int(os.environ.get("LOCAL_RANK", 0))
     else:
         return 0
 

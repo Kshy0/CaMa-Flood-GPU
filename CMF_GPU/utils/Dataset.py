@@ -96,7 +96,26 @@ class DailyBinDataset(RunoffDataset):
         self.dtype = dtype
         self.prefix = prefix
         self.suffix = suffix
-    
+        self._validate_files_exist()
+
+    def _validate_files_exist(self):
+        """
+        Validates that all expected files between start_date and end_date exist.
+        """
+        missing_files = []
+        for idx in range(self.num_samples):
+            date = self.get_time_by_index(idx)
+            filename = f"{self.prefix}{date:%Y%m%d}{self.suffix}"
+            file_path = Path(self.base_dir) / filename
+            if not file_path.exists():
+                missing_files.append(str(file_path))
+        
+        if missing_files:
+            raise FileNotFoundError(
+                f"The following required data files are missing:\n" +
+                "\n".join(missing_files)
+            )
+
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         lat = np.arange(89.5, -89.5 - 1, -1)
         lon = np.arange(-179.5, 179.5 + 1, 1)
@@ -109,6 +128,7 @@ class DailyBinDataset(RunoffDataset):
         data = np.fromfile(file_path, dtype=self.dtype)
         # data = data.reshape(self.shape, order='C')
         data[~(data > 0)] = 0.0
+        
         return data / self.unit_factor, 86400
     
     def get_mask(self) -> np.ndarray:
@@ -208,7 +228,7 @@ class YearlyNetCDFDataset(RunoffDataset):
         time_index = current_time.timetuple().tm_yday - 1
         var = self._cached_dataset.variables[self.var_name]
         data = self._read_and_process_var(var, time_index, fill_missing)
-        return data / self.unit_factor, 86400
+        return torch.tensor(data / self.unit_factor), 86400
     
     def get_mask(self):
         example_data, _ = self.get_data(datetime(2000, 1, 1), False)

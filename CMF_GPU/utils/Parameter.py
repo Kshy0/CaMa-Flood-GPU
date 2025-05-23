@@ -105,6 +105,25 @@ def topological_sort(catchment_id, downstream_id):
 
     return result_idx
 
+def reorder_by_basin_size(topo_idx: np.ndarray,
+                          basin_id: np.ndarray):
+
+    groups = defaultdict(list)
+    for idx in topo_idx:                      
+        groups[basin_id[idx]].append(idx)
+
+    ordered_basins = sorted(groups.keys(),
+                            key=lambda b: len(groups[b]),
+                            reverse=True)
+
+    new_order   = []
+    basin_sizes = np.empty(len(ordered_basins), dtype=np.int64)
+    for k, b in enumerate(ordered_basins):
+        new_order.extend(groups[b])
+        basin_sizes[k] = len(groups[b])
+
+    return (np.asarray(new_order, dtype=np.int64), basin_sizes)            
+
 def read_bifparam(filename):
     with open(filename, 'r') as f:
         first_line = f.readline().strip().split()
@@ -296,20 +315,12 @@ class DefaultGlobalCatchment:
             (next_catchment_x[valid_next], next_catchment_y[valid_next]),
             self.map_shape
         )
-        sorted_idx = topological_sort(catchment_id, next_catchment_id)
-        self.catchment_x = catchment_x[sorted_idx]
-        self.catchment_y = catchment_y[sorted_idx]
-        self.catchment_id = catchment_id[sorted_idx]
-        self.next_catchment_id = next_catchment_id[sorted_idx]
-        self.downstream_idx = find_indices_in(self.next_catchment_id, self.catchment_id)
-        self.is_river_mouth = (self.downstream_idx == -1)
-        self.downstream_idx[self.is_river_mouth] = np.flatnonzero(self.is_river_mouth)
-        self.is_reservoir = np.zeros_like(catchment_id, dtype=bool)
-        self.num_catchments = len(np.where(next_catchment_x != self.missing_value)[0])
-        self.river_mouth_id = trace_outlets_dict(self.catchment_id, self.next_catchment_id)
-        self.unique_river_mouth_id = np.unique(self.river_mouth_id)
-        self.num_basins = len(self.unique_river_mouth_id)
-        self.num_catchments_per_basin = np.array([len(np.where(self.river_mouth_id == r)[0]) for r in self.unique_river_mouth_id], dtype=np.int64)
+        river_mouth_id = trace_outlets_dict(catchment_id, next_catchment_id)
+        self.catchment_x = catchment_x
+        self.catchment_y = catchment_y
+        self.catchment_id = catchment_id
+        self.next_catchment_id = next_catchment_id
+        self.river_mouth_id = river_mouth_id
 
     def _load_bifurcation_parameters(self):
         num_bifurcation_levels, pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifparam(self.map_dir / self.bif_info)
@@ -319,14 +330,14 @@ class DefaultGlobalCatchment:
         bifurcation_catchment_id = np.ravel_multi_index((pth_upst[:, 0] - 1, pth_upst[:, 1] - 1), self.map_shape)
         bifurcation_next_catchment_id = np.ravel_multi_index((pth_down[:, 0] - 1, pth_down[:, 1] - 1), self.map_shape)
         num_bifurcation_paths = len(bifurcation_catchment_id)
-        
+        unique_river_mouth_id = np.unique(self.river_mouth_id)
         temp_idx = find_indices_in(bifurcation_catchment_id, self.catchment_id)
         ori_river_mouth_id = self.river_mouth_id[temp_idx]
         temp_idx = find_indices_in(bifurcation_next_catchment_id, self.catchment_id)
         bif_river_mouth_id = self.river_mouth_id[temp_idx]
-        id2idx = {id_: idx for idx, id_ in enumerate(self.unique_river_mouth_id)}
+        id2idx = {id_: idx for idx, id_ in enumerate(unique_river_mouth_id)}
 
-        parent = np.arange(len(self.unique_river_mouth_id))
+        parent = np.arange(len(unique_river_mouth_id))
         def find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
@@ -341,35 +352,30 @@ class DefaultGlobalCatchment:
         for a, b in zip(ori_river_mouth_id, bif_river_mouth_id):
             union(id2idx[a], id2idx[b])
 
-        root_mouth = np.array([self.unique_river_mouth_id[find(id2idx[m])] for m in self.river_mouth_id])
-
-        integrated_basins = defaultdict(list)
-        for idx, rm in enumerate(root_mouth):
-            integrated_basins[rm].append(idx)
-
-        sorted_roots = sorted(integrated_basins.keys(),
-                            key=lambda r: len(integrated_basins[r]),
-                            reverse=True)
-
-        new_order = np.concatenate([integrated_basins[r] for r in sorted_roots])
-
-        self.catchment_id      = self.catchment_id[new_order]
-        self.next_catchment_id = self.next_catchment_id[new_order]
-        self.catchment_x       = self.catchment_x[new_order]
-        self.catchment_y       = self.catchment_y[new_order]
-        self.is_river_mouth   = self.is_river_mouth[new_order]
+        topo_idx = topological_sort(self.catchment_id, self.next_catchment_id)
+        root_mouth = np.array([unique_river_mouth_id[find(id2idx[m])] for m in self.river_mouth_id])
+        sorted_idx, basin_sizes = reorder_by_basin_size(topo_idx, root_mouth)
+        self.catchment_id      = self.catchment_id[sorted_idx]
+        self.next_catchment_id = self.next_catchment_id[sorted_idx]
+        self.catchment_x       = self.catchment_x[sorted_idx]
+        self.catchment_y       = self.catchment_y[sorted_idx]
+        self.root_mouth    = root_mouth[sorted_idx]
         self.downstream_idx = find_indices_in(self.next_catchment_id, self.catchment_id)
         self.is_river_mouth = (self.downstream_idx == -1)
         self.downstream_idx[self.is_river_mouth] = np.flatnonzero(self.is_river_mouth)
-        root_mouth = root_mouth[new_order]
-
-        self.num_basins = len(sorted_roots)
-        self.num_catchments_per_basin = np.array([len(integrated_basins[r]) for r in sorted_roots], dtype=np.int64)
-
+        self.num_basins = len(basin_sizes)
+        self.num_catchments_per_basin = basin_sizes
+        self.is_reservoir = np.zeros_like(self.catchment_id, dtype=bool)
+        self.num_catchments = int(basin_sizes.sum())
         bifurcation_catchment_idx = find_indices_in(bifurcation_catchment_id, self.catchment_id)
         bifurcation_downstream_idx = find_indices_in(bifurcation_next_catchment_id, self.catchment_id)
         sort_idx  = np.argsort(bifurcation_catchment_idx)
-
+        self.params["is_reservoir"] = self.is_reservoir
+        self.params["is_river_mouth"] = self.is_river_mouth
+        self.params["downstream_idx"] = self.downstream_idx
+        self.params["num_catchments"] = self.num_catchments
+        self.params["num_basins"] = self.num_basins
+        self.params["num_catchments_per_basin"] = self.num_catchments_per_basin
         self.params["num_bifurcation_paths"] = num_bifurcation_paths
         self.params["num_bifurcation_levels"] = num_bifurcation_levels
         self.params["bifurcation_catchment_idx"] = bifurcation_catchment_idx
@@ -380,6 +386,34 @@ class DefaultGlobalCatchment:
         self.params["bifurcation_elevation"] = np.asarray(pth_elv, dtype=self.numpy_precision)[sort_idx]
         self.states["bifurcation_outflow"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[sort_idx]
         self.states["bifurcation_cross_section_depth"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[sort_idx]
+
+
+    def _visualize_basin(self):
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+        basin_map = np.full(self.map_shape, fill_value=-1, dtype=int)
+
+        unique_roots = np.unique(self.root_mouth)
+        root_to_basin = {root: i for i, root in enumerate(unique_roots)}
+        basin_ids = np.array([root_to_basin[r] for r in self.root_mouth])
+        basin_map[self.catchment_x, self.catchment_y] = basin_ids
+
+        num_basins = len(unique_roots)
+        rng = np.random.default_rng(seed=42)  
+        random_colors = rng.random((num_basins, 3))  
+        all_colors = np.vstack(([1, 1, 1], random_colors))  
+        cmap = ListedColormap(all_colors)
+
+        masked_map = np.ma.masked_where(basin_map == -1, basin_map + 1)
+
+        plt.figure(figsize=(10, 8))
+        plt.imshow(masked_map.T, origin='upper', cmap=cmap, interpolation='nearest')
+        plt.title("Basins Grouped by Root Mouth")
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.grid(False)
+        plt.tight_layout()
+        plt.show()
 
     def _check_flow_direction(self):
         assert (self.downstream_idx[~self.is_river_mouth] > np.flatnonzero(~self.is_river_mouth)).all(), "Flow direction is not correct! Downstream catchment ID should be greater than upstream catchment ID."
@@ -402,28 +436,20 @@ class DefaultGlobalCatchment:
             self.params[param_name] = data
         
         self.params["gravity"] = self.gravity
-        self.params["is_reservoir"] = self.is_reservoir
-        self.params["is_river_mouth"] = self.is_river_mouth
-        self.params["downstream_idx"] = self.downstream_idx
         self.params["flood_manning"] = 0.1 * np.ones(self.num_catchments, dtype=self.numpy_precision)
         self.params["log_buffer_size"] = self.log_buffer_size
         self.params["adaptation_factor"] = self.adaptation_factor
-        self.params["num_catchments"] = self.num_catchments
-        self.params["num_flood_levels"] = self.num_flood_levels
         self.params["downstream_distance"][self.is_river_mouth] = self.river_mouth_distance
-        self.params["num_basins"] = self.num_basins
-        self.params["num_catchments_per_basin"] = self.num_catchments_per_basin
+        self.params["num_flood_levels"] = self.num_flood_levels
+
         self.parameters_loaded = True
     
     def _init_river_depth(self):
-        """
-        Initialize river depth based on the catchment elevation and river height.
-        """
         assert self.parameters_loaded, "init_river_depth should be called after load_parameters!"
         river_depth_init = np.zeros(self.num_catchments, dtype=self.numpy_precision)
-        next_id_map = find_indices_in(self.next_catchment_id, self.catchment_id)
         river_elevation = self.params["catchment_elevation"] - self.params["river_height"]
-        for ii, jj in zip(reversed(range(self.num_catchments)), reversed(next_id_map)):
+
+        for ii, jj in zip(reversed(range(self.num_catchments)), reversed(self.downstream_idx)):
             if ii == jj or jj < 0:
                 river_depth_init[ii] = self.params["river_height"][ii]
             else:
@@ -432,9 +458,12 @@ class DefaultGlobalCatchment:
                     0.0
                 )
             river_depth_init[ii] = min(river_depth_init[ii], self.params["river_height"][ii])
+
         self.states["river_depth"] = river_depth_init
-        self.states["river_storage"] = self.params["river_width"] * self.states["river_depth"] * self.params["river_length"]
-    
+        self.states["river_storage"] = (
+            self.params["river_width"] * self.states["river_depth"] * self.params["river_length"]
+        )
+        
     def _simple_init_other_states(self):
         for state in self.zero_init_states:
             self.states[state] = np.zeros(self.num_catchments, dtype=self.numpy_precision)
@@ -563,6 +592,7 @@ class DefaultGlobalCatchment:
         self._load_map_info()
         self._load_catchment_id()
         self._load_bifurcation_parameters()
+        # self._visualize_basin()
         self._load_parameters()
         self._check_flow_direction()
         self._init_river_depth()
@@ -575,6 +605,6 @@ class DefaultGlobalCatchment:
         
 if __name__ == "__main__":
     from omegaconf import OmegaConf
-    config = OmegaConf.load("./configs/glb_01min.yaml")
+    config = OmegaConf.load("./configs/glb_03min.yaml")
     default_global_catchment = DefaultGlobalCatchment(config)
     default_global_catchment.build_model_input_pipeline()
