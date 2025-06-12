@@ -2,6 +2,7 @@ import numpy as np
 import importlib
 import os
 import sys
+import pickle
 from collections import defaultdict
 from pathlib import Path
 from omegaconf import OmegaConf
@@ -226,6 +227,7 @@ class DefaultGlobalCatchment:
     log_buffer_size = 800
     adaptation_factor = 0.7
     missing_value = -9999
+    gauge_err_threshold = 0.05
     possible_modules = ["base", "adaptive_time_step", "log", "bifurcation"]
     
     var_maps = {
@@ -264,11 +266,14 @@ class DefaultGlobalCatchment:
         self.map_dir = Path(parameter_config["map_dir"])
         self.hires_map_dir = Path(parameter_config["hires_map_dir"])
         self.inp_dir = Path(parameter_config["inp_dir"])
+        self.gauge_file = Path(parameter_config["gauge_file"]) if parameter_config["gauge_file"] is not None else None
+        self.save_gauge_only = parameter_config["save_gauge_only"]
+        self.simulate_gauge_only = parameter_config["simulate_gauge_only"]
         self.runoff_config = runoff_config
         self.modules = self.possible_modules
-
         self.params = {}
         self.states = {}
+        self.gauge_info = {}
         self.parameters_loaded = False
 
     def _check_config(self, config):
@@ -322,6 +327,47 @@ class DefaultGlobalCatchment:
         self.next_catchment_id = next_catchment_id
         self.river_mouth_id = river_mouth_id
 
+    def _load_gauge_id(self):
+        gauge_id_set = set()
+        if self.gauge_file is not None:
+            with open(self.gauge_file, "r") as f:
+                lines = f.readlines()
+
+            # skip header
+            for line in lines[1:]:
+                data = line.split()
+                if len(data) < 14:
+                    raise ValueError(f"Invalid gauge data line: {line.strip()}")
+                gauge_name = int(data[0])
+                lat = float(data[1])
+                lon = float(data[2])
+                type_num = int(data[7])
+                ix1, iy1 = int(data[8]), int(data[9])
+                ix2, iy2 = int(data[10]), int(data[11])
+
+                catchment_ids = []
+
+                if ix1 >= 0 and iy1 >= 0:
+                    catchment1 = np.ravel_multi_index((ix1, iy1), self.map_shape)
+                    catchment_ids.append(catchment1)
+                    gauge_id_set.add(catchment1)
+
+                if type_num == 2 and ix2 >= 0 and iy2 >= 0:
+                    catchment2 = np.ravel_multi_index((ix2, iy2), self.map_shape)
+                    catchment_ids.append(catchment2)
+                    gauge_id_set.add(catchment2)
+
+                if catchment_ids:  
+                    self.gauge_info[gauge_name] = {
+                        "upstream_id": catchment_ids,
+                        "lat": lat,
+                        "lon": lon
+                    }
+            if len(self.gauge_info) == 0:
+                raise ValueError("No valid gauges found in the gauge file.")
+        
+        self.gauge_id = np.array(sorted(gauge_id_set), dtype=np.int64)
+
     def _load_bifurcation_parameters(self):
         num_bifurcation_levels, pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifparam(self.map_dir / self.bif_info)
         bifurcation_manning = [self.river_manning] + [self.flood_manning] * (num_bifurcation_levels - 1)
@@ -352,8 +398,25 @@ class DefaultGlobalCatchment:
         for a, b in zip(ori_river_mouth_id, bif_river_mouth_id):
             union(id2idx[a], id2idx[b])
 
-        topo_idx = topological_sort(self.catchment_id, self.next_catchment_id)
+        # Rebuild the root river mouth IDs based on union-find
         root_mouth = np.array([unique_river_mouth_id[find(id2idx[m])] for m in self.river_mouth_id])
+        if self.simulate_gauge_only:
+            gauge_idx = find_indices_in(self.gauge_id, self.catchment_id)
+            gauge_basin_roots = np.unique(root_mouth[gauge_idx])
+            basin_keep_mask = np.isin(root_mouth, gauge_basin_roots)
+            self.catchment_id = self.catchment_id[basin_keep_mask]
+            self.next_catchment_id = self.next_catchment_id[basin_keep_mask]
+            self.catchment_x = self.catchment_x[basin_keep_mask]
+            self.catchment_y = self.catchment_y[basin_keep_mask]
+            self.river_mouth_id = self.river_mouth_id[basin_keep_mask]
+            root_mouth = root_mouth[basin_keep_mask]
+            bif_keep_mask = np.isin(bifurcation_catchment_id, self.catchment_id)
+            bifurcation_catchment_id = bifurcation_catchment_id[bif_keep_mask]
+            bifurcation_next_catchment_id = bifurcation_next_catchment_id[bif_keep_mask]
+            assert np.isin(bifurcation_catchment_id, self.catchment_id).all(), "Bifurcation catchment ID must be in the catchment ID list."
+            assert np.isin(bifurcation_next_catchment_id, self.catchment_id).all(), "Bifurcation next catchment ID must be in the catchment ID list."
+
+        topo_idx = topological_sort(self.catchment_id, self.next_catchment_id)
         sorted_idx, basin_sizes = reorder_by_basin_size(topo_idx, root_mouth)
         self.catchment_id      = self.catchment_id[sorted_idx]
         self.next_catchment_id = self.next_catchment_id[sorted_idx]
@@ -367,9 +430,9 @@ class DefaultGlobalCatchment:
         self.num_catchments_per_basin = basin_sizes
         self.is_reservoir = np.zeros_like(self.catchment_id, dtype=bool)
         self.num_catchments = int(basin_sizes.sum())
-        bifurcation_catchment_idx = find_indices_in(bifurcation_catchment_id, self.catchment_id)
-        bifurcation_downstream_idx = find_indices_in(bifurcation_next_catchment_id, self.catchment_id)
-        sort_idx  = np.argsort(bifurcation_catchment_idx)
+        self.bifurcation_catchment_idx = find_indices_in(bifurcation_catchment_id, self.catchment_id)
+        self.bifurcation_downstream_idx = find_indices_in(bifurcation_next_catchment_id, self.catchment_id)
+        bif_sorted_idx  = np.argsort(self.bifurcation_catchment_idx)
         self.params["is_reservoir"] = self.is_reservoir
         self.params["is_river_mouth"] = self.is_river_mouth
         self.params["downstream_idx"] = self.downstream_idx
@@ -378,42 +441,106 @@ class DefaultGlobalCatchment:
         self.params["num_catchments_per_basin"] = self.num_catchments_per_basin
         self.params["num_bifurcation_paths"] = num_bifurcation_paths
         self.params["num_bifurcation_levels"] = num_bifurcation_levels
-        self.params["bifurcation_catchment_idx"] = bifurcation_catchment_idx
-        self.params["bifurcation_downstream_idx"] = bifurcation_downstream_idx
-        self.params["bifurcation_manning"] = np.tile(np.asarray(bifurcation_manning, dtype=self.numpy_precision), (num_bifurcation_paths, 1))[sort_idx]
-        self.params["bifurcation_width"] = np.asarray(pth_wth, dtype=self.numpy_precision)[sort_idx]
-        self.params["bifurcation_length"] = np.asarray(pth_dst, dtype=self.numpy_precision)[sort_idx]
-        self.params["bifurcation_elevation"] = np.asarray(pth_elv, dtype=self.numpy_precision)[sort_idx]
-        self.states["bifurcation_outflow"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[sort_idx]
-        self.states["bifurcation_cross_section_depth"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[sort_idx]
+        self.params["bifurcation_catchment_idx"] = self.bifurcation_catchment_idx
+        self.params["bifurcation_downstream_idx"] = self.bifurcation_downstream_idx
+        self.params["bifurcation_manning"] = np.tile(np.asarray(bifurcation_manning, dtype=self.numpy_precision), (num_bifurcation_paths, 1))[bif_sorted_idx]
+        self.params["bifurcation_width"] = np.asarray(pth_wth, dtype=self.numpy_precision)[bif_sorted_idx]
+        self.params["bifurcation_length"] = np.asarray(pth_dst, dtype=self.numpy_precision)[bif_sorted_idx]
+        self.params["bifurcation_elevation"] = np.asarray(pth_elv, dtype=self.numpy_precision)[bif_sorted_idx]
+        self.states["bifurcation_outflow"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[bif_sorted_idx]
+        self.states["bifurcation_cross_section_depth"] = np.zeros((num_bifurcation_paths, num_bifurcation_levels), dtype=self.numpy_precision)[bif_sorted_idx]
+        if self.save_gauge_only:
+            catchment_save_idx = find_indices_in(self.gauge_id, self.catchment_id)
+        else:
+            catchment_save_idx = np.arange(self.num_catchments, dtype=np.int64)
+        self.params["catchment_save_idx"] = catchment_save_idx
+        self.params["num_catchments_to_save"] = len(catchment_save_idx)
+        self.bifurcation_path_save_idx = np.arange(num_bifurcation_paths, dtype=np.int64)
+        self.params["bifurcation_path_save_idx"] = self.bifurcation_path_save_idx
+        self.params["num_bifurcation_paths_to_save"] = len(self.params["bifurcation_path_save_idx"])
 
 
     def _visualize_basin(self):
         import matplotlib.pyplot as plt
         from matplotlib.colors import ListedColormap
-        basin_map = np.full(self.map_shape, fill_value=-1, dtype=int)
+        from matplotlib.collections import LineCollection
 
+        def generate_random_colors(N, avoid_rgb_colors):
+            colors = []
+            avoid_rgb_colors = np.array(avoid_rgb_colors)
+            
+            while len(colors) < N:
+                color = np.random.rand(3)
+                if np.all(np.linalg.norm(avoid_rgb_colors - color, axis=1) > 0.7):
+                    colors.append(color)
+            
+            return np.array(colors)
+
+        special_colors = [
+            (1, 0, 0),      # gauges pure red
+            (0, 0, 1),      # saved bifurcations pure blue
+            (0, 1, 0)       # non-saved bifurcations pure green
+        ]
+
+        basin_map = np.full(self.map_shape, fill_value=-1, dtype=int)
         unique_roots = np.unique(self.root_mouth)
         root_to_basin = {root: i for i, root in enumerate(unique_roots)}
         basin_ids = np.array([root_to_basin[r] for r in self.root_mouth])
         basin_map[self.catchment_x, self.catchment_y] = basin_ids
 
         num_basins = len(unique_roots)
-        rng = np.random.default_rng(seed=42)  
-        random_colors = rng.random((num_basins, 3))  
-        all_colors = np.vstack(([1, 1, 1], random_colors))  
+        basin_colors = generate_random_colors(num_basins, avoid_rgb_colors=special_colors)
+        all_colors = np.vstack(([1, 1, 1], basin_colors))
         cmap = ListedColormap(all_colors)
 
         masked_map = np.ma.masked_where(basin_map == -1, basin_map + 1)
 
-        plt.figure(figsize=(10, 8))
+        plt.figure(figsize=(12, 10))
         plt.imshow(masked_map.T, origin='upper', cmap=cmap, interpolation='nearest')
-        plt.title("Basins Grouped by Root Mouth")
+        plt.title("Global basins with Bifurcation Paths")
         plt.xlabel("X")
         plt.ylabel("Y")
         plt.grid(False)
+        
+
+        gauge_catchment_ids = []
+        for info in self.gauge_info.values():
+            gauge_catchment_ids.extend(info["upstream_id"])
+        gauge_catchment_ids = np.unique(gauge_catchment_ids)
+
+        catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
+        gauge_indices = [catchment_id_to_idx[cid] for cid in gauge_catchment_ids if cid in catchment_id_to_idx]
+        gauge_x = self.catchment_x[gauge_indices]
+        gauge_y = self.catchment_y[gauge_indices]
+
+        plt.scatter(gauge_x, gauge_y, c='#FF0000', s=0.5, label='Gauges')
+
+        upstream_x = self.catchment_x[self.bifurcation_catchment_idx]
+        upstream_y = self.catchment_y[self.bifurcation_catchment_idx]
+        downstream_x = self.catchment_x[self.bifurcation_downstream_idx]
+        downstream_y = self.catchment_y[self.bifurcation_downstream_idx]
+
+        line_segments = np.array([[[upstream_x[i], upstream_y[i]], 
+                                [downstream_x[i], downstream_y[i]]] 
+                                for i in range(len(upstream_x))])
+
+        saved_mask = np.isin(np.arange(len(self.bifurcation_catchment_idx)), self.bifurcation_path_save_idx)
+
+        if np.any(saved_mask):
+            saved_lines = LineCollection(line_segments[saved_mask], colors='#0000FF', linestyles='dashed', linewidths=0.5, alpha=0.5)
+            plt.gca().add_collection(saved_lines)
+
+        non_saved_mask = ~saved_mask
+        if np.any(non_saved_mask):
+            non_saved_lines = LineCollection(line_segments[non_saved_mask], colors='#00FF00', linestyles='dashed', linewidths=0.5, alpha=0.5)
+            plt.gca().add_collection(non_saved_lines)
+
+        plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.5, label=f'Saved Bifurcation Paths ({np.sum(saved_mask)})')
+        plt.plot([], [], color='#00FF00', linestyle='--', linewidth=0.5, alpha=0.5, label=f'Non-saved Bifurcation Paths ({np.sum(non_saved_mask)})')
+        plt.legend(loc='lower right')
         plt.tight_layout()
-        plt.show()
+        # plt.show()
+        plt.savefig(self.inp_dir / "basin_map.png", dpi=600, bbox_inches='tight')
 
     def _check_flow_direction(self):
         assert (self.downstream_idx[~self.is_river_mouth] > np.flatnonzero(~self.is_river_mouth)).all(), "Flow direction is not correct! Downstream catchment ID should be greater than upstream catchment ID."
@@ -468,9 +595,7 @@ class DefaultGlobalCatchment:
         for state in self.zero_init_states:
             self.states[state] = np.zeros(self.num_catchments, dtype=self.numpy_precision)
     
-
     def _create_input_matrix(self):
-
         location_file = Path(self.hires_map_dir) / "location.txt"
         with open(location_file, "r") as f:
             lines = f.readlines()
@@ -527,16 +652,21 @@ class DefaultGlobalCatchment:
                 "because all their associated grid cells are invalid; their runoff input will always be 0. "
                 "If there are many such catchments, this may indicate an issue with the input data or code logic."
             )
-
-
         self.runoff_matrix = csr_matrix((valid_areas[row_mask], (row_indices[row_mask], col_indices[row_mask])), shape=(len(self.catchment_id), col_mask.sum()), dtype=self.numpy_precision)
 
     def _create_files(self):
-        
         os.makedirs(self.inp_dir, exist_ok=True)
         save_npz(self.inp_dir / "runoff_input_matrix.npz", self.runoff_matrix, compressed=True)
-        snapshot_to_h5(self.inp_dir / "parameters.h5", self.params, "param", self.modules, omit_hidden=True)
-        snapshot_to_h5(self.inp_dir / "init_states.h5", self.states, "state", self.modules, omit_hidden=True)
+        snapshot_to_h5(self.inp_dir / "parameters.h5", self.params, "param", self.modules, np.dtype(self.numpy_precision).name, omit_hidden=True)
+        snapshot_to_h5(self.inp_dir / "init_states.h5", self.states, "state", self.modules, np.dtype(self.numpy_precision).name, omit_hidden=True)
+        with open(self.inp_dir / "gauge_info.pkl", "wb") as f:
+            pickle.dump(self.gauge_info, f)
+        np.savez_compressed(self.inp_dir / "catchment_id.npz", 
+                            catchment_id=self.catchment_id, 
+                            catchment_x=self.catchment_x, 
+                            catchment_y=self.catchment_y, 
+                            bifurcation_catchment_idx=self.bifurcation_catchment_idx,
+                            bifurcation_downstream_idx=self.bifurcation_downstream_idx,)
 
     def _summary(self):
         # ---------- basic stats ----------
@@ -544,6 +674,7 @@ class DefaultGlobalCatchment:
         print(f"Number of Reservoirs         : {self.is_reservoir.sum()}")
         print(f"Number of Catchments        : {self.num_catchments}")
         print(f"Number of Bifurcation Paths :  {self.params['num_bifurcation_paths']}")
+        print(f"Number of gauges              : {len(self.gauge_info)}")
         # ---------- 1) completeness check ----------
 
         errors = []          
@@ -591,20 +722,21 @@ class DefaultGlobalCatchment:
         """
         self._load_map_info()
         self._load_catchment_id()
+        self._load_gauge_id()
         self._load_bifurcation_parameters()
-        # self._visualize_basin()
         self._load_parameters()
         self._check_flow_direction()
         self._init_river_depth()
         self._simple_init_other_states()
         self._create_input_matrix()
         self._create_files()
+        self._visualize_basin()
         self._summary()
         print("Model input pipeline built successfully.")
         
         
 if __name__ == "__main__":
     from omegaconf import OmegaConf
-    config = OmegaConf.load("./configs/glb_03min.yaml")
+    config = OmegaConf.load("./configs/glb_15min.yaml")
     default_global_catchment = DefaultGlobalCatchment(config)
     default_global_catchment.build_model_input_pipeline()

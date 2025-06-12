@@ -1,8 +1,8 @@
 parameter_config:
   experiment_name: glb_03min
-  map_dir: /project/kangshengyu/cmf_v420_pkg/map/glb_03min
-  hires_map_dir: /project/kangshengyu/cmf_v420_pkg/map/glb_03min/1min
-  working_dir: /project/kangshengyu/CaMa-Flood-GPU
+  map_dir: /home/eat/cmf_v420_pkg/map/glb_03min
+  hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_03min/1min
+  working_dir: /home/eat/CaMa-Flood-GPU
   inp_dir: ${parameter_config.working_dir}/inp/${parameter_config.experiment_name}/
   precision: float32
 
@@ -28,7 +28,7 @@ runoff_config:
   params:
     shape: [180, 360]
     unit_factor: 86400000 # mm/day divided by unit_factor to get m/s
-    base_dir: /project/kangshengyu/CMF_Runoff
+    base_dir: /home/eat/cmf_v420_pkg/inp/test_1deg/runoff
     start_date: ${simulation_config.start_date}
     end_date: ${simulation_config.end_date}
     dtype: float32

@@ -8,6 +8,7 @@ import torch
 MODULES_INFO = {
     "base": {
         "params": [
+            "catchment_save_idx", # the index of the catchment to save in the output
             "downstream_idx", # equal to itself if the catchment is river mouth
             "num_catchments_per_basin", # size of associated basins due to bifurcation
             "is_river_mouth",
@@ -34,6 +35,7 @@ MODULES_INFO = {
         "scalar_params": [
             "num_basins",
             "num_catchments",
+            "num_catchments_to_save",
             "num_flood_levels",
             "gravity", 
         ],
@@ -82,6 +84,7 @@ MODULES_INFO = {
     },
     "bifurcation": {
         "params": [
+            "bifurcation_path_save_idx",
             "bifurcation_catchment_idx",
             "bifurcation_downstream_idx",
             "bifurcation_manning",
@@ -91,6 +94,7 @@ MODULES_INFO = {
         ],
         "scalar_params": [
             "num_bifurcation_paths",
+            "num_bifurcation_paths_to_save",
             "num_bifurcation_levels"
         ],
         "states": [
@@ -123,11 +127,13 @@ MODULES_INFO = {
 SCALAR_TYPES = {
     "num_basins": int,
     "num_catchments": int,
+    "num_catchments_to_save": int,
     "num_flood_levels": int,
     "gravity": float,
     "log_buffer_size": int,
     "adaptation_factor": float,
     "num_bifurcation_paths": int,
+    "num_bifurcation_paths_to_save": int,
     "num_bifurcation_levels": int,
     "num_reservoirs": int,
     "num_upstreams": int,
@@ -135,10 +141,12 @@ SCALAR_TYPES = {
 }
 
 SPECIAL_ARRAY_TYPES = {
+    "catchment_save_idx": np.int64,
     "downstream_idx": np.int64,
     "num_catchments_per_basin": np.int64,
     "is_river_mouth": np.bool,
     "is_reservoir": np.bool,
+    "bifurcation_path_save_idx": np.int64,
     "bifurcation_catchment_idx": np.int64,
     "bifurcation_downstream_idx": np.int64,
 }

@@ -7,11 +7,19 @@ from CMF_GPU.utils.Checker import SPECIAL_INPUT_SHAPES, SPECIAL_HIDDEN_STATE_SHA
 from CMF_GPU.utils.Spliter import ORDERS, SPECIAL_SPLIT_ARRAYS, SPECIAL_SPLIT_SCALARS, default_scalar_split, default_array_split
 from CMF_GPU.utils.utils import gather_all_keys
 
-def check_input_h5(params_filename, states_filename, enabled_modules, precision):
-    dtype = np.float32 if precision == "float32" else np.float64
+def check_input_h5(params_filename, states_filename, enabled_modules):
     # 1. check modules
     params_h5 = h5py.File(params_filename, 'r', swmr=True)
     states_h5 = h5py.File(states_filename, 'r', swmr=True)
+    if params_h5.attrs['default_dtype'] != states_h5.attrs['default_dtype']:
+        raise ValueError("Inconsistent data types found in HDF5 files.")
+    default_dtype_str = params_h5.attrs['default_dtype']
+    if default_dtype_str == "float32":
+        dtype = np.float32
+    elif default_dtype_str == "float64":
+        dtype = np.float64
+    else:
+        raise ValueError(f"Unsupported default_dtype: '{default_dtype_str}'. Expected 'float32' or 'float64'.")
     for input_type, data_h5 in [("param", params_h5), ("state", states_h5)]:
         all_keys, all_hidden_keys, all_scalar_keys = gather_all_keys(input_type, MODULES_INFO.keys())
         used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, enabled_modules)
@@ -90,14 +98,19 @@ def make_order(params_filename, enabled_modules, statistics, num_gpus):
     orders["statistics"] = statistics
     orders["modules"] = enabled_modules
 
-    for (mod, keys), func in ORDERS.items():
-        if mod in enabled_modules:
-            results = func(params_h5, orders, num_gpus)
-            if isinstance(keys, tuple):                  
-                orders.update(dict(zip(keys, results)))
-            else:
-                orders[keys] = results
+    for mod in enabled_modules:
+        if mod in ORDERS:
+            for keys, func in ORDERS[mod].items():
+                results = func(params_h5, orders, num_gpus)
+                if isinstance(keys, tuple):
+                    orders.update(dict(zip(keys, results)))
+                else:
+                    orders[keys] = results
     return orders
+
+# def make_dim_info(params_filename, orders, rank):
+
+#     return dim_info
 
 def load_input_h5(params_filename, states_filename, orders, rank):
     # Load the input h5 files
@@ -106,19 +119,26 @@ def load_input_h5(params_filename, states_filename, orders, rank):
     statistics = orders["statistics"]
     params = {}
     states = {}
+    # TODO: make dim_info
+    catchment_save_idx = default_array_split(orders["inverse_order"][params_h5["catchment_save_idx"][()]], orders, rank, indices_name="save_split_indices", order_name="save_order").detach().cpu()
+    # bifurcation_catchment_idx = default_array_split(orders["inverse_order"][params_h5["bifurcation_catchment_idx"][()]], orders, rank, indices_name="bifurcation_split_indices", order_name="bifurcation_order").detach().cpu()
+    dim_info = {
+        "catchment_save_idx": catchment_save_idx,
+        # "bifurcation_catchment_idx": bifurcation_catchment_idx,
+    }
     for input_type, data_h5, data_dict in [("param", params_h5, params), ("state", states_h5, states)]:
         used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, orders["modules"])
         for key in scalar_keys:
             type_fcn = SCALAR_TYPES[key]
             if key in SPECIAL_SPLIT_SCALARS:
-                data_dict[key] = type_fcn(SPECIAL_SPLIT_SCALARS[key](data_h5[key], orders, rank))
+                data_dict[key] = type_fcn(SPECIAL_SPLIT_SCALARS[key](data_h5[key][()], orders, rank))
             else:
-                data_dict[key] = type_fcn(default_scalar_split(data_h5[key], orders, rank))
+                data_dict[key] = type_fcn(default_scalar_split(data_h5[key][()], orders, rank))
         for key in used_keys:
             if key in SPECIAL_SPLIT_ARRAYS:
-                data_dict[key] = SPECIAL_SPLIT_ARRAYS[key](data_h5[key], orders, rank)
+                data_dict[key] = SPECIAL_SPLIT_ARRAYS[key](data_h5[key][()], orders, rank)
             else:
-                data_dict[key] = default_array_split(data_h5[key], orders, rank)
+                data_dict[key] = default_array_split(data_h5[key][()], orders, rank)
         for key in hidden_keys:
             if input_type == "param":
                 data_dict[key] = HIDDEN_PARAMS[key](params) # data_dict
@@ -132,17 +152,11 @@ def load_input_h5(params_filename, states_filename, orders, rank):
             for stat_type, keys in statistics.items():
                 for key in keys:
                     full_key = f"{key}_{stat_type}"
-                    shape_keys = LEGAL_AGG_ARRAYS.get((key,), ("num_catchments",))
-                    size = [params.get(k, 0) for k in shape_keys]
+                    shape_keys = next(
+                        (shape_key_tuple for shape_key_tuple, key_list in LEGAL_AGG_ARRAYS.items() if key in key_list),
+                        ("num_catchments_to_save",)
+                    )[1] # TODO: use NamedTuple
+                    size = [params[k] for k in shape_keys]
                     data_dict[full_key] = torch.zeros(size)
 
-    return params, states
-
-
-if __name__ == "__main__":
-    from pathlib import Path
-    input_dir = Path("/home/eat/CaMa-Flood-GPU/inp/glb_06min")
-    check_input_h5(input_dir / "parameters.h5", input_dir / "init_states.h5", ["base"], "float32")
-    orders = make_order(input_dir / "parameters.h5", ["base"], [],2)
-    params, states = load_input_h5(input_dir / "parameters.h5", input_dir / "init_states.h5", orders, 0)
-    pass
+    return params, states, dim_info

@@ -7,7 +7,7 @@ LEGAL_STATS = [
 ]
 
 LEGAL_AGG_ARRAYS = {
-    ("num_catchments",): [
+    ("catchment_save_idx", ("num_catchments_to_save",)): [
         "river_storage",
         "flood_storage",
         "river_depth",
@@ -23,13 +23,20 @@ LEGAL_AGG_ARRAYS = {
         "flood_area",
         "flood_fraction",
     ],
-    ("num_bifurcation_paths", "num_bifurcation_levels"): [
+    ("bifurcation_path_save_idx", ("num_bifurcation_paths_to_save", "num_bifurcation_levels")): [
         "bifurcation_outflow",
         "bifurcation_cross_section_depth",
     ],
     # ("num_bifurcation_paths",): [
     #     "bifurcation_outflow_sum",
     # ],
+}
+
+# dim_length: coord_name
+DIM_INFO = {
+    "num_catchments_to_save": "catchment_save_idx",
+    "num_bifurcation_paths_to_save": "bifurcation_path_save_idx",
+    "num_bifurcation_levels": "bifurcation_level_idx",  
 }
 
 def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
@@ -50,23 +57,21 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
         "    pass"
     ]
     var_to_shape = {}
-    for shape_key, vars_ in LEGAL_AGG_ARRAYS.items():
+    for (save_idx_name, shape_key_tuple), vars_ in LEGAL_AGG_ARRAYS.items():
         for v in vars_:
-            var_to_shape[v] = shape_key
+            var_to_shape[v] = (save_idx_name, shape_key_tuple)
 
     # ---------- 2. Group by dim0 and record agg types for each variable ----------
-    grouped = {}  # dim0 → dict(var → set(agg_types))
-    if agg_keys is None:
-        script_path.write_text("\n".join(default_lines), encoding="utf-8")
-        return
+    grouped = {}  # key = (dim0, save_idx_name) → var → set(aggs)
+
     for agg, vars_ in agg_keys.items():
         if vars_ is not None:
             for v in vars_:
                 if v not in var_to_shape:
-                    raise ValueError(
-                        f"Variable '{v}' not in LEGAL_AGG_ARRAYS")
-                dim0 = var_to_shape[v][0]
-                grouped.setdefault(dim0, {}).setdefault(v, set()).add(agg)
+                    raise ValueError(f"Variable '{v}' not in LEGAL_AGG_ARRAYS")
+                save_idx_name, shape_keys = var_to_shape[v]
+                dim0 = shape_keys[0]
+                grouped.setdefault((dim0, save_idx_name), {}).setdefault(v, set()).add(agg)
     if not grouped:
         script_path.write_text("\n".join(default_lines), encoding="utf-8")
         return
@@ -78,21 +83,22 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
     ]
 
     # ---------- 4. Generate kernel for each dim0 ----------
-    for dim0, var_to_aggs in grouped.items():
+    for (dim0, save_idx_name), var_to_aggs in grouped.items():
         # 4.1 Classify 1-D / 2-D variables
-        vars_1d = [v for v in var_to_aggs if len(var_to_shape[v]) == 1]
-        vars_2d = [v for v in var_to_aggs if len(var_to_shape[v]) == 2]
+        vars_1d = [v for v in var_to_aggs if len(var_to_shape[v][1]) == 1]
+        vars_2d = [v for v in var_to_aggs if len(var_to_shape[v][1]) == 2]
         dim1 = None
         if vars_2d:
-            second_dims = {var_to_shape[v][1] for v in vars_2d}
+            second_dims = {var_to_shape[v][1][1] for v in vars_2d}
             if len(second_dims) != 1:
                 raise ValueError(
                     f"Vars under dim0 '{dim0}' have multiple dim1 names: {second_dims}")
             dim1 = second_dims.pop()  # e.g. 'num_bifurcation_levels'
 
-        kernel_name = f"update_stats_kernel_{dim0}"
+        kernel_name = f"update_stats_kernel__{dim0}"
         # 4.2 Parameter list (deduplicated)
         ptrs = set()
+        ptrs.add(f"{save_idx_name}_ptr")
         for v, aggs in var_to_aggs.items():
             ptrs.add(f"{v}_ptr")
             for agg in ("min", "max", "mean"):
@@ -114,16 +120,16 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
             f"def {kernel_name}(",
             *arg_lines,
             "):",
-            "    pid  = tl.program_id(0)",
-            "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
-            f"    mask = offs < {dim0}",
-            "",
         ]
+        lines.append("    pid  = tl.program_id(0)")
+        lines.append("    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)")
+        lines.append(f"    mask = offs < {dim0}")
+        lines.append(f"    idx  = tl.load({save_idx_name}_ptr + offs, mask=mask)")
         # ------------------ Handle 1-D variables ------------------ #
         if vars_1d:
             lines.append("    # -------- 1-D variables --------")
             for v in vars_1d:
-                lines.append(f"    {v} = tl.load({v}_ptr + offs, mask=mask, other=0.0)")
+                lines.append(f"    {v} = tl.load({v}_ptr + idx, mask=mask, other=0.0)")
             lines.append("    # init / load previous")
             lines.append("    if current_step == 0:")
             for v in vars_1d:
@@ -178,7 +184,7 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
             lines.append(f"    for level in tl.static_range({dim1}):")
             for v in vars_2d:
                 lines.append(
-                    f"        {v} = tl.load({v}_ptr + offs * {dim1} + level, mask=mask, other=0.0)")
+                    f"        {v} = tl.load({v}_ptr + idx * {dim1} + level, mask=mask, other=0.0)")
             lines.append("        if current_step == 0:")
             for v in vars_2d:
                 aggs = var_to_aggs[v]
@@ -234,12 +240,13 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
         "",
         "def update_statistics(params, states, current_step, num_sub_steps, BLOCK_SIZE):",
     ]
-    for dim0, var_to_aggs in grouped.items():
-        kernel_name = f"update_stats_kernel_{dim0}"
+    for (dim0, save_idx_name), var_to_aggs in grouped.items():
+        kernel_name = f"update_stats_kernel__{dim0}"
         grid_name   = f'grid_{dim0}'
         lines.append(f"    {grid_name} = lambda meta: (triton.cdiv(params['{dim0}'], meta['BLOCK_SIZE']),)")
         lines.append(f"    {kernel_name}[{grid_name}](")
         # 5.1 Pass pointers
+        lines.append(f"        {save_idx_name}_ptr=params['{save_idx_name}'],")
         for v, aggs in sorted(var_to_aggs.items()):
             lines.append(f"        {v}_ptr=states['{v}'],")
             if 'min' in aggs:
@@ -255,9 +262,9 @@ def generate_triton_aggregator_script(script_path: Path, agg_keys: dict):
             f"        {dim0}=params['{dim0}'],",
         ]
         # If there are 2-D variables, add dim1
-        vars_2d = [v for v in var_to_aggs if len(var_to_shape[v]) == 2]
+        vars_2d = [v for v in var_to_aggs if len(var_to_shape[v][1]) == 2]
         if vars_2d:
-            dim1 = var_to_shape[vars_2d[0]][1]
+            dim1 = var_to_shape[vars_2d[0]][1][1]
             lines.append(f"        {dim1}=params['{dim1}'],")
         lines.append("        BLOCK_SIZE=BLOCK_SIZE")
         lines.append("    )\n")

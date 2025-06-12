@@ -34,8 +34,8 @@
 ## Prerequisites
 
 - Python == 3.13.3  
-- PyTorch (with CUDA support) == 2.7.0+cu128
-- Triton == 3.3.0
+- PyTorch (with CUDA support) == 2.7.1+cu128
+- Triton == 3.3.1
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - netCDF4
   - omegaconf

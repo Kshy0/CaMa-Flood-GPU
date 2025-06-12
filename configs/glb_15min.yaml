@@ -4,15 +4,17 @@ parameter_config:
   hires_map_dir: /home/eat/cmf_v420_pkg/map/glb_15min/1min
   working_dir: /home/eat/CaMa-Flood-GPU
   inp_dir: ${parameter_config.working_dir}/inp/${parameter_config.experiment_name}/
+  gauge_file: /home/eat/cmf_v420_pkg/map/glb_15min/GRDC_alloc.txt
   precision: float32
+  save_gauge_only: false
+  simulate_gauge_only: false
 
 simulation_config:
   experiment_name: glb_15min
   working_dir: ${parameter_config.working_dir}
   out_dir: ${simulation_config.working_dir}/out/${simulation_config.experiment_name}/
   inp_dir: ${simulation_config.working_dir}/inp/${simulation_config.experiment_name}/
-  states_file: None
-  precision: ${parameter_config.precision} # TODO: delete this key
+  states_file: null
   start_date: 2000-01-01
   end_date: 2000-12-31
   modules: [base, adaptive_time_step, log]

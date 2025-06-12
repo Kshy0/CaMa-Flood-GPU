@@ -89,7 +89,7 @@ def gather_device_dicts(data_dict, keys=None):
 
     return merged
 
-def snapshot_to_h5(filename, data_dict, input_type, modules, omit_hidden=True):
+def snapshot_to_h5(filename, data_dict, input_type, modules, precision, omit_hidden=True):
     """
     Save a snapshot of params or states to an .h5 file, excluding hidden entries.
 
@@ -106,6 +106,7 @@ def snapshot_to_h5(filename, data_dict, input_type, modules, omit_hidden=True):
     saved_keys = []
 
     with h5py.File(filename, 'w') as h5f:
+        h5f.attrs['default_dtype'] = precision
         for k in params_or_states:
             if k in data_dict:
                 h5f.create_dataset(k, data=data_dict[k])

@@ -1,5 +1,3 @@
-import torch
-import os
 from datetime import datetime
 from CMF_GPU.utils.Variables import MODULES_INFO
 from CMF_GPU.utils.Aggregator import LEGAL_AGG_ARRAYS, LEGAL_STATS
@@ -32,7 +30,7 @@ def _check_parameter_config(cfg):
 
     required = [
         "experiment_name", "map_dir", "hires_map_dir",
-        "working_dir", "inp_dir", "precision"
+        "working_dir", "inp_dir", "precision", "gauge_file", "save_gauge_only", "simulate_gauge_only"
     ]
     for key in required:
         if key not in cfg:
@@ -54,6 +52,42 @@ def _check_parameter_config(cfg):
     if cfg["precision"] not in ["float32", "float64"]:
         raise ValueError(f"CONFIG ERROR: Invalid precision: {cfg['precision']}")
     
+    if cfg["gauge_file"] == "None":
+        raise ValueError("CONFIG ERROR: in yaml, gauge_file should be null, not 'None' to indicate no gauge file.")
+    if cfg["gauge_file"] is not None:
+        if not isinstance(cfg["gauge_file"], str):
+            raise ValueError(f"CONFIG ERROR: gauge_file must be a string path, got {type(cfg['gauge_file'])}")
+        gauge_path = Path(cfg["gauge_file"])
+        if not gauge_path.is_file():
+            raise ValueError(f"CONFIG ERROR: gauge_file does not exist or is not a file: {gauge_path}")
+    
+    for key in ["save_gauge_only", "simulate_gauge_only"]:
+        if not isinstance(cfg[key], bool):
+            raise ValueError(f"CONFIG ERROR: {key} must be a boolean value, got {type(cfg[key])}")
+        
+    save_gauge_only = cfg["save_gauge_only"]
+    simulate_gauge_only = cfg["simulate_gauge_only"]
+    if save_gauge_only and not simulate_gauge_only:
+        print("[CONFIG] save_gauge_only is True, but simulate_gauge_only is False.\n"
+              " - Only gauge results will be saved, but all catchments will be simulated.\n"
+              " - Water balance can be fully reflected in logs.\n"
+              " - This setting may slow down calibration.")
+    elif not save_gauge_only and simulate_gauge_only:
+        print("[CONFIG] simulate_gauge_only is True, but save_gauge_only is False.\n"
+              " - Only gauge basins will be simulated, but all available results will be saved.\n"
+              " - Logs will reflect water balance for gauge basins only.")
+    elif save_gauge_only and simulate_gauge_only:
+        print("[CONFIG] save_gauge_only and simulate_gauge_only are both True.\n"
+              " - Only gauge basins will be simulated and saved.\n"
+              " - This can speed up parameter calibration.")
+    else:
+        print("[CONFIG] save_gauge_only and simulate_gauge_only are both False.\n"
+              " - All catchments will be simulated and all results will be saved.\n")
+    
+    if cfg["gauge_file"] is None and save_gauge_only:
+        raise ValueError("CONFIG ERROR: gauge_file is None, but save_gauge_only is True")
+    if cfg["gauge_file"] is None and simulate_gauge_only:
+        raise ValueError("CONFIG ERROR: gauge_file is None, but simulate_gauge_only is True")
     return True
 
 def _check_runoff_config(cfg):
@@ -75,16 +109,13 @@ def _check_simulation_config(cfg):
         if module not in MODULES_INFO:
             raise ValueError(f"CONFIG ERROR: Invalid module in simulation_config: {module}")
     required = [
-        "experiment_name", "working_dir", "out_dir", "inp_dir", "states_file", "precision",
+        "experiment_name", "working_dir", "out_dir", "inp_dir", "states_file", 
         "start_date", "end_date", "time_step", "default_num_sub_steps",
     ]
     for key in required:
         if key not in cfg:
             raise ValueError(f"CONFIG ERROR: simulation_config missing required key '{key}'")
         
-    if cfg["precision"] not in ["float32", "float64"]:
-        raise ValueError(f"CONFIG ERROR: Invalid precision: {cfg['precision']}")
-    
     if not isinstance(cfg["experiment_name"], str) or not cfg["experiment_name"]:
         raise ValueError(f"CONFIG ERROR: Invalid experiment_name: {cfg['experiment_name']}")
     
@@ -99,6 +130,15 @@ def _check_simulation_config(cfg):
         if not parent_dir.is_dir():
             raise ValueError(f"CONFIG ERROR: {key} parent does not exist or is not a directory: {parent_dir}")
 
+    if cfg["states_file"] == "None":
+        raise ValueError("CONFIG ERROR: in yaml, states_file should be null, not 'None' to indicate no states file.")
+    if cfg["states_file"] is not None:
+        if not isinstance(cfg["states_file"], str):
+            raise ValueError(f"CONFIG ERROR: states_file must be a string path, got {type(cfg['states_file'])}")
+        states_path = Path(cfg["states_file"])
+        if not states_path.is_file():
+            raise ValueError(f"CONFIG ERROR: states_file does not exist or is not a file: {states_path}")
+    
     try:
         datetime.strptime(cfg["start_date"], "%Y-%m-%d")
         datetime.strptime(cfg["end_date"], "%Y-%m-%d")
@@ -169,6 +209,7 @@ SPECIAL_HIDDEN_STATE_SHAPES = {
     
 SPECIAL_INPUT_SHAPES = {
     # base
+    "save_idx": lambda p: (p["num_catchments_to_save"][()],),
     "runoff_input_matrix": lambda p: p["runoff_input_matrix"][()].shape, # not check, TODO: trim the second dimension by the mask
     "flood_depth_table": lambda p: (p["num_catchments"][()], p["num_flood_levels"][()] + 3),
     "num_catchments_per_basin": lambda p: (p["num_basins"][()],),
