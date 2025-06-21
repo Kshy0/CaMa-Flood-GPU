@@ -23,7 +23,7 @@ LEGAL_AGG_ARRAYS = {
         "flood_area",
         "flood_fraction",
     ],
-    ("bifurcation_path_save_idx", ("num_bifurcation_paths_to_save", "num_bifurcation_levels")): [
+    ("bifurcation_path_save_idx", ("num_bifurcation_paths", "num_bifurcation_levels")): [
         "bifurcation_outflow",
         "bifurcation_cross_section_depth",
     ],
@@ -35,7 +35,7 @@ LEGAL_AGG_ARRAYS = {
 # dim_length: coord_name
 DIM_INFO = {
     "num_catchments_to_save": "catchment_save_idx",
-    "num_bifurcation_paths_to_save": "bifurcation_path_save_idx",
+    "num_bifurcation_paths": "bifurcation_path_save_idx",
     "num_bifurcation_levels": "bifurcation_level_idx",  
 }
 

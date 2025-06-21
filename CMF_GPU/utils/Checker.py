@@ -209,18 +209,20 @@ SPECIAL_HIDDEN_STATE_SHAPES = {
     
 SPECIAL_INPUT_SHAPES = {
     # base
-    "save_idx": lambda p: (p["num_catchments_to_save"][()],),
+    "catchment_save_idx": lambda p: (p["num_catchments_to_save"][()],),
     "runoff_input_matrix": lambda p: p["runoff_input_matrix"][()].shape, # not check, TODO: trim the second dimension by the mask
-    "flood_depth_table": lambda p: (p["num_catchments"][()], p["num_flood_levels"][()] + 3),
+    "flood_depth_table": lambda p: (p["num_catchments"][()], p["num_flood_levels"][()] + 1),
     "num_catchments_per_basin": lambda p: (p["num_basins"][()],),
     # bifurcation
-    "bifurcation_catchment_id": _bifurcation_1D_shape,
-    "bifurcation_downstream_id": _bifurcation_1D_shape,
+    "bifurcation_path_save_idx": _bifurcation_1D_shape,
+    "bifurcation_catchment_idx": _bifurcation_1D_shape,
+    "bifurcation_downstream_idx": _bifurcation_1D_shape,
     "bifurcation_length": _bifurcation_1D_shape,
     "bifurcation_manning": _bifurcation_2D_shape,
     "bifurcation_width": _bifurcation_2D_shape,
     "bifurcation_elevation": _bifurcation_2D_shape,
     "bifurcation_outflow": _bifurcation_2D_shape,
+    "bifurcation_cross_section_depth": _bifurcation_2D_shape,
     # reservoir
     "reservoir_catchment_idx": _reservoir_shape,
     "conservation_volume": _reservoir_shape,

@@ -3,7 +3,7 @@ import triton.language as tl
 
 @triton.jit
 def compute_reservoir_outflow_kernel(
-    catchment_idx_ptr,                      # *bool mask: 1 means river mouth 
+    reservoir_catchment_idx_ptr,                      # *bool mask: 1 means river mouth 
 
     # river/flood variables
     river_inflow_ptr,                      # *f32 in/out river inflow
@@ -33,13 +33,13 @@ def compute_reservoir_outflow_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
 
-    catchment_idx = tl.load(catchment_idx_ptr + offs, mask=mask, other=0)
-    river_inflow = tl.load(river_inflow_ptr + catchment_idx, mask=mask, other=0.0)
-    flood_inflow = tl.load(flood_inflow_ptr + catchment_idx, mask=mask, other=0.0)
-    river_storage = tl.load(river_storage_ptr + catchment_idx, mask=mask, other=0.0)
-    flood_storage = tl.load(flood_storage_ptr + catchment_idx, mask=mask, other=0.0)
+    reservoir_catchment_idx = tl.load(reservoir_catchment_idx_ptr + offs, mask=mask, other=0)
+    river_inflow = tl.load(river_inflow_ptr + reservoir_catchment_idx, mask=mask, other=0.0)
+    flood_inflow = tl.load(flood_inflow_ptr + reservoir_catchment_idx, mask=mask, other=0.0)
+    river_storage = tl.load(river_storage_ptr + reservoir_catchment_idx, mask=mask, other=0.0)
+    flood_storage = tl.load(flood_storage_ptr + reservoir_catchment_idx, mask=mask, other=0.0)
 
-    runoff = tl.load(runoff_ptr + catchment_idx, mask=mask, other=0.0)
+    runoff = tl.load(runoff_ptr + reservoir_catchment_idx, mask=mask, other=0.0)
     reservoir_inflow = river_inflow + flood_inflow + runoff
 
     total_storage = river_storage + flood_storage
@@ -106,16 +106,16 @@ def compute_reservoir_outflow_kernel(
     )
 
     reservoir_outflow = tl.clamp(reservoir_outflow, 0.0, total_storage / time_step)
-    tl.store(river_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask)
-    tl.store(total_storage_ptr + catchment_idx, total_storage, mask=mask)
+    tl.store(river_outflow_ptr + reservoir_catchment_idx, reservoir_outflow, mask=mask)
+    tl.store(total_storage_ptr + reservoir_catchment_idx, total_storage, mask=mask)
     tl.atomic_add(outgoing_storage_ptr + offs, reservoir_outflow * time_step, mask=mask)
 
 
 @triton.jit
 def compute_manning_outflow_kernel(
     # Indices
-    catchment_idx_ptr,                          # *i32: Catchment indices
-    downstream_idx_ptr,                         # *i32: Downstream indices
+    reservoir_upstream_idx_ptr,                          # *i32: Catchment indices
+    reservoir_catchment_idx_ptr,                         # *i32: Downstream indices
 
     # river variables
     river_outflow_ptr,                      # *f32 in/out river outflow
@@ -147,20 +147,20 @@ def compute_manning_outflow_kernel(
     mask = offs < num_catchments
     
     # Update upstream outflow
-    catchment_idx = tl.load(catchment_idx_ptr + offs, mask=mask, other=0)
-    downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
-    downstream_distance = tl.load(downstream_distance_ptr + catchment_idx, mask=mask, other=0.0)
-    river_manning = tl.load(river_manning_ptr + catchment_idx, mask=mask, other=0.0)
-    flood_manning = tl.load(flood_manning_ptr + catchment_idx, mask=mask, other=0.0)
-    river_width = tl.load(river_width_ptr + catchment_idx, mask=mask, other=0.0)
-    river_depth = tl.load(river_depth_ptr + catchment_idx, mask=mask, other=0.0)
-    river_length = tl.load(river_length_ptr + catchment_idx, mask=mask, other=0.0)
-    flood_depth = tl.load(flood_depth_ptr + catchment_idx, mask=mask, other=0.0)
-    river_storage = tl.load(river_storage_ptr + catchment_idx, mask=mask, other=0.0)
-    flood_storage = tl.load(flood_storage_ptr + catchment_idx, mask=mask, other=0.0)
+    reservoir_upstream_idx = tl.load(reservoir_upstream_idx_ptr + offs, mask=mask, other=0)
+    reservoir_catchment_idx = tl.load(reservoir_catchment_idx_ptr + offs, mask=mask, other=0)
+    downstream_distance = tl.load(downstream_distance_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    river_manning = tl.load(river_manning_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    flood_manning = tl.load(flood_manning_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    river_width = tl.load(river_width_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    river_depth = tl.load(river_depth_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    river_length = tl.load(river_length_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    flood_depth = tl.load(flood_depth_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    river_storage = tl.load(river_storage_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    flood_storage = tl.load(flood_storage_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
 
-    catchment_elevation = tl.load(catchment_elevation_ptr + catchment_idx, mask=mask, other=0.0)
-    catchment_elevation_downstream = tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0)
+    catchment_elevation = tl.load(catchment_elevation_ptr + reservoir_upstream_idx, mask=mask, other=0.0)
+    catchment_elevation_downstream = tl.load(catchment_elevation_ptr + reservoir_catchment_idx, mask=mask, other=0.0)
     river_slope = (catchment_elevation - catchment_elevation_downstream) / downstream_distance
     river_slope = tl.maximum(river_slope, min_slope)
     
@@ -169,16 +169,16 @@ def compute_manning_outflow_kernel(
     flood_slope = tl.minimum(river_slope, 0.005)
     flood_velocity = tl.sqrt(flood_slope) * tl.exp((2.0/3.0) * tl.log(flood_depth) / flood_manning)
     flood_outflow = flood_velocity * tl.maximum(flood_storage / river_length - flood_depth * river_width, 0.0)
-    tl.store(river_outflow_ptr + catchment_idx, river_outflow, mask=mask)
-    tl.store(flood_outflow_ptr + catchment_idx, flood_outflow, mask=mask)
-    tl.store(total_storage_ptr + catchment_idx, river_storage + flood_storage, mask=mask)
+    tl.store(river_outflow_ptr + reservoir_upstream_idx, river_outflow, mask=mask)
+    tl.store(flood_outflow_ptr + reservoir_upstream_idx, flood_outflow, mask=mask)
+    tl.store(total_storage_ptr + reservoir_upstream_idx, river_storage + flood_storage, mask=mask)
 
     pos = tl.maximum(river_outflow, 0.0) + tl.maximum(flood_outflow, 0.0)
     neg = tl.minimum(river_outflow, 0.0) + tl.minimum(flood_outflow, 0.0)
 
 
     tl.atomic_add(outgoing_storage_ptr + offs, pos * time_step, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx, -neg * time_step, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + reservoir_catchment_idx, -neg * time_step, mask=mask)
 
 
 
@@ -228,7 +228,7 @@ def compute_reservoir_outflow(
     reservoir_grid = lambda meta: (triton.cdiv(num_reservoirs, meta['BLOCK_SIZE']),)
 
     compute_reservoir_outflow_kernel[reservoir_grid](
-        catchment_idx_ptr=reservoir_catchment_idx_ptr,
+        reservoir_catchment_idx_ptr=reservoir_catchment_idx_ptr,
         river_inflow_ptr=river_inflow_ptr,
         river_outflow_ptr=river_outflow_ptr,
         river_storage_ptr=river_storage_ptr,
@@ -251,8 +251,8 @@ def compute_reservoir_outflow(
     upstream_grid = lambda meta: (triton.cdiv(num_upstreams, meta['BLOCK_SIZE']),)
 
     compute_manning_outflow_kernel[upstream_grid](
-        catchment_idx_ptr=reservoir_upstream_idx_ptr,
-        downstream_idx_ptr=reservoir_catchment_idx_ptr,
+        reservoir_upstream_idx_ptr=reservoir_upstream_idx_ptr,
+        reservoir_catchment_idx_ptr=reservoir_catchment_idx_ptr,
         river_outflow_ptr=river_outflow_ptr,
         river_manning_ptr=river_manning_ptr,
         river_depth_ptr=river_depth_ptr,

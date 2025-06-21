@@ -70,15 +70,15 @@ def _compute_sub_order(
     split_indices: np.ndarray,
     input_idx: np.ndarray,
 ):
-    positions     = inverse_order[input_idx]                 # GPU-major positions
+    global_idx     = inverse_order[input_idx]                 # GPU-major positions
 
-    sub_order = np.argsort(positions)                        # permutation
+    sub_order = np.argsort(global_idx)                        # permutation
 
     num_gpus = split_indices.size - 1
     counts   = np.zeros(num_gpus, dtype=np.int64)
     for g in range(num_gpus):
         start, end = split_indices[g], split_indices[g + 1]
-        counts[g]  = np.sum((positions >= start) & (positions < end))
+        counts[g]  = np.sum((global_idx >= start) & (global_idx < end))
 
     sub_split_indices        = np.empty(num_gpus + 1, dtype=np.int64)
     sub_split_indices[0]     = 0
@@ -112,38 +112,40 @@ ORDERS = {
         ("catchment_order", "inverse_order", "split_indices"): lambda p, o, n: 
             _compute_greedy_partition(n, p["num_catchments_per_basin"][()]),
 
-        ("save_order", "save_split_indices"): lambda p, o, n:
-            _compute_sub_order(o["inverse_order"][()], o["split_indices"][()], p["catchment_save_idx"][()]),
+        ("catchment_save_order", "catchment_save_split_indices"): lambda p, o, n:
+            _compute_sub_order(o["inverse_order"], o["split_indices"], p["catchment_save_idx"][()]),
 
         ("catchment_save_idx"): lambda p, o, n:
-            _compute_local_idx(o["inverse_order"][()], o["split_indices"][()], p["catchment_save_idx"][()]),
+            _compute_local_idx(o["inverse_order"], o["split_indices"], p["catchment_save_idx"][()]),
 
         ("downstream_idx"): lambda p, o, n: 
-            _compute_local_idx(o["inverse_order"][()], o["split_indices"][()], p["downstream_idx"][()]),
+            _compute_local_idx(o["inverse_order"], o["split_indices"], p["downstream_idx"][()]),
     },
     
     "bifurcation": {
         ("bifurcation_order", "bifurcation_split_indices"): lambda p, o, n: 
-            _compute_sub_order(o["inverse_order"][()], o["split_indices"][()], p["bifurcation_catchment_idx"][()]),
+            _compute_sub_order(o["inverse_order"], o["split_indices"], p["bifurcation_catchment_idx"][()]),
+
+        ("bifurcation_path_save_idx"): lambda p, o, n: np.arange(p["num_bifurcation_paths"][()]),
 
         ("bifurcation_catchment_idx"): lambda p, o, n: 
-            _compute_local_idx(o["inverse_order"][()], o["split_indices"][()], p["bifurcation_catchment_idx"][()]),
+            _compute_local_idx(o["inverse_order"], o["split_indices"], p["bifurcation_catchment_idx"][()]),
 
         ("bifurcation_downstream_idx"): lambda p, o, n: 
-            _compute_local_idx(o["inverse_order"][()], o["split_indices"][()], p["bifurcation_downstream_idx"][()]),
+            _compute_local_idx(o["inverse_order"], o["split_indices"], p["bifurcation_downstream_idx"][()]),
     },
 
     "reservoir": {
         ("reservoir_order", "reservoir_split_indices"): lambda p, o, n: 
-            _compute_sub_order(o["inverse_order"][()], o["split_indices"][()], p["reservoir_catchment_idx"][()]),
+            _compute_sub_order(o["inverse_order"], o["split_indices"], p["reservoir_catchment_idx"][()]),
 
         ("reservoir_idx"): lambda p, o, n: 
-            _compute_local_idx(o["inverse_order"][()], o["split_indices"][()], p["reservoir_catchment_idx"][()]),
+            _compute_local_idx(o["inverse_order"], o["split_indices"], p["reservoir_catchment_idx"][()]),
     },
 }
 
-def _delete(ds, orders, rank):
-    return ds[()] # to be modified
+def _delete(x, orders, rank):
+    return x[()] # to be modified
 
 def _split_array(x, orders, rank, indices_name, order_name):
     """
@@ -165,7 +167,7 @@ def _split_array(x, orders, rank, indices_name, order_name):
     sliced_data = x[orders[order_name][start_idx:end_idx]]
     return torch.tensor(sliced_data)
 
-def _update_idx(ds, orders, rank, indices_name, idx_name, order_name):
+def _update_idx(x, orders, rank, indices_name, idx_name, order_name):
     """
     Update an array based on the provided indices and order.
     
@@ -204,23 +206,24 @@ def split_runoff_input_matrix(file, orders, rank):
     )
     return torch_sparse
 
-def _split_is_reservoir(ds, orders, rank):
+def _split_is_reservoir(x, orders, rank):
     if "reservoir" not in orders["modules"]:
-        sliced_data = np.zeros_like(ds[()])
+        sliced_data = np.zeros_like(x)
     else:
         split_indices = orders["reservoir_split_indices"]
         start_idx = split_indices[rank]
         end_idx = split_indices[rank + 1]
-        sliced_data = ds[()][orders["reservoir_order"][start_idx:end_idx]]
+        sliced_data = x[orders["reservoir_order"][start_idx:end_idx]]
     return torch.tensor(sliced_data)
 
 
 # default: np.split(ARRAY, o["split_indices"][1::-1])
 # None means that the array will not be used in the simulation
 SPECIAL_SPLIT_ARRAYS = {
-    "catchment_save_idx": lambda x, o, r: _update_idx(x, o, r, "save_split_indices", "catchment_save_idx", "save_order"),
+    "catchment_save_idx": lambda x, o, r: _update_idx(x, o, r, "catchment_save_split_indices", "catchment_save_idx", "catchment_save_order"),
     "downstream_idx": lambda x, o, r: _update_idx(x, o, r, "split_indices", "downstream_idx", "catchment_order"),
     "num_catchments_per_basin": _delete,
+    "bifurcation_path_save_idx": lambda x, o, r: _update_idx(x, o, r, "bifurcation_split_indices", "bifurcation_path_save_idx", "bifurcation_order"),
     "bifurcation_catchment_idx": lambda x, o, r: _update_idx(x, o, r, "bifurcation_split_indices", "bifurcation_catchment_idx", "bifurcation_order"),
     "bifurcation_downstream_idx": lambda x, o, r: _update_idx(x, o, r, "bifurcation_split_indices", "bifurcation_downstream_idx", "bifurcation_order"),
     "bifurcation_manning": lambda x, o, r: _split_array(x, o, r, "bifurcation_split_indices", "bifurcation_order"),
@@ -228,6 +231,7 @@ SPECIAL_SPLIT_ARRAYS = {
     "bifurcation_length": lambda x, o, r: _split_array(x, o, r, "bifurcation_split_indices", "bifurcation_order"),
     "bifurcation_elevation": lambda x, o, r: _split_array(x, o, r, "bifurcation_split_indices", "bifurcation_order"),
     "bifurcation_outflow": lambda x, o, r: _split_array(x, o, r, "bifurcation_split_indices", "bifurcation_order"),
+    "bifurcation_cross_section_depth": lambda x, o, r: _split_array(x, o, r, "bifurcation_split_indices", "bifurcation_order"),
     "is_reservoir": _split_is_reservoir,
     "reservoir_catchment_idx": lambda x, o, r: _update_idx(x, o, r, "reservoir_split_indices", "reservoir_catchment_idx", "reservoir_order"),
     "conservation_volume": lambda x, o, r: _split_array(x, o, r, "reservoir_split_indices", "reservoir_order"),
@@ -238,6 +242,7 @@ SPECIAL_SPLIT_ARRAYS = {
 
 SPECIAL_SPLIT_SCALARS = {
     "num_basins": _delete,
+    "num_catchments_to_save": lambda ds, o, r: int(np.diff(o["catchment_save_split_indices"])[r]),
     "num_catchments": lambda ds, o, r: int(np.diff(o["split_indices"])[r]),
     "num_bifurcation_paths": lambda ds, o, r: int(np.diff(o["bifurcation_split_indices"])[r]),
     "num_reservoirs": lambda ds, o, r: int(np.diff(o["reservoir_split_indices"])[r]),

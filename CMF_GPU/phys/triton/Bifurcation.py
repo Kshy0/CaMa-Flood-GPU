@@ -4,8 +4,8 @@ import triton.language as tl
 @triton.jit
 def compute_bifurcation_outflow_kernel(
     # Indices and configuration
-    catchment_idx_ptr,                          # *i32: Catchment indices
-    downstream_idx_ptr,                         # *i32: Downstream indices
+    bifurcation_catchment_idx_ptr,                          # *i32: Catchment indices
+    bifurcation_downstream_idx_ptr,                         # *i32: Downstream indices
     bifurcation_manning_ptr,                    # *f32: Bifurcation Manning coefficient
     bifurcation_outflow_ptr,                    # *f32: Bifurcation outflow (in/out)
     bifurcation_width_ptr,                      # *f32: Bifurcation width
@@ -17,25 +17,25 @@ def compute_bifurcation_outflow_kernel(
     outgoing_storage_ptr,                       # *f32: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
     time_step,                                  # f32: Time step
-    num_paths: tl.constexpr,                    # Total number of bifurcation paths
+    num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     BLOCK_SIZE: tl.constexpr                    # Block size
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < num_paths
+    mask = offs < num_bifurcation_paths
     
     # Load indices
-    catchment_idx = tl.load(catchment_idx_ptr + offs, mask=mask, other=0)
-    downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
+    bifurcation_catchment_idx = tl.load(bifurcation_catchment_idx_ptr + offs, mask=mask, other=0)
+    bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
     
     # Load bifurcation properties
     
     bifurcation_length = tl.load(bifurcation_length_ptr + offs, mask=mask, other=0.0)
     
     # Load river properties for catchment and downstream
-    bifurcation_water_surface_elevation = tl.load(water_surface_elevation_ptr + catchment_idx, mask=mask, other=0.0)
-    bifurcation_water_surface_elevation_downstream = tl.load(water_surface_elevation_ptr + downstream_idx, mask=mask, other=0.0)
+    bifurcation_water_surface_elevation = tl.load(water_surface_elevation_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
+    bifurcation_water_surface_elevation_downstream = tl.load(water_surface_elevation_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
     max_bifurcation_water_surface_elevation = tl.maximum(bifurcation_water_surface_elevation, bifurcation_water_surface_elevation_downstream)
 
     # Bifurcation slope (clamped similarly to flood slope)
@@ -43,9 +43,9 @@ def compute_bifurcation_outflow_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = tl.load(total_storage_ptr + catchment_idx, mask=mask, other=0.0)
-    bifurcation_total_storage_downstream = tl.load(total_storage_ptr + downstream_idx, mask=mask, other=0.0)
-    bifurcation_outflow_sum = tl.zeros_like(bifurcation_length)
+    bifurcation_total_storage = tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
+    bifurcation_total_storage_downstream = tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+    sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     for level in tl.static_range(num_bifurcation_levels):
         
@@ -75,18 +75,52 @@ def compute_bifurcation_outflow_kernel(
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
         updated_bifurcation_outflow = tl.where(bifurcation_condition, updated_bifurcation_outflow, 0.0)
-        bifurcation_outflow_sum += updated_bifurcation_outflow
+        sum_bifurcation_outflow += updated_bifurcation_outflow
         tl.store(bifurcation_cross_section_depth_ptr + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
-    limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(bifurcation_outflow_sum) * time_step), 1.0)
-    bifurcation_outflow_sum *= limit_rate
+    limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
+    sum_bifurcation_outflow *= limit_rate
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
         updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask)
         updated_bifurcation_outflow *= limit_rate
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
 
-    pos_flow = tl.maximum(bifurcation_outflow_sum, 0.0)
-    neg_flow = tl.minimum(bifurcation_outflow_sum, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + catchment_idx, pos_flow * time_step, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx, -neg_flow * time_step, mask=mask)
+    pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
+    neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
+    tl.atomic_add(outgoing_storage_ptr + bifurcation_catchment_idx, pos_flow * time_step, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + bifurcation_downstream_idx, -neg_flow * time_step, mask=mask)
+
+@triton.jit
+def compute_bifurcation_inflow_kernel(
+    # Indices and configuration
+    bifurcation_catchment_idx_ptr,                          # *i32: Catchment indices
+    bifurcation_downstream_idx_ptr,                         # *i32: Downstream indices
+    limit_rate_ptr,                             # *f32: Bifurcation Manning coefficient
+    bifurcation_outflow_ptr,                    # *f32: Bifurcation inflow (in/out)
+    global_bifurcation_outflow_ptr,            # *f32: Bifurcation width
+    num_bifurcation_paths: tl.constexpr,                    # Total number of bifurcation paths
+    num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels
+    BLOCK_SIZE: tl.constexpr                     # Block size
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_bifurcation_paths
+    
+    # Load indices
+    bifurcation_catchment_idx = tl.load(bifurcation_catchment_idx_ptr + offs, mask=mask, other=0)
+    bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
+    # Load limit rate
+    limit_rate = tl.load(limit_rate_ptr + bifurcation_catchment_idx, mask=mask, other=1.0)
+    limit_rate_downstream = tl.load(limit_rate_ptr + bifurcation_downstream_idx, mask=mask, other=1.0)
+    sum_bifurcation_outflow = tl.zeros_like(limit_rate)
+
+    for level in tl.static_range(num_bifurcation_levels):
+        level_idx = offs * num_bifurcation_levels + level
+        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask)
+        updated_bifurcation_outflow = tl.where(updated_bifurcation_outflow >= 0.0, updated_bifurcation_outflow * limit_rate, updated_bifurcation_outflow * limit_rate_downstream)
+        sum_bifurcation_outflow += updated_bifurcation_outflow
+        tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
+        
+    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_catchment_idx, sum_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_downstream_idx, -sum_bifurcation_outflow, mask=mask)

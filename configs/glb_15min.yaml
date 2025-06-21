@@ -13,17 +13,17 @@ simulation_config:
   experiment_name: glb_15min
   working_dir: ${parameter_config.working_dir}
   out_dir: ${simulation_config.working_dir}/out/${simulation_config.experiment_name}/
-  inp_dir: ${simulation_config.working_dir}/inp/${simulation_config.experiment_name}/
+  inp_dir: ${simulation_config.working_dir}/inp/${parameter_config.experiment_name}/
   states_file: null
   start_date: 2000-01-01
   end_date: 2000-12-31
-  modules: [base, adaptive_time_step, log]
+  modules: [base, adaptive_time_step, bifurcation, log]
   time_step: 86400 # seconds
   default_num_sub_steps: 360
   statistics: 
     min: [river_outflow]
     max: [river_outflow]
-    mean: [river_outflow, flood_outflow]
+    mean: [river_outflow, flood_outflow, bifurcation_outflow]
 
 runoff_config:
   class_name: DailyBinDataset

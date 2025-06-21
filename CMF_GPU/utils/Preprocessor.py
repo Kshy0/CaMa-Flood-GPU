@@ -120,12 +120,13 @@ def load_input_h5(params_filename, states_filename, orders, rank):
     params = {}
     states = {}
     # TODO: make dim_info
-    catchment_save_idx = default_array_split(orders["inverse_order"][params_h5["catchment_save_idx"][()]], orders, rank, indices_name="save_split_indices", order_name="save_order").detach().cpu()
-    # bifurcation_catchment_idx = default_array_split(orders["inverse_order"][params_h5["bifurcation_catchment_idx"][()]], orders, rank, indices_name="bifurcation_split_indices", order_name="bifurcation_order").detach().cpu()
+    catchment_save_idx = default_array_split(orders["inverse_order"][params_h5["catchment_save_idx"][()]], orders, rank, indices_name="catchment_save_split_indices", order_name="catchment_save_order").detach().cpu()
     dim_info = {
         "catchment_save_idx": catchment_save_idx,
-        # "bifurcation_catchment_idx": bifurcation_catchment_idx,
     }
+    if "bifurcation_order" in params_h5:
+        bifurcation_path_save_idx = default_array_split(orders["inverse_order"][params_h5["bifurcation_catchment_idx"][()]], orders, rank, indices_name="bifurcation_split_indices", order_name="bifurcation_order").detach().cpu()
+        dim_info["bifurcation_path_save_idx"] = bifurcation_path_save_idx
     for input_type, data_h5, data_dict in [("param", params_h5, params), ("state", states_h5, states)]:
         used_keys, hidden_keys, scalar_keys = gather_all_keys(input_type, orders["modules"])
         for key in scalar_keys:

@@ -3,7 +3,6 @@ import runpy
 import os
 import torch
 import torch.distributed as dist
-import numpy as np
 from CMF_GPU.phys.triton.StepAdvance import advance_step
 from CMF_GPU.utils.Dataset import DailyBinDataset
 from CMF_GPU.utils.Aggregator import generate_triton_aggregator_script
@@ -36,7 +35,7 @@ def setup_distributed():
     
     return local_rank, rank, world_size
 
-def broadcast_orders(inp_dir, out_dir, simulation_config, rank, world_size):
+def broadcast_orders(inp_dir, simulation_config, rank, world_size):
     """Compute on rank 0, send to others."""
     statistics = simulation_config.get("statistics", [])
     modules = simulation_config["modules"]
@@ -44,11 +43,8 @@ def broadcast_orders(inp_dir, out_dir, simulation_config, rank, world_size):
         generate_triton_aggregator_script(inp_dir / "Aggregate.py", statistics)
         check_input_h5(inp_dir / "parameters.h5", inp_dir / "init_states.h5", modules)
         orders = make_order(inp_dir / "parameters.h5",
-                            ["base","adaptive_time_step","log"],
+                            modules,
                             statistics, world_size)
-        np.savez_compressed(
-            out_dir / "save_idx.npz",
-            orders["save_idx"]["save_order"].numpy())
     else:
         orders = None
     obj_list = [orders]
@@ -67,8 +63,13 @@ def main(config):
     statistics   = simulation_config.get("statistics", [])
     inp_dir = Path(simulation_config["inp_dir"])
     out_dir = Path(simulation_config["out_dir"])
-    orders = broadcast_orders(inp_dir, out_dir, simulation_config, rank, world_size)
-    params, states = load_input_h5(inp_dir / "parameters.h5", inp_dir / "init_states.h5", orders, rank)
+    orders = broadcast_orders(inp_dir, simulation_config, rank, world_size)
+    params, states, dim_info = load_input_h5(inp_dir / "parameters.h5", inp_dir / "init_states.h5", orders, rank)
+    if rank == 0:
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir)
+        os.makedirs(out_dir)
+
     runoff_input_matrix = split_runoff_input_matrix(inp_dir / "runoff_input_matrix.npz", orders, rank)
     ns = runpy.run_path(inp_dir / "Aggregate.py")
     agg_fn = ns["update_statistics"]
@@ -85,14 +86,12 @@ def main(config):
     )
     dumper = DataDumper(
         base_dir=out_dir,
-        statistics=statistics,
         file_format="nc",
-        num_workers=1,
+        statistics=statistics,
+        dim_info=dim_info,
+        num_workers=3,
     )
-    if rank == 0:
-        if os.path.exists(out_dir):
-            shutil.rmtree(out_dir)
-        os.makedirs(out_dir)
+
     logger = Logger(base_dir=out_dir,
         disabled=False if "log" in simulation_config["modules"] else True
     )

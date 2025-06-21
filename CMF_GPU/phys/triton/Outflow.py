@@ -79,9 +79,9 @@ def compute_outflow_kernel(
     water_surface_elevation = river_depth + river_elevation
     total_storage = river_storage + flood_storage
     # Downstream water surface elevation
-    downstream_river_depth = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
-    downstream_river_elevation = tl.load(river_elevation_ptr + downstream_idx, mask=mask, other=0.0)
-    water_surface_elevation_downstream = downstream_river_depth + downstream_river_elevation
+    river_depth_downstream = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
+    river_elevation_downstream = tl.load(river_elevation_ptr + downstream_idx, mask=mask, other=0.0)
+    water_surface_elevation_downstream = river_depth_downstream + river_elevation_downstream
     
     # (3) Compute maximum water surface elevation
     max_water_surface_elevation = tl.maximum(water_surface_elevation, water_surface_elevation_downstream)
@@ -120,7 +120,7 @@ def compute_outflow_kernel(
         0.0
     )
     flood_implicit_area = tl.maximum(tl.sqrt(
-        updated_flood_cross_section_area * flood_cross_section_area
+        updated_flood_cross_section_area * tl.maximum(flood_cross_section_area, 1e-6)
     ), 1e-6)
 
     #----------------------------------------------------------------------
@@ -147,7 +147,7 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     # (8) Update flood outflow
     #----------------------------------------------------------------------
-    flood_condition = (flood_semi_implicit_flow_depth > 1e-5) & (flood_implicit_area > 1e-5)
+    flood_condition = (flood_semi_implicit_flow_depth > 1e-5) & (updated_flood_cross_section_area > 1e-5)
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     

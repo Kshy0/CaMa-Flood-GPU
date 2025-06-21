@@ -39,7 +39,7 @@ def open_file(
                 ds.createDimension(coord_name, size)
                 # Create coordinate variable
                 coord_var = ds.createVariable(coord_name, 'i8', (coord_name,))
-                coord_var[:] = dim_info.get(dim_name, np.arange(size))
+                coord_var[:] = dim_info.get(coord_name, np.arange(size))
             
         # Also create/ensure time dimension
         if 'time' not in ds.dimensions:

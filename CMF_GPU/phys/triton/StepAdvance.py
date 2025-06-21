@@ -3,12 +3,12 @@ from triton import cdiv
 from CMF_GPU.utils.utils import is_rank_zero
 from CMF_GPU.phys.AdaptTime import compute_adaptive_time_step
 from CMF_GPU.phys.triton.Outflow import compute_outflow_kernel, compute_inflow_kernel
-from CMF_GPU.phys.triton.Bifurcation import compute_bifurcation_outflow_kernel
+from CMF_GPU.phys.triton.Bifurcation import compute_bifurcation_outflow_kernel, compute_bifurcation_inflow_kernel
 from CMF_GPU.phys.triton.Storage import compute_flood_stage_kernel, compute_flood_stage_log_kernel
 from CMF_GPU.phys.triton.Reservoir import compute_reservoir_outflow
 
 def do_one_substep(
-    runtime_flags: dict,
+    simulation_config: dict,
     params: dict,
     states: dict,
     runoff: torch.Tensor,
@@ -55,11 +55,11 @@ def do_one_substep(
         BLOCK_SIZE=BLOCK_SIZE
     )
 
-    if "bifurcation" in runtime_flags["modules"]:
+    if "bifurcation" in simulation_config["modules"]:
         bifurcation_grid = lambda meta: (cdiv(params["num_bifurcation_paths"], meta['BLOCK_SIZE']),)
         compute_bifurcation_outflow_kernel[bifurcation_grid](
-            catchment_idx_ptr=params["bifurcation_catchment_idx"],
-            downstream_idx_ptr=params["bifurcation_downstream_idx"],
+            bifurcation_catchment_idx_ptr=params["bifurcation_catchment_idx"],
+            bifurcation_downstream_idx_ptr=params["bifurcation_downstream_idx"],
             bifurcation_manning_ptr=params["bifurcation_manning"],
             bifurcation_outflow_ptr=states["bifurcation_outflow"],
             bifurcation_width_ptr=params["bifurcation_width"],
@@ -71,12 +71,12 @@ def do_one_substep(
             outgoing_storage_ptr=states["outgoing_storage"],
             gravity=params["gravity"],
             time_step=dT,
-            num_paths=params["num_bifurcation_paths"],
+            num_bifurcation_paths=params["num_bifurcation_paths"],
             num_bifurcation_levels=params["num_bifurcation_levels"],
             BLOCK_SIZE=BLOCK_SIZE
         )
     
-    if "reservoir" in runtime_flags["modules"]:
+    if "reservoir" in simulation_config["modules"]:
         compute_reservoir_outflow(
             reservoir_catchment_idx_ptr=params["reservoir_catchment_idx"],
             reservoir_upstream_idx_ptr=params["reservoir_upstream_idx"],
@@ -100,8 +100,8 @@ def do_one_substep(
             catchment_elevation_ptr=params["catchment_elevation"],
             downstream_distance_ptr=params["downstream_distance"],
             runoff_ptr=runoff,
-            total_storage_ptr=params["total_storage_ptr"],
-            outgoing_storage_ptr=params["outgoing_storage_ptr"],
+            total_storage_ptr=states["total_storage_ptr"],
+            outgoing_storage_ptr=states["outgoing_storage_ptr"],
             time_step=dT,
             num_reservoirs=params["num_reservoirs"],
             num_upstreams=params["num_upstreams"],
@@ -127,15 +127,28 @@ def do_one_substep(
         BLOCK_SIZE=BLOCK_SIZE
     )
 
+    if "bifurcation" in simulation_config["modules"]:
+        compute_bifurcation_inflow_kernel[bifurcation_grid](
+            bifurcation_catchment_idx_ptr=params["bifurcation_catchment_idx"],
+            bifurcation_downstream_idx_ptr=params["bifurcation_downstream_idx"],
+            limit_rate_ptr=states["limit_rate"],
+            bifurcation_outflow_ptr=states["bifurcation_outflow"],
+            global_bifurcation_outflow_ptr=states["global_bifurcation_outflow"],
+            num_bifurcation_paths=params["num_bifurcation_paths"],
+            num_bifurcation_levels=params["num_bifurcation_levels"],
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+
     # ---------------------------
     # 3) Compute flood stage and update water levels
     # ---------------------------
-    if "log" in runtime_flags["modules"]:
+    if "log" in simulation_config["modules"]:
         compute_flood_stage_log_kernel[grid](
             river_inflow_ptr=states["river_inflow"],
             flood_inflow_ptr=states["flood_inflow"],
             river_outflow_ptr=states["river_outflow"],
             flood_outflow_ptr=states["flood_outflow"],
+            global_bifurcation_outflow_ptr=states["global_bifurcation_outflow"],
             runoff_ptr=runoff,
             time_step=dT,
             river_storage_ptr=states["river_storage"],
@@ -146,8 +159,6 @@ def do_one_substep(
             flood_fraction_ptr=states["flood_fraction"],
             flood_area_ptr=states["flood_area"],
             river_max_storage_ptr=params["river_max_storage"],
-            river_area_ptr=params["river_area"],
-            max_flood_area_ptr=params["max_flood_area"],
             total_storage_table_ptr=params["total_storage_table"],
             flood_depth_table_ptr=params["flood_depth_table"],
             total_width_table_ptr=params["total_width_table"],
@@ -178,6 +189,7 @@ def do_one_substep(
             flood_inflow_ptr=states["flood_inflow"],
             river_outflow_ptr=states["river_outflow"],
             flood_outflow_ptr=states["flood_outflow"],
+            global_bifurcation_outflow_ptr=states["global_bifurcation_outflow"],
             runoff_ptr=runoff,
             time_step=dT,
             river_storage_ptr=states["river_storage"],
@@ -188,8 +200,6 @@ def do_one_substep(
             flood_fraction_ptr=states["flood_fraction"],
             flood_area_ptr=states["flood_area"],
             river_max_storage_ptr=params["river_max_storage"],
-            river_area_ptr=params["river_area"],
-            max_flood_area_ptr=params["max_flood_area"],
             total_storage_table_ptr=params["total_storage_table"],
             flood_depth_table_ptr=params["flood_depth_table"],
             total_width_table_ptr=params["total_width_table"],

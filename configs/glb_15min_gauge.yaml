@@ -17,7 +17,7 @@ simulation_config:
   states_file: null
   start_date: 2000-01-01
   end_date: 2000-12-31
-  modules: [base, adaptive_time_step, log]
+  modules: [base, adaptive_time_step, log, bifurcation]
   time_step: 86400 # seconds
   default_num_sub_steps: 360
   statistics: 

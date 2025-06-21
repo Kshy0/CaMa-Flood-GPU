@@ -25,9 +25,7 @@ MODULES_INFO = {
         ],
         "hidden_params": [
             "river_elevation",
-            "river_area",
             "river_max_storage",
-            "max_flood_area",
             "total_width_table",
             "total_storage_table",
             "flood_gradient_table",
@@ -51,6 +49,7 @@ MODULES_INFO = {
             "flood_cross_section_area",
         ],
         "hidden_states": [
+            "global_bifurcation_outflow",
             "total_storage",
             "outgoing_storage",
             "water_surface_elevation",
@@ -94,7 +93,6 @@ MODULES_INFO = {
         ],
         "scalar_params": [
             "num_bifurcation_paths",
-            "num_bifurcation_paths_to_save",
             "num_bifurcation_levels"
         ],
         "states": [
@@ -133,7 +131,6 @@ SCALAR_TYPES = {
     "log_buffer_size": int,
     "adaptation_factor": float,
     "num_bifurcation_paths": int,
-    "num_bifurcation_paths_to_save": int,
     "num_bifurcation_levels": int,
     "num_reservoirs": int,
     "num_upstreams": int,
@@ -154,30 +151,27 @@ SPECIAL_ARRAY_TYPES = {
 HIDDEN_PARAMS = {
     # base
     "river_elevation": lambda p: p["catchment_elevation"] - p["river_height"],
-    "river_area": lambda p: p["river_length"] * p["river_width"],
-    "river_max_storage": lambda p: p["river_area"] * p["river_height"],
-    "max_flood_area": lambda p: p["river_area"] + p["catchment_area"],
+    "river_max_storage": lambda p: p["river_length"] * p["river_width"] * p["river_height"],
     "total_width_table": lambda p: torch.cat([
         p["river_width"][:, None],
         p["river_width"][:, None] + torch.linspace(
             0, 1, p["num_flood_levels"] + 1
-        )[None, :] * p["catchment_area"][:, None] / p["river_length"][:, None],
-        (p["river_width"] + p["catchment_area"] / p["river_length"])[:, None]
+        )[None, 1:] * p["catchment_area"][:, None] / p["river_length"][:, None],
     ], dim=1),
     "total_storage_table": lambda p: torch.cat([
-        torch.zeros((p["num_catchments"], 1)),
-        torch.cumsum(
+        p["river_max_storage"][:, None],
+        p["river_max_storage"][:, None] + torch.cumsum(
             p["river_length"][:, None] *
             0.5 * (p["total_width_table"][:, :-1] + p["total_width_table"][:, 1:]) *
             (p["flood_depth_table"][:, 1:] - p["flood_depth_table"][:, :-1]),
             dim=1
         )
     ], dim=1),
-    "flood_gradient_table": lambda p: torch.where(
-        (p["total_width_table"][:, 1:] - p["total_width_table"][:, :-1]) != 0,
+    "flood_gradient_table": lambda p: torch.cat([
         (p["flood_depth_table"][:, 1:] - p["flood_depth_table"][:, :-1]) /
         (p["total_width_table"][:, 1:] - p["total_width_table"][:, :-1]),
-        torch.zeros_like(p["flood_depth_table"][:, 1:])
+        torch.zeros_like(p["flood_depth_table"][:, :1]),
+    ], dim=1
     ),
     # reservoir
     "adjustment_volume": lambda p: p["conservation_volume"] + p["emergency_volume"] * 0.1,
