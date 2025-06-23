@@ -12,8 +12,6 @@ from CMF_GPU.utils.Variables import MODULES_INFO
 from CMF_GPU.utils.Checker import CONFIG_REQUIRED_KEYS
 from CMF_GPU.utils.utils import snapshot_to_h5, gather_all_keys
 
-sys.setrecursionlimit(100000) 
-
 def binread(filename, shape, dtype_str):
     """
     Reads a binary file and reshapes it to a specified shape.
@@ -193,27 +191,34 @@ def find_indices_in(a, b):
 
 def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
     """
-    Calculates the runoff grid ID corresponding to each high-resolution grid based on the boundary and spacing of the coarse-resolution grid.
-    Triggers an assertion error if out of range.
+    Calculates runoff grid IDs considering ascending or descending order of coordinates.
     """
-    gsize_lon = runoff_lon[1] - runoff_lon[0]  # Longitude resolution
-    gsize_lat = runoff_lat[0] - runoff_lat[1]  # Latitude resolution (usually negative)
+    lon_ascending = runoff_lon[1] > runoff_lon[0]
+    lat_ascending = runoff_lat[1] > runoff_lat[0]
 
-    westin = runoff_lon[0] - 0.5 * gsize_lon
-    northin = runoff_lat[0] + 0.5 * gsize_lat
+    gsize_lon = abs(runoff_lon[1] - runoff_lon[0])
+    gsize_lat = abs(runoff_lat[1] - runoff_lat[0])
+
+    if lon_ascending:
+        westin = runoff_lon[0] - 0.5 * gsize_lon
+        ixin = np.floor((hires_lon - westin) / gsize_lon).astype(int)
+    else:
+        westin = runoff_lon[0] + 0.5 * gsize_lon
+        ixin = np.floor((westin - hires_lon) / gsize_lon).astype(int)
+
+    if lat_ascending:
+        southin = runoff_lat[0] - 0.5 * gsize_lat
+        iyin = np.floor((hires_lat - southin) / gsize_lat).astype(int)
+    else:
+        northin = runoff_lat[0] + 0.5 * gsize_lat
+        iyin = np.floor((northin - hires_lat) / gsize_lat).astype(int)
 
     nxin = len(runoff_lon)
     nyin = len(runoff_lat)
 
-    # Calculate indices (without truncation)
-    ixin = np.floor((hires_lon - westin) / gsize_lon).astype(int)
-    iyin = np.floor((northin - hires_lat) / gsize_lat).astype(int)
-
-    # Use assert to ensure all indices are within valid range
     assert np.all((ixin >= 0) & (ixin < nxin)), "Some hires_lon points fall outside the runoff grid (longitude)"
     assert np.all((iyin >= 0) & (iyin < nyin)), "Some hires_lat points fall outside the runoff grid (latitude)"
 
-    # Convert 2D grid indices to 1D indices
     runoff_id = iyin * nxin + ixin
 
     return runoff_id
@@ -525,7 +530,7 @@ class DefaultGlobalCatchment:
 
         saved_lines = LineCollection(line_segments, colors='#0000FF', linestyles='dashed', linewidths=0.5, alpha=0.5)
         plt.gca().add_collection(saved_lines)
-        plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.5, label=f'Saved Bifurcation Paths')
+        plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.5, label=f'Bifurcation Paths')
         plt.legend(loc='lower right')
         plt.tight_layout()
         # plt.show()
