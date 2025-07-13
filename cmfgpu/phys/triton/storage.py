@@ -157,15 +157,15 @@ def compute_flood_stage_log_kernel(
     # scalar for log storage
     total_storage_pre_sum_ptr, # *f32
     total_storage_next_sum_ptr, # *f32
-    total_storage_new_ptr, # *f32
-    total_inflow_ptr,
-    total_outflow_ptr,
-    total_storage_stage_new_ptr, # *f32
-    total_river_storage_ptr, # *f32
-    total_flood_storage_ptr, # *f32
-    total_flood_area_ptr, # *f32
-    total_inflow_error_ptr, # *f32
-    total_stage_error_ptr, # *f32
+    total_storage_new_sum_ptr, # *f32
+    total_inflow_sum_ptr,
+    total_outflow_sum_ptr,
+    total_storage_stage_sum_ptr, # *f32
+    river_storage_sum_ptr, # *f32
+    flood_storage_sum_ptr, # *f32
+    flood_area_sum_ptr, # *f32
+    total_inflow_error_sum_ptr, # *f32
+    total_stage_error_sum_ptr, # *f32
     # Constants
     current_step,
     num_catchments: tl.constexpr,
@@ -204,10 +204,10 @@ def compute_flood_stage_log_kernel(
     total_storage_next = river_storage_updated + flood_storage_updated
     tl.atomic_add(total_storage_next_sum_ptr + current_step, tl.sum(total_storage_next) * 1e-9)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + runoff * time_step, 0.0)
-    tl.atomic_add(total_storage_new_ptr + current_step, tl.sum(total_storage) * 1e-9)
-    tl.atomic_add(total_inflow_ptr + current_step, tl.sum((river_inflow + flood_inflow) * time_step) * 1e-9)
-    tl.atomic_add(total_outflow_ptr + current_step, tl.sum((river_outflow + flood_outflow) * time_step) * 1e-9)
-    tl.atomic_add(total_inflow_error_ptr + current_step, tl.sum(total_stage_pre - total_storage_next + (river_inflow + flood_inflow - river_outflow - flood_outflow) * time_step) * 1e-9)
+    tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(total_storage) * 1e-9)
+    tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum((river_inflow + flood_inflow) * time_step) * 1e-9)
+    tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum((river_outflow + flood_outflow) * time_step) * 1e-9)
+    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(total_stage_pre - total_storage_next + (river_inflow + flood_inflow - river_outflow - flood_outflow) * time_step) * 1e-9)
 
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
@@ -257,11 +257,11 @@ def compute_flood_stage_log_kernel(
 
     # log
     total_storage_stage_new = river_storage_final + flood_storage_final
-    tl.atomic_add(total_storage_stage_new_ptr + current_step, tl.sum(total_storage_stage_new) * 1e-9)
-    tl.atomic_add(total_river_storage_ptr + current_step, tl.sum(river_storage_final) * 1e-9)
-    tl.atomic_add(total_flood_storage_ptr + current_step, tl.sum(flood_storage_final) * 1e-9)
-    tl.atomic_add(total_flood_area_ptr + current_step, tl.sum(flood_area) * 1e-9)
-    tl.atomic_add(total_stage_error_ptr + current_step, tl.sum((total_storage_stage_new - total_storage) * 1e-9))
+    tl.atomic_add(total_storage_stage_sum_ptr + current_step, tl.sum(total_storage_stage_new) * 1e-9)
+    tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(river_storage_final) * 1e-9)
+    tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(flood_storage_final) * 1e-9)
+    tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(flood_area) * 1e-9)
+    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum((total_storage_stage_new - total_storage) * 1e-9))
 
     # Return to zero
     tl.store(river_inflow_ptr + offs, 0.0, mask=mask)

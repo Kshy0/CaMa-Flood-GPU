@@ -37,8 +37,8 @@
 - PyTorch (with CUDA support) == 2.7.1+cu128
 - Triton == 3.3.1
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
+  - pydantic
   - netCDF4
-  - omegaconf
   - h5py
   - and other utility packages as needed
 
@@ -78,12 +78,12 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
 
-This command installs the `CMF_GPU` package in editable mode, along with its required dependencies such as `netCDF4`, `omegaconf`, `h5py`, and others.
+This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `omegaconf`, `h5py`, and others.
 
-If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `CMF_GPU` and reinstall it to ensure all required packages are correctly installed:
+If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `cmfgpu` and reinstall it to ensure all required packages are correctly installed:
 
 ```bash
-pip uninstall CMF_GPU
+pip uninstall cmfgpu
 pip install -e .
 ```
 
