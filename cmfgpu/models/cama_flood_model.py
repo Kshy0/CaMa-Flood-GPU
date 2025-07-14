@@ -4,11 +4,11 @@ Updated to work with the new AbstractModule hierarchy and SimulationConfig valid
 """
 import triton
 import torch
-from typing import Dict, List, Optional, Type, ClassVar, Callable
+from typing import Dict, Optional, Type, ClassVar, Callable
 from pathlib import Path
 from datetime import datetime
 from torch import distributed as dist
-from pydantic import Field, computed_field
+from pydantic import computed_field
 from functools import cached_property
 from cmfgpu.models.abstract_model import AbstractModel
 from cmfgpu.modules.base import BaseModule
@@ -106,6 +106,9 @@ class CaMaFlood(AbstractModel):
             is_river_mouth_ptr=self.base.is_river_mouth,
             is_reservoir_ptr=self.base.is_reservoir,
             downstream_idx_ptr=self.base.downstream_idx,
+            river_inflow_ptr=self.base.river_inflow,
+            flood_inflow_ptr=self.base.flood_inflow,
+            global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
             river_outflow_ptr=self.base.river_outflow,
             flood_outflow_ptr=self.base.flood_outflow,
             river_manning_ptr=self.base.river_manning,
@@ -251,7 +254,7 @@ class CaMaFlood(AbstractModel):
             )
         self.update_statistics(
             weight=num_sub_steps,
-            refresh=(sub_step == num_sub_steps - 1)
+            refresh=(sub_step == 0)
         )
 
     def save_states(self, filepath: Path) -> None:

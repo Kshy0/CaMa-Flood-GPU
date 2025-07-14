@@ -8,6 +8,7 @@ def compute_outflow_kernel(
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
+    river_inflow_ptr,                       # *f32 river inflow (turn to zero)
     river_outflow_ptr,                      # *f32 in/out river outflow
     river_manning_ptr,                      # *f32 river Manning coefficient
     river_depth_ptr,                        # *f32 river depth
@@ -17,6 +18,7 @@ def compute_outflow_kernel(
     river_storage_ptr,                      # *f32 river storage
 
     # flood variables
+    flood_inflow_ptr,                       # *f32 flood inflow (turn to zero)
     flood_outflow_ptr,                      # *f32 in/out flood outflow
     flood_manning_ptr,                      # *f32 flood Manning coefficient
     flood_depth_ptr,                        # *f32 flood depth
@@ -30,6 +32,7 @@ def compute_outflow_kernel(
     flood_cross_section_area_ptr,      # *f32 previous flood cross-section area
 
     # other 
+    global_bifurcation_outflow_ptr,          # *f32 global bifurcation outflow (turn to zero)
     total_storage_ptr,
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
@@ -184,6 +187,10 @@ def compute_outflow_kernel(
     tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)
     tl.store(total_storage_ptr + offs, total_storage, mask=mask)
     
+    tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
+    tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
+    tl.store(global_bifurcation_outflow_ptr + offs, 0.0, mask=mask)
+
     #----------------------------------------------------------------------
     # (11) Fused outgoing storage computation (was compute_outgoing_storage_kernel)
     #----------------------------------------------------------------------

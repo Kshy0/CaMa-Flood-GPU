@@ -1,14 +1,14 @@
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from datetime import timedelta, datetime
+from datetime import datetime, timedelta
 from cmfgpu.utils import setup_distributed
 from cmfgpu.models.cama_flood_model import CaMaFlood
-from cmfgpu.datasets.daily_bin_dataset import DailyBinDataset
+from cmfgpu.datasets.yearly_nc_dataset import YearlyNetCDFDataset
 
 def main():
     ### Configuration Start ###
-    experiment_name = "glb_15min_bin"
+    experiment_name = "glb_15min_nc"
     input_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/parameters.h5"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
@@ -16,22 +16,20 @@ def main():
     precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360
-    batch_size = 8
+    batch_size = 64
     loader_workers = 2
     output_workers = 2
-    output_complevel = 4 
+    unit_factor = 86400000
     prefetch_factor = 2
     ### Configuration End ###
 
-    runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
-    runoff_mapping_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/runoff_mapping_bin.npz"
-    runoff_shape = [180, 360]
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 12, 31)
-    unit_factor = 86400000
-    bin_dtype = "float32"
-    prefix = "Roff____"
-    suffix = ".one"
+    runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_15min_nc"
+    runoff_mapping_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/runoff_mapping_nc.npz"
+    prefix = "e2o_ecmwf_wrr2_glob15_day_Runoff_"
+    suffix = ".nc"
+    var_name = "Runoff"
 
     local_rank, rank, world_size = setup_distributed()
 
@@ -46,17 +44,15 @@ def main():
         variables_to_save=variables_to_save,
         precision=precision,
         output_workers=output_workers,
-        output_complevel=output_complevel,
     )
 
-    dataset = DailyBinDataset(
+    dataset = YearlyNetCDFDataset(
         base_dir=runoff_dir,
-        shape=runoff_shape,
         start_date=start_date,
         end_date=end_date,
         unit_factor=unit_factor,
-        bin_dtype=bin_dtype,
         out_dtype=precision,
+        var_name=var_name,
         prefix=prefix,
         suffix=suffix,
     )
@@ -71,10 +67,10 @@ def main():
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=False, # must be False
         num_workers=loader_workers,
         pin_memory=True,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=prefetch_factor, 
     )
 
     current_time = start_date

@@ -39,6 +39,7 @@ class AbstractModel(BaseModel, ABC):
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
     BLOCK_SIZE: int = Field(default=256, description="GPU block size for kernels")
     output_workers: int = Field(default=2, description="Number of workers for writing output files")
+    output_complevel: int = Field(default=4, description="Compression level for output NetCDF files", ge=0, le=9)
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
@@ -150,6 +151,7 @@ class AbstractModel(BaseModel, ABC):
             output_dir=self.output_full_dir,
             rank=self.rank,
             num_workers=self.output_workers,
+            complevel=self.output_complevel,
         )
 
         if not self.variables_to_save:
@@ -208,12 +210,12 @@ class AbstractModel(BaseModel, ABC):
         if self._statistics_aggregator is not None:
             self._statistics_aggregator.update_statistics(weight, refresh, self.BLOCK_SIZE)
 
-    def finalize_time_step(self, dt: datetime) -> None:
+    def finalize_time_step(self, current_time: datetime) -> None:
         """
         Finalize time step in aggregator (write current means to disk).
         """
         if self._statistics_aggregator is not None:
-            self._statistics_aggregator.finalize_time_step(dt)
+            self._statistics_aggregator.finalize_time_step(current_time)
     
     def get_h5data(self) -> Dict[str, Any]:
         """

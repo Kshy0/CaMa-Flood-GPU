@@ -24,10 +24,9 @@
 
     ```bash
     module load scl/gcc11.2
-    export OMP_NUM_THREADS=4
     ```
-
-  - Job submission via `sbatch` is being tested and will be updated soon.
+    
+- Job submission via `sbatch` is being tested and will be updated soon.
 
 ---
 
@@ -91,6 +90,26 @@ pip install -e .
 
 ## Quick Start
 
+All scripts in this repository are designed for maximum flexibility. Before running any script (such as `params/merit_map.py` to generate model parameters), **you must manually set the correct file and directory paths** inside the script. This may include:
+
+- `map_dir`: Path to your CaMa-Flood input map directory (e.g., `cmf_v420_pkg/map/glb_15min`)
+- `out_dir`: Path to your desired output directory
+- `gauge_file`: Path to the GRDC gauge file (optional)
+- Other Runtime Settings
+
+These paths are currently **hardcoded in the Python script**, typically under the `if __name__ == "__main__":` block at the bottom of the file.
+ Please edit them to match your local file structure before execution.
+
+```python
+if __name__ == "__main__":
+    merit_map = MERITMap(
+        map_dir="/your/path/to/map",
+        out_dir="/your/path/to/output",
+        gauge_file="/your/path/to/gauge_file.txt",  # Optional
+        visualize_basins=True
+    )
+```
+
 - ### 1. Prepare data
 
   - CaMa-Flood-GPU is fully compatible with CaMa-Flood input data (river maps, runoff, etc.).
@@ -98,36 +117,51 @@ pip install -e .
   - Typically, you will download a folder named `cmf_v420_pkg` from the official site and place it somewhere on your local machine.
   - For `glb_15min` maps, the `cmf_v420_pkg` contains the estimated river channel parameters. So no additional work is required to run this GPU program. If you want to use a higher resolution map, please refer to the instructions in the original Fortran repository. You need to compile the Fortran code and [generate river channel parameters](https://github.com/global-hydrodynamics/CaMa-Flood_v4/blob/master/map/src/src_param/s01-channel_params.sh) , such as river width.
   
-  ### 2. Configure your run
+  ### 2. Generate parameters
   
-  **You only need to modify the following paths in `configs/glb_15min.yaml`:**
   
-  - `parameter_config`: 
-    1. `working_dir`: Set this to the path of this project (i.e., the directory where you cloned CaMa-Flood-GPU).
-    2. `map_dir`, `hires_map_dir`: These three paths are easy to modify once you have downloaded `cmf_v420_pkg` (available on the CaMa-Flood official website). Just point them to the corresponding folders on your machine.
-  - `runoff_config`: 
-    1. `base_dir`: The location where the "test_1deg" runoff data is stored.
-  
-  Other parameters usually do not require changes unless you have specific needs.
-  
-  ### 3. Generate parameters
+  This step converts the original `.bin` map parameter files (such as `nextxy.bin`, `rivlen.bin`, `elevtn.bin`, etc.) from the official [CaMa-Flood package](https://hydro.iis.u-tokyo.ac.jp/~yamadai/cama-flood/) into an `.h5` file format that is optimized for GPU-based simulation in CaMa-Flood-GPU.
   
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  python ./CMF_GPU/generate_parameters.py ./configs/glb_15min.yaml
+  python ./cmfgpu/params/merit_map.py
   ```
   
-  This script generates the parameter file `parameters.h5`, the state file `init_states.h5`, and the runoff input matrix `runoff_input_matrix.npz`.
+  > **Note:** Please re-execute the code when you get the update from git!
   
-  > **Note:** Please re-execute `generate_parameters.py` when you get the update from git!
+  ### 3. Generate runoff input map
+  
+  In order to use external runoff datasets with CaMa-Flood-GPU, we first need to **generate a mapping table** that links **runoff grid cells** to the corresponding **catchments**.
+  
+  This repository includes dataset classes for both binary (`.bin`) and NetCDF (`.nc`) input formats. Each dataset type is defined in its own script under the `./datasets/` directory. For example:
+  
+  - `./datasets/daily_bin_dataset.py` — for daily binary runoff data
+  - `./datasets/daily_nc_dataset.py` — for NetCDF-based runoff
+  
+  These classes include built-in methods such as `generate_runoff_mapping_table()` to create the required mapping `.npz` file.
+  
+  ```shell
+  cd /path/to/CaMa-Flood-GPU
+  python ./cmfgpu/datasets/daily_bin_dataset.py
+  ```
+  
+  Once created, the `.npz` file will contain a **sparse matrix** mapping each runoff grid cell to the affected catchments, which is then used during simulation.
+  
+  Based on our tests, CaMa-Flood-GPU is likely **I/O (CPU) bound**, meaning the hydrodynamic simulation runs faster than the time it takes to read and decode input data (especially from NetCDF files). If you're highly sensitive to runtime performance:
+  
+  1. Consider converting data to `.bin` format or using `.nc` files with lower compression levels—though this may require significantly more disk space.
+  2. If feasible, you can precompute and store runoff data **already mapped to each catchment**, eliminating the need for sparse matrix operations during runtime. This applies especially to cases where the size of the runoff grid is larger than the size of the catchment. While we've made efforts to decouple I/O from model execution, you still need to understand how CaMa-Flood-GPU assigns basins to different GPUs in multi-GPU runs. You must ensure each rank (based on `rank` and `world_size`) reads only its assigned subset of catchments and handles multi-process data loading correctly.
+  3. The framework already uses **multi-process and asynchronous prefetching**, so performance is generally acceptable for most scenarios.
   
   ### 4. Run the model
+  
+  Several script templates are provided in the `./scripts` directory, such as `run_daily_bin.py` and `run_daily_nc.py`. You are encouraged to modify or customize these scripts to fit your specific workflow and simulation requirements.
   
   For 4 GPUs on a single machine:
   
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  torchrun --nproc_per_node=4 CMF_GPU/main.py --config ./configs/glb_15min.yaml
+  torchrun --nproc_per_node=4 ./cmfgpu/scripts/run_daily_bin.py
   ```
   
   - [Optional] For distributed runs, please refer to upcoming documentation and code samples.

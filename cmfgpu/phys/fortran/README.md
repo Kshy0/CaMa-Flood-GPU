@@ -29,13 +29,3 @@ To use the Fortran modules in Python:
    ```
 
 3. The compilation process uses [**NumPy’s f2py**](https://numpy.org/doc/stable/f2py/) to generate Python-callable modules.
-
-## Example Usage
-
-See `do_one_substep_fortran()` in your Python integration code for how the Fortran routines are invoked. This function coordinates:
-
-* Flow and storage updates
-* River-flood interaction logic
-* Bifurcation handling (optional)
-
-These routines act as direct counterparts to the Triton kernels, enabling side-by-side step comparisons for validation.

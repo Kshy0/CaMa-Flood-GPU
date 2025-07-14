@@ -27,6 +27,21 @@ def get_world_size():
     else:
         return 1
 
+def setup_distributed():
+    torch.multiprocessing.set_start_method("spawn", force=True)
+    if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = get_local_rank()
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+
+    return local_rank, rank, world_size
+
+
 def binread(filename, shape, dtype_str):
     """
     Reads a binary file and reshapes it to a specified shape.

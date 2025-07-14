@@ -241,8 +241,11 @@ class MERITMap(BaseModel):
         "bifurcation_path_id",
         "bifurcation_catchment_id",
         "bifurcation_downstream_id",
+        "bifurcation_manning",
         "bifurcation_catchment_x",
+        "bifurcation_downstream_x",
         "bifurcation_catchment_y",
+        "bifurcation_downstream_y",
         "bifurcation_basin_id",
         "bifurcation_width",
         "bifurcation_length",
@@ -606,12 +609,10 @@ class MERITMap(BaseModel):
 
 
 if __name__ == "__main__":
-    # Example usage
     merit_map = MERITMap(
         map_dir="/home/eat/cmf_v420_pkg/map/glb_15min",
         out_dir="/home/eat/CaMa-Flood-GPU/inp/glb_15min",
         gauge_file="/home/eat/cmf_v420_pkg/map/glb_15min/GRDC_alloc.txt",
         visualize_basins=True
     )
-    
     merit_map.build_model_input_pipeline()

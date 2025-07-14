@@ -117,17 +117,15 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
     Returns:
         Path to the created NetCDF file
     """
-    (mean_var_name, metadata, coord_values, output_dir, rank) = args
-    
+    (mean_var_name, metadata, coord_values, output_dir, complevel, rank) = args
+
     filename = f"{mean_var_name}_rank{rank}.nc"
     output_path = output_dir / filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     with nc.Dataset(output_path, 'w', format='NETCDF4') as ncfile:
         # Write global attributes
-        ncfile.setncattr('title', f'Streaming time series for rank {rank}: {mean_var_name}')
-        ncfile.setncattr('description', f'Streaming time series simulation rank {rank}: {metadata.get("description", "")}')
-        
+        ncfile.setncattr('title', f'Time series for rank {rank}: {mean_var_name}')
         actual_shape = metadata.get('actual_shape', ())  # Spatial shape
         tensor_shape = metadata.get('tensor_shape', ())  # Logical grid shape
         coord_name = metadata.get('save_coord', None)
@@ -155,7 +153,6 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
                 ('saved_points',),
             )
             coord_var[:] = coord_values
-            coord_var.setncattr('long_name', f'Coordinate values for {mean_var_name}')
 
         time_unit = "seconds since 1900-01-01 00:00:00"
         calendar = "standard"
@@ -163,7 +160,13 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
         time_var.setncattr('units', time_unit)
         time_var.setncattr('calendar', calendar)
         # Create main data variable (empty, will be filled during streaming)
-        nc_var = ncfile.createVariable(mean_var_name, dtype, dim_names, chunksizes=None)
+        nc_var = ncfile.createVariable(
+            mean_var_name,
+            dtype,
+            dim_names,
+            zlib=True,
+            complevel=complevel)
+        nc_var.setncattr('description', metadata.get("description", ""))
         nc_var.setncattr('actual_shape', str(actual_shape))
         nc_var.setncattr('tensor_shape', str(tensor_shape))
     
@@ -176,7 +179,7 @@ class StatisticsAggregator:
     """
     
     def __init__(self, device: torch.device, output_dir: Path, rank: int, 
-                 num_workers: int = 4, save_kernels: bool = True):
+                 num_workers: int = 4, complevel: int = 4, save_kernels: bool = False):
         """
         Initialize the statistics aggregator.
         
@@ -191,8 +194,9 @@ class StatisticsAggregator:
         self.output_dir = output_dir
         self.rank = rank
         self.num_workers = num_workers
+        self.complevel = complevel
         self.save_kernels = save_kernels
-        
+
         # Create kernels directory if saving is enabled
         if self.save_kernels:
             self.kernels_dir = self.output_dir / "generated_kernels"
@@ -326,6 +330,7 @@ class StatisticsAggregator:
                     metadata,
                     coord_values,
                     self.output_dir,
+                    self.complevel,
                     self.rank,
                 )
                 

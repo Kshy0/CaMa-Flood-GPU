@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 from cmfgpu.datasets.abstract_dataset import DefaultDataset
 import numpy as np
 from datetime import timedelta
@@ -33,8 +33,6 @@ class DailyBinDataset(DefaultDataset):
         self.suffix = suffix
         self._validate_files_exist()
     
-    
-
     def __len__(self):
         """
         Returns the total number of samples in the dataset based on the time range.
@@ -87,3 +85,16 @@ class DailyBinDataset(DefaultDataset):
     
     def close(self):
         pass
+
+if __name__ == "__main__":
+    dataset = DailyBinDataset(
+        base_dir="/home/eat/cmf_v420_pkg/inp/test_1deg/runoff",
+        shape=[180, 360],
+        start_date=datetime(2000, 1, 1),
+        end_date=datetime(2000, 12, 31),
+    )
+    dataset.generate_runoff_mapping_table(
+        map_dir="/home/eat/cmf_v420_pkg/map/glb_15min",
+        out_dir="/home/eat/CaMa-Flood-GPU/inp/glb_15min",
+        npz_file="runoff_mapping_bin.npz",
+    )

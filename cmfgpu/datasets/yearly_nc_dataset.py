@@ -10,8 +10,8 @@ from datetime import timedelta
 class YearlyNetCDFDataset(DefaultDataset):
     def __init__(self,
                  base_dir: str,
-                 start_date: str,
-                 end_date: str,
+                 start_date: datetime,
+                 end_date: datetime,
                  unit_factor: float = 1.0,
                  out_dtype: str = "float32",
                  var_name: str = "Runoff",
@@ -20,8 +20,8 @@ class YearlyNetCDFDataset(DefaultDataset):
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.base_dir = base_dir
-        self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
-        self.end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        self.start_date = start_date
+        self.end_date = end_date
         self.unit_factor = unit_factor
         self.out_dtype = out_dtype
         self.var_name = var_name
@@ -137,7 +137,18 @@ class YearlyNetCDFDataset(DefaultDataset):
         return self.start_date + timedelta(days=idx)
 
     def close(self) -> None:
-        """
-        Placeholder close method - no cached resources to clean up.
-        """
         pass
+if __name__ == "__main__":
+    dataset = YearlyNetCDFDataset(
+        base_dir="/home/eat/cmf_v420_pkg/inp/test_15min_nc",
+        start_date=datetime(2000, 1, 1),
+        end_date=datetime(2000, 12, 31),
+        prefix="e2o_ecmwf_wrr2_glob15_day_Runoff_",
+        suffix=".nc",
+        var_name="Runoff",
+    )
+    dataset.generate_runoff_mapping_table(
+        map_dir="/home/eat/cmf_v420_pkg/map/glb_15min",
+        out_dir="/home/eat/CaMa-Flood-GPU/inp/glb_15min",
+        npz_file="runoff_mapping_nc.npz",
+    )

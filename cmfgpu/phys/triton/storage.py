@@ -113,10 +113,7 @@ def compute_flood_stage_kernel(
     flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
 
     # Return to zero
-    tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
-    tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
     tl.store(outgoing_storage_ptr + offs, 0.0, mask=mask)
-    tl.store(global_bifurcation_outflow_ptr + offs, 0.0, mask=mask)
 
     # Store outputs (in-place update)
     tl.store(river_storage_ptr    + offs, river_storage_final, mask=mask)
@@ -264,10 +261,7 @@ def compute_flood_stage_log_kernel(
     tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum((total_storage_stage_new - total_storage) * 1e-9))
 
     # Return to zero
-    tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
-    tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
     tl.store(outgoing_storage_ptr + offs, 0.0, mask=mask)
-    tl.store(global_bifurcation_outflow_ptr + offs, 0.0, mask=mask)
 
     # Store outputs (in-place update)
     tl.store(river_storage_ptr    + offs, river_storage_final, mask=mask)
