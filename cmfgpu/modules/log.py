@@ -39,15 +39,6 @@ class LogModule(AbstractModule):
     module_name: ClassVar[str] = "log"
     description: ClassVar[str] = "Log module for storing and managing simulation data"
     dependencies: ClassVar[list] = ["base"]
-    h5_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "world_size", "rank", "device", "precision", "log_path"
-    ]  # Fields to exclude from HDF5
-    # ------------------------------------------------------------------ #
-    # Configuration
-    # ------------------------------------------------------------------ #
-    log_path: Path = Field(
-        description="Path to the log file for simulation data"
-    )
 
     log_buffer_size: int = Field(
         default=1000,
@@ -67,7 +58,7 @@ class LogModule(AbstractModule):
     def log_vars(self) -> List[str]:
         return list(LogModule.model_computed_fields.keys())
 
-    def write_header(self) -> None:
+    def write_header(self, log_path: Path) -> None:
         headers = [
             "StepStartTime", "StoragePre", "StorageNext",
             "StorageNew", "InflowError", "Inflow",
@@ -75,7 +66,7 @@ class LogModule(AbstractModule):
             "RiverStorage", "FloodStorage", "FloodArea",
         ]
         widths = [18] + [16] * (len(headers) - 1)
-        with self.log_path.open("w") as f:
+        with log_path.open("w") as f:
             f.write(
                 "".join(
                     f"{h:<{w}}" if i == 0 else f"{h:>{w}}"
@@ -83,15 +74,6 @@ class LogModule(AbstractModule):
                 )
                 + "\n"
             )
-
-    def write_time_step(self) -> None:
-        if self.rank == 0:
-            if not self.log_path.exists():
-                self.write_header()
-            with self.log_path.open("a") as f:
-                f.write(
-                    f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {self._num_steps}\n"
-                )
 
     def set_time(self, time_step: float, num_steps: int, current_time: datetime) -> None:
         if not isinstance(current_time, datetime):
@@ -103,7 +85,6 @@ class LogModule(AbstractModule):
         self._time_step = time_step
         self._num_steps = num_steps
         self._current_time = current_time
-        self.write_time_step()
         self._times = [
             self._current_time + timedelta(seconds=time_step * i) for i in range(num_steps)
         ]
@@ -112,27 +93,33 @@ class LogModule(AbstractModule):
             for field in self.log_vars:
                 getattr(self, field).resize_(self.log_buffer_size).zero_()
 
-    def write_step(self) -> None:
+    def write_step(self, log_path: Path) -> None:
+        if not log_path.exists():
+            self.write_header(log_path)
+        with log_path.open("a") as f:
+            f.write(
+                f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {self._num_steps}\n"
+            )
+        print(f"Processed step at {self._current_time.strftime('%Y-%m-%d %H:%M:%S')}, adaptive_time_step={self._num_steps}")
+
         if self.world_size > 1:
             for field in self.log_vars:
                 dist.all_reduce(getattr(self, field), op=dist.ReduceOp.SUM)
 
-        if self.rank == 0:
-            num_steps = self._num_steps
-            time_strs = np.array(
-                [t.strftime("%Y-%m-%d %H:%M") for t in self._times[:num_steps]], dtype=str
-            )
-            data_arrays = {
-                field: getattr(self, field).cpu().numpy()[:num_steps] for field in self.log_vars
-            }
-            fmt = ["%-18s"] + ["%16.6g"] * 3 + ["%16.3e"] + ["%16.6g"] * 3 + ["%16.3e"] + [
-                "%16.6g"
-            ] * 3
-            with self.log_path.open("a") as f:
-                for i in range(num_steps):
-                    row = [time_strs[i]] + [data_arrays[field][i] for field in self.log_vars]
-                    f.write("".join(f_ % v for f_, v in zip(fmt, row)) + "\n")
-
+        num_steps = self._num_steps
+        time_strs = np.array(
+            [t.strftime("%Y-%m-%d %H:%M") for t in self._times[:num_steps]], dtype=str
+        )
+        data_arrays = {
+            field: getattr(self, field).cpu().numpy()[:num_steps] for field in self.log_vars
+        }
+        fmt = ["%-18s"] + ["%16.6g"] * 3 + ["%16.3e"] + ["%16.6g"] * 3 + ["%16.3e"] + [
+            "%16.6g"
+        ] * 3
+        with log_path.open("a") as f:
+            for i in range(num_steps):
+                row = [time_strs[i]] + [data_arrays[field][i] for field in self.log_vars]
+                f.write("".join(f_ % v for f_, v in zip(fmt, row)) + "\n")
         for field in self.log_vars:
             getattr(self, field).zero_()
 

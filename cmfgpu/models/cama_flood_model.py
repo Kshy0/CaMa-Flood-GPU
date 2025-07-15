@@ -101,8 +101,8 @@ class CaMaFlood(AbstractModel):
         for sub_step in range(num_sub_steps):
             self.do_one_sub_step(time_sub_step, runoff, sub_step, num_sub_steps)
         self.finalize_time_step(current_time)
-        if self.log is not None:
-            self.log.write_step()
+        if self.log is not None and self.rank == 0:
+            self.log.write_step(self.log_path)
 
     def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int, num_sub_steps: int) -> None:
         """Execute one sub time step calculation"""

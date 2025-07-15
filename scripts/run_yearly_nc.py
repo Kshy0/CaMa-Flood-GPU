@@ -92,8 +92,6 @@ def main():
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                 )
-                if rank == 0:
-                    print(f"Processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 current_time += timedelta(seconds=time_step)
     if rank == 0:              
         model.save_states(current_time)

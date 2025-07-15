@@ -82,7 +82,6 @@ class AbstractModel(BaseModel, ABC):
                 device=self.device,
                 world_size=self.world_size,
                 precision=self.dtype, 
-                log_path=self.log_path,
                 **module_data
             )
             self._modules[module_name] = module_instance
