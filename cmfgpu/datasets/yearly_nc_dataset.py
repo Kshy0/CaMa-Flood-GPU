@@ -142,6 +142,7 @@ class YearlyNetCDFDataset(DefaultDataset):
         return (self.end_date - self.start_date).days + 1
     
 if __name__ == "__main__":
+    resolution = "glb_15min"
     dataset = YearlyNetCDFDataset(
         base_dir="/home/eat/cmf_v420_pkg/inp/test_15min_nc",
         start_date=datetime(2000, 1, 1),
@@ -151,7 +152,7 @@ if __name__ == "__main__":
         var_name="Runoff",
     )
     dataset.generate_runoff_mapping_table(
-        map_dir="/home/eat/cmf_v420_pkg/map/glb_15min",
-        out_dir="/home/eat/CaMa-Flood-GPU/inp/glb_15min",
+        map_dir=f"/home/eat/cmf_v420_pkg/map/{resolution}",
+        out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{resolution}",
         npz_file="runoff_mapping_nc.npz",
     )

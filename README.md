@@ -24,6 +24,7 @@
 
     ```bash
     module load scl/gcc11.2
+    OMP_NUM_THREADS=4
     ```
   
 - Job submission via `sbatch` is being tested and will be updated soon.

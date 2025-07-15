@@ -64,7 +64,7 @@ class DailyBinDataset(DefaultDataset):
     
     def close(self):
         pass
-    
+
     def __len__(self):
         """
         Returns the total number of samples in the dataset based on the time range.
@@ -90,6 +90,7 @@ class DailyBinDataset(DefaultDataset):
             )
 
 if __name__ == "__main__":
+    resolution = "glb_03min"
     dataset = DailyBinDataset(
         base_dir="/home/eat/cmf_v420_pkg/inp/test_1deg/runoff",
         shape=[180, 360],
@@ -97,7 +98,7 @@ if __name__ == "__main__":
         end_date=datetime(2000, 12, 31),
     )
     dataset.generate_runoff_mapping_table(
-        map_dir="/home/eat/cmf_v420_pkg/map/glb_15min",
-        out_dir="/home/eat/CaMa-Flood-GPU/inp/glb_15min",
+        map_dir=f"/home/eat/cmf_v420_pkg/map/{resolution}",
+        out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{resolution}",
         npz_file="runoff_mapping_bin.npz",
     )

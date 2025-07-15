@@ -11,10 +11,11 @@ from cmfgpu.utils import setup_distributed
 
 BLOCK_SIZE_LIST = [64, 128, 256, 512, 1024]
 
-def benchmark_block_size(block_size):
+def benchmark_block_sizes():
     ### Benchmark Configuration ###
     experiment_name = f"benchmark_run"
-    input_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/parameters.h5"
+    resolution = "glb_15min"
+    input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.h5"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
     variables_to_save = []
@@ -26,7 +27,7 @@ def benchmark_block_size(block_size):
     prefetch_factor = 2
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
-    runoff_mapping_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/runoff_mapping_bin.npz"
+    runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
     runoff_shape = [180, 360]
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 4, 1)
@@ -36,11 +37,12 @@ def benchmark_block_size(block_size):
     suffix = ".one"
 
     local_rank, rank, world_size = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}")
 
     model = CaMaFlood(
         rank=rank,
         world_size=world_size,
-        device=torch.device(f"cuda:{local_rank}"),
+        device=device,
         experiment_name=experiment_name,
         input_file=input_file,
         output_dir=output_dir,
@@ -49,7 +51,7 @@ def benchmark_block_size(block_size):
         precision=precision,
         output_workers=0,
         output_complevel=0,
-        BLOCK_SIZE=block_size
+        BLOCK_SIZE=BLOCK_SIZE_LIST[0], 
     )
 
     dataset = DailyBinDataset(
@@ -68,7 +70,7 @@ def benchmark_block_size(block_size):
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         precision=precision,
-        device=torch.device(f"cuda:{local_rank}"),
+        device=device,
     )
 
     loader = DataLoader(
@@ -80,43 +82,42 @@ def benchmark_block_size(block_size):
         prefetch_factor=prefetch_factor,
     )
 
-    current_time = start_date
-    stream = torch.cuda.Stream(device=torch.device(f"cuda:{local_rank}"))
+    results = []
+    print("Benchmarking BLOCK_SIZE...")
 
-    torch.cuda.synchronize()
-    start = time.time()
+    for block_size in BLOCK_SIZE_LIST:
+        model.BLOCK_SIZE = block_size
+        current_time = start_date
+        stream = torch.cuda.Stream(device=device)
 
-    for batch_runoff in loader:
-        with torch.cuda.stream(stream):
-            batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff, local_runoff_matrix)
-            for batch in batch_runoff:
-                model.step_advance(
-                    runoff=batch,
-                    time_step=time_step,
-                    default_num_sub_steps=default_num_sub_steps,
-                    current_time=current_time,
-                )
-                current_time += timedelta(seconds=time_step)
+        torch.cuda.synchronize()
+        start = time.time()
 
-    torch.cuda.synchronize()
-    end = time.time()
+        for batch_runoff in loader:
+            with torch.cuda.stream(stream):
+                batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff, local_runoff_matrix)
+                for batch in batch_runoff:
+                    model.step_advance(
+                        runoff=batch,
+                        time_step=time_step,
+                        default_num_sub_steps=default_num_sub_steps,
+                        current_time=current_time,
+                    )
+                    current_time += timedelta(seconds=time_step)
+
+        torch.cuda.synchronize()
+        end = time.time()
+
+        elapsed_ms = (end - start) * 1000
+        results.append((block_size, elapsed_ms))
 
     if world_size > 1:
         dist.destroy_process_group()
-
-    return (end - start) * 1000 
-
-def main():
-    print("Benchmarking BLOCK_SIZE...")
-    results = []
-    for bs in BLOCK_SIZE_LIST:
-        elapsed_ms = benchmark_block_size(bs)
-        print(f"BLOCK_SIZE {bs}: {elapsed_ms:.2f} ms")
-        results.append((bs, elapsed_ms))
-
-    print("\n=== Benchmark Summary ===")
-    for bs, t in results:
-        print(f"BLOCK_SIZE={bs} --> {t:.2f} ms")
+    if rank == 0:
+        print("\n=== Benchmark Results ===")
+        for bs, t in results:
+            print(f"BLOCK_SIZE={bs} --> {t:.2f} ms")
 
 if __name__ == "__main__":
-    main()
+    benchmark_block_sizes()
+

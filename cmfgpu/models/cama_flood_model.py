@@ -59,11 +59,11 @@ class CaMaFlood(AbstractModel):
     def bifurcation_flag(self) -> bool:
         return self.bifurcation is not None and self.bifurcation.num_bifurcation_paths > 0
 
-    @cached_property
+    @property
     def base_grid(self) -> Callable:
         return lambda META: (triton.cdiv(self.base.num_catchments, META["BLOCK_SIZE"]),)
 
-    @cached_property
+    @property
     def bifurcation_grid(self) -> Callable:
         return lambda META: (triton.cdiv(self.bifurcation.num_bifurcation_paths, META["BLOCK_SIZE"]),) if self.bifurcation_flag else None
 

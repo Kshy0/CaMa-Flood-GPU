@@ -91,9 +91,11 @@ def main():
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                 )
-                print(f"Rank {rank} processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                if rank == 0:
+                    print(f"Processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 current_time += timedelta(seconds=time_step)
-    model.save_states(current_time)
+    if rank == 0:              
+        model.save_states(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 
