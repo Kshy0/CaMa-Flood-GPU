@@ -4,7 +4,6 @@ Updated to work with the new AbstractModule hierarchy and SimulationConfig valid
 """
 from datetime import datetime
 from functools import cached_property
-from pathlib import Path
 from typing import Callable, ClassVar, Dict, Optional, Type
 
 import torch
@@ -260,5 +259,6 @@ class CaMaFlood(AbstractModel):
             )
         self.update_statistics(
             weight=num_sub_steps,
-            refresh=(sub_step == 0)
+            refresh=(sub_step == 0),
+            BLOCK_SIZE=self.BLOCK_SIZE
         )

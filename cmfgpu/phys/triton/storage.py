@@ -79,6 +79,7 @@ def compute_flood_stage_kernel(
         prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + i, mask=mask)
         level += tl.where(total_storage > prev_total_storage, 1, 0)
     no_flood_cond = level < 0
+    level = tl.maximum(level, 0)
     prev_flood_depth   = tl.load(flood_depth_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
     prev_total_width   = tl.load(total_width_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
     prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
@@ -220,11 +221,12 @@ def compute_flood_stage_log_kernel(
         prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + i, mask=mask)
         level += tl.where(total_storage > prev_total_storage, 1, 0)
     no_flood_cond = level < 0
+    level = tl.maximum(level, 0)
     prev_flood_depth   = tl.load(flood_depth_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
     prev_total_width   = tl.load(total_width_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
     prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
     flood_grad         = tl.load(flood_gradient_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
-
+    
     diff_width = tl.sqrt(
         prev_total_width * prev_total_width +
         2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)

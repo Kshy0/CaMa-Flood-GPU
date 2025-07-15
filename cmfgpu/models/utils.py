@@ -782,7 +782,7 @@ class StatisticsAggregator:
         self._prepare_kernel_states()
 
     
-    def update_statistics(self, weight: int, refresh: bool = False, BLOCK_SIZE: int = 256) -> None:
+    def update_statistics(self, weight: int, refresh: bool = False, BLOCK_SIZE: int = 128) -> None:
         if not self._aggregator_generated:
             raise RuntimeError("Mean aggregation not initialized. Call initialize_mean_aggregation() first.")
         

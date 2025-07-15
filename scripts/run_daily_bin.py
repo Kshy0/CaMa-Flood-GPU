@@ -11,9 +11,10 @@ from cmfgpu.utils import setup_distributed
 
 def main():
     ### Configuration Start ###
-    experiment_name = "glb_15min_bin"
-    input_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/parameters.h5"
-    output_dir = "/home/eat/CaMa-Flood-GPU/out"
+    resolution = "glb_15min"
+    experiment_name = f"{resolution}_bin"
+    input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.h5"
+    output_dir = "/home/eat/CaMa-Flood-GPU/out/"
     opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
     variables_to_save = ["river_outflow"]
     precision = "float32"
@@ -28,7 +29,7 @@ def main():
     ### Configuration End ###
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
-    runoff_mapping_file = "/home/eat/CaMa-Flood-GPU/inp/glb_15min/runoff_mapping_bin.npz"
+    runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
     runoff_shape = [180, 360]
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 12, 31)

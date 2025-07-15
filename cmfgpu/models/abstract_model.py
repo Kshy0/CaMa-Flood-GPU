@@ -207,12 +207,12 @@ class AbstractModel(BaseModel, ABC):
             variable_names=self.variables_to_save
         )
 
-    def update_statistics(self, weight: int, refresh: bool = False) -> None:
+    def update_statistics(self, weight: int, refresh: bool = False, BLOCK_SIZE: int = 128) -> None:
         """
         Call the statistics aggregator to update mean values at current step.
         """
         if self._statistics_aggregator is not None:
-            self._statistics_aggregator.update_statistics(weight, refresh, self.BLOCK_SIZE)
+            self._statistics_aggregator.update_statistics(weight, refresh, BLOCK_SIZE)
 
     def finalize_time_step(self, current_time: datetime) -> None:
         """

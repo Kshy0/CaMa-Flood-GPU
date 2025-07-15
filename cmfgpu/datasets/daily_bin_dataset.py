@@ -90,7 +90,7 @@ class DailyBinDataset(DefaultDataset):
             )
 
 if __name__ == "__main__":
-    resolution = "glb_03min"
+    resolution = "glb_15min"
     dataset = DailyBinDataset(
         base_dir="/home/eat/cmf_v420_pkg/inp/test_1deg/runoff",
         shape=[180, 360],
