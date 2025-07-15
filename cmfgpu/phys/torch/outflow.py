@@ -1,5 +1,6 @@
-import torch
 import numpy as np
+import torch
+
 
 def compute_outflow_torch(
     is_river_mouth,                     # bool mask: 1 means river mouth 

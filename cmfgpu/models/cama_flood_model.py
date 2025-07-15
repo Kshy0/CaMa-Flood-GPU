@@ -2,23 +2,28 @@
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
 Updated to work with the new AbstractModule hierarchy and SimulationConfig validation.
 """
-import triton
-import torch
-from typing import Dict, Optional, Type, ClassVar, Callable
-from pathlib import Path
 from datetime import datetime
-from torch import distributed as dist
-from pydantic import computed_field
 from functools import cached_property
+from pathlib import Path
+from typing import Callable, ClassVar, Dict, Optional, Type
+
+import torch
+import triton
+from pydantic import computed_field
+from torch import distributed as dist
+
 from cmfgpu.models.abstract_model import AbstractModel
+from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
 from cmfgpu.modules.log import LogModule
-from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
-from cmfgpu.phys.triton.outflow import compute_outflow_kernel, compute_inflow_kernel
-from cmfgpu.phys.triton.bifurcation import compute_bifurcation_outflow_kernel, compute_bifurcation_inflow_kernel
 from cmfgpu.phys.triton.adaptive_time import compute_adaptive_time_step_kernel
-from cmfgpu.phys.triton.storage import compute_flood_stage_kernel, compute_flood_stage_log_kernel
+from cmfgpu.phys.triton.bifurcation import (compute_bifurcation_inflow_kernel,
+                                            compute_bifurcation_outflow_kernel)
+from cmfgpu.phys.triton.outflow import (compute_inflow_kernel,
+                                        compute_outflow_kernel)
+from cmfgpu.phys.triton.storage import (compute_flood_stage_kernel,
+                                        compute_flood_stage_log_kernel)
 
 
 class CaMaFlood(AbstractModel):
@@ -52,9 +57,6 @@ class CaMaFlood(AbstractModel):
     @computed_field
     @cached_property
     def bifurcation_flag(self) -> bool:
-        """
-        Check if bifurcation module is enabled
-        """
         return self.bifurcation is not None and self.bifurcation.num_bifurcation_paths > 0
 
     @cached_property
@@ -67,8 +69,12 @@ class CaMaFlood(AbstractModel):
 
     def step_advance(self, runoff: torch.Tensor, time_step: float, default_num_sub_steps: int, current_time: Optional[datetime]) -> None:
         """
-        Advance model by one time step
-        This method orchestrates the entire step advance process, including outflow, inflow, and flood stage calculations
+        Advance the model by one time step using the provided runoff input.
+        Args:
+            runoff (torch.Tensor): Input runoff tensor for this time step.
+            time_step (float): Duration of the time step.
+            default_num_sub_steps (int): Default number of sub-steps if adaptive time stepping is not used.
+            current_time (Optional[datetime]): Current simulation time. Required for logging and adaptive time stepping.
         """
         if self.adaptive_time is not None:
             self.adaptive_time.min_time_sub_step.fill_(float('inf'))
@@ -256,19 +262,3 @@ class CaMaFlood(AbstractModel):
             weight=num_sub_steps,
             refresh=(sub_step == 0)
         )
-
-    def save_states(self, filepath: Path) -> None:
-        """
-        Save current simulation states
-        
-        Args:
-            filepath: Save path
-        """
-        
-        # Save states for all modules
-        for module_name in self.opened_modules:
-            module_instance = self._modules.get(module_name)
-            if module_instance is not None:
-                self.save_h5data(module_name, module_instance)
-        
-        print(f"States saved to: {filepath}")

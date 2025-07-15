@@ -1,16 +1,21 @@
 from __future__ import annotations
-import torch
+
 import shutil
-import h5py
-from functools import cached_property
-from datetime import datetime
-from typing import Dict, Any, Literal, ClassVar, Optional, List, Type, Self
 from abc import ABC
-from pydantic import BaseModel, Field, ConfigDict, field_validator, FilePath, model_validator, PrivateAttr
+from datetime import datetime
+from functools import cached_property
 from pathlib import Path
-from cmfgpu.models.utils import compute_group_to_rank, StatisticsAggregator
-from cmfgpu.modules.abstract_module import AbstractModule
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Type
+
+import h5py
 import numpy as np
+import torch
+from pydantic import (BaseModel, ConfigDict, Field, FilePath, PrivateAttr,
+                      field_validator, model_validator)
+
+from cmfgpu.models.utils import StatisticsAggregator, compute_group_to_rank
+from cmfgpu.modules.abstract_module import AbstractModule
+
 
 class AbstractModel(BaseModel, ABC):
     """
@@ -146,6 +151,8 @@ class AbstractModel(BaseModel, ABC):
         Registers all variables to save, including their save_idx and save_coord if present.
         Avoids duplicate registration.
         """
+        if not self.variables_to_save:
+            return
         self._statistics_aggregator = StatisticsAggregator(
             device=self.device,
             output_dir=self.output_full_dir,
@@ -153,9 +160,6 @@ class AbstractModel(BaseModel, ABC):
             num_workers=self.output_workers,
             complevel=self.output_complevel,
         )
-
-        if not self.variables_to_save:
-            return
 
         registered_vars = set()
 
@@ -295,7 +299,7 @@ class AbstractModel(BaseModel, ABC):
             
         return module_data
         
-    def save_h5data(self, module_name: str, module_instance: AbstractModule) -> None:
+    def save_h5data(self, module_name: str, module_instance: AbstractModule, h5_path: Path) -> None:
         """
         Save module data to H5 file, including both required and optional fields.
         
@@ -303,7 +307,6 @@ class AbstractModel(BaseModel, ABC):
             module_name: Name of the module
             module_instance: Instance of the module to save
         """
-        h5_path = Path(self.input_file)
         
         try:
             with h5py.File(h5_path, 'a') as f:  # 'a' mode for append/create
@@ -317,6 +320,9 @@ class AbstractModel(BaseModel, ABC):
                 for field_name, field_info in all_fields.items():
                     if field_name in module_instance.h5_excluded_fields:
                         # Skip manager-controlled fields
+                        continue
+                    if field_name in f:
+                        print(f"  Skipping already existing field in H5: {field_name}")
                         continue
                     
                     value = getattr(module_instance, field_name)
@@ -347,7 +353,17 @@ class AbstractModel(BaseModel, ABC):
                 
         except Exception as e:
             raise RuntimeError(f"Error saving module '{module_name}' to H5 file: {e}")
-    
+        
+    def save_states(self, current_time: Optional[datetime]) -> None:
+        # Save states for all modules
+        timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
+        h5_path = self.output_full_dir / f"model_state_{timestamp}.h5"
+        for module_name in self.opened_modules:
+            module_instance = self._modules.get(module_name)
+            if module_instance is not None:
+                self.save_h5data(module_name, module_instance, h5_path)
+        print(f"Saved model states to {h5_path}")
+
     @field_validator("opened_modules")
     @classmethod
     def validate_modules(cls, v: List[str]) -> List[str]:

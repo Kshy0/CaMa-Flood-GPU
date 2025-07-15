@@ -1,7 +1,9 @@
 import os
+
 import numpy as np
 import torch
 from torch import distributed as dist
+
 
 def get_global_rank():
     if dist.is_available() and dist.is_initialized():

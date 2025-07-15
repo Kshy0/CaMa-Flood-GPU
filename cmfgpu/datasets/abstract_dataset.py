@@ -1,12 +1,15 @@
+import os
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Literal
+from typing import Literal, Tuple
+
 import numpy as np
 import torch
-import os
 from scipy.sparse import csr_matrix
-from cmfgpu.utils import read_map, find_indices_in, binread
+
+from cmfgpu.utils import binread, find_indices_in, read_map
+
 
 def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
     """
@@ -55,16 +58,6 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         
         # Initialize mapping-related attributes
         self.local_runoff_indices = None
-
-    
-    def __getitem__(self, idx: int) -> np.ndarray:
-        """
-        Fetches data for a given index.
-        Returns distributed data based on rank.
-        """
-        current_time = self.get_time_by_index(idx)
-        runoff_data = self.get_data(current_time)
-        return runoff_data
 
     def apply_runoff_to_catchments(self, runoff_data: np.ndarray, local_runoff_matrix) -> torch.Tensor:
         """
@@ -279,100 +272,6 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
             f"and {len(sparse_matrix.data)} non-zero runoff grid mappings")
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
 
-    def debug_runoff_mapping(
-        self,
-        map_dir: str,
-        out_dir: str,
-        npz_file: str = "runoff_mapping.npz",
-        mapinfo_txt: str = "location.txt",
-        hires_map_tag: str = "1min",
-        lowres_idx_precision: str = "<i4",
-        hires_idx_precision: str = "<i2",
-        map_precision: str = "<f4"
-    ):
-        """
-        Debug tool to inspect spatial distribution of high-res catchments excluded due to missing runoff.
-        Shows a 2D map (catchment_x vs catchment_y) of invalid catchments.
-        """
-        import matplotlib.pyplot as plt
-
-        map_dir = Path(map_dir)
-        hires_map_dir = map_dir / hires_map_tag
-        mapdim_path = map_dir / "mapdim.txt"
-
-        # Load low-resolution map dimensions
-        with open(mapdim_path, "r") as f:
-            lines = f.readlines()
-            nx = int(lines[0].split('!!')[0].strip())
-            ny = int(lines[1].split('!!')[0].strip())
-
-        nextxy_path = map_dir / "nextxy.bin"
-        nextxy_data = binread(nextxy_path, (nx, ny, 2), dtype_str=lowres_idx_precision)
-        catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != -9999)
-        catchment_id = np.ravel_multi_index((catchment_x, catchment_y), (nx, ny))
-
-        # Load high-resolution map info
-        with open(hires_map_dir / mapinfo_txt, "r") as f:
-            lines = f.readlines()
-        data = lines[2].split()
-        Nx, Ny = int(data[6]), int(data[7])
-        West, East = float(data[2]), float(data[3])
-        South, North = float(data[4]), float(data[5])
-        Csize = float(data[8])
-
-        hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
-        hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
-        lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
-        hires_lon_2D = lon2D.T
-        hires_lat_2D = lat2D.T
-
-        HighResCatchmentId = read_map(
-            hires_map_dir / f"{hires_map_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
-        )
-        valid_mask = HighResCatchmentId[:, :, 0] > 0
-        x_idx, y_idx = np.where(valid_mask)
-
-        HighResCatchmentId -= 1  # convert from 1-based to 0-based
-        valid_x = HighResCatchmentId[x_idx, y_idx, 0]
-        valid_y = HighResCatchmentId[x_idx, y_idx, 1]
-
-        valid_lon = hires_lon_2D[x_idx, y_idx]
-        valid_lat = hires_lat_2D[x_idx, y_idx]
-
-        # Get runoff coordinates
-        ro_lon, ro_lat = self.get_coordinates()
-        runoff_idx = compute_runoff_id(ro_lon, ro_lat, valid_lon, valid_lat)
-
-        # Prepare mask and mapping
-        col_mask = self.data_mask
-        if col_mask is not None:
-            col_mask = np.ravel(col_mask, order="C")
-        else:
-            col_mask = np.ones((len(ro_lat) * len(ro_lon)), dtype=bool)
-
-        col_mapping = -np.ones_like(col_mask, dtype=np.int64)
-        col_mapping[np.flatnonzero(col_mask)] = np.arange(col_mask.sum())
-
-        mapped_runoff_idx = col_mapping[runoff_idx]
-        invalid_mask = mapped_runoff_idx == -1
-
-        invalid_catchment_x = valid_x[invalid_mask]
-        invalid_catchment_y = valid_y[invalid_mask]
-
-        print(f"Total invalid high-res points: {len(invalid_catchment_x)}")
-
-        # Plot scatter of invalid catchment grid positions
-        plt.figure(figsize=(8, 6))
-        plt.scatter(invalid_catchment_x, invalid_catchment_y, s=1, alpha=0.5)
-        plt.title("Spatial Distribution of Invalid High-Res Catchments")
-        plt.xlabel("Catchment X")
-        plt.ylabel("Catchment Y")
-        plt.axis("equal")
-        plt.grid(True)
-        plt.gca().invert_yaxis()
-        plt.tight_layout()
-        plt.show()
-
     @abstractmethod
     def get_data(self, current_time: datetime) -> Tuple[np.ndarray, int]:
         """
@@ -409,3 +308,12 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         Closes any open resources or files.
         """
         pass
+    
+    def __getitem__(self, idx: int) -> np.ndarray:
+        """
+        Fetches data for a given index.
+        Returns distributed data based on rank.
+        """
+        current_time = self.get_time_by_index(idx)
+        runoff_data = self.get_data(current_time)
+        return runoff_data

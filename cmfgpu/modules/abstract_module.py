@@ -3,10 +3,13 @@ Abstract base class for all CaMa-Flood-GPU modules using Pydantic v2.
 This is the highest level abstraction that all modules inherit from.
 """
 from __future__ import annotations
-import torch
-from typing import Dict, Any, ClassVar, Tuple, List, Literal, Self, Optional
+
 from abc import ABC
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Tuple
+
+import torch
+from pydantic import (BaseModel, ConfigDict, Field, computed_field,
+                      model_validator)
 from pydantic.fields import FieldInfo
 
 

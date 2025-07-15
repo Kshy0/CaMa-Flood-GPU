@@ -1,5 +1,6 @@
 import torch
 
+
 def compute_bifurcation_outflow(
     catchment_idx,
     downstream_idx,

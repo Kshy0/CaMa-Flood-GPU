@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def compute_adaptive_time_step_kernel(
     is_reservoir_ptr,                       # *bool mask: 1 means reservoir

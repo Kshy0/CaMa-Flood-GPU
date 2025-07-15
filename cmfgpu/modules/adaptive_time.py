@@ -1,13 +1,16 @@
-from typing import ClassVar
-import torch
 from functools import cached_property
+from typing import ClassVar
+
+import torch
 from pydantic import Field
-from cmfgpu.modules.abstract_module import AbstractModule, computed_tensor_field
+
+from cmfgpu.modules.abstract_module import (AbstractModule,
+                                            computed_tensor_field)
+
 
 class AdaptiveTimeModule(AbstractModule):
     """
-    Bifurcation hydraulic module for CaMa-Flood-GPU.
-    Handles bifurcation flow calculations in river networks.
+    Adaptive time step calculation module for river networks.
     """
     
     # Module metadata

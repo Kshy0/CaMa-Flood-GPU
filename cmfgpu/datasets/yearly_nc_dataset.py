@@ -1,11 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import cached_property
 from pathlib import Path
 from typing import Tuple
-from cmfgpu.datasets.abstract_dataset import DefaultDataset
-from netCDF4 import Dataset
+
 import numpy as np
-from functools import cached_property
-from datetime import timedelta
+from netCDF4 import Dataset
+
+from cmfgpu.datasets.abstract_dataset import DefaultDataset
+
 
 class YearlyNetCDFDataset(DefaultDataset):
     def __init__(self,
@@ -27,12 +29,6 @@ class YearlyNetCDFDataset(DefaultDataset):
         self.var_name = var_name
         self.prefix = prefix
         self.suffix = suffix
-
-    def __len__(self):
-        """
-        Returns the total number of samples in the dataset based on the time range.
-        """
-        return (self.end_date - self.start_date).days + 1
     
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         filename = f"{self.prefix}{2000}{self.suffix}"
@@ -138,6 +134,13 @@ class YearlyNetCDFDataset(DefaultDataset):
 
     def close(self) -> None:
         pass
+
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset based on the time range.
+        """
+        return (self.end_date - self.start_date).days + 1
+    
 if __name__ == "__main__":
     dataset = YearlyNetCDFDataset(
         base_dir="/home/eat/cmf_v420_pkg/inp/test_15min_nc",

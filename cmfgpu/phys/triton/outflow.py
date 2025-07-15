@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def compute_outflow_kernel(
     is_river_mouth_ptr,                     # *bool mask: 1 means river mouth 

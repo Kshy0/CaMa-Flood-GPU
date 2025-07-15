@@ -3,19 +3,19 @@ Log module for CaMa-Flood-GPU using TensorField / computed_tensor_field helpers.
 """
 
 from __future__ import annotations
-from typing import List, ClassVar, Tuple, Literal
-from pathlib import Path
-from datetime import timedelta, datetime
-import torch
-import numpy as np
-import torch.distributed as dist
+
+from datetime import datetime, timedelta
 from functools import cached_property
+from pathlib import Path
+from typing import ClassVar, List, Literal, Tuple
+
+import numpy as np
+import torch
+import torch.distributed as dist
 from pydantic import Field, PrivateAttr
 
-from cmfgpu.modules.abstract_module import (
-    AbstractModule,
-    computed_tensor_field,
-)
+from cmfgpu.modules.abstract_module import (AbstractModule,
+                                            computed_tensor_field)
 
 
 def computed_log_field(
@@ -40,7 +40,7 @@ class LogModule(AbstractModule):
     description: ClassVar[str] = "Log module for storing and managing simulation data"
     dependencies: ClassVar[list] = ["base"]
     h5_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "modules", "world_size", "rank", "device", "log_path"
+        "opened_modules", "world_size", "rank", "device", "precision", "log_path"
     ]  # Fields to exclude from HDF5
     # ------------------------------------------------------------------ #
     # Configuration

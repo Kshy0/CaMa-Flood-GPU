@@ -1,10 +1,13 @@
+from datetime import datetime, timedelta
+
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from datetime import datetime, timedelta
-from cmfgpu.utils import setup_distributed
-from cmfgpu.models.cama_flood_model import CaMaFlood
+
 from cmfgpu.datasets.yearly_nc_dataset import YearlyNetCDFDataset
+from cmfgpu.models.cama_flood_model import CaMaFlood
+from cmfgpu.utils import setup_distributed
+
 
 def main():
     ### Configuration Start ###
@@ -16,11 +19,12 @@ def main():
     precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360
-    batch_size = 64
+    batch_size = 32
     loader_workers = 2
     output_workers = 2
     unit_factor = 86400000
     prefetch_factor = 2
+    BLOCK_SIZE = 128
     ### Configuration End ###
 
     start_date = datetime(2000, 1, 1)
@@ -44,6 +48,8 @@ def main():
         variables_to_save=variables_to_save,
         precision=precision,
         output_workers=output_workers,
+        output_complevel=4,
+        BLOCK_SIZE=BLOCK_SIZE
     )
 
     dataset = YearlyNetCDFDataset(
@@ -79,15 +85,15 @@ def main():
         with torch.cuda.stream(stream):
             batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff, local_runoff_matrix)
             for batch in batch_runoff:
-                print(f"Rank {rank} processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 model.step_advance(
                     runoff=batch,
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                 )
+                print(f"Rank {rank} processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 current_time += timedelta(seconds=time_step)
-
+    model.save_states(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 

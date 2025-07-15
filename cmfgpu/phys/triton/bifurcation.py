@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def compute_bifurcation_outflow_kernel(
     # Indices and configuration

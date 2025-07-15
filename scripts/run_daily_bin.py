@@ -1,10 +1,13 @@
+from datetime import datetime, timedelta
+
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from datetime import timedelta, datetime
-from cmfgpu.utils import setup_distributed
-from cmfgpu.models.cama_flood_model import CaMaFlood
+
 from cmfgpu.datasets.daily_bin_dataset import DailyBinDataset
+from cmfgpu.models.cama_flood_model import CaMaFlood
+from cmfgpu.utils import setup_distributed
+
 
 def main():
     ### Configuration Start ###
@@ -21,6 +24,7 @@ def main():
     output_workers = 2
     output_complevel = 4 
     prefetch_factor = 2
+    BLOCK_SIZE = 128
     ### Configuration End ###
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
@@ -47,6 +51,7 @@ def main():
         precision=precision,
         output_workers=output_workers,
         output_complevel=output_complevel,
+        BLOCK_SIZE=BLOCK_SIZE
     )
 
     dataset = DailyBinDataset(
@@ -83,15 +88,15 @@ def main():
         with torch.cuda.stream(stream):
             batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff, local_runoff_matrix)
             for batch in batch_runoff:
-                print(f"Rank {rank} processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 model.step_advance(
                     runoff=batch,
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                 )
+                print(f"Rank {rank} processed data for time {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 current_time += timedelta(seconds=time_step)
-
+    model.save_states(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 

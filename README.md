@@ -25,14 +25,14 @@
     ```bash
     module load scl/gcc11.2
     ```
-    
+  
 - Job submission via `sbatch` is being tested and will be updated soon.
 
 ---
 
 ## Prerequisites
 
-- Python == 3.13.3  
+- Python == 3.13.5  
 - PyTorch (with CUDA support) == 2.7.1+cu128
 - Triton == 3.3.1
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
@@ -41,7 +41,7 @@
   - h5py
   - and other utility packages as needed
 
-The codebase dependencies of this program are not strict, and I think any newer version of torch will run smoothly. For example, I also successfully tested torch 2.7.0 with CUDA 12.6 version, even though CUDA 12.2 is installed on the cluster. This codebase will always rely on newer versions of python, torch, and triton for the latest feature support and optimal performance.
+The codebase dependencies are not strict, and I think any newer version of torch will run smoothly. For example, I also successfully tested torch 2.7.0 with CUDA 12.6 version, even though CUDA 12.2 is installed on the cluster. This codebase will always rely on newer versions of python, torch, and triton for the latest feature support and optimal performance.
 
 In theory, the codebase should also run on AMD GPUs, but I haven’t had the chance to test that setup yet.
 
@@ -77,7 +77,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
 
-This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `omegaconf`, `h5py`, and others.
+This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, `h5py`, and others.
 
 If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `cmfgpu` and reinstall it to ensure all required packages are correctly installed:
 
@@ -95,7 +95,7 @@ All scripts in this repository are designed for maximum flexibility. Before runn
 - `map_dir`: Path to your CaMa-Flood input map directory (e.g., `cmf_v420_pkg/map/glb_15min`)
 - `out_dir`: Path to your desired output directory
 - `gauge_file`: Path to the GRDC gauge file (optional)
-- Other Runtime Settings
+- Other runtime settings
 
 These paths are currently **hardcoded in the Python script**, typically under the `if __name__ == "__main__":` block at the bottom of the file.
  Please edit them to match your local file structure before execution.
@@ -106,7 +106,7 @@ if __name__ == "__main__":
         map_dir="/your/path/to/map",
         out_dir="/your/path/to/output",
         gauge_file="/your/path/to/gauge_file.txt",  # Optional
-        visualize_basins=True
+        visualize_basins=False
     )
 ```
 
@@ -119,8 +119,11 @@ if __name__ == "__main__":
   
   ### 2. Generate parameters
   
+  CaMa-Flood-GPU is fully compatible with CaMa-Flood input data (river maps, runoff, etc.).
   
-  This step converts the original `.bin` map parameter files (such as `nextxy.bin`, `rivlen.bin`, `elevtn.bin`, etc.) from the official [CaMa-Flood package](https://hydro.iis.u-tokyo.ac.jp/~yamadai/cama-flood/) into an `.h5` file format that is optimized for GPU-based simulation in CaMa-Flood-GPU.
+  For `map_dir`, it is important to note that it should include river channel parameter files such as `rivhgt.bin`, `rivwth_gwdlr.bin`, and `bifprm.txt`, which are generated using the original Fortran code from the CaMa-Flood repository. To produce them, you may need to compile and run the script `s01-channel_params.sh` provided in the original CaMa-Flood repository.
+  
+  If you are using the `glb_15min` maps from the official CaMa-Flood package, the required river channel parameters are already included. However, if you are using higher resolution maps, you will need to refer to the original Fortran repository to compile the necessary data and generate the required parameters.
   
   ```shell
   cd /path/to/CaMa-Flood-GPU
@@ -150,21 +153,39 @@ if __name__ == "__main__":
   Based on our tests, CaMa-Flood-GPU is likely **I/O (CPU) bound**, meaning the hydrodynamic simulation runs faster than the time it takes to read and decode input data (especially from NetCDF files). If you're highly sensitive to runtime performance:
   
   1. Consider converting data to `.bin` format or using `.nc` files with lower compression levels—though this may require significantly more disk space.
-  2. If feasible, you can precompute and store runoff data **already mapped to each catchment**, eliminating the need for sparse matrix operations during runtime. This applies especially to cases where the size of the runoff grid is larger than the size of the catchment. While we've made efforts to decouple I/O from model execution, you still need to understand how CaMa-Flood-GPU assigns basins to different GPUs in multi-GPU runs. You must ensure each rank (based on `rank` and `world_size`) reads only its assigned subset of catchments and handles multi-process data loading correctly.
+  2. If feasible, you can precompute and store runoff data **already mapped to each catchment**, eliminating the need for sparse matrix operations during runtime. This applies especially to cases where the size of the runoff grid is much larger than the size of the catchment. While we've made efforts to decouple I/O from model execution, you still need to understand how CaMa-Flood-GPU assigns basins to different GPUs in multi-GPU runs. You must ensure each rank (based on `rank` and `world_size`) reads only its assigned subset of catchments and handles multi-process data loading correctly.
   3. The framework already uses **multi-process and asynchronous prefetching**, so performance is generally acceptable for most scenarios.
   
   ### 4. Run the model
   
   Several script templates are provided in the `./scripts` directory, such as `run_daily_bin.py` and `run_daily_nc.py`. You are encouraged to modify or customize these scripts to fit your specific workflow and simulation requirements.
   
+  For 1 GPU on a single machine, simply run:
+  
+  ```shell
+  cd /path/to/CaMa-Flood-GPU
+  python ./scripts/run_daily_bin.py
+  ```
+  
   For 4 GPUs on a single machine:
   
   ```shell
   cd /path/to/CaMa-Flood-GPU
-  torchrun --nproc_per_node=4 ./cmfgpu/scripts/run_daily_bin.py
+  torchrun --nproc_per_node=4 ./scripts/run_daily_bin.py
   ```
   
   - [Optional] For distributed runs, please refer to upcoming documentation and code samples.
+  
+  ### [Optional] Choosing Block Size for Optimal Performance
+  
+  The `block_size` parameter varies depending on your hardware, impacting memory usage and computational efficiency. To find the optimal size for your system, run a benchmark across typical values `[64, 128, 256, 512, 1024]`. Smaller block sizes may improve memory utilization, while larger ones can speed up computation by reducing kernel launch overhead. Use the provided `benchmark_block_size()` function to test and select the best block size for your setup.
+  
+  ```bash
+  cd /path/to/CaMa-Flood-GPU
+  python ./scripts/benchmark_block_size.py
+  ```
+  
+  Once the benchmark is complete, select the block size that provides the best balance between performance and resource usage for your system.
 
 
 ---
