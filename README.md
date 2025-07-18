@@ -37,7 +37,7 @@
 - PyTorch (with CUDA support) == 2.7.1+cu128
 - Triton == 3.3.1
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
-  - pydantic
+  - pydantic (for better data validation)
   - netCDF4
   - h5py
   - and other utility packages as needed
@@ -75,17 +75,10 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 ### 3. Install other dependencies
 
 ```shell
-pip install -e .
+pip install -r requirements.txt
 ```
 
-This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, `h5py`, and others.
-
-If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `cmfgpu` and reinstall it to ensure all required packages are correctly installed:
-
-```bash
-pip uninstall cmfgpu
-pip install -e .
-```
+This command installs required dependencies such as `netCDF4`, `scipy`, `h5py`, and others.
 
 ---
 
@@ -116,15 +109,12 @@ if __name__ == "__main__":
   - CaMa-Flood-GPU is fully compatible with CaMa-Flood input data (river maps, runoff, etc.).
   - Download the required datasets from the [official CaMa-Flood site](https://hydro.iis.u-tokyo.ac.jp/~yamadai/cama-flood/) or follow the instructions in the original CaMa-Flood documentation.
   - Typically, you will download a folder named `cmf_v420_pkg` from the official site and place it somewhere on your local machine.
-  - For `glb_15min` maps, the `cmf_v420_pkg` contains the estimated river channel parameters. So no additional work is required to run this GPU program. If you want to use a higher resolution map, please refer to the instructions in the original Fortran repository. You need to compile the Fortran code and [generate river channel parameters](https://github.com/global-hydrodynamics/CaMa-Flood_v4/blob/master/map/src/src_param/s01-channel_params.sh) , such as river width.
   
   ### 2. Generate parameters
   
   CaMa-Flood-GPU is fully compatible with CaMa-Flood input data (river maps, runoff, etc.).
-  
-  For `map_dir`, it is important to note that it should include river channel parameter files such as `rivhgt.bin`, `rivwth_gwdlr.bin`, and `bifprm.txt`, which are generated using the original Fortran code from the CaMa-Flood repository. To produce them, you may need to compile and run the script `s01-channel_params.sh` provided in the original CaMa-Flood repository.
-  
-  If you are using the `glb_15min` maps from the official CaMa-Flood package, the required river channel parameters are already included. However, if you are using higher resolution maps, you will need to refer to the original Fortran repository to compile the necessary data and generate the required parameters.
+
+  For `glb_15min` maps, the `cmf_v420_pkg` contains the estimated river channel parameters. So no additional work is required to run this GPU program. If you want to use a higher resolution map, please refer to the instructions in the original Fortran repository. You need to compile the Fortran code and [generate river channel parameters](https://github.com/global-hydrodynamics/CaMa-Flood_v4/blob/master/map/src/src_param/s01-channel_params.sh) , such as `rivhgt.bin`, `rivwth_gwdlr.bin`, and `bifprm.txt`.
   
   ```shell
   cd /path/to/CaMa-Flood-GPU
@@ -168,6 +158,8 @@ if __name__ == "__main__":
   python ./scripts/run_daily_bin.py
   ```
   
+  There's no need for complex multi-GPU configurations! As long as each catchment's basin is already specified (`catchment_basin_id` in `merit_map.py`), CaMa-Flood-GPU will automatically distribute tasks across different GPUs, ensuring a balanced workload.
+  
   For 4 GPUs on a single machine:
   
   ```shell
@@ -175,7 +167,7 @@ if __name__ == "__main__":
   torchrun --nproc_per_node=4 ./scripts/run_daily_bin.py
   ```
   
-  - [Optional] For distributed runs, please refer to upcoming documentation and code samples.
+  - For distributed runs, please refer to upcoming documentation and code samples.
   
   ### [Optional] Choosing Block Size for Optimal Performance
   
@@ -202,8 +194,9 @@ if __name__ == "__main__":
 
 ## Roadmap & To-Do
 
-1. **Triton autotune support:** Add support for Triton's autotune functionality to automatically find the best kernel parameters for your specific GPU, maximizing performance.
-4. **Parameter calibration:** Develop tools for easier model tuning and result analysis.
+1. **Handle the huge basin with bifurcation:** Some finer resolution maps like glb_01min may connect previously separate large basins due to bifurcations, leading to load imbalance across multiple GPUs. Possible solutions include: (1) disabling some bifurcation links between large basins like Fortran version, or (2) enabling inter-GPU communication—which may require significant effort to implement.
+
+2. **Parameter calibration:** Develop tools for easier model tuning and result analysis.
 
 ---
 
