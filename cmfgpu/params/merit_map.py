@@ -544,6 +544,21 @@ class MERITMap(BaseModel):
         plt.ylabel("Y")
         plt.grid(False)
 
+        # Plot gauges if available
+        if len(self.gauge_info) > 0:
+            gauge_catchment_ids = []
+            for info in self.gauge_info.values():
+                gauge_catchment_ids.extend(info["upstream_id"])
+            gauge_catchment_ids = np.unique(gauge_catchment_ids)
+
+            catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
+            gauge_indices = [catchment_id_to_idx[cid] for cid in gauge_catchment_ids if cid in catchment_id_to_idx]
+            
+            if gauge_indices:
+                gauge_x = self.catchment_x[gauge_indices]
+                gauge_y = self.catchment_y[gauge_indices]
+                plt.scatter(gauge_x, gauge_y, c='#FF0000', s=0.5, label='Gauges')
+
         # Plot bifurcation paths if available
         if len(self.bifurcation_catchment_id) > 0:
             x1 = self.bifurcation_catchment_x
@@ -561,16 +576,6 @@ class MERITMap(BaseModel):
             plt.gca().add_collection(saved_lines)
             plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.5, label=f'Bifurcation Paths')
 
-        if len(self.bifurcation_catchment_id) > 0:
-            # Get the bifurcation catchment IDs and filter out the ones that exist
-            valid_bifurcation_idx = np.isin(self.bifurcation_catchment_id, self.catchment_id)
-
-            # Filter the catchment coordinates for valid bifurcation points
-            bifurcation_x = self.bifurcation_catchment_x[valid_bifurcation_idx]
-            bifurcation_y = self.bifurcation_catchment_y[valid_bifurcation_idx]
-
-            # Plot the bifurcation points
-            plt.scatter(bifurcation_x, bifurcation_y, c='#0000FF', s=0.5, label='Bifurcation Points')
         plt.legend(loc='lower right')
         plt.tight_layout()
         plt.savefig(self.out_dir / f"basin_map.png", dpi=600, bbox_inches='tight')
@@ -617,7 +622,7 @@ class MERITMap(BaseModel):
         return self
 
 if __name__ == "__main__":
-    map_resolution = "glb_05min" 
+    map_resolution = "glb_15min" 
     merit_map = MERITMap(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
         out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}",

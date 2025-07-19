@@ -75,10 +75,17 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 ### 3. Install other dependencies
 
 ```shell
-pip install -r requirements.txt
+pip install -e .
 ```
 
-This command installs required dependencies such as `netCDF4`, `scipy`, `h5py`, and others.
+This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, `h5py`, and others.
+
+If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `cmfgpu` and reinstall it to ensure all required packages are correctly installed:
+
+```bash
+pip uninstall cmfgpu
+pip install -e .
+```
 
 ---
 

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmfgpu"
+version = "0.1"
+description = ""
+authors = [
+    {name = "Shengyu Kang", email = "kshy0204@whu.edu.cn"}
+]
+dependencies = [
+    "netCDF4",
+    "h5py",
+    "scipy",
+    "numba",
+    "pydantic",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

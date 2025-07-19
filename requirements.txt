@@ -1,8 +1,0 @@
-netCDF4
-h5py
-scipy
-numba
-pydantic
-
-# Please install PyTorch manually (choose the version that matches your CUDA setup):
-# pip3 install torch --index-url https://download.pytorch.org/whl/cu128
