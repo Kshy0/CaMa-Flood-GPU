@@ -17,5 +17,5 @@ dependencies = [
     "pydantic",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
+[project.optional-dependencies]
+dev = ["ipykernel", "matplotlib", "pandas"]

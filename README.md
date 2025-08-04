@@ -118,8 +118,6 @@ if __name__ == "__main__":
   - Typically, you will download a folder named `cmf_v420_pkg` from the official site and place it somewhere on your local machine.
   
   ### 2. Generate parameters
-  
-  CaMa-Flood-GPU is fully compatible with CaMa-Flood input data (river maps, runoff, etc.).
 
   For `glb_15min` maps, the `cmf_v420_pkg` contains the estimated river channel parameters. So no additional work is required to run this GPU program. If you want to use a higher resolution map, please refer to the instructions in the original Fortran repository. You need to compile the Fortran code and [generate river channel parameters](https://github.com/global-hydrodynamics/CaMa-Flood_v4/blob/master/map/src/src_param/s01-channel_params.sh) , such as `rivhgt.bin`, `rivwth_gwdlr.bin`, and `bifprm.txt`.
   
