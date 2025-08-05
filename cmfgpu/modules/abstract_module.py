@@ -118,12 +118,10 @@ class AbstractModule(BaseModel, ABC):
     dependencies: ClassVar[list] = []  # List of modules this module depends on
     group_by: ClassVar[Optional[str]] = None  # Variable indicating basin membership
     h5_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "world_size", "rank", "device", "precision"
+        "opened_modules", "device", "precision"
     ]  # Fields to exclude from HDF5
 
     opened_modules: List[str] = Field(default_factory=list)
-    world_size: int = Field(default=1, description="Total number of distributed processes")
-    rank: int = Field(description="Current process rank in distributed setup")
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
     precision: torch.dtype = Field(default=torch.float32, description="Data type for tensors")
 

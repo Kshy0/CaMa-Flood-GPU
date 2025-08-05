@@ -15,20 +15,18 @@ class YearlyNetCDFDataset(DefaultDataset):
                  start_date: datetime,
                  end_date: datetime,
                  unit_factor: float = 1.0,
-                 out_dtype: str = "float32",
                  var_name: str = "Runoff",
                  prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
                  suffix: str = ".nc",
                  *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self.base_dir = base_dir
         self.start_date = start_date
         self.end_date = end_date
         self.unit_factor = unit_factor
-        self.out_dtype = out_dtype
         self.var_name = var_name
         self.prefix = prefix
         self.suffix = suffix
+        super().__init__(*args, **kwargs)
     
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         filename = f"{self.prefix}{2000}{self.suffix}"
@@ -86,9 +84,9 @@ class YearlyNetCDFDataset(DefaultDataset):
             transpose_order = [dim_order.index(i) for i in (0, 1, 2)]
             data = np.transpose(data, axes=[transpose_order[1], transpose_order[2]])
         
-        data = data[self.data_mask][self.local_runoff_indices] if self.local_runoff_indices is not None else data
-        return data.astype(self.out_dtype)
-    
+        data = data[self.data_mask]
+        return data
+
     def get_data(self, current_time: datetime) -> np.ndarray:
         year_str = current_time.strftime("%Y")
         filename = f"{self.prefix}{year_str}{self.suffix}"
@@ -98,8 +96,8 @@ class YearlyNetCDFDataset(DefaultDataset):
             time_index = current_time.timetuple().tm_yday - 1
             var = dataset.variables[self.var_name]
             data = self._read_and_process_var(var, time_index)
-            return data / self.unit_factor
-    
+            return data.astype(self.out_dtype) / self.unit_factor
+
     @cached_property
     def data_mask(self) -> np.ndarray:
         """

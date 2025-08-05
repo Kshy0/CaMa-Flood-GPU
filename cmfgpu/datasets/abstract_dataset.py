@@ -1,5 +1,6 @@
 import os
 from abc import ABC, abstractmethod
+from functools import cached_property
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Tuple
@@ -8,8 +9,7 @@ import numpy as np
 import torch
 from scipy.sparse import csr_matrix
 
-from cmfgpu.utils import binread, find_indices_in, read_map
-
+from cmfgpu.utils import binread, find_indices_in, read_map, is_rank_zero
 
 def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
     """
@@ -50,26 +50,23 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
     Custom abstract class that inherits from PyTorch Dataset.
     Defines a common interface for accessing data with distributed support.
     """
-    def __init__(self, rank: int = 0, world_size: int = 1, 
-                *args, **kwargs):
+    def __init__(self, out_dtype: str = "float32", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.rank = rank
-        self.world_size = world_size
-        
+        self.out_dtype = out_dtype
+
         # Initialize mapping-related attributes
         self.local_runoff_indices = None
 
-    def apply_runoff_to_catchments(self, runoff_data: np.ndarray, local_runoff_matrix) -> torch.Tensor:
+    def apply_runoff_to_catchments(self, runoff_data: torch.Tensor) -> torch.Tensor:
         """
         Applies the local runoff matrix to the provided runoff data.
         Assumes runoff_data is a 1D array ordered according to the mapping file.
         Returns a tensor of catchment runoff values.
         """
-        
-        return (runoff_data.to(local_runoff_matrix.device) @ local_runoff_matrix).contiguous()
+        return (runoff_data[:, self.local_runoff_indices] @ self.local_runoff_matrix).contiguous()
 
     def build_local_runoff_matrix(self, runoff_mapping_file: str, desired_catchment_ids: np.ndarray, 
-                                precision: Literal["float32", "float64"], device: torch.device = torch.device('cpu')) -> None:
+                                precision: Literal["float32", "float64"], device: torch.device) -> None:
         """
         Build PyTorch CSR matrix for mapping runoff data to specified catchments.
         Loads scipy compressed sparse matrix data and converts to PyTorch.
@@ -120,16 +117,16 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
         
         # Store the information needed for data extraction
-        self.local_runoff_indices = non_zero_cols
-        
+        self.local_runoff_indices = torch.tensor(non_zero_cols, dtype=torch.int64, device=device)
+
         # Convert to PyTorch tensors
         row_tensor = torch.from_numpy(final_submatrix.row.astype(np.int64)).to(device)
         col_tensor = torch.from_numpy(final_submatrix.col.astype(np.int64)).to(device)
         data_tensor = torch.from_numpy(final_submatrix.data.astype(np.float32)).to(device).to(precision)
-        
+
         # Create PyTorch sparse CSR tensor
         indices = torch.stack([row_tensor, col_tensor])
-        local_runoff_matrix = torch.sparse_coo_tensor(
+        self.local_runoff_matrix = torch.sparse_coo_tensor(
             indices, data_tensor, 
             size=(len(non_zero_cols), len(desired_catchment_ids)),
             device=device, dtype=precision
@@ -137,9 +134,8 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         
         print(f"Built local runoff matrix for {len(desired_catchment_ids)} catchments "
             f"and {len(non_zero_cols)} runoff grids on device {device}")
-        print(f"Original matrix shape: {matrix_shape}, Local matrix shape: {local_runoff_matrix.shape}")
+        print(f"Original matrix shape: {matrix_shape}, Local matrix shape: {self.local_runoff_matrix.shape}")
         print(f"Found {np.sum(valid_idx)} out of {len(desired_catchment_ids)} requested catchments")
-        return local_runoff_matrix
     
     def generate_runoff_mapping_table(
         self,
@@ -273,10 +269,10 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
 
     @abstractmethod
-    def get_data(self, current_time: datetime) -> Tuple[np.ndarray, int]:
+    def get_data(self, current_time: datetime) -> np.ndarray:
         """
         To be implemented by subclasses, reads data of the specified date and time point from storage.
-        Returns (data, seconds) where data is 1D array ordered according to mapping file.
+        Returns data which is 1D array ordered according to mapping file.
         """
         pass
     
@@ -309,11 +305,21 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         """
         pass
     
+    @cached_property
+    def data_size(self) -> int:
+        return int(self.data_mask.sum())
+
     def __getitem__(self, idx: int) -> np.ndarray:
         """
         Fetches data for a given index.
         Returns distributed data based on rank.
         """
+        if self.local_runoff_indices is None:
+            raise RuntimeError("local_runoff_matrix not initialized. Please call build_local_runoff_matrix first.")
         current_time = self.get_time_by_index(idx)
-        runoff_data = self.get_data(current_time)
-        return runoff_data
+        if is_rank_zero():
+            data = self.get_data(current_time)
+        else:
+            data = np.empty(self.data_size, dtype=self.out_dtype)
+
+        return data

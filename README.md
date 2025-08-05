@@ -146,11 +146,6 @@ if __name__ == "__main__":
   
   Once created, the `.npz` file will contain a **sparse matrix** mapping each runoff grid cell to the affected catchments, which is then used during simulation.
   
-  Based on our tests, CaMa-Flood-GPU is likely **I/O (CPU) bound**, meaning the hydrodynamic simulation runs faster than the time it takes to read and decode input data (especially from NetCDF files). If you're highly sensitive to runtime performance:
-  
-  1. Consider converting data to `.bin` format or using `.nc` files with lower compression levels—though this may require significantly more disk space.
-  2. If feasible, you can precompute and store runoff data **already mapped to each catchment**, eliminating the need for sparse matrix operations during runtime. This applies especially to cases where the size of the runoff grid is much larger than the size of the catchment. While we've made efforts to decouple I/O from model execution, you still need to understand how CaMa-Flood-GPU assigns basins to different GPUs in multi-GPU runs. You must ensure each rank (based on `rank` and `world_size`) reads only its assigned subset of catchments and handles multi-process data loading correctly.
-  3. The framework already uses **multi-process and asynchronous prefetching**, so performance is generally acceptable for most scenarios.
   
   ### 4. Run the model
   

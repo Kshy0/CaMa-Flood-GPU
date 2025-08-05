@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from functools import cached_property
 from pathlib import Path
 from typing import List, Tuple
 
@@ -19,22 +20,21 @@ class DailyBinDataset(DefaultDataset):
                  start_date: datetime,
                  end_date: datetime,
                  unit_factor: float = 1.0,
-                 out_dtype: str = "float32",
                  bin_dtype: str = "float32",
                  prefix: str = "Roff____",
                  suffix: str = ".one",
                  *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        
         self.base_dir = base_dir
         self.shape = tuple(shape)
         self.start_date = start_date
         self.end_date = end_date
         self.unit_factor = unit_factor
-        self.out_dtype = out_dtype
         self.bin_dtype = bin_dtype
         self.prefix = prefix
         self.suffix = suffix
         self._validate_files_exist()
+        super().__init__(*args, **kwargs)
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         lat = np.arange(89.5, -89.5 - 1, -1)
@@ -47,14 +47,13 @@ class DailyBinDataset(DefaultDataset):
 
         data = np.fromfile(file_path, dtype=self.bin_dtype)
         # data = data.reshape(self.shape, order='C')
-        data = data[self.local_runoff_indices] if self.local_runoff_indices is not None else data
         data[~(data >= 0)] = 0.0
-        
+
         return data.astype(self.out_dtype) / self.unit_factor
-    
-    @property
+
+    @cached_property
     def data_mask(self):
-        return None
+        return np.ones(np.prod(self.shape), dtype=bool)
     
     def get_time_by_index(self, idx: int) -> datetime:
         """

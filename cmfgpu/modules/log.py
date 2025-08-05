@@ -91,7 +91,15 @@ class LogModule(AbstractModule):
         if num_steps > self.log_buffer_size:
             self.log_buffer_size = num_steps + 20
             for field in self.log_vars:
-                getattr(self, field).resize_(self.log_buffer_size).zero_()
+                getattr(self, field).resize_(self.log_buffer_size)
+    
+    def gather_results(self) -> None:
+        """
+        Gathers results from the model and prepares them for logging.
+        This method should be called after each time step to collect data.
+        """
+        for field in self.log_vars:
+            dist.all_reduce(getattr(self, field), op=dist.ReduceOp.SUM)
 
     def write_step(self, log_path: Path) -> None:
         if not log_path.exists():
@@ -101,10 +109,6 @@ class LogModule(AbstractModule):
                 f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {self._num_steps}\n"
             )
         print(f"Processed step at {self._current_time.strftime('%Y-%m-%d %H:%M:%S')}, adaptive_time_step={self._num_steps}")
-
-        if self.world_size > 1:
-            for field in self.log_vars:
-                dist.all_reduce(getattr(self, field), op=dist.ReduceOp.SUM)
 
         num_steps = self._num_steps
         time_strs = np.array(
