@@ -11,7 +11,7 @@ from cmfgpu.utils import setup_distributed
 
 def main():
     ### Configuration Start ###
-    resolution = "glb_15min"
+    resolution = "glb_03min"
     experiment_name = f"{resolution}_nc"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.h5"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
@@ -65,7 +65,7 @@ def main():
         suffix=suffix,
     )
 
-    dataset.build_local_runoff_matrix(
+    local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         precision=precision,
@@ -85,10 +85,7 @@ def main():
     stream = torch.cuda.Stream(device=device)
     for batch_runoff in loader:
         with torch.cuda.stream(stream):
-            batch_runoff = batch_runoff.to(device)
-            if world_size > 1:
-                dist.broadcast(batch_runoff, src=0)
-            batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff)
+            batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
                 model.step_advance(
                     runoff=runoff,

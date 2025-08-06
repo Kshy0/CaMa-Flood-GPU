@@ -7,6 +7,7 @@ from typing import Literal, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from scipy.sparse import csr_matrix
 
 from cmfgpu.utils import binread, find_indices_in, read_map, is_rank_zero
@@ -54,19 +55,22 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         super().__init__(*args, **kwargs)
         self.out_dtype = out_dtype
 
-        # Initialize mapping-related attributes
-        self.local_runoff_indices = None
-
-    def apply_runoff_to_catchments(self, runoff_data: torch.Tensor) -> torch.Tensor:
+    def apply_runoff_to_catchments(self, 
+                                   batch_runoff: torch.Tensor, 
+                                   local_runoff_matrix: torch.Tensor, 
+                                   local_runoff_indices: torch.Tensor,
+                                   world_size: int) -> torch.Tensor:
         """
         Applies the local runoff matrix to the provided runoff data.
         Assumes runoff_data is a 1D array ordered according to the mapping file.
         Returns a tensor of catchment runoff values.
         """
-        return (runoff_data[:, self.local_runoff_indices] @ self.local_runoff_matrix).contiguous()
+        if world_size > 1:
+            dist.broadcast(batch_runoff, src=0)
+        return (batch_runoff[:, local_runoff_indices] @ local_runoff_matrix).contiguous()
 
     def build_local_runoff_matrix(self, runoff_mapping_file: str, desired_catchment_ids: np.ndarray, 
-                                precision: Literal["float32", "float64"], device: torch.device) -> None:
+                                precision: Literal["float32", "float64"], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Build PyTorch CSR matrix for mapping runoff data to specified catchments.
         Loads scipy compressed sparse matrix data and converts to PyTorch.
@@ -117,7 +121,7 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
         
         # Store the information needed for data extraction
-        self.local_runoff_indices = torch.tensor(non_zero_cols, dtype=torch.int64, device=device)
+        local_runoff_indices = torch.tensor(non_zero_cols, dtype=torch.int64,device=device)
 
         # Convert to PyTorch tensors
         row_tensor = torch.from_numpy(final_submatrix.row.astype(np.int64)).to(device)
@@ -126,16 +130,18 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
 
         # Create PyTorch sparse CSR tensor
         indices = torch.stack([row_tensor, col_tensor])
-        self.local_runoff_matrix = torch.sparse_coo_tensor(
+        local_runoff_matrix = torch.sparse_coo_tensor(
             indices, data_tensor, 
             size=(len(non_zero_cols), len(desired_catchment_ids)),
-            device=device, dtype=precision
+            dtype=precision,
+            device=device
         ).coalesce()
         
         print(f"Built local runoff matrix for {len(desired_catchment_ids)} catchments "
             f"and {len(non_zero_cols)} runoff grids on device {device}")
-        print(f"Original matrix shape: {matrix_shape}, Local matrix shape: {self.local_runoff_matrix.shape}")
+        print(f"Original matrix shape: {matrix_shape}, Local matrix shape: {local_runoff_matrix.shape}")
         print(f"Found {np.sum(valid_idx)} out of {len(desired_catchment_ids)} requested catchments")
+        return local_runoff_matrix, local_runoff_indices
     
     def generate_runoff_mapping_table(
         self,
@@ -314,8 +320,6 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         Fetches data for a given index.
         Returns distributed data based on rank.
         """
-        if self.local_runoff_indices is None:
-            raise RuntimeError("local_runoff_matrix not initialized. Please call build_local_runoff_matrix first.")
         current_time = self.get_time_by_index(idx)
         if is_rank_zero():
             data = self.get_data(current_time)
