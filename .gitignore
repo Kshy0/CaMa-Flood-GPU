@@ -5,7 +5,6 @@ __pycache__/
 *.npz
 *.json
 *.mod
-*.h5
 *.so
 .DS_Store
 tests/

@@ -7,9 +7,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import ClassVar, List, Optional
 
-import h5py
 import numpy as np
 from numba import njit
+from netCDF4 import Dataset
 from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, FilePath, model_validator
 
 from cmfgpu.utils import binread, find_indices_in, read_map
@@ -100,7 +100,7 @@ def compute_init_river_depth(catchment_elevation, river_height, downstream_idx):
 def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
     """Reorder by basin size."""
     groups = defaultdict(list)
-    for idx in topo_idx:                      
+    for idx in topo_idx:
         groups[basin_id[idx]].append(idx)
 
     ordered_basins = sorted(groups.keys(),
@@ -138,7 +138,7 @@ def read_bifparam(filename):
             dst = float(line[4])
             pelv = float(line[5])
             pdph = float(line[6])
-            
+
             pth_upst.append([ix, iy])
             pth_down.append([jx, jy])
             pth_dst.append(dst)
@@ -167,22 +167,22 @@ def read_bifparam(filename):
 
 class MERITMap(BaseModel):
     """
-    MERIT-based map parameter generation class using Pydantic v2.
-    
+    MERIT-based map parameter generation class using netCDF4 (.nc).
+
     This class handles the loading and processing of MERIT Hydro global hydrography data
     for CaMa-Flood-GPU simulations. It follows the AbstractModule design pattern with
     proper field validation and type safety.
-    
+
     Default configuration is for 15-minute resolution global maps.
     """
-    
+
     # Pydantic configuration
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
         validate_assignment=False,
         extra='allow'
     )
-    
+
     # === Input Configuration Fields ===
     map_dir: DirectoryPath = Field(
         description="Directory containing map files (nextxy.bin, rivlen.bin, etc.)"
@@ -192,16 +192,16 @@ class MERITMap(BaseModel):
         description="Output directory for generated input files"
     )
 
-    h5_file: str = Field(
-        description="Name of the output HDF5 file for storing map parameters",
-        default="parameters.h5"
+    nc_file: str = Field(
+        description="Name of the output NetCDF file for storing map parameters",
+        default="parameters.nc"
     )
 
     gauge_file: Optional[FilePath] = Field(
         default=None,
         description="Path to gauge information file"
     )
-    
+
     # === Physical Parameters ===
     gravity: float = Field(
         default=9.8,
@@ -217,12 +217,14 @@ class MERITMap(BaseModel):
         default=True,
         description="Generate basin visualization"
     )
-    
+
     # === File Mapping ===
     missing_value: ClassVar[float] = -9999.0
-    h5_save_keys: ClassVar[List[str]] = [
+    nc_save_keys: ClassVar[List[str]] = [
         "catchment_id",
         "downstream_id",
+        "nx",
+        "ny",
         "catchment_x",
         "catchment_y",
         "catchment_basin_id",
@@ -258,40 +260,39 @@ class MERITMap(BaseModel):
     idx_precision: ClassVar[str] = "<i4"
     map_precision: ClassVar[str] = "<f4"
     numpy_precision: ClassVar[str] = "float32"
-    
-    
+
     def _load_map_info(self) -> None:
         """Load map dimensions from mapdim.txt file."""
         mapdim_path = self.map_dir / "mapdim.txt"
-        
+
         with open(mapdim_path, "r") as f:
             lines = f.readlines()
             self.nx = int(lines[0].split('!!')[0].strip())
             self.ny = int(lines[1].split('!!')[0].strip())
-            self.num_flood_levels  = int(lines[2].split('!!')[0].strip())
+            self.num_flood_levels = int(lines[2].split('!!')[0].strip())
 
         print(f"Loaded map dimensions: nx={self.nx}, ny={self.ny}, num_flood_levels={self.num_flood_levels}")
 
     def _load_catchment_id(self) -> None:
         """Load catchment IDs and connectivity from nextxy.bin."""
         nextxy_path = self.map_dir / "nextxy.bin"
-            
+
         nextxy_data = binread(
-            nextxy_path, 
-            (self.nx, self.ny, 2), 
+            nextxy_path,
+            (self.nx, self.ny, 2),
             dtype_str=self.idx_precision
         )
-        
+
         self.map_shape = nextxy_data.shape[:2]
-        
+
         # Find valid catchments
         catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != self.missing_value)
         next_catchment_x = nextxy_data[catchment_x, catchment_y, 0] - 1
         next_catchment_y = nextxy_data[catchment_x, catchment_y, 1] - 1
-        
+
         # Create catchment IDs
         catchment_id = np.ravel_multi_index((catchment_x, catchment_y), self.map_shape)
-        
+
         # Create downstream connectivity
         downstream_id = np.full_like(next_catchment_x, -1, dtype=np.int64)
         valid_next = (next_catchment_x >= 0) & (next_catchment_y >= 0)
@@ -299,10 +300,10 @@ class MERITMap(BaseModel):
             (next_catchment_x[valid_next], next_catchment_y[valid_next]),
             self.map_shape
         )
-        
+
         # Trace to river mouths
         river_mouth_id = trace_outlets_dict(catchment_id, downstream_id)
-        
+
         # Store results
         self.catchment_x = catchment_x
         self.catchment_y = catchment_y
@@ -310,19 +311,19 @@ class MERITMap(BaseModel):
         self.downstream_id = downstream_id
         self.river_mouth_id = river_mouth_id
         self.num_catchments = len(catchment_id)
-        
+
         print(f"Loaded {len(catchment_id)} catchments")
 
     def _load_gauge_id(self) -> None:
         """Load gauge information from gauge file."""
         gauge_id_set = set()
         self.gauge_info = {}
-        
+
         if self.gauge_file is None:
             print("No gauge file provided, skipping gauge loading")
             self.gauge_id = np.array([], dtype=np.int64)
             return
-            
+
         with open(self.gauge_file, "r") as f:
             lines = f.readlines()
 
@@ -331,7 +332,7 @@ class MERITMap(BaseModel):
             data = line.split()
             if len(data) < 14:
                 raise ValueError(f"Invalid gauge data line: {line.strip()}")
-                
+
             gauge_name = int(data[0])
             lat = float(data[1])
             lon = float(data[2])
@@ -353,21 +354,21 @@ class MERITMap(BaseModel):
                 catchment_ids.append(catchment2)
                 gauge_id_set.add(catchment2)
 
-            if catchment_ids:  
+            if catchment_ids:
                 self.gauge_info[gauge_name] = {
                     "upstream_id": catchment_ids,
                     "lat": lat,
                     "lon": lon
                 }
-        
+
         if len(self.gauge_info) == 0:
             print("Warning: No valid gauges found in the gauge file")
-        
+
         self.gauge_id = np.array(sorted(gauge_id_set), dtype=np.int64)
         self.gauge_mask = np.zeros(self.num_catchments, dtype=bool)
         temp_idx = find_indices_in(self.gauge_id, self.catchment_id)
         self.gauge_mask[temp_idx] = True
-        
+
         print(f"Loaded {len(self.gauge_info)} gauges covering {len(self.gauge_id)} catchments")
 
     def _load_bifurcation_parameters(self) -> None:
@@ -403,7 +404,7 @@ class MERITMap(BaseModel):
 
         # Union-find for basin integration
         parent = np.arange(len(unique_river_mouth_id))
-        
+
         def find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
@@ -414,7 +415,7 @@ class MERITMap(BaseModel):
             ra, rb = find(a), find(b)
             if ra != rb:
                 parent[rb] = ra
-        
+
         for a, b in zip(ori_river_mouth_id, bif_river_mouth_id):
             union(id2idx[a], id2idx[b])
 
@@ -424,7 +425,7 @@ class MERITMap(BaseModel):
         # Topological sorting and basin reordering
         topo_idx = topological_sort(self.catchment_id, self.downstream_id)
         sorted_idx, basin_sizes = reorder_by_basin_size(topo_idx, root_mouth)
-        
+
         # Apply sorting
         self.catchment_id = self.catchment_id[sorted_idx]
         self.downstream_id = self.downstream_id[sorted_idx]
@@ -440,15 +441,13 @@ class MERITMap(BaseModel):
         if np.any(temp_idx == -1):
             raise ValueError("Bifurcation catchment IDs do not match catchment IDs")
         self.bifurcation_basin_id = self.catchment_basin_id[temp_idx]
-        
+
         # Create downstream indices
         self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
         self.is_river_mouth = (self.downstream_idx < 0)
         self.downstream_id[self.is_river_mouth] = self.catchment_id[self.is_river_mouth]
         # Initialize reservoir mask TODO: this should be set based on actual reservoir data
         self.is_reservoir = np.zeros_like(self.catchment_id, dtype=bool)
-        
-            
 
     def _load_parameters(self) -> None:
 
@@ -464,7 +463,7 @@ class MERITMap(BaseModel):
         self.catchment_area = _read_2d_map("ctmare.bin")
         self.downstream_distance = _read_2d_map("nxtdst.bin")
         self.downstream_distance[self.is_river_mouth] = self.river_mouth_distance
-        
+
         data = read_map(self.map_dir / "fldhgt.bin", (self.nx, self.ny, self.num_flood_levels), precision=self.map_precision)
         flood_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
         self.flood_depth_table = np.hstack([
@@ -477,7 +476,7 @@ class MERITMap(BaseModel):
         non_mouth = ~self.is_river_mouth
         if not (self.downstream_idx[non_mouth] > np.flatnonzero(non_mouth)).all():
             raise ValueError("Flow direction error: downstream catchment should have higher index")
-            
+
         if not (self.downstream_idx[self.is_river_mouth] == -1).all():
             raise ValueError("Flow direction error: river mouths should point to themselves")
 
@@ -491,17 +490,88 @@ class MERITMap(BaseModel):
 
         self.river_storage = self.river_length * self.river_width * self.river_depth
 
-    def _create_h5_file(self) -> None:
-        with h5py.File(self.out_dir / self.h5_file, 'w') as f:
-            for key in self.h5_save_keys:
+    def _create_nc_file(self) -> None:
+        """Create a NetCDF4 file and store parameters."""
+        nc_path = self.out_dir / self.nc_file
+        with Dataset(nc_path, 'w', format='NETCDF4') as ds:
+            # Global attributes
+            ds.title = "MERIT-based map parameters for CaMa-Flood-GPU"
+            ds.history = "Created by CaMa-Flood-GPU netCDF4 writer"
+
+            # Define dimensions (only if needed)
+            ds.createDimension("catchment", getattr(self, "num_catchments", 0))
+            ds.createDimension("basin", getattr(self, "num_basins", 0))
+            ds.createDimension("bifurcation_path", getattr(self, "num_bifurcation_paths", 0))
+
+            # Flood level dimension (includes the leading zero column)
+            if hasattr(self, "flood_depth_table"):
+                ds.createDimension("flood_level", int(self.flood_depth_table.shape[1]))
+            else:
+                ds.createDimension("flood_level", 0)
+
+            # Bifurcation level dimension
+            if hasattr(self, "bifurcation_width"):
+                ds.createDimension("bifurcation_level", int(self.bifurcation_width.shape[1]))
+            else:
+                ds.createDimension("bifurcation_level", 0)
+
+            # Helper to map data shapes to dims
+            def infer_dims(arr: np.ndarray):
+                shape = arr.shape
+                if shape == ():  # scalar
+                    return ()
+                if len(shape) == 1:
+                    if shape[0] == getattr(self, "num_catchments", -1):
+                        return ("catchment",)
+                    if shape[0] == getattr(self, "num_basins", -1):
+                        return ("basin",)
+                    if shape[0] == getattr(self, "num_bifurcation_paths", -1):
+                        return ("bifurcation_path",)
+                    if hasattr(self, "flood_depth_table") and shape[0] == self.flood_depth_table.shape[1]:
+                        return ("flood_level",)
+                elif len(shape) == 2:
+                    if shape[0] == getattr(self, "num_catchments", -1) and hasattr(self, "flood_depth_table") and shape[1] == self.flood_depth_table.shape[1]:
+                        return ("catchment", "flood_level")
+                    if shape[0] == getattr(self, "num_bifurcation_paths", -1) and hasattr(self, "bifurcation_width") and shape[1] == self.bifurcation_width.shape[1]:
+                        return ("bifurcation_path", "bifurcation_level")
+                # Fallback: create anonymous dims for unexpected shapes
+                dims = []
+                for i, n in enumerate(shape):
+                    dim_name = f"dim_{i}_{n}"
+                    if dim_name not in ds.dimensions:
+                        ds.createDimension(dim_name, n)
+                    dims.append(dim_name)
+                return tuple(dims)
+
+            # Write variables
+            for key in self.nc_save_keys:
                 if not hasattr(self, key):
                     raise ValueError(f"Missing required field: {key}")
                 data = getattr(self, key)
-                # Skip compression for scalar datasets
-                if np.isscalar(data) or (isinstance(data, np.ndarray) and data.shape == ()):
-                    f.create_dataset(key, data=data)
+                arr = np.array(data)
+
+                dims = infer_dims(arr)
+
+                # Choose dtype (netCDF4 may not support bool directly in all cases)
+                if arr.dtype == np.bool_:
+                    vdtype = 'u1'
+                    arr_to_write = arr.astype('u1')
                 else:
-                    f.create_dataset(key, data=data, compression='gzip')
+                    vdtype = arr.dtype
+                    arr_to_write = arr
+
+                # Compression for non-scalars
+                kwargs = {}
+                if len(dims) > 0:
+                    kwargs = dict(zlib=True, complevel=4, shuffle=True)
+
+                var = ds.createVariable(key, vdtype, dims, **kwargs)
+                var[:] = arr_to_write
+
+            # Save some useful scalar attributes as global too
+            ds.setncattr("nx", int(self.nx))
+            ds.setncattr("ny", int(self.ny))
+            ds.setncattr("num_basins", int(self.num_basins))
 
     def _visualize_basins(self) -> None:
         """Generate basin visualization if requested."""
@@ -516,12 +586,12 @@ class MERITMap(BaseModel):
         def generate_random_colors(N, avoid_rgb_colors):
             colors = []
             avoid_rgb_colors = np.array(avoid_rgb_colors)
-            
+
             while len(colors) < N:
                 color = np.random.rand(3)
                 if np.all(np.linalg.norm(avoid_rgb_colors - color, axis=1) > 0.7):
                     colors.append(color)
-            
+
             return np.array(colors)
 
         special_colors = [
@@ -558,7 +628,7 @@ class MERITMap(BaseModel):
 
             catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
             gauge_indices = [catchment_id_to_idx[cid] for cid in gauge_catchment_ids if cid in catchment_id_to_idx]
-            
+
             if gauge_indices:
                 gauge_x = self.catchment_x[gauge_indices]
                 gauge_y = self.catchment_y[gauge_indices]
@@ -585,7 +655,7 @@ class MERITMap(BaseModel):
         plt.tight_layout()
         plt.savefig(self.out_dir / f"basin_map.png", dpi=600, bbox_inches='tight')
         plt.close()
-        
+
         print(f"Saved basin visualization to {self.out_dir / f'basin_map.png'}")
 
     def _print_summary(self) -> None:
@@ -599,12 +669,11 @@ class MERITMap(BaseModel):
         print(f"Gauge catchments         : {len(self.gauge_id)}")
         print(f"Output directory         : {self.out_dir}")
 
-
     def build_model_input_pipeline(self) -> None:
         print(f"Starting MERIT Map processing pipeline")
         print(f"Map directory: {self.map_dir}")
-        print(f"Output file: {self.out_dir / self.h5_file}")
-        
+        print(f"Output file: {self.out_dir / self.nc_file}")
+
         # Core processing steps
         self._load_map_info()
         self._load_catchment_id()
@@ -613,11 +682,11 @@ class MERITMap(BaseModel):
         self._load_parameters()
         self._check_flow_direction()
         self._init_river_depth()
-        self._create_h5_file()
+        self._create_nc_file()
         if self.visualize_basins:
             self._visualize_basins()
         self._print_summary()
-        
+
         print("MERIT Map processing pipeline completed successfully")
 
     @model_validator(mode="after")
@@ -627,11 +696,12 @@ class MERITMap(BaseModel):
         return self
 
 if __name__ == "__main__":
-    map_resolution = "glb_15min" 
+    map_resolution = "glb_15min"
     merit_map = MERITMap(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
-        out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}",
-        gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
-        visualize_basins=True
+        out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
+        gauge_file=Path(f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt"),
+        visualize_basins=True,
+        nc_file="parameters.nc",
     )
     merit_map.build_model_input_pipeline()

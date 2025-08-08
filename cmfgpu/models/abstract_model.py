@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import shutil
 from abc import ABC
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Set, Literal, Optional, Self, Type
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Type
 
-import h5py
 import numpy as np
+import numpy.ma as ma
 import torch
 import torch.distributed as dist
+from netCDF4 import Dataset
 
 from pydantic import (BaseModel, ConfigDict, Field, FilePath, PrivateAttr,
                       field_validator, model_validator)
@@ -23,21 +23,21 @@ class AbstractModel(BaseModel, ABC):
     """
     Master controller for CaMa-Flood-GPU workflow using the AbstractModule hierarchy.
     """
-    
+
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
         validate_assignment=False,
         extra='forbid'
     )
-    
+
     # Class variables
     module_list: ClassVar[Dict[str, Type[AbstractModule]]] = {}
     group_by: ClassVar[str] = "group_id"  # Default group variable, override in subclasses
 
     # Instance fields
     experiment_name: str = Field(default="experiment", description="Name of the experiment")
-    input_file: FilePath = Field(default=..., description="Path to the H5 data file")
-    output_dir: Path = Field(default_factory=lambda :Path("./out"), description="Path to the H5 data file")
+    input_file: FilePath = Field(default=..., description="Path to the NetCDF (.nc) data file")
+    output_dir: Path = Field(default_factory=lambda: Path("./out"), description="Path to the output directory")
     opened_modules: List[str] = Field(default_factory=list, description="List of active modules")
     variables_to_save: Optional[List[str]] = Field(None, description="Variables to be collected during the simulation")
     precision: Literal["float32", "float64"] = Field(default="float32", description="Precision of the model")
@@ -54,7 +54,7 @@ class AbstractModel(BaseModel, ABC):
     @cached_property
     def dtype(self) -> torch.dtype:
         return torch.float32 if self.precision == "float32" else torch.float64
-    
+
     @cached_property
     def output_full_dir(self) -> Path:
         output_full_dir = self.output_dir / self.experiment_name
@@ -64,26 +64,26 @@ class AbstractModel(BaseModel, ABC):
     def log_path(self) -> Path:
         log_path = self.output_full_dir / "log.txt"
         return log_path
-    
+
     def model_post_init(self, __context):
         """
         Post-initialization hook to validate opened modules and register them.
         """
         print(f"[{self.rank}]: Initializing ModelManager with opened modules:", self.opened_modules)
         print(f"Using primary group variable: {self.group_by}")
-        
+
         # Validate that all opened modules are registered
-        module_data = self.get_h5data()
+        module_data = self.load_input()  # reads from NetCDF
         for module_name in self.opened_modules:
-            
+
             # Register the module instance with data
             module_class = self.module_list[module_name]
             module_instance = module_class(
-                opened_modules=self.opened_modules, 
+                opened_modules=self.opened_modules,
                 rank=self.rank,
                 device=self.device,
                 world_size=self.world_size,
-                precision=self.dtype, 
+                precision=self.dtype,
                 **module_data
             )
             self._modules[module_name] = module_instance
@@ -97,18 +97,18 @@ class AbstractModel(BaseModel, ABC):
     def variable_group_mapping(self) -> Dict[str, str]:
         """
         Build a mapping from each variable to its group variable.
-        
+
         Returns:
             Dictionary mapping variable_name -> group_by_name
         """
         variable_group_mapping = {}
-        
+
         # Iterate through all opened modules to collect field information
         for module_name in self.opened_modules:
             module_class = self.module_list[module_name]
             # Get all fields from the module class
             for field_name, field_info in module_class.get_model_fields().items():
-                if field_name in module_class.h5_excluded_fields:
+                if field_name in module_class.nc_excluded_fields:
                     continue
                 json_schema_extra = getattr(field_info, 'json_schema_extra', None)
                 if json_schema_extra is None:
@@ -122,13 +122,13 @@ class AbstractModel(BaseModel, ABC):
     @cached_property
     def group_id_to_rank(self) -> np.ndarray:
         """
-        Load primary group variable from H5 and compute
+        Load primary group variable from NetCDF and compute
         a full ID->rank map using compute_group_to_rank.
         """
-        with h5py.File(self.input_file, 'r') as f:
-            if self.group_by not in f:
-                raise ValueError(f"Missing primary group variable '{self.group_by}'")
-            grp = f[self.group_by][()]
+        with Dataset(self.input_file, 'r') as ds:
+            if self.group_by not in ds.variables:
+                raise ValueError(f"Missing primary group variable '{self.group_by}' in NetCDF file.")
+            grp = np.asarray(ds.variables[self.group_by][:])
         # call the new single-step Numba function
         group_id_to_rank = compute_group_to_rank(self.world_size, grp)
         return group_id_to_rank
@@ -140,8 +140,10 @@ class AbstractModel(BaseModel, ABC):
         Given a group-variable dataset and a full ID->rank map,
         return all indices that belong to this process.
         """
-        with h5py.File(self.input_file, 'r') as f:
-            data = f[group_var][()]
+        with Dataset(self.input_file, 'r') as ds:
+            if group_var not in ds.variables:
+                raise ValueError(f"Group variable '{group_var}' not found in NetCDF file.")
+            data = np.asarray(ds.variables[group_var][:])
         # boolean mask where assigned rank == current rank
         mask = (group_id_to_rank[data] == self.rank)
         return np.nonzero(mask)[0]
@@ -221,167 +223,267 @@ class AbstractModel(BaseModel, ABC):
         """
         if self._statistics_aggregator is not None:
             self._statistics_aggregator.finalize_time_step(current_time)
-    
-    def get_h5data(self) -> Dict[str, Any]:
+
+    def load_input(self) -> Dict[str, Any]:
         """
-        Load data for a specific module from the H5 file with unified distribution logic.
-        Handles cases where rank has no data.
+        Load fields by reading full datasets once and slicing in-memory per rank.
+        This implementation reads from a NetCDF (.nc) file via netCDF4.
         """
         module_data: Dict[str, torch.Tensor] = {}
-        visited_fields: Set[str] = set()  # Track visited fields to avoid duplicates
-        group_indices_cache: Dict[str, np.ndarray] = {}
-        
+
+        # Collect unique fields to load across all opened modules
+        fields_to_load: Dict[str, Any] = {}
         for module_name in self.opened_modules:
             module_class = self.module_list[module_name]
-            
-            try:
-                with h5py.File(self.input_file, 'r') as f:
-                    # Get field information from the module class
+            for field_name, field_info in module_class.get_model_fields().items():
+                if field_name in module_class.nc_excluded_fields:
+                    continue
+                if field_name not in fields_to_load:
+                    fields_to_load[field_name] = field_info
 
-                    print(f"[rank {self.rank}]: Loading data for module '{module_name}':")
-                    
-                    # Load fields based on distribution strategy
-                    for field_name, field_info in module_class.get_model_fields().items():
+        def read_var(ds: Dataset, name: str) -> np.ndarray:
+            v = ds.variables[name][:]
+            if ma.isMaskedArray(v):
+                # Fill masked values conservatively depending on dtype
+                if np.issubdtype(v.dtype, np.floating):
+                    return np.asarray(v.filled(np.nan))
+                else:
+                    return np.asarray(v.filled(-1))
+            return np.asarray(v)
 
-                        if field_name in module_class.h5_excluded_fields or field_name in visited_fields:
-                            continue
-                        
-                        # Check if field is required but missing
-                        if field_info.is_required() and field_name not in f:
-                            raise KeyError(
-                                f"Required field '{field_name}' missing from H5 file. "
-                                f"Available fields: {list(f.keys())}"
-                            )
-                        
-                        # Skip optional fields not present in H5
-                        if field_name not in f:
-                            print(f"[rank {self.rank}]: Optional field not in H5, will use default: {field_name}")
-                            continue
-                        
-                        # Check if this field needs distribution
-                        if field_name in self.variable_group_mapping:
-                            group_var = self.variable_group_mapping[field_name]
+        try:
+            with Dataset(self.input_file, "r") as ds:
+                # Validate required fields exist
+                missing_required = [
+                    name for name, info in fields_to_load.items()
+                    if info.is_required() and name not in ds.variables
+                ]
+                if missing_required:
+                    raise KeyError(
+                        f"Required fields missing from NetCDF file: {missing_required}. "
+                        f"Available fields: {list(ds.variables.keys())}"
+                    )
 
-                            if group_var in f:
-                                # Compute indices for this specific group variable
-                                if group_var not in group_indices_cache:
-                                    group_indices_cache[group_var] = self.compute_rank_indices_for_group_var(
-                                        group_var, self.group_id_to_rank
-                                    )
+                # Pre-compute indices per group var for current rank (single file open)
+                group_vars_needed = {
+                    self.variable_group_mapping[name]
+                    for name in fields_to_load.keys()
+                    if name in self.variable_group_mapping
+                }
+                group_indices_cache: Dict[str, np.ndarray] = {}
+                for group_var in group_vars_needed:
+                    if group_var not in ds.variables:
+                        raise ValueError(f"Group variable '{group_var}' not found in NetCDF file.")
+                    grp = read_var(ds, group_var)
+                    idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
+                    group_indices_cache[group_var] = idx
 
-                                current_rank_indices = group_indices_cache[group_var]
-                                
-                                if len(current_rank_indices) == 0:
-                                    raise ValueError(
-                                        f"No data found for group variable '{group_var}' on rank {self.rank} for field '{field_name}'."
-                                    )
-                                else:
-                                    # Normal case - read with indices
-                                    h5_dataset = f[field_name]
-                                    filtered_data = h5_dataset[:][current_rank_indices]
-                                    print(f"[rank {self.rank}]: Loaded distributed field: {field_name} (shape: {filtered_data.shape} group_by: {group_var})")
-                                
-                                module_data[field_name] = torch.tensor(filtered_data)
-                            else:
-                                raise ValueError(
-                                    f"Group variable '{group_var}' not found in H5 file for field '{field_name}'"
-                                )
+                print(f"[rank {self.rank}]: Loading data for modules {self.opened_modules}")
+
+                def to_torch(arr: Any) -> torch.Tensor:
+                    # Use as_tensor to avoid unnecessary copy; unify float dtype only
+                    t = torch.as_tensor(arr)
+                    if t.is_floating_point() and t.dtype != self.dtype:
+                        t = t.to(self.dtype)
+                    return t
+
+                for field_name, field_info in fields_to_load.items():
+                    if field_name not in ds.variables:
+                        print(f"[rank {self.rank}]: Optional field not in NetCDF, will use default: {field_name}")
+                        continue
+
+                    full_np = read_var(ds, field_name)
+
+                    group_var = self.variable_group_mapping.get(field_name, None)
+                    if group_var is not None:
+                        idx = group_indices_cache[group_var]
+                        if idx.size == 0:
+                            # Construct empty with correct trailing shape
+                            base_shape = full_np.shape[1:] if isinstance(full_np, np.ndarray) else ()
+                            empty_np = np.empty((0, *base_shape), dtype=getattr(full_np, "dtype", np.float32))
+                            module_data[field_name] = to_torch(empty_np)
+                            print(f"[rank {self.rank}]: No local data for distributed field: {field_name} (group_by: {group_var})")
                         else:
-                            # No group_by specified, load full data
-                            full_data = f[field_name][()]
-                            if isinstance(full_data, np.ndarray):
-                                module_data[field_name] = torch.tensor(full_data)
-                            else:
-                                module_data[field_name] = full_data
-                            print(f"[rank {self.rank}]: Loaded full field: {field_name} (no group_by)")
-                        
-                        visited_fields.add(field_name)
-                        
-            except Exception as e:
-                raise RuntimeError(f"Error loading data for module '{module_name}': {e}")
-            
+                            local_np = full_np[idx]
+                            module_data[field_name] = to_torch(local_np)
+                            print(f"[rank {self.rank}]: Loaded distributed field: {field_name} (shape: {local_np.shape}, group_by: {group_var})")
+                    else:
+                        module_data[field_name] = to_torch(full_np)
+                        print(f"[rank {self.rank}]: Loaded full field: {field_name} (no group_by)")
+
+        except Exception as e:
+            raise RuntimeError(f"Error loading data from NetCDF: {e}")
+
         return module_data
-        
-        
+
     def save_states(self, current_time: Optional[datetime]) -> None:
         """
-        Save model state to HDF5 files, handling distributed and global variable logic.
+        Save model state to NetCDF files (.nc), handling distributed and global variable logic.
         Variables not in `variable_group_mapping` are saved only by rank 0.
+        Rank>0 will skip non-distributed variables.
         """
         timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
 
         # Determine file path per-rank
         if self.world_size > 1:
-            h5_path = self.output_full_dir / f"model_state_rank{self.rank}_{timestamp}.h5"
+            nc_path = self.output_full_dir / f"model_state_rank{self.rank}_{timestamp}.nc"
         else:
-            h5_path = self.output_full_dir / f"model_state_{timestamp}.h5"
+            nc_path = self.output_full_dir / f"model_state_{timestamp}.nc"
 
-        visited_fields = set()
+        # Helpers for NetCDF writing
+        def _ensure_dim(ds: Dataset, name: str, size: Optional[int], unlimited: bool = False) -> None:
+            if name in ds.dimensions:
+                # If exists, optionally validate size (skip if unlimited or None)
+                return
+            ds.createDimension(name, None if unlimited else size)
 
-        for module_name in self.opened_modules:
-            module = self._modules[module_name]
-            try:
-                with h5py.File(h5_path, 'a') as f:
-                    for field_name in module.get_model_fields():
-                        if field_name in module.h5_excluded_fields or field_name in visited_fields:
-                            continue
+        def _infer_and_write_var(ds: Dataset, name: str, data: np.ndarray, is_distributed: bool) -> None:
+            arr = np.asarray(data)
+            # netCDF4 does not support bool reliably across libs; write as unsigned byte
+            if arr.dtype == np.bool_:
+                vtype = 'u1'
+                arr_to_write = arr.astype('u1')
+            else:
+                vtype = arr.dtype
+                arr_to_write = arr
 
-                        is_distributed = field_name in self.variable_group_mapping
+            # Define dimensions
+            if arr.ndim == 0:
+                dims = ()
+            else:
+                dims = []
+                for ax, sz in enumerate(arr.shape):
+                    dim_name = f"{name}_dim{ax}"
+                    _ensure_dim(ds, dim_name, sz, unlimited=False)
+                    dims.append(dim_name)
 
-                        # Only rank 0 saves non-distributed variables
-                        if not is_distributed and self.rank != 0:
-                            continue
+            # Create variable if missing
+            if name not in ds.variables:
+                kwargs = {}
+                if len(dims) > 0:
+                    kwargs = dict(zlib=True, complevel=self.output_complevel, shuffle=True)
+                var = ds.createVariable(name, vtype, dims, **kwargs)
+            else:
+                var = ds.variables[name]
 
-                        data = getattr(module, field_name)
-                        if isinstance(data, torch.Tensor):
-                            data = data.detach().cpu().numpy()
+            # Write data
+            if arr.ndim == 0:
+                var.assignValue(arr_to_write)
+            else:
+                var[:] = arr_to_write
 
-                        if data is not None:
-                            if np.isscalar(data) or (isinstance(data, np.ndarray) and data.shape == ()):
-                                f.create_dataset(field_name, data=data)
-                            else:
-                                f.create_dataset(field_name, data=data, compression="gzip")
-                            visited_fields.add(field_name)
+        visited_fields: set[str] = set()
+        if nc_path.exists():
+            print(f"[rank {self.rank}] Warning: Overwriting existing model state file: {nc_path}")
+        # Write per-rank file
+        with Dataset(nc_path, 'w', format='NETCDF4') as ds:
+            ds.title = "CaMa-Flood-GPU Model State (per-rank)" if self.world_size > 1 else "CaMa-Flood-GPU Model State"
+            ds.history = f"Created by CaMa-Flood-GPU at {datetime.now().isoformat()}"
+            ds.source = "AbstractModel.save_states (netCDF4)"
+            for module_name in self.opened_modules:
+                module = self._modules[module_name]
+                for field_name in module.get_model_fields():
+                    if field_name in module.nc_excluded_fields or field_name in visited_fields:
+                        continue
 
-            except Exception as e:
-                raise RuntimeError(f"Error saving data for module '{module_name}': {e}")
+                    is_distributed = field_name in self.variable_group_mapping
+
+                    # Only rank 0 saves non-distributed variables
+                    if not is_distributed and self.rank != 0:
+                        continue
+
+                    data = getattr(module, field_name)
+                    if isinstance(data, torch.Tensor):
+                        data = data.detach().cpu().numpy()
+
+                    if data is None:
+                        continue
+
+                    _infer_and_write_var(ds, field_name, np.asarray(data), is_distributed)
+                    visited_fields.add(field_name)
 
         if self.world_size > 1:
             dist.barrier()
 
         # Merge step only done by rank 0
         if self.rank == 0 and self.world_size > 1:
-            merged_path = self.output_full_dir / f"model_state_{timestamp}.h5"
-            with h5py.File(merged_path, 'w') as merged_file:
-                for rank in range(self.world_size):
-                    rank_path = self.output_full_dir / f"model_state_rank{rank}_{timestamp}.h5"
+            merged_path = self.output_full_dir / f"model_state_{timestamp}.nc"
+            offsets: Dict[str, int] = {}
+
+            with Dataset(merged_path, 'w', format='NETCDF4') as merged_ds:
+                merged_ds.title = "CaMa-Flood-GPU Model State (merged)"
+                merged_ds.history = f"Created by CaMa-Flood-GPU at {datetime.now().isoformat()}"
+                merged_ds.source = "AbstractModel.save_states (netCDF4 merge)"
+
+                for r in range(self.world_size):
+                    rank_path = self.output_full_dir / f"model_state_rank{r}_{timestamp}.nc"
                     if not rank_path.exists():
                         raise FileNotFoundError(f"Missing file: {rank_path}")
 
-                    with h5py.File(rank_path, 'r') as rank_file:
-                        for field_name in rank_file:
-                            data = rank_file[field_name][()]
-                            if field_name in merged_file:
-                                # Append distributed variable
-                                merged_dset = merged_file[field_name]
-                                merged_dset.resize((merged_dset.shape[0] + data.shape[0]), axis=0)
-                                merged_dset[-data.shape[0]:] = data
-                            else:
-                                # Create new dataset (set maxshape if we expect appending)
-                                if isinstance(data, np.ndarray) and data.ndim >= 1:
-                                    merged_file.create_dataset(
-                                        field_name,
-                                        data=data,
-                                        maxshape=(None,) + data.shape[1:],
-                                        compression='gzip'
-                                    )
-                                else:
-                                    merged_file.create_dataset(field_name, data=data)
+                    with Dataset(rank_path, 'r') as rank_ds:
+                        for var_name, var_in in rank_ds.variables.items():
+                            is_distributed = var_name in self.variable_group_mapping
+                            data = np.asarray(var_in[:])
 
-                    rank_path.unlink()
+                            # Define/create dims and variable in merged file
+                            if var_name not in merged_ds.variables:
+                                # Build dims
+                                if data.ndim == 0:
+                                    dims = ()
+                                else:
+                                    dims = []
+                                    for ax, sz in enumerate(data.shape):
+                                        if is_distributed and ax == 0:
+                                            dname = f"{var_name}_n"
+                                            _ensure_dim(merged_ds, dname, None, unlimited=True)
+                                        else:
+                                            dname = f"{var_name}_dim{ax}"
+                                            _ensure_dim(merged_ds, dname, sz, unlimited=False)
+                                        dims.append(dname)
+
+                                # Dtype handling
+                                if data.dtype == np.bool_:
+                                    vtype = 'u1'
+                                else:
+                                    vtype = data.dtype
+
+                                kwargs = {}
+                                if len(dims) > 0:
+                                    kwargs = dict(zlib=True, complevel=self.output_complevel, shuffle=True)
+                                merged_var = merged_ds.createVariable(var_name, vtype, tuple(dims), **kwargs)
+                            else:
+                                merged_var = merged_ds.variables[var_name]
+
+                            # Write/append
+                            if data.ndim == 0:
+                                # Only copy from rank 0 for non-distributed scalars
+                                if r == 0:
+                                    if data.dtype == np.bool_:
+                                        merged_var.assignValue(data.astype('u1'))
+                                    else:
+                                        merged_var.assignValue(data)
+                            else:
+                                if is_distributed:
+                                    off = offsets.get(var_name, 0)
+                                    n = data.shape[0]
+                                    if data.dtype == np.bool_:
+                                        data = data.astype('u1')
+                                    merged_var[off:off + n, ...] = data
+                                    offsets[var_name] = off + n
+                                else:
+                                    # Only copy non-distributed arrays from rank 0
+                                    if r == 0:
+                                        if data.dtype == np.bool_:
+                                            data = data.astype('u1')
+                                        merged_var[:] = data
+
+                    # Remove rank file after merging
+                    try:
+                        rank_path.unlink()
+                    except Exception:
+                        pass
 
             print(f"[rank 0] Model state merged to: {merged_path}")
-                    
 
     @field_validator("opened_modules")
     @classmethod
@@ -416,7 +518,7 @@ class AbstractModel(BaseModel, ABC):
             if not has_save_idx:
                 raise ValueError(f"Variable '{var}' does not have `save_idx` defined, and cannot be saved.")
         return self
-        
+
     @model_validator(mode="after")
     def validate_rank(self) -> Self:
         """
@@ -425,7 +527,7 @@ class AbstractModel(BaseModel, ABC):
         if self.rank < 0 or self.rank >= self.world_size:
             raise ValueError(f"Invalid rank {self.rank} for world size {self.world_size}.")
         return self
-    
+
     @model_validator(mode="after")
     def validate_output_full_dir(self) -> Self:
         if self.rank == 0:

@@ -13,7 +13,7 @@ def main():
     ### Configuration Start ###
     resolution = "glb_15min"
     experiment_name = f"{resolution}_bin"
-    input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.h5"
+    input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out/"
     opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
     variables_to_save = ["river_outflow"]

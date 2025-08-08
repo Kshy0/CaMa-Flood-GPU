@@ -1,6 +1,5 @@
 """
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
-Updated to work with the new AbstractModule hierarchy and SimulationConfig validation.
 """
 from datetime import datetime
 from functools import cached_property

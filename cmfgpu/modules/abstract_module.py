@@ -117,7 +117,7 @@ class AbstractModule(BaseModel, ABC):
     description: ClassVar[str] = "Abstract base module"
     dependencies: ClassVar[list] = []  # List of modules this module depends on
     group_by: ClassVar[Optional[str]] = None  # Variable indicating basin membership
-    h5_excluded_fields: ClassVar[List[str]] = [
+    nc_excluded_fields: ClassVar[List[str]] = [
         "opened_modules", "device", "precision"
     ]  # Fields to exclude from HDF5
 

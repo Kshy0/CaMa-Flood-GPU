@@ -39,7 +39,6 @@
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4
-  - h5py
   - and other utility packages as needed
 
 The codebase dependencies are not strict, and I think any newer version of torch will run smoothly. For example, I also successfully tested torch 2.7.0 with CUDA 12.6 version, even though CUDA 12.2 is installed on the cluster. This codebase will always rely on newer versions of python, torch, and triton for the latest feature support and optimal performance.
@@ -78,7 +77,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
 
-This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, `h5py`, and others.
+This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, and others.
 
 If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `cmfgpu` and reinstall it to ensure all required packages are correctly installed:
 

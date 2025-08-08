@@ -15,7 +15,7 @@ def benchmark_block_sizes():
     ### Benchmark Configuration ###
     experiment_name = f"benchmark_run"
     resolution = "glb_15min"
-    input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.h5"
+    input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
     variables_to_save = []
