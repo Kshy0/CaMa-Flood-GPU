@@ -96,9 +96,8 @@ def main():
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                 )
-                current_time += timedelta(seconds=time_step)
-    if rank == 0:              
-        model.save_states(current_time)
+                current_time += timedelta(seconds=time_step)         
+    model.save_states(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 

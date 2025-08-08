@@ -85,6 +85,11 @@ class ReservoirModule(AbstractModule):
         dtype="int",
     )
 
+    reservoir_basin_id: torch.Tensor = ReservoirField(
+        description="Basin ID for each reservoir (used to group reservoirs by basin)",
+        dtype="int",
+    )
+
     # ------------------------------------------------------------------ #
     # Physical properties
     # ------------------------------------------------------------------ #

@@ -83,6 +83,11 @@ class BaseModule(AbstractModule):
         dtype="int",
     )
 
+    catchment_basin_id: torch.Tensor = BaseField(
+        description="Basin ID for each catchment",
+        dtype="int",
+    )
+
     downstream_id: torch.Tensor = BaseField(
         description="ID of immediate downstream catchment (points to self at river mouth)",
         dtype="int",

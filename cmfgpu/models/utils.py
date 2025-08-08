@@ -287,7 +287,7 @@ class StatisticsAggregator:
         # Invalidate pre-computed states when new tensors are registered
         self._kernel_states = None
         
-        print(f"Registered tensor: {name} (actual_shape: {tensor.shape}, device: {tensor.device})")
+        print(f"[{self.rank}]: Registered tensor: {name} (actual_shape: {tensor.shape}, device: {tensor.device})")
     
     def initialize_streaming_aggregation(self, variable_names: List[str]) -> None:
         """

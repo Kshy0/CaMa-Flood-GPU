@@ -5,11 +5,13 @@ from abc import ABC
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Type
+from typing import Any, ClassVar, Dict, List, Set, Literal, Optional, Self, Type
 
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
+
 from pydantic import (BaseModel, ConfigDict, Field, FilePath, PrivateAttr,
                       field_validator, model_validator)
 
@@ -67,7 +69,7 @@ class AbstractModel(BaseModel, ABC):
         """
         Post-initialization hook to validate opened modules and register them.
         """
-        print(f"Initializing ModelManager (rank: {self.rank} world size: {self.world_size}) with opened modules:", self.opened_modules)
+        print(f"[{self.rank}]: Initializing ModelManager with opened modules:", self.opened_modules)
         print(f"Using primary group variable: {self.group_by}")
         
         # Validate that all opened modules are registered
@@ -225,8 +227,10 @@ class AbstractModel(BaseModel, ABC):
         Load data for a specific module from the H5 file with unified distribution logic.
         Handles cases where rank has no data.
         """
-        module_data = {}
-        visited_fields = set()  # Track visited fields to avoid duplicates
+        module_data: Dict[str, torch.Tensor] = {}
+        visited_fields: Set[str] = set()  # Track visited fields to avoid duplicates
+        group_indices_cache: Dict[str, np.ndarray] = {}
+        
         for module_name in self.opened_modules:
             module_class = self.module_list[module_name]
             
@@ -234,10 +238,9 @@ class AbstractModel(BaseModel, ABC):
                 with h5py.File(self.input_file, 'r') as f:
                     # Get field information from the module class
 
-                    print(f"Loading data for module '{module_name}' (rank {self.rank}):")
+                    print(f"[rank {self.rank}]: Loading data for module '{module_name}':")
                     
                     # Load fields based on distribution strategy
-                    
                     for field_name, field_info in module_class.get_model_fields().items():
 
                         if field_name in module_class.h5_excluded_fields or field_name in visited_fields:
@@ -252,7 +255,7 @@ class AbstractModel(BaseModel, ABC):
                         
                         # Skip optional fields not present in H5
                         if field_name not in f:
-                            print(f"  Optional field not in H5, will use default: {field_name}")
+                            print(f"[rank {self.rank}]: Optional field not in H5, will use default: {field_name}")
                             continue
                         
                         # Check if this field needs distribution
@@ -261,28 +264,28 @@ class AbstractModel(BaseModel, ABC):
 
                             if group_var in f:
                                 # Compute indices for this specific group variable
-                                current_rank_indices = self.compute_rank_indices_for_group_var(group_var, self.group_id_to_rank)
+                                if group_var not in group_indices_cache:
+                                    group_indices_cache[group_var] = self.compute_rank_indices_for_group_var(
+                                        group_var, self.group_id_to_rank
+                                    )
+
+                                current_rank_indices = group_indices_cache[group_var]
                                 
-                                # Handle empty indices case
                                 if len(current_rank_indices) == 0:
-                                    # Create empty tensor with correct dtype
-                                    h5_dataset = f[field_name]
-                                    if len(h5_dataset.shape) == 1:
-                                        empty_shape = (0,)
-                                    else:
-                                        empty_shape = (0,) + h5_dataset.shape[1:]
-                                    
-                                    filtered_data = np.empty(empty_shape, dtype=h5_dataset.dtype)
-                                    print(f"  Created empty tensor for field: {field_name} (shape: {empty_shape})")
+                                    raise ValueError(
+                                        f"No data found for group variable '{group_var}' on rank {self.rank} for field '{field_name}'."
+                                    )
                                 else:
                                     # Normal case - read with indices
                                     h5_dataset = f[field_name]
                                     filtered_data = h5_dataset[:][current_rank_indices]
-                                    print(f"  Loaded distributed field: {field_name} (shape: {filtered_data.shape} group_by: {group_var})")
+                                    print(f"[rank {self.rank}]: Loaded distributed field: {field_name} (shape: {filtered_data.shape} group_by: {group_var})")
                                 
                                 module_data[field_name] = torch.tensor(filtered_data)
                             else:
-                                raise ValueError(f"Group variable '{group_var}' not found in H5 file for field '{field_name}'")
+                                raise ValueError(
+                                    f"Group variable '{group_var}' not found in H5 file for field '{field_name}'"
+                                )
                         else:
                             # No group_by specified, load full data
                             full_data = f[field_name][()]
@@ -290,7 +293,8 @@ class AbstractModel(BaseModel, ABC):
                                 module_data[field_name] = torch.tensor(full_data)
                             else:
                                 module_data[field_name] = full_data
-                            print(f"  Loaded full field: {field_name} (no group_by)")
+                            print(f"[rank {self.rank}]: Loaded full field: {field_name} (no group_by)")
+                        
                         visited_fields.add(field_name)
                         
             except Exception as e:
@@ -298,70 +302,86 @@ class AbstractModel(BaseModel, ABC):
             
         return module_data
         
-    def save_h5data(self, module_name: str, module_instance: AbstractModule, h5_path: Path) -> None:
-        """
-        Save module data to H5 file, including both required and optional fields.
-        
-        Args:
-            module_name: Name of the module
-            module_instance: Instance of the module to save
-        """
-        
-        try:
-            with h5py.File(h5_path, 'a') as f:  # 'a' mode for append/create
-                # Get both required and optional fields from the module
-                
-                # Combine both field types
-                all_fields = module_instance.get_model_fields()
-
-                print(f"Saving module '{module_name}' data to H5 file:")
-                
-                for field_name, field_info in all_fields.items():
-                    if field_name in module_instance.h5_excluded_fields:
-                        # Skip manager-controlled fields
-                        continue
-                    if field_name in f:
-                        print(f"  Skipping already existing field in H5: {field_name}")
-                        continue
-                    
-                    value = getattr(module_instance, field_name)
-                    
-                    # Skip None values for optional fields
-                    if value is None and not field_info.is_required():
-                        print(f"  Skipping None optional field: {field_name}")
-                        continue
-
-                    if isinstance(value, torch.Tensor):
-                        # Convert tensor to numpy for H5 storage
-                        numpy_data = value.detach().cpu().numpy()
-                        f.create_dataset(field_name, data=numpy_data)
-                        print(f"  Saved tensor field: {field_name} (shape: {numpy_data.shape}, dtype: {numpy_data.dtype})")
-                    elif isinstance(value, (int, float, bool)):
-                        f.create_dataset(field_name, data=value)
-                        print(f"  Saved scalar field: {field_name} = {value}")
-                    elif isinstance(value, str):
-                        f.create_dataset(field_name, data=value.encode())
-                        print(f"  Saved string field: {field_name}")
-                    elif isinstance(value, np.ndarray):
-                        f.create_dataset(field_name, data=value)
-                        print(f"  Saved numpy array field: {field_name} (shape: {value.shape}, dtype: {value.dtype})")
-                    else:
-                        raise TypeError(f"Unsupported type for field '{field_name}': {type(value)}")
-                
-                print(f"Successfully saved module '{module_name}' data to H5 file")
-                
-        except Exception as e:
-            raise RuntimeError(f"Error saving module '{module_name}' to H5 file: {e}")
         
     def save_states(self, current_time: Optional[datetime]) -> None:
-        # Save states for all modules
+        """
+        Save model state to HDF5 files, handling distributed and global variable logic.
+        Variables not in `variable_group_mapping` are saved only by rank 0.
+        """
         timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
-        h5_path = self.output_full_dir / f"model_state_{timestamp}.h5"
+
+        # Determine file path per-rank
+        if self.world_size > 1:
+            h5_path = self.output_full_dir / f"model_state_rank{self.rank}_{timestamp}.h5"
+        else:
+            h5_path = self.output_full_dir / f"model_state_{timestamp}.h5"
+
+        visited_fields = set()
+
         for module_name in self.opened_modules:
-            module_instance = self._modules.get(module_name)
-            if module_instance is not None:
-                self.save_h5data(module_name, module_instance, h5_path)
-        print(f"Saved model states to {h5_path}")
+            module = self._modules[module_name]
+            try:
+                with h5py.File(h5_path, 'a') as f:
+                    for field_name in module.get_model_fields():
+                        if field_name in module.h5_excluded_fields or field_name in visited_fields:
+                            continue
+
+                        is_distributed = field_name in self.variable_group_mapping
+
+                        # Only rank 0 saves non-distributed variables
+                        if not is_distributed and self.rank != 0:
+                            continue
+
+                        data = getattr(module, field_name)
+                        if isinstance(data, torch.Tensor):
+                            data = data.detach().cpu().numpy()
+
+                        if data is not None:
+                            if np.isscalar(data) or (isinstance(data, np.ndarray) and data.shape == ()):
+                                f.create_dataset(field_name, data=data)
+                            else:
+                                f.create_dataset(field_name, data=data, compression="gzip")
+                            visited_fields.add(field_name)
+
+            except Exception as e:
+                raise RuntimeError(f"Error saving data for module '{module_name}': {e}")
+
+        if self.world_size > 1:
+            dist.barrier()
+
+        # Merge step only done by rank 0
+        if self.rank == 0 and self.world_size > 1:
+            merged_path = self.output_full_dir / f"model_state_{timestamp}.h5"
+            with h5py.File(merged_path, 'w') as merged_file:
+                for rank in range(self.world_size):
+                    rank_path = self.output_full_dir / f"model_state_rank{rank}_{timestamp}.h5"
+                    if not rank_path.exists():
+                        raise FileNotFoundError(f"Missing file: {rank_path}")
+
+                    with h5py.File(rank_path, 'r') as rank_file:
+                        for field_name in rank_file:
+                            data = rank_file[field_name][()]
+                            if field_name in merged_file:
+                                # Append distributed variable
+                                merged_dset = merged_file[field_name]
+                                merged_dset.resize((merged_dset.shape[0] + data.shape[0]), axis=0)
+                                merged_dset[-data.shape[0]:] = data
+                            else:
+                                # Create new dataset (set maxshape if we expect appending)
+                                if isinstance(data, np.ndarray) and data.ndim >= 1:
+                                    merged_file.create_dataset(
+                                        field_name,
+                                        data=data,
+                                        maxshape=(None,) + data.shape[1:],
+                                        compression='gzip'
+                                    )
+                                else:
+                                    merged_file.create_dataset(field_name, data=data)
+
+                    rank_path.unlink()
+
+            print(f"[rank 0] Model state merged to: {merged_path}")
+                    
 
     @field_validator("opened_modules")
     @classmethod
@@ -409,7 +429,8 @@ class AbstractModel(BaseModel, ABC):
     @model_validator(mode="after")
     def validate_output_full_dir(self) -> Self:
         if self.rank == 0:
-            if self.output_full_dir.exists():
-                shutil.rmtree(self.output_full_dir)
-            self.output_full_dir.mkdir(parents=True, exist_ok=True)
+            if not self.output_full_dir.exists():
+                self.output_full_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                print(f"Warning: Output directory {self.output_full_dir} already exists. Contents may be overwritten.")
         return self

@@ -11,7 +11,7 @@ from cmfgpu.utils import setup_distributed
 
 def main():
     ### Configuration Start ###
-    resolution = "glb_03min"
+    resolution = "glb_15min"
     experiment_name = f"{resolution}_nc"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.h5"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
@@ -93,9 +93,8 @@ def main():
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                 )
-                current_time += timedelta(seconds=time_step)
-    if rank == 0:              
-        model.save_states(current_time)
+                current_time += timedelta(seconds=time_step)           
+    model.save_states(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 

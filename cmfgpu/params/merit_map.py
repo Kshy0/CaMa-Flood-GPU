@@ -496,7 +496,12 @@ class MERITMap(BaseModel):
             for key in self.h5_save_keys:
                 if not hasattr(self, key):
                     raise ValueError(f"Missing required field: {key}")
-                f.create_dataset(key, data=getattr(self, key))
+                data = getattr(self, key)
+                # Skip compression for scalar datasets
+                if np.isscalar(data) or (isinstance(data, np.ndarray) and data.shape == ()):
+                    f.create_dataset(key, data=data)
+                else:
+                    f.create_dataset(key, data=data, compression='gzip')
 
     def _visualize_basins(self) -> None:
         """Generate basin visualization if requested."""
