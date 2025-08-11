@@ -73,7 +73,7 @@ class AbstractModel(BaseModel, ABC):
         print(f"Using primary group variable: {self.group_by}")
 
         # Validate that all opened modules are registered
-        module_data = self.load_input()  # reads from NetCDF
+        module_data = self.shard_param()  # reads from NetCDF
         for module_name in self.opened_modules:
 
             # Register the module instance with data
@@ -224,7 +224,7 @@ class AbstractModel(BaseModel, ABC):
         if self._statistics_aggregator is not None:
             self._statistics_aggregator.finalize_time_step(current_time)
 
-    def load_input(self) -> Dict[str, Any]:
+    def shard_param(self) -> Dict[str, Any]:
         """
         Load fields by reading full datasets once and slicing in-memory per rank.
         This implementation reads from a NetCDF (.nc) file via netCDF4.

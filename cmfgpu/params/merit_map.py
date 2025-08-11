@@ -218,6 +218,11 @@ class MERITMap(BaseModel):
         description="Generate basin visualization"
     )
 
+    simulate_gauged_basins_only: bool = Field(
+        default=False,
+        description="If True, only include basins that contain at least one gauge"
+    )
+
     # === File Mapping ===
     missing_value: ClassVar[float] = -9999.0
     nc_save_keys: ClassVar[List[str]] = [
@@ -365,9 +370,6 @@ class MERITMap(BaseModel):
             print("Warning: No valid gauges found in the gauge file")
 
         self.gauge_id = np.array(sorted(gauge_id_set), dtype=np.int64)
-        self.gauge_mask = np.zeros(self.num_catchments, dtype=bool)
-        temp_idx = find_indices_in(self.gauge_id, self.catchment_id)
-        self.gauge_mask[temp_idx] = True
 
         print(f"Loaded {len(self.gauge_info)} gauges covering {len(self.gauge_id)} catchments")
 
@@ -431,6 +433,7 @@ class MERITMap(BaseModel):
         self.downstream_id = self.downstream_id[sorted_idx]
         self.catchment_x = self.catchment_x[sorted_idx]
         self.catchment_y = self.catchment_y[sorted_idx]
+        self.river_mouth_id = self.river_mouth_id[sorted_idx]
         self.root_mouth = root_mouth[sorted_idx]
         self.basin_sizes = basin_sizes
         self.num_basins = len(basin_sizes)
@@ -448,6 +451,114 @@ class MERITMap(BaseModel):
         self.downstream_id[self.is_river_mouth] = self.catchment_id[self.is_river_mouth]
         # Initialize reservoir mask TODO: this should be set based on actual reservoir data
         self.is_reservoir = np.zeros_like(self.catchment_id, dtype=bool)
+
+        self.gauge_mask = np.zeros(self.catchment_id.shape[0], dtype=bool)
+        if hasattr(self, "gauge_id") and self.gauge_id.size > 0:
+            gi = find_indices_in(self.gauge_id, self.catchment_id)
+            gi = gi[gi >= 0]
+            self.gauge_mask[gi] = True
+
+    def _filter_to_gauged_basins(self) -> None:
+        """
+        Optionally keep only basins that contain at least one gauge; update all dependent arrays.
+        """
+        if not self.simulate_gauged_basins_only:
+            return
+
+        if not hasattr(self, "gauge_id") or self.gauge_id.size == 0:
+            raise ValueError("simulate_gauged_basins_only=True but no gauges were loaded.")
+
+        # Build gauge mask in current ordering
+        gauge_mask = np.zeros(self.catchment_id.shape[0], dtype=bool)
+        gi = find_indices_in(self.gauge_id, self.catchment_id)
+        gi = gi[gi >= 0]
+        gauge_mask[gi] = True
+
+        # Determine basins to keep, preserving their original relative order via first occurrence
+        kept_basin_ids, kept_first_idx = np.unique(self.catchment_basin_id[gauge_mask], return_index=True)
+        order_first = np.argsort(kept_first_idx)
+        kept_basin_ids = kept_basin_ids[order_first]
+
+        keep_mask = np.isin(self.catchment_basin_id, kept_basin_ids)
+
+        # Helper to slice catchment-level arrays (1D arrays whose leading dim == num_catchments)
+        def _slice_catchment_arr(name: str):
+            if hasattr(self, name):
+                arr = getattr(self, name)
+                if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == self.num_catchments:
+                    setattr(self, name, arr[keep_mask])
+
+        # Slice catchment-level arrays that depend on catchment dimension
+        for key in [
+            "catchment_id",
+            "downstream_id",
+            "is_river_mouth",
+            "catchment_x",
+            "catchment_y",
+            "root_mouth",
+            "catchment_basin_id",
+            "is_reservoir",
+            "river_mouth_id",
+        ]:
+            _slice_catchment_arr(key)
+
+        # Update count
+        self.num_catchments = int(self.catchment_id.shape[0])
+
+        # Reindex basin IDs to contiguous [0..num_basins-1], preserving kept basin relative order.
+        old = kept_basin_ids  # desired order
+        order_val = np.argsort(old)        # order to sort by value for searchsorted
+        old_sorted = old[order_val]
+        pos = np.empty_like(order_val)     # map from value-sorted index -> desired-order index
+        pos[order_val] = np.arange(order_val.size)
+        idx_in_sorted = np.searchsorted(old_sorted, self.catchment_basin_id)
+        self.catchment_basin_id = pos[idx_in_sorted].astype(np.int64)
+
+        self.basin_sizes = np.bincount(self.catchment_basin_id, minlength=old.size).astype(np.int64)
+        self.num_basins = int(self.basin_sizes.shape[0])
+        self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
+        self.downstream_idx[self.is_river_mouth] = -1
+
+        # Refresh gauge_mask after filtering
+        self.gauge_mask = np.zeros(self.num_catchments, dtype=bool)
+        gi = find_indices_in(self.gauge_id, self.catchment_id)
+        gi = gi[gi >= 0]
+        self.gauge_mask[gi] = True
+
+        # Filter bifurcation paths to kept basins and remap their basin ids to the new contiguous ids
+        if hasattr(self, "num_bifurcation_paths") and self.num_bifurcation_paths > 0:
+            # kept_basin_ids are in old numbering; select bifurcations within kept basins first
+            keep_bif = np.isin(self.bifurcation_basin_id, kept_basin_ids)
+
+            def _slice_bif_arr(name: str):
+                if hasattr(self, name):
+                    arr = getattr(self, name)
+                    if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == self.num_bifurcation_paths:
+                        setattr(self, name, arr[keep_bif])
+
+            for key in [
+                "bifurcation_path_id",
+                "bifurcation_catchment_id",
+                "bifurcation_downstream_id",
+                "bifurcation_manning",
+                "bifurcation_catchment_x",
+                "bifurcation_downstream_x",
+                "bifurcation_catchment_y",
+                "bifurcation_downstream_y",
+                "bifurcation_basin_id",
+                "bifurcation_width",
+                "bifurcation_length",
+                "bifurcation_elevation",
+            ]:
+                _slice_bif_arr(key)
+
+            self.num_bifurcation_paths = int(np.sum(keep_bif))
+            self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
+
+            # Remap bifurcation basin ids
+            if self.num_bifurcation_paths > 0:
+                idx_in_sorted_bif = np.searchsorted(old_sorted, self.bifurcation_basin_id)
+                self.bifurcation_basin_id = pos[idx_in_sorted_bif].astype(np.int64)
 
     def _load_parameters(self) -> None:
 
@@ -575,6 +686,8 @@ class MERITMap(BaseModel):
 
     def _visualize_basins(self) -> None:
         """Generate basin visualization if requested."""
+        if self.visualize_basins is False:
+            return
         try:
             import matplotlib.pyplot as plt
             from matplotlib.collections import LineCollection
@@ -679,12 +792,12 @@ class MERITMap(BaseModel):
         self._load_catchment_id()
         self._load_gauge_id()
         self._load_bifurcation_parameters()
+        self._filter_to_gauged_basins()
         self._load_parameters()
         self._check_flow_direction()
         self._init_river_depth()
         self._create_nc_file()
-        if self.visualize_basins:
-            self._visualize_basins()
+        self._visualize_basins()
         self._print_summary()
 
         print("MERIT Map processing pipeline completed successfully")
@@ -702,6 +815,7 @@ if __name__ == "__main__":
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
         gauge_file=Path(f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt"),
         visualize_basins=True,
+        simulate_gauged_basins_only=False,
         nc_file="parameters.nc",
     )
     merit_map.build_model_input_pipeline()
