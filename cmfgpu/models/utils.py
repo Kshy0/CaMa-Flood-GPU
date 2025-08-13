@@ -23,54 +23,45 @@ def compute_group_to_rank(world_size: int, group_assignments: np.ndarray):
     """
     Compute a mapping from each original group ID to a rank, using a greedy load balance.
 
-    Steps:
-      1. Compress original group IDs to 0..n_groups-1
-      2. Count each compressed group size via bincount
-      3. Greedily assign largest groups first to the rank with minimal current load
-      4. Expand the compressed mapping back to the full original ID space
-
     Returns:
       full_map: array of length (max_original_id+1), where
-                full_map[original_group_id] = assigned_rank
+                full_map[original_group_id] = assigned_rank (or -1 if absent)
     """
-    # 1. build a map old_id -> new_id
-    max_gid = group_assignments.max()
+    # Handle edge cases early
+    if world_size <= 0 or group_assignments.size == 0:
+        max_gid = int(group_assignments.max()) if group_assignments.size > 0 else -1
+        return np.full(max_gid + 1, -1, np.int64)
+
+    # 1) Compress original IDs → 0..n_groups-1
+    # unique_ids: sorted unique original IDs
+    # inv: for each entry in group_assignments, its compressed ID
+    unique_ids, inv = np.unique(group_assignments), None
+    # compute inv via a dense id_map:
+    max_gid = int(unique_ids[-1]) if unique_ids.size > 0 else -1
     id_map = np.full(max_gid + 1, -1, np.int64)
-    counts = np.zeros(max_gid + 1, np.int64)
-    for gid in group_assignments:
-        counts[gid] += 1
-    new_id = 0
-    for old_id in range(max_gid + 1):
-        if counts[old_id] > 0:
-            id_map[old_id] = new_id
-            new_id += 1
-    n_groups = new_id
+    id_map[unique_ids] = np.arange(unique_ids.size, dtype=np.int64)
 
-    # 2. count sizes of each compressed group
-    compressed = id_map[group_assignments]
-    group_sizes = np.bincount(compressed, minlength=n_groups)
+    inv = id_map[group_assignments]
+    n_groups = unique_ids.size
 
-    # 3. greedy assignment into ranks
+    # 2) Count sizes of each compressed group
+    group_sizes = np.bincount(inv, minlength=n_groups).astype(np.int64)
+
+    # 3) Greedy assignment: largest groups first → argmin(rank_loads)
+    order = np.argsort(group_sizes)          # ascending
     rank_loads = np.zeros(world_size, np.int64)
     comp_to_rank = np.empty(n_groups, np.int64)
-    order = np.argsort(group_sizes)  # ascending
-    for idx in order[::-1]:          # assign largest first
-        # find rank with smallest load
-        best = 0
-        best_load = rank_loads[0]
-        for r in range(1, world_size):
-            if rank_loads[r] < best_load:
-                best_load = rank_loads[r]
-                best = r
-        comp_to_rank[idx] = best
-        rank_loads[best] += group_sizes[idx]
 
-    # 4. expand back to full original ID space
+    for i in range(order.size - 1, -1, -1):  # iterate from largest to smallest
+        g = order[i]
+        r = int(np.argmin(rank_loads))       # lightest rank
+        comp_to_rank[g] = r
+        rank_loads[r] += group_sizes[g]
+
+    # 4) Expand back to the full original ID space (fill -1 for IDs not present)
     full_map = np.full(max_gid + 1, -1, np.int64)
-    for old_id in range(max_gid + 1):
-        nid = id_map[old_id]
-        if nid >= 0:
-            full_map[old_id] = comp_to_rank[nid]
+    # unique_ids are the only valid original IDs; assign directly
+    full_map[unique_ids] = comp_to_rank
 
     return full_map
 

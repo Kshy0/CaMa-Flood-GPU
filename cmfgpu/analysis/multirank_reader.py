@@ -30,6 +30,143 @@ class MultiRankStatsReader:
       - Optional coordinate variable aligned to ('saved_points',) is used as save_coord.
     """
 
+    def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> Optional[str]:
+        """Pick a ('saved_points',) variable to serve as save_coord."""
+        if self.coord_name and self.coord_name in ds.variables:
+            v = ds.variables[self.coord_name]
+            if v.dimensions == ("saved_points",) and len(v) == saved_points:
+                return self.coord_name
+
+        for name, v in ds.variables.items():
+            if name in ("time", self.var_name):
+                continue
+            if v.dimensions == ("saved_points",) and len(v) == saved_points:
+                return name
+        return None
+
+    # -----------------------------
+    # Internal: scan and parse
+    # -----------------------------
+    def _scan_rank_files(self) -> List[dict]:
+        pattern = f"{self.var_name}_rank*.nc"
+        files = sorted(self.base_dir.glob(pattern))
+        rank_infos: List[dict] = []
+        rank_re = re.compile(rf"{re.escape(self.var_name)}_rank(\d+)\.nc$")
+
+        for fp in files:
+            try:
+                with nc.Dataset(fp, "r") as ds:
+                    if self.var_name not in ds.variables:
+                        continue
+                    var = ds.variables[self.var_name]
+                    dims = var.dimensions
+                    has_levels = len(dims) == 3 and dims[-1] == "levels"
+                    n_levels = int(ds.dimensions["levels"].size) if has_levels else 0
+                    saved_points = int(ds.dimensions["saved_points"].size)
+
+                    coord_name = self._select_coord_name(ds, saved_points)
+                    coord_raw = None
+                    if coord_name is not None:
+                        coord_raw = np.array(ds.variables[coord_name][:])
+
+                    rank_infos.append(
+                        {
+                            "path": fp,
+                            "saved_points": saved_points,
+                            "has_levels": has_levels,
+                            "n_levels": n_levels,
+                            "coord_name": coord_name,
+                            "coord_raw": coord_raw,
+                            "x": None,
+                            "y": None,
+                        }
+                    )
+            except Exception as e:
+                print(f"Warning: skipping file {fp.name}, reason: {e}")
+
+        def _rank_key(info: dict):
+            m = rank_re.search(info["path"].name)
+            return int(m.group(1)) if m else 1_000_000
+
+        rank_infos.sort(key=_rank_key)
+        return rank_infos
+
+    def _read_time_axis(self) -> None:
+        if not self._rank_files:
+            raise RuntimeError("No rank files loaded.")
+
+        with nc.Dataset(self._rank_files[0]["path"], "r") as ds0:
+            tvar = ds0.variables["time"]
+            self._time_units = getattr(tvar, "units")
+            self._time_calendar = getattr(tvar, "calendar", "standard")
+            t0 = np.array(tvar[:])
+            self._time_values_num = t0
+            self._time_datetimes = nc.num2date(
+                t0, units=self._time_units, calendar=self._time_calendar
+            ).tolist()
+            self._time_len = len(t0)
+
+        for info in self._rank_files[1:]:
+            with nc.Dataset(info["path"], "r") as dsi:
+                tvar = dsi.variables["time"]
+                if len(tvar) != self._time_len:
+                    print(
+                        f"Warning: {info['path'].name} has {len(tvar)} time steps, "
+                        f"mismatch with first file {self._time_len}. Truncating to min length."
+                    )
+                    self._time_len = min(self._time_len, len(tvar))
+                units = getattr(tvar, "units")
+                cal = getattr(tvar, "calendar", "standard")
+                if units != self._time_units or cal != self._time_calendar:
+                    print(
+                        f"Warning: {info['path'].name} time units/calendar mismatch; using first file settings: "
+                        f"units={self._time_units}, calendar={self._time_calendar}"
+                    )
+
+        if self._time_len < len(self._time_values_num):
+            self._time_values_num = self._time_values_num[: self._time_len]
+            self._time_datetimes = self._time_datetimes[: self._time_len]
+
+    def _compute_all_xy(self, force: bool = False) -> None:
+        """
+        Compute (x, y) for each rank:
+          - If custom converter provided, use converter(coord_raw) -> (x, y).
+          - Else, if map_shape exists and coord_raw is a linear index in [0, nx*ny), use unravel_index.
+          - Else, keep None to indicate no grid projection is available.
+        """
+        for info in self._rank_files:
+            if info["coord_raw"] is None or info["saved_points"] == 0:
+                info["x"], info["y"] = None, None
+                continue
+
+            if (info["x"] is not None and info["y"] is not None) and not force:
+                continue
+
+            if self._coord_converter is not None:
+                try:
+                    x, y = self._coord_converter(info["coord_raw"])
+                    info["x"] = np.asarray(x, dtype=np.int64)
+                    info["y"] = np.asarray(y, dtype=np.int64)
+                    continue
+                except Exception as e:
+                    print(f"Custom coord converter failed ({info['path'].name}): {e}. Trying fallback.")
+
+            if self._map_shape is not None:
+                nx_, ny_ = self._map_shape
+                total = nx_ * ny_
+                flat = np.asarray(info["coord_raw"]).astype(np.int64)
+                if flat.ndim == 1 and np.all((flat >= 0) & (flat < total)):
+                    x, y = np.unravel_index(flat, (nx_, ny_))
+                    info["x"] = x.astype(np.int64)
+                    info["y"] = y.astype(np.int64)
+                else:
+                    info["x"], info["y"] = None, None
+                    print(
+                        f"Note: {info['path'].name} save_coord is not a valid linear index; cannot auto-convert."
+                    )
+            else:
+                info["x"], info["y"] = None, None
+
     def __init__(
         self,
         base_dir: Union[str, Path],
@@ -193,143 +330,6 @@ class MultiRankStatsReader:
         """Set a custom single-argument converter: converter(coord_raw) -> (x, y)."""
         self._coord_converter = converter
         self._compute_all_xy(force=True)
-
-    # -----------------------------
-    # Internal: scan and parse
-    # -----------------------------
-    def _scan_rank_files(self) -> List[dict]:
-        pattern = f"{self.var_name}_rank*.nc"
-        files = sorted(self.base_dir.glob(pattern))
-        rank_infos: List[dict] = []
-        rank_re = re.compile(rf"{re.escape(self.var_name)}_rank(\d+)\.nc$")
-
-        for fp in files:
-            try:
-                with nc.Dataset(fp, "r") as ds:
-                    if self.var_name not in ds.variables:
-                        continue
-                    var = ds.variables[self.var_name]
-                    dims = var.dimensions
-                    has_levels = len(dims) == 3 and dims[-1] == "levels"
-                    n_levels = int(ds.dimensions["levels"].size) if has_levels else 0
-                    saved_points = int(ds.dimensions["saved_points"].size)
-
-                    coord_name = self._select_coord_name(ds, saved_points)
-                    coord_raw = None
-                    if coord_name is not None:
-                        coord_raw = np.array(ds.variables[coord_name][:])
-
-                    rank_infos.append(
-                        {
-                            "path": fp,
-                            "saved_points": saved_points,
-                            "has_levels": has_levels,
-                            "n_levels": n_levels,
-                            "coord_name": coord_name,
-                            "coord_raw": coord_raw,
-                            "x": None,
-                            "y": None,
-                        }
-                    )
-            except Exception as e:
-                print(f"Warning: skipping file {fp.name}, reason: {e}")
-
-        def _rank_key(info: dict):
-            m = rank_re.search(info["path"].name)
-            return int(m.group(1)) if m else 1_000_000
-
-        rank_infos.sort(key=_rank_key)
-        return rank_infos
-
-    def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> Optional[str]:
-        """Pick a ('saved_points',) variable to serve as save_coord."""
-        if self.coord_name and self.coord_name in ds.variables:
-            v = ds.variables[self.coord_name]
-            if v.dimensions == ("saved_points",) and len(v) == saved_points:
-                return self.coord_name
-
-        for name, v in ds.variables.items():
-            if name in ("time", self.var_name):
-                continue
-            if v.dimensions == ("saved_points",) and len(v) == saved_points:
-                return name
-        return None
-
-    def _read_time_axis(self) -> None:
-        if not self._rank_files:
-            raise RuntimeError("No rank files loaded.")
-
-        with nc.Dataset(self._rank_files[0]["path"], "r") as ds0:
-            tvar = ds0.variables["time"]
-            self._time_units = getattr(tvar, "units")
-            self._time_calendar = getattr(tvar, "calendar", "standard")
-            t0 = np.array(tvar[:])
-            self._time_values_num = t0
-            self._time_datetimes = nc.num2date(
-                t0, units=self._time_units, calendar=self._time_calendar
-            ).tolist()
-            self._time_len = len(t0)
-
-        for info in self._rank_files[1:]:
-            with nc.Dataset(info["path"], "r") as dsi:
-                tvar = dsi.variables["time"]
-                if len(tvar) != self._time_len:
-                    print(
-                        f"Warning: {info['path'].name} has {len(tvar)} time steps, "
-                        f"mismatch with first file {self._time_len}. Truncating to min length."
-                    )
-                    self._time_len = min(self._time_len, len(tvar))
-                units = getattr(tvar, "units")
-                cal = getattr(tvar, "calendar", "standard")
-                if units != self._time_units or cal != self._time_calendar:
-                    print(
-                        f"Warning: {info['path'].name} time units/calendar mismatch; using first file settings: "
-                        f"units={self._time_units}, calendar={self._time_calendar}"
-                    )
-
-        if self._time_len < len(self._time_values_num):
-            self._time_values_num = self._time_values_num[: self._time_len]
-            self._time_datetimes = self._time_datetimes[: self._time_len]
-
-    def _compute_all_xy(self, force: bool = False) -> None:
-        """
-        Compute (x, y) for each rank:
-          - If custom converter provided, use converter(coord_raw) -> (x, y).
-          - Else, if map_shape exists and coord_raw is a linear index in [0, nx*ny), use unravel_index.
-          - Else, keep None to indicate no grid projection is available.
-        """
-        for info in self._rank_files:
-            if info["coord_raw"] is None or info["saved_points"] == 0:
-                info["x"], info["y"] = None, None
-                continue
-
-            if (info["x"] is not None and info["y"] is not None) and not force:
-                continue
-
-            if self._coord_converter is not None:
-                try:
-                    x, y = self._coord_converter(info["coord_raw"])
-                    info["x"] = np.asarray(x, dtype=np.int64)
-                    info["y"] = np.asarray(y, dtype=np.int64)
-                    continue
-                except Exception as e:
-                    print(f"Custom coord converter failed ({info['path'].name}): {e}. Trying fallback.")
-
-            if self._map_shape is not None:
-                nx_, ny_ = self._map_shape
-                total = nx_ * ny_
-                flat = np.asarray(info["coord_raw"]).astype(np.int64)
-                if flat.ndim == 1 and np.all((flat >= 0) & (flat < total)):
-                    x, y = np.unravel_index(flat, (nx_, ny_))
-                    info["x"] = x.astype(np.int64)
-                    info["y"] = y.astype(np.int64)
-                else:
-                    info["x"], info["y"] = None, None
-                    print(
-                        f"Note: {info['path'].name} save_coord is not a valid linear index; cannot auto-convert."
-                    )
-            else:
-                info["x"], info["y"] = None, None
 
     # -----------------------------
     # Data read

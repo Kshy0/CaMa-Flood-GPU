@@ -10,38 +10,17 @@
 
 ---
 
-## WSL2 & SLURM Configuration Notes
-
-- **WSL2:** Ensure your WSL2 instance can access your GPU (NVIDIA drivers and CUDA toolkit installed on Windows).  
-  - It's recommended to follow the [WSL2 CUDA support](https://docs.nvidia.com/cuda/wsl-user-guide/index.html).
-  - A successful CUDA installation is confirmed when `nvidia-smi` shows your GPU information correctly in the terminal.
-  
-- **SLURM:** 
-
-  - Ensure that the GPU drivers and CUDA toolkit are correctly installed on your compute cluster.
-
-  - I have applied for a GPU node, connected to the corresponding compute node via `ssh`, and executed the following commands. (please adapt them as needed for your environment — for example, `scl/gcc11.2` may not be available on all systems):
-
-    ```bash
-    module load scl/gcc11.2
-    OMP_NUM_THREADS=4 # based on your machine
-    ```
-  
-- Job submission via `sbatch` is being tested and will be updated soon.
-
----
-
 ## Prerequisites
 
 - Python == 3.13.5  
-- PyTorch (with CUDA support) == 2.7.1+cu128
-- Triton == 3.3.1
+- PyTorch (with CUDA support) == 2.8.0+cu129
+- Triton == 3.4.0
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4
   - and other utility packages as needed
 
-The codebase dependencies are not strict, and I think any newer version of torch will run smoothly. For example, I also successfully tested torch 2.7.0 with CUDA 12.6 version, even though CUDA 12.2 is installed on the cluster. This codebase will always rely on newer versions of python, torch, and triton for the latest feature support and optimal performance.
+The installable version of torch depends on your system. This project will always rely on the official latest releases of torch and triton for the newest features and optimal performance. Tests have confirmed that the project can also run with torch 2.6.0 and CUDA 12.4.
 
 In theory, the codebase should also run on AMD GPUs, but I haven’t had the chance to test that setup yet.
 
@@ -61,15 +40,15 @@ cd CaMa-Flood-GPU
 It is recommended to use a virtual environment (`venv` or `conda`).
 
 Please follow the official [PyTorch installation guide](https://pytorch.org/get-started/locally/) for your environment. 
-For CUDA 12.8, you may use:
+For CUDA 12.9, you may use:
 
 ```shell
-pip3 install torch --index-url https://download.pytorch.org/whl/cu128
+pip install torch --index-url https://download.pytorch.org/whl/cu129
 ```
 
-> **Note:** By default, `triton` will be installed automatically when you install PyTorch. You don't need to install packages `torchvision` and `torchaudio` as stated in the official manual.
+> **Note:** By default, `triton` will be installed automatically when you install PyTorch. You don't need to install packages `torchvision` or `torchaudio` as stated in the official manual.
 >
-> Sometimes, the above command may not be compatible with your system—for example, your environment might not yet support CUDA 12.8. In that case, you can slightly modify the command (e.g., simply run `pip3 install torch`) to install a version of PyTorch compatible with CUDA 12.6.
+> Sometimes, the above command may not be compatible with your system. For example, on some clusters running older systems, you can use pip index versions torch to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
 ### 3. Install other dependencies
 
@@ -78,13 +57,6 @@ pip install -e .
 ```
 
 This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, and others.
-
-If you later clone or pull a newer version of the repository and notice that `setup.py` includes updated or additional dependencies, it is recommended to uninstall `cmfgpu` and reinstall it to ensure all required packages are correctly installed:
-
-```bash
-pip uninstall cmfgpu
-pip install -e .
-```
 
 ---
 
@@ -105,10 +77,16 @@ if __name__ == "__main__":
     merit_map = MERITMap(
         map_dir="/your/path/to/map",
         out_dir="/your/path/to/output",
+        bifori_file="/your/path/to/bifori.txt",  # Optional
         gauge_file="/your/path/to/gauge_file.txt",  # Optional
-        visualize_basins=False
+        visualize_basins=False,
+        target_gpus=4
     )
 ```
+
+The `target_gpus` parameter specifies the number of GPUs for basin workload distribution.
+In high-resolution cases—especially with `glb_03min` or finer maps—too many bifurcations may merge large basins, causing severe load imbalance on 4+ GPU runs.
+This option lets CaMa-Flood-GPU cut a small number of inter-basin links to improve balance.
 
 - ### 1. Prepare data
 
@@ -118,7 +96,7 @@ if __name__ == "__main__":
   
   ### 2. Generate parameters
 
-  For `glb_15min` maps, the `cmf_v420_pkg` contains the estimated river channel parameters. So no additional work is required to run this GPU program. If you want to use a higher resolution map, please refer to the instructions in the original Fortran repository. You need to compile the Fortran code and [generate river channel parameters](https://github.com/global-hydrodynamics/CaMa-Flood_v4/blob/master/map/src/src_param/s01-channel_params.sh) , such as `rivhgt.bin`, `rivwth_gwdlr.bin`, and `bifprm.txt`.
+  For `glb_15min` maps, the `cmf_v420_pkg` contains the estimated river channel parameters. So no additional work is required to run this GPU program. If you want to use a higher resolution map, please refer to the instructions in the original Fortran repository. You need to compile the Fortran code and [generate river channel parameters](https://github.com/global-hydrodynamics/CaMa-Flood_v4/blob/master/map/src/src_param/s01-channel_params.sh) , such as `rivhgt.bin`, `rivwth_gwdlr.bin`.
   
   ```shell
   cd /path/to/CaMa-Flood-GPU

@@ -6,10 +6,10 @@ from typing import Tuple
 import numpy as np
 from netCDF4 import Dataset
 
-from cmfgpu.datasets.abstract_dataset import DefaultDataset
+from cmfgpu.datasets.abstract_dataset import AbstractDataset
 
 
-class YearlyNetCDFDataset(DefaultDataset):
+class YearlyNetCDFDataset(AbstractDataset):
     def __init__(self,
                  base_dir: str,
                  start_date: datetime,

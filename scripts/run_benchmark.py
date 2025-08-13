@@ -94,7 +94,7 @@ def benchmark_block_sizes():
 
         for batch_runoff in loader:
             with torch.cuda.stream(stream):
-                batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
+                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
                 for runoff in batch_runoff:
                     model.step_advance(
                         runoff=runoff,
@@ -119,4 +119,3 @@ def benchmark_block_sizes():
 
 if __name__ == "__main__":
     benchmark_block_sizes()
-

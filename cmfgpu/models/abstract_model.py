@@ -11,7 +11,6 @@ import numpy.ma as ma
 import torch
 import torch.distributed as dist
 from netCDF4 import Dataset
-
 from pydantic import (BaseModel, ConfigDict, Field, FilePath, PrivateAttr,
                       field_validator, model_validator)
 
@@ -316,7 +315,7 @@ class AbstractModel(BaseModel, ABC):
 
         return module_data
 
-    def save_states(self, current_time: Optional[datetime]) -> None:
+    def save_state(self, current_time: Optional[datetime]) -> None:
         """
         Save model state to NetCDF files (.nc), handling distributed and global variable logic.
         Variables not in `variable_group_mapping` are saved only by rank 0.

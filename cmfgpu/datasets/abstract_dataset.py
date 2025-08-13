@@ -1,7 +1,7 @@
 import os
 from abc import ABC, abstractmethod
-from functools import cached_property
 from datetime import datetime
+from functools import cached_property
 from pathlib import Path
 from typing import Literal, Tuple
 
@@ -10,7 +10,8 @@ import torch
 import torch.distributed as dist
 from scipy.sparse import csr_matrix
 
-from cmfgpu.utils import binread, find_indices_in, read_map, is_rank_zero
+from cmfgpu.utils import binread, find_indices_in, is_rank_zero, read_map
+
 
 def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
     """
@@ -46,7 +47,7 @@ def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
 
     return runoff_id
 
-class DefaultDataset(torch.utils.data.Dataset, ABC):
+class AbstractDataset(torch.utils.data.Dataset, ABC):
     """
     Custom abstract class that inherits from PyTorch Dataset.
     Defines a common interface for accessing data with distributed support.
@@ -55,7 +56,7 @@ class DefaultDataset(torch.utils.data.Dataset, ABC):
         super().__init__(*args, **kwargs)
         self.out_dtype = out_dtype
 
-    def apply_runoff_to_catchments(self, 
+    def shard_forcing(self, 
                                    batch_runoff: torch.Tensor, 
                                    local_runoff_matrix: torch.Tensor, 
                                    local_runoff_indices: torch.Tensor,

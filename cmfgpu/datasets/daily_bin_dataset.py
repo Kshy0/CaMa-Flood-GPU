@@ -5,14 +5,38 @@ from typing import List, Tuple
 
 import numpy as np
 
-from cmfgpu.datasets.abstract_dataset import DefaultDataset
+from cmfgpu.datasets.abstract_dataset import AbstractDataset
 
 
-class DailyBinDataset(DefaultDataset):
+class DailyBinDataset(AbstractDataset):
     """
     Example of a Dataset class that reads daily binary files.
     Each bin file contains one day's data.
     """
+
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset based on the time range.
+        """
+        return (self.end_date - self.start_date).days + 1
+    
+    def _validate_files_exist(self):
+        """
+        Validates that all expected files between start_date and end_date exist.
+        """
+        missing_files = []
+        for idx in range(self.__len__()):
+            date = self.get_time_by_index(idx)
+            filename = f"{self.prefix}{date:%Y%m%d}{self.suffix}"
+            file_path = Path(self.base_dir) / filename
+            if not file_path.exists():
+                missing_files.append(str(file_path))
+        
+        if missing_files:
+            raise FileNotFoundError(
+                f"The following required data files are missing:\n" +
+                "\n".join(missing_files)
+            )
         
     def __init__(self,
                  base_dir: str,
@@ -63,30 +87,6 @@ class DailyBinDataset(DefaultDataset):
     
     def close(self):
         pass
-
-    def __len__(self):
-        """
-        Returns the total number of samples in the dataset based on the time range.
-        """
-        return (self.end_date - self.start_date).days + 1
-    
-    def _validate_files_exist(self):
-        """
-        Validates that all expected files between start_date and end_date exist.
-        """
-        missing_files = []
-        for idx in range(self.__len__()):
-            date = self.get_time_by_index(idx)
-            filename = f"{self.prefix}{date:%Y%m%d}{self.suffix}"
-            file_path = Path(self.base_dir) / filename
-            if not file_path.exists():
-                missing_files.append(str(file_path))
-        
-        if missing_files:
-            raise FileNotFoundError(
-                f"The following required data files are missing:\n" +
-                "\n".join(missing_files)
-            )
 
 if __name__ == "__main__":
     resolution = "glb_15min"

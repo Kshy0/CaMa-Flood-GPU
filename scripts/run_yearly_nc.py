@@ -85,7 +85,7 @@ def main():
     stream = torch.cuda.Stream(device=device)
     for batch_runoff in loader:
         with torch.cuda.stream(stream):
-            batch_runoff = dataset.apply_runoff_to_catchments(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
+            batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
                 model.step_advance(
                     runoff=runoff,
@@ -94,7 +94,7 @@ def main():
                     current_time=current_time,
                 )
                 current_time += timedelta(seconds=time_step)           
-    model.save_states(current_time)
+    model.save_state(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 
