@@ -25,6 +25,7 @@ def benchmark_block_sizes():
     batch_size = 8
     loader_workers = 2
     prefetch_factor = 2
+    save_state = False
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
@@ -83,7 +84,8 @@ def benchmark_block_sizes():
     )
 
     results = []
-    print("Benchmarking BLOCK_SIZE...")
+    if rank == 0:
+        print("Benchmarking BLOCK_SIZE...")
 
     for block_size in BLOCK_SIZE_LIST:
         model.BLOCK_SIZE = block_size
@@ -109,7 +111,8 @@ def benchmark_block_sizes():
 
         elapsed_ms = (end - start) * 1000
         results.append((block_size, elapsed_ms))
-
+    if save_state:  
+        model.save_state(current_time)
     if world_size > 1:
         dist.destroy_process_group()
     if rank == 0:

@@ -26,7 +26,7 @@ def main():
     output_complevel = 4 
     prefetch_factor = 2
     BLOCK_SIZE = 128
-    ### Configuration End ###
+    save_state = False
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
@@ -37,6 +37,7 @@ def main():
     bin_dtype = "float32"
     prefix = "Roff____"
     suffix = ".one"
+    ### Configuration End ###
 
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
@@ -97,7 +98,8 @@ def main():
                     current_time=current_time,
                 )
                 current_time += timedelta(seconds=time_step)         
-    model.save_state(current_time)
+    if save_state:  
+        model.save_state(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 

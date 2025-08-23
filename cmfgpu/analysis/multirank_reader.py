@@ -556,7 +556,7 @@ class MultiRankStatsReader:
         out_dir: Union[str, Path],
         out_var_name: str,
         t_range: Optional[Tuple[int, int]] = None,
-        fill_value: float = -9999.0,
+        fill_value: float = 1e20,
         dtype: np.dtype = np.float32,
         progress: bool = True,
     ) -> None:

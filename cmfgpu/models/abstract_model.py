@@ -336,7 +336,7 @@ class AbstractModel(BaseModel, ABC):
                 return
             ds.createDimension(name, None if unlimited else size)
 
-        def _infer_and_write_var(ds: Dataset, name: str, data: np.ndarray, is_distributed: bool) -> None:
+        def _infer_and_write_var(ds: Dataset, name: str, data: np.ndarray, output_complevel: int) -> None:
             arr = np.asarray(data)
             # netCDF4 does not support bool reliably across libs; write as unsigned byte
             if arr.dtype == np.bool_:
@@ -360,7 +360,7 @@ class AbstractModel(BaseModel, ABC):
             if name not in ds.variables:
                 kwargs = {}
                 if len(dims) > 0:
-                    kwargs = dict(zlib=True, complevel=self.output_complevel, shuffle=True)
+                    kwargs = dict(zlib=True, complevel=output_complevel, shuffle=True)
                 var = ds.createVariable(name, vtype, dims, **kwargs)
             else:
                 var = ds.variables[name]
@@ -398,7 +398,7 @@ class AbstractModel(BaseModel, ABC):
                     if data is None:
                         continue
 
-                    _infer_and_write_var(ds, field_name, np.asarray(data), is_distributed)
+                    _infer_and_write_var(ds, field_name, np.asarray(data), output_complevel=self.output_complevel if self.world_size == 1 else 0)
                     visited_fields.add(field_name)
 
         if self.world_size > 1:

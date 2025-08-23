@@ -26,7 +26,7 @@ def main():
     unit_factor = 86400000
     prefetch_factor = 2
     BLOCK_SIZE = 128
-    ### Configuration End ###
+    save_state = False
 
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 12, 31)
@@ -35,6 +35,7 @@ def main():
     prefix = "e2o_ecmwf_wrr2_glob15_day_Runoff_"
     suffix = ".nc"
     var_name = "Runoff"
+    ### Configuration End ###
 
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
@@ -94,7 +95,8 @@ def main():
                     current_time=current_time,
                 )
                 current_time += timedelta(seconds=time_step)           
-    model.save_state(current_time)
+    if save_state:  
+        model.save_state(current_time)
     if world_size > 1:
         dist.destroy_process_group()
 

@@ -99,7 +99,7 @@ class LogModule(AbstractModule):
         This method should be called after each time step to collect data.
         """
         for field in self.log_vars:
-            dist.all_reduce(getattr(self, field), op=dist.ReduceOp.SUM)
+            dist.reduce(getattr(self, field), dst=0, op=dist.ReduceOp.SUM)
 
     def write_step(self, log_path: Path) -> None:
         if not log_path.exists():

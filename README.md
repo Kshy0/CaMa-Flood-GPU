@@ -1,7 +1,5 @@
 # CaMa-Flood-GPU
 
-## Introduction
-
 **CaMa-Flood-GPU** is a high-performance, GPU-accelerated re-implementation of the [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) hydrodynamic model. This project leverages the [Triton](https://github.com/openai/triton) language and the [PyTorch](https://github.com/pytorch/pytorch) tensor ecosystem to achieve rapid, scalable global river simulations. By using Triton's custom GPU kernels and PyTorch's tensor abstraction, CaMa-Flood-GPU delivers significant speed-ups over both the original Fortran and the MATLAB-based versions introduced during [the CaMa-Flood developer/user international meeting 2024](https://global-hydrodynamics.github.io/cmf-meet-2024/).
 
 **Note:** This repository is under active development, and both the code structure and content are subject to significant changes at any time.
@@ -48,7 +46,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu129
 
 > **Note:** By default, `triton` will be installed automatically when you install PyTorch. You don't need to install packages `torchvision` or `torchaudio` as stated in the official manual.
 >
-> Sometimes, the above command may not be compatible with your system. For example, on some clusters running older systems, you can use pip index versions torch to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
+> Sometimes, the above command may not be compatible with your system. For example, on some clusters running older systems, you can use `pip index versions torch` to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
 ### 3. Install other dependencies
 
@@ -166,14 +164,6 @@ This option lets CaMa-Flood-GPU cut a small number of inter-basin links to impro
   **Benchmark:** `test1-glb_15min`, simulation from 2000-01-01 to 2000-12-31 with `adaptive_time_step` enabled runs in ~32 seconds (single 4070Ti GPU + i7-13700 CPU)—even faster than the MATLAB version.
 - **Modular design:** The codebase is structured for easy expansion and maintenance, allowing users to add or replace modules as needed.
 - **Scalable architecture:** This codebase is designed to be suitable for multi-node, multi-GPU. It has the ability to simulate floods on extremely high-resolution geographic maps.
-
----
-
-## Roadmap & To-Do
-
-1. **Handle the huge basin with bifurcation:** Some finer resolution maps like glb_01min may connect previously separate large basins due to bifurcations, leading to load imbalance across multiple GPUs. Possible solutions include: (1) disabling some bifurcation links between large basins like Fortran version, or (2) enabling inter-GPU communication—which may require significant effort to implement.
-
-2. **Parameter calibration:** Develop tools for easier model tuning and result analysis.
 
 ---
 
