@@ -16,7 +16,7 @@ def main():
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out/"
     opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
-    variables_to_save = ["river_outflow"]
+    variables_to_save = {"mean": ["river_outflow"], "last": ["river_depth"]}
     precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360

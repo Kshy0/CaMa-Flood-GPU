@@ -4,7 +4,7 @@ from abc import ABC
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Type
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Type, Union
 
 import numpy as np
 import numpy.ma as ma
@@ -38,7 +38,11 @@ class AbstractModel(BaseModel, ABC):
     input_file: FilePath = Field(default=..., description="Path to the NetCDF (.nc) data file")
     output_dir: Path = Field(default_factory=lambda: Path("./out"), description="Path to the output directory")
     opened_modules: List[str] = Field(default_factory=list, description="List of active modules")
-    variables_to_save: Optional[List[str]] = Field(None, description="Variables to be collected during the simulation")
+    # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
+    # one variable can appear under multiple ops.
+    variables_to_save: Optional[Dict[str, Union[str, List[str]]]] = Field(
+        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last."
+    )
     precision: Literal["float32", "float64"] = Field(default="float32", description="Precision of the model")
     world_size: int = Field(default=1, description="Total number of distributed processes")
     rank: int = Field(default=0, description="Current process rank in distributed setup")
@@ -165,7 +169,25 @@ class AbstractModel(BaseModel, ABC):
 
         registered_vars = set()
 
-        for var_name in self.variables_to_save:
+        # Normalize variables_to_save (op -> vars) into var -> set[ops]
+        allowed_ops = {"mean", "max", "min", "last"}
+        var_to_ops: Dict[str, List[str]] = {}
+        for op, vars_val in self.variables_to_save.items():
+            op_l = str(op).lower()
+            if op_l not in allowed_ops:
+                raise ValueError(f"Invalid op '{op}'. Allowed: {sorted(allowed_ops)}")
+            if isinstance(vars_val, str):
+                names = [vars_val]
+            elif isinstance(vars_val, list):
+                names = list(vars_val)
+            else:
+                raise ValueError(f"variables_to_save['{op}'] must be a string or list of strings")
+            for name in names:
+                var_to_ops.setdefault(name, [])
+                if op_l not in var_to_ops[name]:
+                    var_to_ops[name].append(op_l)
+
+        for var_name in var_to_ops.keys():
             for module_name in self.opened_modules:
                 module_instance = self.get_module(module_name)
                 if not hasattr(module_instance, var_name):
@@ -206,15 +228,15 @@ class AbstractModel(BaseModel, ABC):
                 break  # break once var_name is found in a module
 
         self._statistics_aggregator.initialize_streaming_aggregation(
-            variable_names=self.variables_to_save
+            variable_ops=var_to_ops
         )
 
-    def update_statistics(self, weight: int, refresh: bool = False, BLOCK_SIZE: int = 128) -> None:
+    def update_statistics(self, weight: int, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
         """
         Call the statistics aggregator to update mean values at current step.
         """
         if self._statistics_aggregator is not None:
-            self._statistics_aggregator.update_statistics(weight, refresh, BLOCK_SIZE)
+            self._statistics_aggregator.update_statistics(weight, is_first, is_last, BLOCK_SIZE)
 
     def finalize_time_step(self, current_time: datetime) -> None:
         """
@@ -499,7 +521,29 @@ class AbstractModel(BaseModel, ABC):
     def validate_variables_to_save(self) -> Self:
         if self.variables_to_save is None:
             return self
-        for var in self.variables_to_save:
+        # Validate shape: dict[op -> vars]
+        allowed_ops = {"mean", "max", "min", "last"}
+        if not isinstance(self.variables_to_save, dict):
+            # Optional convenience: list[str] => mean
+            names = list(self.variables_to_save) if isinstance(self.variables_to_save, list) else []
+            pairs = [(n, "mean") for n in names]
+        else:
+            pairs = []
+            for op, vs in self.variables_to_save.items():
+                op_l = str(op).lower()
+                if op_l not in allowed_ops:
+                    raise ValueError(f"Invalid statistics op '{op}'. Allowed: {sorted(allowed_ops)}")
+                if isinstance(vs, str):
+                    vars_list = [vs]
+                elif isinstance(vs, list):
+                    vars_list = vs
+                else:
+                    raise ValueError(f"variables_to_save['{op}'] must be a string or list of strings")
+                for var in vars_list:
+                    pairs.append((var, op_l))
+
+        # Validate each variable exists and has save_idx
+        for var, _ in pairs:
             found = False
             has_save_idx = False
             for module in self.opened_modules:

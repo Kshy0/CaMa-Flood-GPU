@@ -18,7 +18,7 @@ def benchmark_block_sizes():
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
-    variables_to_save = []
+    variables_to_save = {}
     precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360

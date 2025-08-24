@@ -105,8 +105,8 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
     This function runs in a separate process.
     
     Args:
-        args: Tuple containing (mean_var_name, metadata, coord_registry, 
-              output_dir, rank)
+        args: Tuple containing (mean_var_name, metadata, coord_values, 
+              output_dir, complevel, rank)
         
     Returns:
         Path to the created NetCDF file
@@ -195,36 +195,40 @@ class StatisticsAggregator:
         if self.save_kernels:
             self.kernels_dir = self.output_dir / "generated_kernels"
             self.kernels_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Internal state
+        # Generic stats state (for all ops)
+        self._variables: Set[str] = set()  # original variable names
+        self._variable_ops: Dict[str, List[str]] = {}  # var -> list[ops]
+        self._storage: Dict[str, torch.Tensor] = {}  # out_name -> tensor
+        self._metadata: Dict[str, Dict[str, Any]] = {}  # out_name -> meta
+        self._coord_cache: Dict[str, np.ndarray] = {}
+        # Backward-compat mean-only state (used by Triton path)
         self._mean_variables: Set[str] = set()
         self._mean_storage: Dict[str, torch.Tensor] = {}
-        self._coord_cache: Dict[str, np.ndarray] = {}
         self._mean_metadata: Dict[str, Dict[str, Any]] = {}
         self._tensor_registry: Dict[str, torch.Tensor] = {}
         self._field_registry: Dict[str, FieldInfo] = {}
-        
-        
-        # Streaming mode support
 
-        self._netcdf_files: Dict[str, Path] = {}  # Variable name -> NetCDF file path
+        # Streaming mode support
+        self._netcdf_files: Dict[str, Path] = {}  # out_name -> NetCDF file path
         self._files_created: bool = False
-        
+
         # Thread pool for background writing
         self._write_executor: Optional[ProcessPoolExecutor] = None
         self._write_futures: List = []
-        
-        # Kernel state
+
+        # Kernel state (mean fast-path)
         self._aggregator_function = None
         self._aggregator_generated = False
         self._kernel_states: Optional[Dict[str, torch.Tensor]] = None
-        
+
         # Temporary file for generated kernels
         self._temp_kernel_file = None
         self._kernel_module = None
         self._saved_kernel_file = None
         
-        print(f"Initialized StreamingStatisticsAggregator for rank {rank} with {num_workers} workers")
+        print(f"Initialized StreamingStatisticsAggregator for rank {self.rank} with {self.num_workers} workers")
         if self.save_kernels:
             print(f"Generated kernels will be saved to: {self.kernels_dir}")
     
@@ -280,21 +284,39 @@ class StatisticsAggregator:
         
         print(f"[{self.rank}]: Registered tensor: {name} (actual_shape: {tensor.shape}, device: {tensor.device})")
     
-    def initialize_streaming_aggregation(self, variable_names: List[str]) -> None:
+    def initialize_streaming_aggregation(self, variable_ops: Optional[Dict[str, List[str]]] = None, variable_names: Optional[List[str]] = None) -> None:
         """
         Initialize streaming aggregation for specified variables.
         Creates NetCDF file structure but writes time steps incrementally.
         
         Args:
-            variable_names: List of variable names to compute means for
+            variable_ops: Dict of variable -> op (mean|max|min|last)
+            variable_names: Backward-compatible list of variable names (defaults to mean)
         """
-        print(f"Variables: {variable_names}")
+        if variable_ops is None:
+            if variable_names is None:
+                raise ValueError("Either variable_ops or variable_names must be provided")
+            # list[str] convenience => all mean
+            variable_ops = {v: ["mean"] for v in variable_names}
+        else:
+            # normalize values to list[str] lowercased
+            norm_ops: Dict[str, List[str]] = {}
+            for var, ops in variable_ops.items():
+                if ops is None:
+                    ops_list = ["mean"]
+                elif isinstance(ops, str):
+                    ops_list = [ops]
+                else:
+                    ops_list = list(ops)
+                norm_ops[var] = [str(op).lower() for op in ops_list]
+            variable_ops = norm_ops
+        print(f"Variables: {variable_ops}")
         
         # Enable streaming mode
         self._files_created = False
         
-        # Initialize single time step aggregation
-        self.initialize_mean_aggregation(variable_names)
+        # Initialize single time step aggregation (generic)
+        self.initialize_statistics(variable_ops)
         
         # Start the write executor
         self._write_executor = ProcessPoolExecutor(max_workers=self.num_workers)
@@ -311,25 +333,22 @@ class StatisticsAggregator:
         
         # Prepare file creation tasks
         creation_futures = {}
-        actual_workers = min(self.num_workers, len(self._mean_variables))
+        # Use number of outputs instead of variables (supports multiple ops)
+        n_outputs = len(self._metadata) if self._metadata else len(self._mean_metadata)
+        actual_workers = max(1, min(self.num_workers, n_outputs))
         
         with ProcessPoolExecutor(max_workers=actual_workers) as executor:
-            for var_name in self._mean_variables:
-                mean_var_name = f"{var_name}_mean"
-                metadata = self._mean_metadata[mean_var_name]
-                coord_name   = metadata.get('save_coord')
+            if self._metadata:
+                items = list(self._metadata.items())
+            else:
+                # fallback for mean-only path
+                items = list(self._mean_metadata.items())
+            for out_name, metadata in items:
+                coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (
-                    mean_var_name,
-                    metadata,
-                    coord_values,
-                    self.output_dir,
-                    self.complevel,
-                    self.rank,
-                )
-                
+                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank)
                 future = executor.submit(_create_netcdf_file_process, args)
-                creation_futures[future] = mean_var_name
+                creation_futures[future] = out_name
             
             # Collect results
             for future in as_completed(creation_futures):
@@ -347,39 +366,36 @@ class StatisticsAggregator:
     
     def _prepare_kernel_states(self) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
-        
-        required_tensors = {}
-        
-        # Add original variables and their means
-        for var_name in self._mean_variables:
+        required_tensors: Dict[str, torch.Tensor] = {}
+
+        # Add original variables and their output buffers
+        for var_name, ops in self._variable_ops.items():
             required_tensors[var_name] = self._tensor_registry[var_name]
-            mean_var_name = f"{var_name}_mean"
-            required_tensors[mean_var_name] = self._mean_storage[mean_var_name]
-        
+            for op in ops:
+                out_name = f"{var_name}_{op}"
+                required_tensors[out_name] = self._storage[out_name]
+
         # Collect required dimensions and save indices
-        required_dims = set()
-        required_save_indices = set()
-        
-        for var_name in self._mean_variables:
+        required_dims: Set[str] = set()
+        required_save_indices: Set[str] = set()
+        for var_name in self._variables:
             field_info = self._field_registry[var_name]
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
             tensor_shape = json_schema_extra.get('tensor_shape', ())
             save_idx = json_schema_extra.get('save_idx')
-            
             if save_idx:
                 required_save_indices.add(save_idx)
-            
             for dim_name in tensor_shape:
                 if isinstance(dim_name, str):
                     required_dims.add(dim_name)
-        
+
         # Add save_idx tensors
         for save_idx in required_save_indices:
             if save_idx in self._tensor_registry:
                 required_tensors[save_idx] = self._tensor_registry[save_idx]
             else:
                 raise RuntimeError(f"Save index tensor '{save_idx}' not registered")
-        
+
         # Add dimension tensors/scalars
         for dim_name in required_dims:
             if dim_name in self._tensor_registry:
@@ -395,11 +411,11 @@ class StatisticsAggregator:
     def _generate_kernel_header(self) -> List[str]:
         """Generate the header for the kernel file with documentation."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        var_list = sorted(list(self._mean_variables))
+        var_list = sorted(list(self._variables))
         
         header = [
             '"""',
-            f'Auto-generated Triton kernels for CaMa-Flood-GPU statistics aggregation',
+            f'Auto-generated Triton kernels for CaMa-Flood-GPU statistics aggregation (mean/max/min/last)',
             f'Generated at: {timestamp}',
             f'Rank: {self.rank}',
             f'Variables: {", ".join(var_list)}',
@@ -408,14 +424,14 @@ class StatisticsAggregator:
             'Kernel Logic:',
             '- Load save_idx values to get original grid indices',
             '- Use idx to access original data: data[idx]',
-            '- Store means using sequential indexing: mean[offs]',
+            '- Store outputs using sequential indexing: out[offs]',
             '"""',
             "",
             "import triton",
             "import triton.language as tl",
             "",
-            "# ============================================================================",
-            f"# Generated Triton kernels for mean statistics aggregation - Rank {self.rank}",
+            '# ============================================================================',
+            f"# Generated Triton kernels for statistics aggregation - Rank {self.rank}",
             "# ============================================================================",
             "",
         ]
@@ -454,14 +470,14 @@ class StatisticsAggregator:
         # Import the module from the temporary file
         module_name = f"aggr_kernels_r{self.rank}_{unique_name}"
         spec = importlib.util.spec_from_file_location(module_name, self._temp_kernel_file)
-        self._kernel_module = importlib.util.module_from_spec(spec)
-        
+        module = importlib.util.module_from_spec(spec)
         # Add to sys.modules to ensure proper import
-        sys.modules[module_name] = self._kernel_module
-        spec.loader.exec_module(self._kernel_module)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
         
-        # Get the aggregation function
-        self._aggregator_function = getattr(self._kernel_module, 'internal_update_mean_statistics')
+        # Bind to instance
+        self._kernel_module = module
+        self._aggregator_function = getattr(module, 'internal_update_statistics')
         self._aggregator_generated = True
     
     def _generate_1d_processing(self, kernel_code_lines: List[str], dims_1d: List[str]) -> None:
@@ -476,7 +492,7 @@ class StatisticsAggregator:
             kernel_code_lines.append(f"    {var} = tl.load({var}_ptr + idx, mask=mask, other=0.0)")
         
         # Load old means using offs (sequential storage)
-        kernel_code_lines.append("    if refresh:")
+        kernel_code_lines.append("    if is_first:")
         for var in dims_1d:
             kernel_code_lines.append(f"        {var}_old_mean = tl.zeros_like({var})")
         kernel_code_lines.append("    else:")
@@ -505,7 +521,7 @@ class StatisticsAggregator:
             kernel_code_lines.append(f"        {var} = tl.load({var}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
         
         # Load old means using offs (sequential storage)
-        kernel_code_lines.append("        if refresh:")
+        kernel_code_lines.append("        if is_first:")
         for var in dims_2d:
             kernel_code_lines.append(f"            {var}_old_mean = tl.zeros_like({var})")
         kernel_code_lines.append("        else:")
@@ -521,46 +537,39 @@ class StatisticsAggregator:
             kernel_code_lines.append(f"        tl.store({var}_mean_ptr + offs * n_levels + level, {var}_new_mean, mask=mask)")
         kernel_code_lines.append("")
     
-    def _generate_kernel_for_group(self, kernel_code_lines: List[str], kernel_name: str, 
-                                  save_idx: str, var_list: List[str], 
-                                  tensor_info: Dict[str, Dict[str, Any]]) -> None:
-        """Generate kernel code for a specific save_idx group."""
-        # Separate 1D and 2D variables based on actual dimensions
+    def _generate_kernel_for_group(self, kernel_code_lines: List[str], kernel_name: str,
+                                   save_idx: str, var_list: List[str],
+                                   tensor_info: Dict[str, Dict[str, Any]]) -> None:
+        """Generate kernel code for a specific save_idx group supporting ops."""
         dims_1d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 1]
         dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
-        
-        # Add documentation for this kernel
+
+        # Header
         kernel_code_lines.extend([
             f"# Kernel for save_idx: {save_idx}",
             f"# Variables: {', '.join(var_list)}",
-            f"# 1D variables (actual): {', '.join(dims_1d) if dims_1d else 'None'}",
-            f"# 2D variables (actual): {', '.join(dims_2d) if dims_2d else 'None'}",
+            f"# 1D: {', '.join(dims_1d) if dims_1d else 'None'}",
+            f"# 2D: {', '.join(dims_2d) if dims_2d else 'None'}",
             "",
-        ])
-        
-        # Generate kernel signature
-        kernel_code_lines.extend([
             "@triton.jit",
             f"def {kernel_name}(",
             f"    {save_idx}_ptr,",
         ])
-        
-        # Add variable pointers
+
+        # Pointers
         for var in var_list:
-            kernel_code_lines.extend([
-                f"    {var}_ptr,",
-                f"    {var}_mean_ptr,",
-            ])
-        
+            kernel_code_lines.append(f"    {var}_ptr,")
+            for op in self._variable_ops[var]:
+                kernel_code_lines.append(f"    {var}_{op}_ptr,")
+
         kernel_code_lines.extend([
             "    weight,",
-            "    refresh,",
+            "    is_first,",
+            "    is_last,",
             "    n_saved_points: tl.constexpr,",
         ])
-        
         if dims_2d:
             kernel_code_lines.append("    n_levels: tl.constexpr,")
-        
         kernel_code_lines.extend([
             "    BLOCK_SIZE: tl.constexpr,",
             "):",
@@ -568,24 +577,124 @@ class StatisticsAggregator:
             "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
             "    mask = offs < n_saved_points",
             "",
-            "    # Load save_idx to get original grid indices",
             f"    idx = tl.load({save_idx}_ptr + offs, mask=mask)",
             "",
         ])
-        
-        # Process 1D variables
+
+        # 1D processing
         if dims_1d:
-            self._generate_1d_processing(kernel_code_lines, dims_1d)
-        
-        # Process 2D variables
+            kernel_code_lines.extend([
+                "    # 1D variables",
+            ])
+            for var in dims_1d:
+                ops = self._variable_ops[var]
+                if len(ops) == 1 and ops[0] == 'last':
+                    # last-only: load only when needed
+                    kernel_code_lines.extend([
+                        "    if is_last:",
+                        f"        val = tl.load({var}_ptr + idx, mask=mask, other=0.0)",
+                        f"        tl.store({var}_last_ptr + offs, val, mask=mask)",
+                    ])
+                else:
+                    kernel_code_lines.append(f"    val = tl.load({var}_ptr + idx, mask=mask, other=0.0)")
+                    for op in ops:
+                        if op == 'mean':
+                            kernel_code_lines.extend([
+                                "    if is_first:",
+                                f"        old = tl.zeros_like(val)",
+                                "    else:",
+                                f"        old = tl.load({var}_mean_ptr + offs, mask=mask, other=0.0)",
+                                f"    new = old + val / weight",
+                                f"    tl.store({var}_mean_ptr + offs, new, mask=mask)",
+                            ])
+                        elif op == 'max':
+                            kernel_code_lines.extend([
+                                "    if is_first:",
+                                f"        tl.store({var}_max_ptr + offs, val, mask=mask)",
+                                "    else:",
+                                f"        old = tl.load({var}_max_ptr + offs, mask=mask, other=val)",
+                                "        new = tl.maximum(old, val)",
+                                f"        tl.store({var}_max_ptr + offs, new, mask=mask)",
+                            ])
+                        elif op == 'min':
+                            kernel_code_lines.extend([
+                                "    if is_first:",
+                                f"        tl.store({var}_min_ptr + offs, val, mask=mask)",
+                                "    else:",
+                                f"        old = tl.load({var}_min_ptr + offs, mask=mask, other=val)",
+                                "        new = tl.minimum(old, val)",
+                                f"        tl.store({var}_min_ptr + offs, new, mask=mask)",
+                            ])
+                        elif op == 'last':
+                            kernel_code_lines.extend([
+                                "    if is_last:",
+                                f"        tl.store({var}_last_ptr + offs, val, mask=mask)",
+                            ])
+                kernel_code_lines.append("")
+
+        # 2D processing
         if dims_2d:
-            self._generate_2d_processing(kernel_code_lines, dims_2d)
-        
-        kernel_code_lines.append("")
+            non_last_only = [v for v in dims_2d if not (len(self._variable_ops[v]) == 1 and self._variable_ops[v][0] == 'last')]
+            last_only_vars = [v for v in dims_2d if (len(self._variable_ops[v]) == 1 and self._variable_ops[v][0] == 'last')]
+
+            if non_last_only:
+                kernel_code_lines.extend([
+                    "    # 2D variables (mean/min/max and mixed)",
+                    "    for level in tl.static_range(n_levels):",
+                ])
+                for var in non_last_only:
+                    kernel_code_lines.append(f"        val = tl.load({var}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+                    for op in self._variable_ops[var]:
+                        if op == 'mean':
+                            kernel_code_lines.extend([
+                                "        if is_first:",
+                                f"            old = tl.zeros_like(val)",
+                                "        else:",
+                                f"            old = tl.load({var}_mean_ptr + offs * n_levels + level, mask=mask, other=0.0)",
+                                f"        new = old + val / weight",
+                                f"        tl.store({var}_mean_ptr + offs * n_levels + level, new, mask=mask)",
+                            ])
+                        elif op == 'max':
+                            kernel_code_lines.extend([
+                                "        if is_first:",
+                                f"            tl.store({var}_max_ptr + offs * n_levels + level, val, mask=mask)",
+                                "        else:",
+                                f"            old = tl.load({var}_max_ptr + offs * n_levels + level, mask=mask, other=val)",
+                                "            new = tl.maximum(old, val)",
+                                f"            tl.store({var}_max_ptr + offs * n_levels + level, new, mask=mask)",
+                            ])
+                        elif op == 'min':
+                            kernel_code_lines.extend([
+                                "        if is_first:",
+                                f"            tl.store({var}_min_ptr + offs * n_levels + level, val, mask=mask)",
+                                "        else:",
+                                f"            old = tl.load({var}_min_ptr + offs * n_levels + level, mask=mask, other=val)",
+                                "            new = tl.minimum(old, val)",
+                                f"            tl.store({var}_min_ptr + offs * n_levels + level, new, mask=mask)",
+                            ])
+                        elif op == 'last':
+                            kernel_code_lines.extend([
+                                "        if is_last:",
+                                f"            tl.store({var}_last_ptr + offs * n_levels + level, val, mask=mask)",
+                            ])
+                kernel_code_lines.append("")
+
+            if last_only_vars:
+                kernel_code_lines.extend([
+                    "    # 2D variables (last-only)",
+                    "    if is_last:",
+                    "        for level in tl.static_range(n_levels):",
+                ])
+                for var in last_only_vars:
+                    kernel_code_lines.extend([
+                        f"            val = tl.load({var}_ptr + idx * n_levels + level, mask=mask, other=0.0)",
+                        f"            tl.store({var}_last_ptr + offs * n_levels + level, val, mask=mask)",
+                    ])
+                kernel_code_lines.append("")
     
-    def _generate_main_function(self, kernel_code_lines: List[str], 
-                               grouped_by_save_idx: Dict[str, List[str]], 
-                               tensor_info: Dict[str, Dict[str, Any]]) -> None:
+    def _generate_main_function(self, kernel_code_lines: List[str],
+                                grouped_by_save_idx: Dict[str, List[str]],
+                                tensor_info: Dict[str, Dict[str, Any]]) -> None:
         """Generate the main aggregation function."""
         kernel_code_lines.extend([
             "",
@@ -593,20 +702,20 @@ class StatisticsAggregator:
             "# Main aggregation function",
             "# ============================================================================",
             "",
-            "def internal_update_mean_statistics(states, weight, refresh, BLOCK_SIZE):",
+            "def internal_update_statistics(states, weight, is_first, is_last, BLOCK_SIZE):",
             '    """',
-            '    Update mean statistics for all registered variables.',
+            '    Update statistics for all registered variables (mean/max/min/last).',
             '    ',
             '    Args:',
             '        states: Dictionary of tensor states',
             '        weight: Total number of sub-steps per time step',
-            '        refresh: 0 for first step, 1 for subsequent steps',
+            '        is_first: 1 on first sub-step, 0 otherwise',
+            '        is_last: 1 on final sub-step of the time step, else 0',
             '        BLOCK_SIZE: GPU block size',
             '    """',
         ])
-        
         for save_idx, var_list in grouped_by_save_idx.items():
-            kernel_name = f"mean_kernel_{save_idx}"
+            kernel_name = f"kernel_{save_idx}"
             
             # Check if any 2D variables exist in this group
             dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
@@ -622,14 +731,14 @@ class StatisticsAggregator:
             
             # Add variable pointers
             for var in var_list:
-                kernel_code_lines.extend([
-                    f"        {var}_ptr=states['{var}'],",
-                    f"        {var}_mean_ptr=states['{var}_mean'],",
-                ])
+                kernel_code_lines.append(f"        {var}_ptr=states['{var}'],")
+                for op in self._variable_ops[var]:
+                    kernel_code_lines.append(f"        {var}_{op}_ptr=states['{var}_{op}'],")
             
             kernel_code_lines.extend([
                 "        weight=weight,",
-                "        refresh=refresh,",
+                "        is_first=is_first,",
+                "        is_last=is_last,",
                 "        n_saved_points=save_idx_len,",
             ])
             
@@ -650,14 +759,14 @@ class StatisticsAggregator:
         """
         Generate and compile the aggregation kernel function.
         """
-        if not self._mean_variables:
-            raise ValueError("No variables initialized for mean aggregation")
+        if not self._variables:
+            raise ValueError("No variables initialized for statistics aggregation")
 
         # Analyze tensor information and group by save_idx
         tensor_info = {}
         grouped_by_save_idx = {}
         
-        for var_name in self._mean_variables:
+        for var_name in self._variables:
             field_info = self._field_registry[var_name]
             tensor = self._tensor_registry[var_name]
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
@@ -680,7 +789,7 @@ class StatisticsAggregator:
         
         # Generate kernels for each save_idx group
         for save_idx, var_list in grouped_by_save_idx.items():
-            kernel_name = f"mean_kernel_{save_idx}"
+            kernel_name = f"kernel_{save_idx}"
             self._generate_kernel_for_group(kernel_code_lines, kernel_name, save_idx, var_list, tensor_info)
         
         # Generate main function
@@ -693,92 +802,105 @@ class StatisticsAggregator:
         # Save kernel file for external inspection if enabled
         if self.save_kernels:
             self._save_kernel_file(kernel_code)
-    
-    def initialize_mean_aggregation(self, variable_names: List[str]) -> None:
-        """
-        Initialize mean aggregation for specified variables.
-        
-        Args:
-            variable_names: List of variable names to compute means for
-        """
-        
-        # Reset state
-        self._mean_variables = set()
+
+    def initialize_statistics(self, variable_ops: Dict[str, List[str]]) -> None:
+        """Initialize aggregation tensors and metadata for provided variables and ops."""
+        # Reset generic state
+        self._variables = set()
+        # Normalize to lower-case list for each variable
+        self._variable_ops = {}
+        for var, ops in variable_ops.items():
+            if ops is None:
+                ops_list = ["mean"]
+            elif isinstance(ops, str):
+                ops_list = [ops]
+            else:
+                ops_list = list(ops)
+            self._variable_ops[var] = [str(o).lower() for o in ops_list]
+        self._storage.clear()
+        self._metadata.clear()
+        # Reset mean fast-path holders
+        self._mean_variables = {k for k, v in self._variable_ops.items() if 'mean' in v}
         self._mean_storage.clear()
         self._mean_metadata.clear()
         self._aggregator_function = None
         self._aggregator_generated = False
         self._kernel_states = None
-        
+
         # Clean up old temporary files
         self._cleanup_temp_files()
-        
+
         # Validate and setup each variable
-        for var_name in variable_names:
+        for var_name, ops in self._variable_ops.items():
             if var_name not in self._tensor_registry:
                 raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
-            
+
             tensor = self._tensor_registry[var_name]
             field_info = self._field_registry[var_name]
-            
-            # Extract metadata
+
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
             tensor_shape = json_schema_extra.get('tensor_shape', ())
             save_idx = json_schema_extra.get('save_idx')
             description = getattr(field_info, 'description', f"Variable {var_name}")
             save_coord = json_schema_extra.get('save_coord')
-            
+
             if not save_idx:
                 raise ValueError(f"Variable '{var_name}' must have save_idx in json_schema_extra")
-            
+
             if save_idx in self._tensor_registry:
                 actual_shape = (len(self._tensor_registry[save_idx]),) + tensor.shape[1:]
             else:
                 raise ValueError(f"Save index '{save_idx}' not registered in tensor registry")
             actual_ndim = tensor.ndim
-            
             if actual_ndim > 2:
                 raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only 1D and 2D variables are supported.")
-            
-            # Add to tracking set
-            self._mean_variables.add(var_name)
-            
-            # Create mean storage tensor with same shape as actual tensor
-            mean_shape = actual_shape
-            mean_tensor = torch.zeros(mean_shape, dtype=tensor.dtype, device=self.device)
-            mean_var_name = f"{var_name}_mean"
-            self._mean_storage[mean_var_name] = mean_tensor
-            if save_coord and save_coord not in self._coord_cache:
-                coord_tensor = self._tensor_registry[save_coord]
-                self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
-            # Store metadata for NetCDF writing
-            self._mean_metadata[mean_var_name] = {
-                'original_variable': var_name,
-                'save_idx': save_idx,
-                'tensor_shape': tensor_shape,
-                'dtype': torch_to_numpy_dtype(tensor.dtype),
-                'actual_shape': actual_shape,
-                'actual_ndim': actual_ndim,
-                'save_coord': save_coord,
-                'description': description,
-            }
-            
-            # Register mean tensor in registry for kernel access
-            self._tensor_registry[mean_var_name] = mean_tensor
-        
-        # Generate aggregation kernels
+
+            # Track
+            self._variables.add(var_name)
+
+            for op in ops:
+                out_name = f"{var_name}_{op}"
+                # Allocate storage by op
+                if op == 'max':
+                    init_tensor = torch.full(actual_shape, -torch.inf, dtype=tensor.dtype, device=self.device)
+                elif op == 'min':
+                    init_tensor = torch.full(actual_shape, torch.inf, dtype=tensor.dtype, device=self.device)
+                else:
+                    init_tensor = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                self._storage[out_name] = init_tensor
+
+                if save_coord and save_coord not in self._coord_cache:
+                    coord_tensor = self._tensor_registry[save_coord]
+                    self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
+
+                meta = {
+                    'original_variable': var_name,
+                    'op': op,
+                    'save_idx': save_idx,
+                    'tensor_shape': tensor_shape,
+                    'dtype': torch_to_numpy_dtype(tensor.dtype),
+                    'actual_shape': actual_shape,
+                    'actual_ndim': actual_ndim,
+                    'save_coord': save_coord,
+                    'description': f"{description} ({op})",
+                }
+                self._metadata[out_name] = meta
+
+                if op == 'mean':
+                    mean_var_name = out_name
+                    self._mean_storage[mean_var_name] = init_tensor
+                    self._mean_metadata[mean_var_name] = meta
+                    self._tensor_registry[mean_var_name] = init_tensor
+
+        # Generate kernels and prepare states for all requested variables/ops
         self._generate_aggregator_function()
-        
-        # Pre-compute kernel states for performance
         self._prepare_kernel_states()
 
     
-    def update_statistics(self, weight: int, refresh: bool = False, BLOCK_SIZE: int = 128) -> None:
+    def update_statistics(self, weight: int, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
         if not self._aggregator_generated:
-            raise RuntimeError("Mean aggregation not initialized. Call initialize_mean_aggregation() first.")
-        
-        # Call the generated aggregation function with pre-computed states
-        self._aggregator_function(self._kernel_states, weight, refresh, BLOCK_SIZE)
+            raise RuntimeError("Statistics aggregation not initialized. Call initialize_streaming_aggregation() first.")
+        self._aggregator_function(self._kernel_states, weight, is_first, is_last, BLOCK_SIZE)
     
     def finalize_time_step(self, dt: datetime) -> None:
         """
@@ -793,23 +915,19 @@ class StatisticsAggregator:
         if not self._files_created:
             self._create_netcdf_files()
         
-        for var_name in self._mean_variables:
-            mean_var_name = f"{var_name}_mean"
-            mean_tensor = self._mean_storage[mean_var_name]
-            output_path = self._netcdf_files[mean_var_name]
-            
-            # Convert to numpy for writing
-            time_step_data = mean_tensor.detach().cpu().numpy()
-            
-            # Submit write task
-            args = (mean_var_name, time_step_data, output_path, dt)
+        # Write all outputs
+        for out_name, tensor in (self._storage if self._storage else self._mean_storage).items():
+            output_path = self._netcdf_files[out_name]
+            time_step_data = tensor.detach().cpu().numpy()
+            args = (out_name, time_step_data, output_path, dt)
             future = self._write_executor.submit(_write_time_step_netcdf_process, args)
             self._write_futures.append(future)
         
         # Wait for this batch to complete before continuing
         # This ensures time steps are written in order
         completed_count = 0
-        for future in self._write_futures[-len(self._mean_variables):]:  # Only wait for current batch
+        batch_n = len(self._storage) if self._storage else len(self._mean_storage)
+        for future in self._write_futures[-batch_n:]:  # Only wait for current batch
             try:
                 var_name, written_time_step = future.result()
                 completed_count += 1

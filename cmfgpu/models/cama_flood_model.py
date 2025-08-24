@@ -261,6 +261,7 @@ class CaMaFlood(AbstractModel):
             )
         self.update_statistics(
             weight=num_sub_steps,
-            refresh=(sub_step == 0),
+            is_first=(sub_step == 0),
+            is_last=(sub_step == num_sub_steps - 1),
             BLOCK_SIZE=self.BLOCK_SIZE
         )
