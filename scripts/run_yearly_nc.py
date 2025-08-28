@@ -11,7 +11,7 @@ from cmfgpu.utils import setup_distributed
 
 def main():
     ### Configuration Start ###
-    resolution = "glb_06min"
+    resolution = "glb_15min"
     experiment_name = f"{resolution}_nc"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"

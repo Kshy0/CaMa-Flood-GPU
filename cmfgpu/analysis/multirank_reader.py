@@ -13,23 +13,23 @@ import numpy as np
 
 class MultiRankStatsReader:
     """
-    Manage NetCDF outputs written per-rank by StatisticsAggregator.
+        Manage NetCDF outputs written per-rank by StatisticsAggregator.
 
-    Key features:
-      - Auto-detect rank files: {var_name}_rank{rank}.nc.
-      - Derive (x, y) locations for saved_points using exactly one of:
-        • coord_source=(nx, ny) tuple
-        • coord_source=NetCDF file path with nx/ny or map_shape
-        • coord_source=converter function taking a single argument: converter(coord_raw) -> (x, y)
-      - Basic visualization (single frame and animation).
-      - Export combined grid-time data to CaMa-Flood-compatible .bin files.
+        Key features:
+            - Auto-detect rank files: {var_name}_rank{rank}.nc.
+            - Derive (x, y) locations for saved_points using exactly one of:
+                • coord_source=(nx, ny) tuple
+                • coord_source=NetCDF file path with nx/ny or map_shape
+                • coord_source=converter function taking a single argument: converter(coord_raw) -> (x, y)
+            - Basic visualization (single frame and animation).
+            - Export combined grid-time data to CaMa-Flood-compatible .bin files.
 
-    Assumptions:
-      - Main variable inside each NetCDF: var_name (exactly as provided)
-      - Dimensions: time (unlimited), saved_points [, levels]
-      - Optional coordinate variable aligned to ('saved_points',) is used as save_coord.
-    """
-
+        Assumptions:
+            - Main variable inside each NetCDF: var_name (exactly as provided)
+            - Dimensions: time (unlimited), saved_points [, levels]
+            - Optional coordinate variable aligned to ('saved_points',) is used as save_coord.
+        """
+    
     def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> Optional[str]:
         """Pick a ('saved_points',) variable to serve as save_coord."""
         if self.coord_name and self.coord_name in ds.variables:
@@ -180,16 +180,17 @@ class MultiRankStatsReader:
                 Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]],
             ]
         ] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        cache: bool = False,
     ):
         """
         Args:
           base_dir: Directory containing per-rank NetCDF files.
           var_name: Full variable name; files are matched as {var_name}_rank*.nc, and the internal variable has the same name.
           coord_name: Explicit variable name to use as save_coord (optional).
-          coord_source: Provide exactly one of:
-            - (nx, ny) tuple
-            - NetCDF file path (str|Path) containing nx/ny or map_shape (as global attrs, variables, or dimensions)
-            - converter function with signature: converter(coord_raw) -> (x, y)
+          coord_source: Provide exactly one of: (nx, ny) tuple, NetCDF path (str|Path), or a converter function(coord_raw)->(x,y).
+          time_range: Optional (start, end) indices to restrict the time axis; end is exclusive.
+          cache: If True, preload variable data of each rank into memory for the chosen time range.
         """
         self.base_dir = Path(base_dir)
         self.var_name = var_name
@@ -198,8 +199,10 @@ class MultiRankStatsReader:
         self._map_shape: Optional[Tuple[int, int]] = None
         self._coord_converter: Optional[Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]] = None
 
-        # Ensure attribute exists before any method potentially uses it
+        # Internal state
         self._rank_files: List[dict] = []
+        self._t_offset = 0
+        self._cache_enabled = bool(cache)
 
         # Interpret coord_source
         if coord_source is not None:
@@ -208,14 +211,8 @@ class MultiRankStatsReader:
             elif isinstance(coord_source, (str, Path)):
                 self.load_map_shape_from_nc(coord_source)
             else:
-                # Expecting a (nx, ny) tuple
-                try:
-                    nx, ny = coord_source  # type: ignore
-                    self.set_map_shape((int(nx), int(ny)))
-                except Exception:
-                    raise TypeError(
-                        "coord_source must be one of: (nx, ny) tuple, NetCDF path (str|Path), or a converter function(coord_raw)->(x,y)."
-                    )
+                nx, ny = coord_source  # type: ignore
+                self.set_map_shape((int(nx), int(ny)))
 
         # Scan rank files
         self._rank_files = self._scan_rank_files()
@@ -227,8 +224,230 @@ class MultiRankStatsReader:
         # Read time axis
         self._read_time_axis()
 
+        # Apply time range (half-open) if provided
+        if time_range is not None:
+            ts = max(0, int(time_range[0]))
+            te = min(self._time_len, int(time_range[1]))
+            if ts >= te:
+                raise ValueError("Invalid time_range: ensure start < end within available time length.")
+            self._t_offset = ts
+            self._time_values_num = self._time_values_num[ts:te]
+            self._time_datetimes = self._time_datetimes[ts:te]
+            self._time_len = te - ts
+
         # Compute (x, y) after files are known
         self._compute_all_xy(force=True)
+
+        # Preload cache if requested
+        if self._cache_enabled:
+            self._preload_cache()
+
+    def _preload_cache(self) -> None:
+        """Preload the variable into memory for the configured time slice."""
+        for info in self._rank_files:
+            if info["saved_points"] == 0:
+                info["cache"] = None
+                continue
+            try:
+                with nc.Dataset(info["path"], "r") as ds:
+                    var = ds.variables[self.var_name]
+                    if info["has_levels"]:
+                        data = var[self._t_offset : self._t_offset + self._time_len, :, :]
+                    else:
+                        data = var[self._t_offset : self._t_offset + self._time_len, :]
+                    info["cache"] = np.array(data, copy=True)
+            except Exception as e:
+                print(f"Warning: failed to cache {info['path'].name}: {e}")
+                info["cache"] = None
+
+    # -----------------------------
+    # Core getters (concise names)
+    # -----------------------------
+    def get_vector(
+        self,
+        t_index: int,
+        level: Optional[int] = None,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray:
+        if t_index < 0 or t_index >= self._time_len:
+            raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
+        parts: List[np.ndarray] = []
+        for info in self._rank_files:
+            if info["saved_points"] == 0:
+                parts.append(np.empty((0,), dtype=dtype or np.float32))
+                continue
+            cache_arr = info.get("cache") if isinstance(info, dict) else None
+            if cache_arr is not None:
+                if info["has_levels"]:
+                    data = cache_arr[t_index, :, level if level is not None else 0]
+                else:
+                    data = cache_arr[t_index, :]
+            else:
+                with nc.Dataset(info["path"], "r") as ds:
+                    var = ds.variables[self.var_name]
+                    ti = self._t_offset + t_index
+                    if info["has_levels"]:
+                        if level is None:
+                            data = var[ti, :, 0]
+                        else:
+                            data = var[ti, :, level]
+                    else:
+                        data = var[ti, :]
+            arr = np.array(data, copy=False)
+            if dtype is not None:
+                arr = arr.astype(dtype, copy=False)
+            parts.append(arr)
+        return np.concatenate(parts, axis=0) if parts else np.array([])
+
+    def get_grid(
+        self,
+        t_index: int,
+        level: Optional[int] = None,
+        fill_value: float = np.nan,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray:
+        if self._map_shape is None:
+            raise RuntimeError("map_shape is not set; cannot project to grid.")
+        if t_index < 0 or t_index >= self._time_len:
+            raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
+        nx_, ny_ = self._map_shape
+        grid = np.full((nx_, ny_), fill_value, dtype=dtype or np.float32)
+        for info in self._rank_files:
+            if info["saved_points"] == 0:
+                continue
+            x = info.get("x")
+            y = info.get("y")
+            if x is None or y is None:
+                raise RuntimeError(f"{info['path'].name} missing (x,y); set map_shape or coord converter.")
+            cache_arr = info.get("cache") if isinstance(info, dict) else None
+            if cache_arr is not None:
+                if info["has_levels"]:
+                    if level is None:
+                        raise ValueError("This variable has 'levels'; please specify 'level'.")
+                    vals = cache_arr[t_index, :, level]
+                else:
+                    vals = cache_arr[t_index, :]
+            else:
+                with nc.Dataset(info["path"], "r") as ds:
+                    var = ds.variables[self.var_name]
+                    ti = self._t_offset + t_index
+                    if info["has_levels"]:
+                        if level is None:
+                            raise ValueError("This variable has 'levels'; please specify 'level'.")
+                        vals = var[ti, :, level]
+                    else:
+                        vals = var[ti, :]
+            vals = np.array(vals, copy=False)
+            grid[x, y] = vals
+        return grid
+
+    def get_series(
+        self,
+        points: Union[np.ndarray, Sequence[np.ndarray]],
+        level: Optional[int] = None,
+        fill_value: float = np.nan,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray:
+        # Input normalization: XY (N,2) arrays or ID (N,) arrays, or lists of them
+        def _as_list(v):
+            return [np.asarray(a) for a in v] if isinstance(v, (list, tuple)) else [np.asarray(v)]
+        arr_list = _as_list(points)
+        if not arr_list:
+            return np.full((self._time_len, 0), fill_value, dtype=dtype or np.float32)
+        def _kind(a: np.ndarray) -> str:
+            if a.ndim == 2 and a.shape[1] == 2:
+                return "xy"
+            if a.ndim == 1:
+                return "id"
+            raise ValueError(f"Unsupported points shape: {a.shape}")
+        kinds = {_kind(a) for a in arr_list}
+        if len(kinds) != 1:
+            raise ValueError("Provide either all XY (N,2) or all IDs (N,). Do not mix.")
+        use_xy = kinds.pop() == "xy"
+
+        if use_xy:
+            xy_pairs: List[Tuple[int, int]] = []
+            for a in arr_list:
+                if not (a.ndim == 2 and a.shape[1] == 2):
+                    raise ValueError(f"Invalid XY array shape: {a.shape}. Expected (N,2).")
+                a2 = np.asarray(a, dtype=np.int64)
+                xy_pairs.extend([(int(px), int(py)) for px, py in a2])
+            queries = xy_pairs
+        else:
+            ids_all: List[int] = []
+            for a in arr_list:
+                if a.ndim != 1:
+                    raise ValueError(f"Invalid ID array shape: {a.shape}. Expected 1D.")
+                ids_all.extend([int(v) for v in np.asarray(a, dtype=np.int64).ravel()])
+            queries = ids_all
+
+        N = len(queries)
+        out = np.full((self._time_len, N), fill_value, dtype=dtype or np.float32)
+
+        # Build mapping (col -> (rank_idx, local_idx))
+        col_to_hits: List[Optional[Tuple[int, int]]] = [None] * N
+        if use_xy:
+            for r_idx, info in enumerate(self._rank_files):
+                if info["saved_points"] == 0:
+                    continue
+                x, y = info.get("x"), info.get("y")
+                if x is None or y is None:
+                    continue
+                for c, (qx, qy) in enumerate(queries):
+                    if col_to_hits[c] is not None:
+                        continue
+                    matches = np.nonzero((x == qx) & (y == qy))[0]
+                    if matches.size:
+                        col_to_hits[c] = (r_idx, int(matches[0]))
+        else:
+            for r_idx, info in enumerate(self._rank_files):
+                if info["saved_points"] == 0 or info["coord_raw"] is None:
+                    continue
+                raw = np.asarray(info["coord_raw"]).ravel()
+                for c, qid in enumerate(queries):
+                    if col_to_hits[c] is not None:
+                        continue
+                    matches = np.nonzero(raw == qid)[0]
+                    if matches.size:
+                        col_to_hits[c] = (r_idx, int(matches[0]))
+
+        # Group by rank and load
+        rank_to_cols: dict[int, List[Tuple[int, int]]] = {}
+        for col, hit in enumerate(col_to_hits):
+            if hit is None:
+                continue
+            r_idx, li = hit
+            rank_to_cols.setdefault(r_idx, []).append((col, li))
+
+        for r_idx, pairs in rank_to_cols.items():
+            info = self._rank_files[r_idx]
+            cache_arr = info.get("cache") if isinstance(info, dict) else None
+            if cache_arr is not None:
+                if info["has_levels"]:
+                    if level is None:
+                        raise ValueError("This variable has 'levels'; please specify `level`.")
+                    for col, li in pairs:
+                        vec = cache_arr[:, li, level]
+                        out[:, col] = np.asarray(vec, dtype=dtype or np.float32)
+                else:
+                    for col, li in pairs:
+                        vec = cache_arr[:, li]
+                        out[:, col] = np.asarray(vec, dtype=dtype or np.float32)
+            else:
+                with nc.Dataset(info["path"], "r") as ds:
+                    var = ds.variables[self.var_name]
+                    s = slice(self._t_offset, self._t_offset + self._time_len)
+                    if info["has_levels"]:
+                        if level is None:
+                            raise ValueError("This variable has 'levels'; please specify `level`.")
+                        for col, li in pairs:
+                            vec = var[s, li, level]
+                            out[:, col] = np.asarray(vec, dtype=dtype or np.float32)
+                    else:
+                        for col, li in pairs:
+                            vec = var[s, li]
+                            out[:, col] = np.asarray(vec, dtype=dtype or np.float32)
+        return out
 
     # -----------------------------
     # Basic info
@@ -332,83 +551,8 @@ class MultiRankStatsReader:
         self._compute_all_xy(force=True)
 
     # -----------------------------
-    # Data read
+    # Data read (new concise APIs are defined above)
     # -----------------------------
-    def _concat_saved_points_across_ranks(
-        self,
-        arrays: Sequence[np.ndarray],
-    ) -> np.ndarray:
-        if not arrays:
-            return np.array([])
-        return np.concatenate(arrays, axis=0)
-
-    def read_time_step_vector(
-        self,
-        t_index: int,
-        level: Optional[int] = None,
-        dtype: Optional[np.dtype] = None,
-    ) -> np.ndarray:
-        if t_index < 0 or t_index >= self._time_len:
-            raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
-
-        parts: List[np.ndarray] = []
-        for info in self._rank_files:
-            if info["saved_points"] == 0:
-                parts.append(np.empty((0,), dtype=dtype or np.float32))
-                continue
-            with nc.Dataset(info["path"], "r") as ds:
-                var = ds.variables[self.var_name]
-                if info["has_levels"]:
-                    if level is None:
-                        data = var[t_index, :, :]
-                    else:
-                        if level < 0 or level >= info["n_levels"]:
-                            raise IndexError(f"level out of range [0, {info['n_levels'] - 1}]")
-                        data = var[t_index, :, level]
-                else:
-                    data = var[t_index, :]
-
-                data = np.array(data, copy=False)
-                if dtype is not None:
-                    data = data.astype(dtype, copy=False)
-                parts.append(data)
-
-        return self._concat_saved_points_across_ranks(parts)
-
-    def read_time_step_grid(
-        self,
-        t_index: int,
-        level: Optional[int] = None,
-        fill_value: float = np.nan,
-        dtype: Optional[np.dtype] = None,
-    ) -> np.ndarray:
-        if self._map_shape is None:
-            raise RuntimeError("map_shape is not set; cannot project to grid.")
-        nx_, ny_ = self._map_shape
-        grid = np.full((nx_, ny_), fill_value, dtype=dtype or np.float32)
-
-        for info in self._rank_files:
-            if info["saved_points"] == 0:
-                continue
-            if info["x"] is None or info["y"] is None:
-                raise RuntimeError(
-                    f"{info['path'].name} is missing (x, y). Provide map_shape or a coord converter."
-                )
-            with nc.Dataset(info["path"], "r") as ds:
-                var = ds.variables[self.var_name]
-                if info["has_levels"]:
-                    if level is None:
-                        raise ValueError("This variable has 'levels'; please specify 'level'.")
-                    if level < 0 or level >= info["n_levels"]:
-                        raise IndexError(f"level out of range [0, {info['n_levels'] - 1}]")
-                    vals = var[t_index, :, level]
-                else:
-                    vals = var[t_index, :]
-
-                vals = np.array(vals, copy=False)
-                grid[info["x"], info["y"]] = vals
-
-        return grid
 
     # -----------------------------
     # Visualization
@@ -432,7 +576,7 @@ class MultiRankStatsReader:
         fig, ax = plt.subplots(figsize=figsize)
 
         if self.map_shape is not None:
-            grid = self.read_time_step_grid(t_index, level=level)
+            grid = self.get_grid(t_index, level=level)
             im = ax.imshow(grid.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             ax.set_title(f"{self.var_name} @ {t_str}")
@@ -451,12 +595,20 @@ class MultiRankStatsReader:
                     )
                 xs.append(info["x"])
                 ys.append(info["y"])
-                with nc.Dataset(info["path"], "r") as ds:
-                    var = ds.variables[self.var_name]
+                cache_arr = info.get("cache") if isinstance(info, dict) else None
+                if cache_arr is not None:
                     if info["has_levels"]:
-                        vv = var[t_index, :, level] if level is not None else var[t_index, :, 0]
+                        vv = cache_arr[t_index, :, level if level is not None else 0]
                     else:
-                        vv = var[t_index, :]
+                        vv = cache_arr[t_index, :]
+                else:
+                    with nc.Dataset(info["path"], "r") as ds:
+                        var = ds.variables[self.var_name]
+                        ti = self._t_offset + t_index
+                        if info["has_levels"]:
+                            vv = var[ti, :, level] if level is not None else var[ti, :, 0]
+                        else:
+                            vv = var[ti, :]
                 vals.append(np.array(vv))
 
             x_all = np.concatenate(xs) if xs else np.array([])
@@ -503,7 +655,7 @@ class MultiRankStatsReader:
         if xmin > xmax or ymin > ymax:
             raise ValueError("Invalid x_range or y_range")
 
-        first_grid = self.read_time_step_grid(t_start, level=level)
+        first_grid = self.get_grid(t_start, level=level)
         window = first_grid[xmin : xmax + 1, ymin : ymax + 1]
         if vmin is None:
             vmin = np.nanmin(window) if np.isfinite(window).any() else 0.0
@@ -522,7 +674,7 @@ class MultiRankStatsReader:
 
         def _update(frame_idx: int):
             ti = t_start + frame_idx
-            grid = self.read_time_step_grid(ti, level=level)
+            grid = self.get_grid(ti, level=level)
             win = grid[xmin : xmax + 1, ymin : ymax + 1]
             im.set_data(win.T)
             ttl.set_text(f"{self.var_name} @ {self.times[ti].isoformat()}")
@@ -597,7 +749,7 @@ class MultiRankStatsReader:
                 print(f"[BIN] writing year {year} -> {year_path.name} ({len(year_to_indices[year])} frames)")
             with open(year_path, "wb") as fw:
                 for ti in year_to_indices[year]:
-                    grid = self.read_time_step_grid(ti, level=None, fill_value=fill_value, dtype=dtype)
+                    grid = self.get_grid(ti, level=None, fill_value=fill_value, dtype=dtype)
                     grid = np.where(np.isfinite(grid), grid, fill_value).astype(dtype, copy=False)
                     arr = np.asfortranarray(grid)
                     fw.write(arr.tobytes(order="F"))

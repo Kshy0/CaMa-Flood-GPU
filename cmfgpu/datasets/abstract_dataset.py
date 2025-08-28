@@ -8,6 +8,7 @@ from typing import Literal, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import netCDF4 as nc
 from scipy.sparse import csr_matrix
 
 from cmfgpu.utils import binread, find_indices_in, is_rank_zero, read_map
@@ -57,10 +58,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.out_dtype = out_dtype
 
     def shard_forcing(self, 
-                                   batch_runoff: torch.Tensor, 
-                                   local_runoff_matrix: torch.Tensor, 
-                                   local_runoff_indices: torch.Tensor,
-                                   world_size: int) -> torch.Tensor:
+                    batch_runoff: torch.Tensor, 
+                    local_runoff_matrix: torch.Tensor, 
+                    local_runoff_indices: torch.Tensor,
+                    world_size: int) -> torch.Tensor:
         """
         Applies the local runoff matrix to the provided runoff data.
         Assumes runoff_data is a 1D array ordered according to the mapping file.
@@ -143,6 +144,126 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         print(f"Original matrix shape: {matrix_shape}, Local matrix shape: {local_runoff_matrix.shape}")
         print(f"Found {np.sum(valid_idx)} out of {len(desired_catchment_ids)} requested catchments")
         return local_runoff_matrix, local_runoff_indices
+
+    def export_catchment_runoff(
+        self,
+        out_dir: str | Path,
+        mapping_npz: str | Path,
+        parameter_nc: str | Path,
+        var_name: str = "runoff",
+        dtype: Literal["float32", "float64"] = "float32",
+        complevel: int = 4,
+    ) -> Path:
+        """
+        Export catchment-aggregated runoff to a NetCDF file readable by MultiRankStatsReader.
+
+        - Output filename: {var_name}_rank0.nc
+        - Dimensions: time (unlimited), saved_points
+        - Variables:
+            * time: numeric with units and calendar
+            * save_coord: (saved_points,) linear catchment IDs (compatible with nx, ny)
+            * {var_name}: (time, saved_points) aggregated runoff (area-weighted mean in mm)
+        - Inputs: sparse mapping NPZ (CSR matrix + catchment_ids) and a parameter NetCDF (to copy nx/ny attrs).
+
+        Time range: uses the dataset's inherent length (e.g., defined by its __len__), no extra arguments.
+        """
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        mapping_npz = Path(mapping_npz)
+        parameter_nc = Path(parameter_nc)
+
+        if not mapping_npz.exists():
+            raise FileNotFoundError(f"Mapping file not found: {mapping_npz}")
+
+        m = np.load(mapping_npz)
+        catchment_ids = m["catchment_ids"].astype(np.int64)
+        sparse_data = m["sparse_data"].astype(np.float32 if dtype == "float32" else np.float64)
+        sparse_indices = m["sparse_indices"].astype(np.int64)
+        sparse_indptr = m["sparse_indptr"].astype(np.int64)
+        mat_shape = tuple(np.array(m["matrix_shape"]).tolist())
+        mapping = csr_matrix((sparse_data, sparse_indices, sparse_indptr), shape=mat_shape)
+
+        # Normalize rows by total area to produce area-weighted mean (weights sum to 1 per catchment)
+        mapping = mapping.tocsr(copy=True)
+        row_sums = np.asarray(mapping.sum(axis=1)).ravel()
+        # Avoid division by zero; rows with zero sum remain zeros
+        for i in range(mapping.shape[0]):
+            start, end = mapping.indptr[i], mapping.indptr[i + 1]
+            s = row_sums[i]
+            if s > 0:
+                mapping.data[start:end] /= s
+
+        n_catch = int(catchment_ids.shape[0])
+        n_cols = int(mat_shape[1])
+        if n_cols != self.data_size:
+            raise ValueError(
+                f"Mapping columns ({n_cols}) != dataset data_size ({self.data_size})."
+            )
+
+        # Resolve time range from dataset length
+        try:
+            time_len = len(self)
+        except Exception as e:
+            raise RuntimeError("Dataset does not provide a length; implement __len__ to use this export.") from e
+        if time_len <= 0:
+            raise ValueError("Dataset length is zero; nothing to export.")
+
+        nc_path = out_dir / f"{var_name}_rank0.nc"
+        dtype_nc = "f4" if dtype == "float32" else "f8"
+        with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
+
+            try:
+                with nc.Dataset(parameter_nc, "r") as pds:
+                    if "nx" in pds.ncattrs():
+                        ds.setncattr("nx", int(pds.getncattr("nx")))
+                    if "ny" in pds.ncattrs():
+                        ds.setncattr("ny", int(pds.getncattr("ny")))
+                    dims = list(pds.dimensions.keys())
+                    for a, b in [("nx", "ny"), ("x", "y"), ("lon", "lat")]:
+                        if a in dims and b in dims and ("nx" not in ds.ncattrs() or "ny" not in ds.ncattrs()):
+                            ds.setncattr("nx", int(pds.dimensions[a].size))
+                            ds.setncattr("ny", int(pds.dimensions[b].size))
+                            break
+            except Exception:
+                pass
+
+            ds.setncattr("title", f"Aggregated catchment runoff ({var_name})")
+            ds.createDimension("time", None)
+            ds.createDimension("saved_points", n_catch)
+
+            time_var = ds.createVariable("time", "f8", ("time",))
+            time_var.setncattr("units", "seconds since 1900-01-01 00:00:00")
+            time_var.setncattr("calendar", "standard")
+
+            save_coord = ds.createVariable("save_coord", "i8", ("saved_points",))
+            save_coord[:] = catchment_ids
+
+            out_var = ds.createVariable(
+                var_name,
+                dtype_nc,
+                ("time", "saved_points"),
+                zlib=True,
+                complevel=int(complevel),
+            )
+            out_var.setncattr("description", f"Catchment-aggregated {var_name} (area-weighted mean)")
+            out_var.setncattr("units", "mm")
+
+            write_idx = 0
+            for ti in range(0, time_len):
+                dt = self.get_time_by_index(ti)
+                vec = self.get_data(dt)
+                if vec.shape[0] != n_cols:
+                    raise ValueError(
+                        f"Data length {vec.shape[0]} != mapping columns {n_cols} at time index {ti}."
+                    )
+                # Aggregate: CSR (catchments x points) @ vector(points) -> vector(catchments)
+                agg = mapping @ vec.astype(np.float32 if dtype == "float32" else np.float64)
+                out_var[write_idx, :] = np.asarray(agg, dtype=np.float32 if dtype == "float32" else np.float64)
+                time_val = nc.date2num(dt, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
+                time_var[write_idx] = time_val
+                write_idx += 1
+
+        return nc_path
     
     def generate_runoff_mapping_table(
         self,

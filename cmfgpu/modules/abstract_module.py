@@ -115,7 +115,8 @@ class AbstractModule(BaseModel, ABC):
     # Module metadata - must be overridden in subclasses
     module_name: ClassVar[str] = "abstract"
     description: ClassVar[str] = "Abstract base module"
-    dependencies: ClassVar[list] = []  # List of modules this module depends on
+    dependencies: ClassVar[List[str]] = []  # List of modules this module depends on
+    conflicts: ClassVar[List[str]] = []  # List of modules that cannot co-exist with this module
     group_by: ClassVar[Optional[str]] = None  # Variable indicating basin membership
     nc_excluded_fields: ClassVar[List[str]] = [
         "opened_modules", "device", "precision"
@@ -317,6 +318,13 @@ class AbstractModule(BaseModel, ABC):
                 f"Module '{self.module_name}' has missing dependencies in opened_modules: {missing_deps}. "
                 f"Required dependencies: {self.dependencies}. "
                 f"Available modules: {v}"
+            )
+
+        present_conflicts = [c for c in self.conflicts if c in v and c != self.module_name]
+        if present_conflicts:
+            raise ValueError(
+                f"Module '{self.module_name}' conflicts with modules present in opened_modules: {present_conflicts}. "
+                f"These modules cannot be enabled together."
             )
         
         return self
