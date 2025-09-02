@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 from __future__ import annotations
 
 import hashlib
@@ -237,7 +243,7 @@ class StatisticsAggregator:
         if self._temp_kernel_file and os.path.exists(self._temp_kernel_file):
             try:
                 os.unlink(self._temp_kernel_file)
-            except:
+            except Exception:
                 pass
     
     def _cleanup_executor(self):
@@ -499,9 +505,13 @@ class StatisticsAggregator:
         for var in dims_1d:
             kernel_code_lines.append(f"        {var}_old_mean = tl.load({var}_mean_ptr + offs, mask=mask, other=0.0)")
         
-        # Update means
+        # Update means (time-weighted)
         for var in dims_1d:
-            kernel_code_lines.append(f"    {var}_new_mean = {var}_old_mean + {var} / weight")
+            kernel_code_lines.append(f"    {var}_new_mean = {var}_old_mean + {var} * weight")
+        # Finalize mean on last by dividing by total_weight
+        kernel_code_lines.append("    if is_last:")
+        for var in dims_1d:
+            kernel_code_lines.append(f"        {var}_new_mean = {var}_new_mean / total_weight")
         
         # Store new means using offs (sequential storage)
         for var in dims_1d:
@@ -528,9 +538,12 @@ class StatisticsAggregator:
         for var in dims_2d:
             kernel_code_lines.append(f"            {var}_old_mean = tl.load({var}_mean_ptr + offs * n_levels + level, mask=mask, other=0.0)")
         
-        # Update means
+        # Update means (time-weighted)
         for var in dims_2d:
-            kernel_code_lines.append(f"        {var}_new_mean = {var}_old_mean + {var} / weight")
+            kernel_code_lines.append(f"        {var}_new_mean = {var}_old_mean + {var} * weight")
+        kernel_code_lines.append("        if is_last:")
+        for var in dims_2d:
+            kernel_code_lines.append(f"            {var}_new_mean = {var}_new_mean / total_weight")
         
         # Store new means using offs (sequential storage)
         for var in dims_2d:
@@ -564,6 +577,7 @@ class StatisticsAggregator:
 
         kernel_code_lines.extend([
             "    weight,",
+            "    total_weight,",
             "    is_first,",
             "    is_last,",
             "    n_saved_points: tl.constexpr,",
@@ -604,7 +618,9 @@ class StatisticsAggregator:
                                 f"        old = tl.zeros_like(val)",
                                 "    else:",
                                 f"        old = tl.load({var}_mean_ptr + offs, mask=mask, other=0.0)",
-                                f"    new = old + val / weight",
+                                f"    new = old + val * weight",
+                                "    if is_last:",
+                                f"        new = new / total_weight",
                                 f"    tl.store({var}_mean_ptr + offs, new, mask=mask)",
                             ])
                         elif op == 'max':
@@ -632,7 +648,7 @@ class StatisticsAggregator:
                             ])
                 kernel_code_lines.append("")
 
-        # 2D processing
+    # 2D processing
         if dims_2d:
             non_last_only = [v for v in dims_2d if not (len(self._variable_ops[v]) == 1 and self._variable_ops[v][0] == 'last')]
             last_only_vars = [v for v in dims_2d if (len(self._variable_ops[v]) == 1 and self._variable_ops[v][0] == 'last')]
@@ -651,7 +667,9 @@ class StatisticsAggregator:
                                 f"            old = tl.zeros_like(val)",
                                 "        else:",
                                 f"            old = tl.load({var}_mean_ptr + offs * n_levels + level, mask=mask, other=0.0)",
-                                f"        new = old + val / weight",
+                                f"        new = old + val * weight",
+                                "        if is_last:",
+                                f"            new = new / total_weight",
                                 f"        tl.store({var}_mean_ptr + offs * n_levels + level, new, mask=mask)",
                             ])
                         elif op == 'max':
@@ -702,13 +720,14 @@ class StatisticsAggregator:
             "# Main aggregation function",
             "# ============================================================================",
             "",
-            "def internal_update_statistics(states, weight, is_first, is_last, BLOCK_SIZE):",
+            "def internal_update_statistics(states, weight, total_weight, is_first, is_last, BLOCK_SIZE):",
             '    """',
             '    Update statistics for all registered variables (mean/max/min/last).',
             '    ',
             '    Args:',
             '        states: Dictionary of tensor states',
-            '        weight: Total number of sub-steps per time step',
+            '        weight: dt (seconds) for this sub-step',
+            '        total_weight: total dt (seconds) for the window; used only when is_last==1',
             '        is_first: 1 on first sub-step, 0 otherwise',
             '        is_last: 1 on final sub-step of the time step, else 0',
             '        BLOCK_SIZE: GPU block size',
@@ -737,6 +756,7 @@ class StatisticsAggregator:
             
             kernel_code_lines.extend([
                 "        weight=weight,",
+                "        total_weight=total_weight,",
                 "        is_first=is_first,",
                 "        is_last=is_last,",
                 "        n_saved_points=save_idx_len,",
@@ -897,10 +917,10 @@ class StatisticsAggregator:
         self._prepare_kernel_states()
 
     
-    def update_statistics(self, weight: int, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
+    def update_statistics(self, weight: float, total_weight: float = 0.0, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
         if not self._aggregator_generated:
             raise RuntimeError("Statistics aggregation not initialized. Call initialize_streaming_aggregation() first.")
-        self._aggregator_function(self._kernel_states, weight, is_first, is_last, BLOCK_SIZE)
+        self._aggregator_function(self._kernel_states, weight, total_weight, is_first, is_last, BLOCK_SIZE)
     
     def finalize_time_step(self, dt: datetime) -> None:
         """

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """
 Abstract base class for all CaMa-Flood-GPU modules using Pydantic v2.
 This is the highest level abstraction that all modules inherit from.

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
 """
@@ -7,7 +13,7 @@ from typing import Callable, ClassVar, Dict, Optional, Type
 
 import torch
 import triton
-from pydantic import computed_field
+from pydantic import PrivateAttr, computed_field
 from torch import distributed as dist
 
 from cmfgpu.models.abstract_model import AbstractModel
@@ -35,6 +41,7 @@ class CaMaFlood(AbstractModel):
         "adaptive_time": AdaptiveTimeModule
     }
     group_by: ClassVar[str] = "catchment_basin_id"
+    _stats_elapsed_time: float = PrivateAttr(default=0.0)
 
     @cached_property
     def base(self) -> BaseModule:
@@ -65,14 +72,39 @@ class CaMaFlood(AbstractModel):
     def bifurcation_grid(self) -> Callable:
         return lambda META: (triton.cdiv(self.bifurcation.num_bifurcation_paths, META["BLOCK_SIZE"]),) if self.bifurcation_flag else None
 
-    def step_advance(self, runoff: torch.Tensor, time_step: float, default_num_sub_steps: int, current_time: Optional[datetime]) -> None:
+    def step_advance(
+        self,
+        runoff: torch.Tensor,
+        time_step: float,
+        default_num_sub_steps: int,
+        current_time: Optional[datetime],
+        stat_is_first: bool = True,
+        stat_is_last: bool = True,
+    ) -> None:
         """
         Advance the model by one time step using the provided runoff input.
+
+        Notes on time-weighted statistics:
+          - Time-weighted accumulation is performed every sub-step with weight = dt (seconds).
+          - If stat_is_first is True, the accumulation window is reset at the first sub-step.
+          - If stat_is_last is True, the window is finalized at the last sub-step: all accumulated
+            sums are divided by the total elapsed time (total_weight) to yield means.
+          - By default (stat_is_first=True, stat_is_last=True), each call to step_advance forms an
+            independent window and is saved once at the end of this call.
+
+        Example: If you want to save daily statistics while the input runoff is hourly:
+          - At 00:00-01:00:    call step_advance(..., stat_is_first=True,  stat_is_last=False)
+          - At 01:00-23:00:    call step_advance(..., stat_is_first=False, stat_is_last=False)
+          - At 23:00-24:00:    call step_advance(..., stat_is_first=False, stat_is_last=True)
+          This makes the whole day one averaging window; only the last hour finalizes the mean.
+
         Args:
             runoff (torch.Tensor): Input runoff tensor for this time step.
-            time_step (float): Duration of the time step.
-            default_num_sub_steps (int): Default number of sub-steps if adaptive time stepping is not used.
-            current_time (Optional[datetime]): Current simulation time. Required for logging and adaptive time stepping.
+            time_step (float): Duration of the time step (seconds).
+            default_num_sub_steps (int): Default sub-steps if adaptive time stepping is disabled.
+            current_time (Optional[datetime]): Current simulation time. Used for logging.
+            stat_is_first (bool): Whether this call starts a new statistics window (resets accumulation).
+            stat_is_last (bool): Whether this call ends the current statistics window (finalize average).
         """
         if self.adaptive_time is not None:
             self.adaptive_time.min_time_sub_step.fill_(float('inf'))
@@ -97,16 +129,41 @@ class CaMaFlood(AbstractModel):
             time_sub_step = time_step / num_sub_steps
         if self.log is not None:
             self.log.set_time(time_sub_step, num_sub_steps, current_time)
+
+        if stat_is_first:
+            # Reset elapsed time counter at the beginning of a stats window
+            self._stats_elapsed_time = 0.0
+
         for sub_step in range(num_sub_steps):
-            self.do_one_sub_step(time_sub_step, runoff, sub_step, num_sub_steps)
-        self.finalize_time_step(current_time)
+            # Determine flags for the first/last sub-step of this model step
+            is_first = stat_is_first and (sub_step == 0)
+            is_last = stat_is_last and (sub_step == num_sub_steps - 1)
+            self.do_one_sub_step(time_sub_step, runoff, sub_step, num_sub_steps, is_first, is_last)
+            # Accumulate elapsed time in seconds for the current window
+            self._stats_elapsed_time += time_sub_step
+            # Compute total_weight only when finalizing
+            total_weight = self._stats_elapsed_time if is_last else 0.0
+            # Update stats after physics for each sub-step
+            self.update_statistics(
+                weight=time_sub_step,
+                total_weight=total_weight,
+                is_first=is_first,
+                is_last=is_last,
+                BLOCK_SIZE=self.BLOCK_SIZE,
+            )
+
+        # Reset elapsed counter after closing a window
+        if stat_is_last:
+            self.finalize_time_step(current_time)
+            self._stats_elapsed_time = 0.0
+        
         if self.log is not None:
             if self.world_size > 1:
                 self.log.gather_results()
             if self.rank == 0:
                 self.log.write_step(self.log_path)
 
-    def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int, num_sub_steps: int) -> None:
+    def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int, num_sub_steps: int, is_first_flag: bool = False, is_last_flag: bool = False) -> None:
         """Execute one sub time step calculation"""
         # Outflow computation
         compute_outflow_kernel[self.base_grid](
@@ -259,9 +316,3 @@ class CaMaFlood(AbstractModel):
                 num_flood_levels=self.base.num_flood_levels,
                 BLOCK_SIZE=self.BLOCK_SIZE
             )
-        self.update_statistics(
-            weight=num_sub_steps,
-            is_first=(sub_step == 0),
-            is_last=(sub_step == num_sub_steps - 1),
-            BLOCK_SIZE=self.BLOCK_SIZE
-        )

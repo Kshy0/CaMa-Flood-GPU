@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -5,10 +11,10 @@ from functools import cached_property
 from pathlib import Path
 from typing import Literal, Tuple
 
+import netCDF4 as nc
 import numpy as np
 import torch
 import torch.distributed as dist
-import netCDF4 as nc
 from scipy.sparse import csr_matrix
 
 from cmfgpu.utils import binread, find_indices_in, is_rank_zero, read_map
@@ -17,7 +23,35 @@ from cmfgpu.utils import binread, find_indices_in, is_rank_zero, read_map
 def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
     """
     Calculates runoff grid IDs considering ascending or descending order of coordinates.
+
+    Notes on longitude handling:
+    - runoff_lon is assumed to be strictly monotonic (usually ascending) and may be in
+      [-180, 180] or [0, 360].
+    - hires_lon values (e.g., generated from high-res maps) are typically in [-180, 180].
+    - To avoid wrap-around mismatches, hires_lon is first normalized to the same range
+      as runoff_lon before computing indices.
     """
+
+    def _wrap_lon(lon_vals, mode):
+        """Normalize longitudes to the target range.
+        mode: '0-360' -> [0, 360), '-180-180' -> [-180, 180)
+        """
+        if mode == '0-360':
+            # Use modulo to bring into [0, 360)
+            return np.mod(lon_vals, 360.0)
+        else:
+            # Shift-mod-wrap into [-180, 180)
+            wrapped = (np.mod(lon_vals + 180.0, 360.0)) - 180.0
+            return wrapped
+
+    # Decide target longitude range based on runoff grid
+    rmin, rmax = float(np.min(runoff_lon)), float(np.max(runoff_lon))
+    # if entirely non-negative and up to 360 -> treat as 0-360; otherwise -180-180
+    target_mode = '0-360' if (rmin >= 0.0 and rmax <= 360.0) else '-180-180'
+
+    # Normalize hires_lon to the same wrap as runoff_lon
+    hires_lon = _wrap_lon(hires_lon, target_mode)
+
     lon_ascending = runoff_lon[1] > runoff_lon[0]
     lat_ascending = runoff_lat[1] > runoff_lat[0]
 
@@ -38,9 +72,10 @@ def compute_runoff_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
         northin = runoff_lat[0] + 0.5 * gsize_lat
         iyin = np.floor((northin - hires_lat) / gsize_lat).astype(int)
 
+    
     nxin = len(runoff_lon)
     nyin = len(runoff_lat)
-
+    ixin[ixin == nxin] = 0
     assert np.all((ixin >= 0) & (ixin < nxin)), "Some hires_lon points fall outside the runoff grid (longitude)"
     assert np.all((iyin >= 0) & (iyin < nyin)), "Some hires_lat points fall outside the runoff grid (latitude)"
 
@@ -53,23 +88,36 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     Custom abstract class that inherits from PyTorch Dataset.
     Defines a common interface for accessing data with distributed support.
     """
-    def __init__(self, out_dtype: str = "float32", *args, **kwargs):
+    def __init__(self, out_dtype: str = "float32", chunk_len: int = 1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.out_dtype = out_dtype
+        self.chunk_len = chunk_len
 
-    def shard_forcing(self, 
-                    batch_runoff: torch.Tensor, 
-                    local_runoff_matrix: torch.Tensor, 
-                    local_runoff_indices: torch.Tensor,
-                    world_size: int) -> torch.Tensor:
+    def shard_forcing(
+        self,
+        batch_runoff: torch.Tensor,
+        local_runoff_matrix: torch.Tensor,
+        local_runoff_indices: torch.Tensor,
+        world_size: int,
+    ) -> torch.Tensor:
         """
-        Applies the local runoff matrix to the provided runoff data.
-        Assumes runoff_data is a 1D array ordered according to the mapping file.
-        Returns a tensor of catchment runoff values.
+        Map grid runoff to catchments and handle distributed sync.
+
+        Expected input shape: (B, T, N). We'll flatten the first two
+        dimensions into a single time-like dimension before mapping to catchments.
+        Output shape: ((B*T), C) where C = number of catchments mapped.
         """
+        if batch_runoff.dim() == 3:
+            B, T, N = batch_runoff.shape
+            flat = batch_runoff.reshape(B * T, N)
+        else:
+            raise ValueError(f"batch_runoff must be 3D, got shape {tuple(batch_runoff.shape)}")
+
         if world_size > 1:
-            dist.broadcast(batch_runoff, src=0)
-        return (batch_runoff[:, local_runoff_indices] @ local_runoff_matrix).contiguous()
+            dist.broadcast(flat, src=0)
+
+        out = (flat[:, local_runoff_indices] @ local_runoff_matrix).contiguous()
+        return out
 
     def build_local_runoff_matrix(self, runoff_mapping_file: str, desired_catchment_ids: np.ndarray, 
                                 precision: Literal["float32", "float64"], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -200,14 +248,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 f"Mapping columns ({n_cols}) != dataset data_size ({self.data_size})."
             )
 
-        # Resolve time range from dataset length
-        try:
-            time_len = len(self)
-        except Exception as e:
-            raise RuntimeError("Dataset does not provide a length; implement __len__ to use this export.") from e
-        if time_len <= 0:
-            raise ValueError("Dataset length is zero; nothing to export.")
-
         nc_path = out_dir / f"{var_name}_rank0.nc"
         dtype_nc = "f4" if dtype == "float32" else "f8"
         with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
@@ -249,19 +289,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             out_var.setncattr("units", "mm")
 
             write_idx = 0
-            for ti in range(0, time_len):
-                dt = self.get_time_by_index(ti)
-                vec = self.get_data(dt)
-                if vec.shape[0] != n_cols:
+            n_chunks = len(self)
+            for ci in range(n_chunks):
+                base_idx = ci * self.chunk_len
+                dt0 = self.get_time_by_index(base_idx)
+                block = self.get_data(dt0, length=self.chunk_len)
+                if block.ndim != 2 or block.shape[1] != n_cols:
                     raise ValueError(
-                        f"Data length {vec.shape[0]} != mapping columns {n_cols} at time index {ti}."
+                        f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols} at chunk {ci}."
                     )
-                # Aggregate: CSR (catchments x points) @ vector(points) -> vector(catchments)
-                agg = mapping @ vec.astype(np.float32 if dtype == "float32" else np.float64)
-                out_var[write_idx, :] = np.asarray(agg, dtype=np.float32 if dtype == "float32" else np.float64)
-                time_val = nc.date2num(dt, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
-                time_var[write_idx] = time_val
-                write_idx += 1
+                T = int(block.shape[0])
+                # Write each timestep in the block
+                for k in range(T):
+                    dt_k = self.get_time_by_index(base_idx + k)
+                    vec = block[k].astype(np.float32 if dtype == "float32" else np.float64, copy=False)
+                    agg = mapping @ vec
+                    out_var[write_idx, :] = np.asarray(agg, dtype=np.float32 if dtype == "float32" else np.float64)
+                    time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
+                    time_var[write_idx] = time_val
+                    write_idx += 1
 
         return nc_path
     
@@ -374,7 +420,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             dtype=np.float32
         )
         
-        
         # Eliminate zeros and compress
         sparse_matrix.eliminate_zeros()
         
@@ -397,12 +442,18 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
 
     @abstractmethod
-    def get_data(self, current_time: datetime) -> np.ndarray:
+    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
         """
-        To be implemented by subclasses, reads data of the specified date and time point from storage.
-        Returns data which is 1D array ordered according to mapping file.
+        Read a contiguous time block starting at current_time.
+
+        Inputs:
+        - current_time: start datetime aligned to dataset time grid
+        - chunk_len: positive integer number of steps to read
+
+        Returns: 2D numpy array with shape (T, N), where T == chunk_len and
+        N equals the number of valid spatial points (sum of data_mask).
         """
-        pass
+        raise NotImplementedError
     
     @property
     @abstractmethod
@@ -417,14 +468,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         To be implemented by subclasses, returns the coordinates of the dataset.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def get_time_by_index(self, idx: int) -> datetime:
         """
         Returns the datetime corresponding to the given index.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def close(self) -> None:
@@ -439,13 +490,31 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
     def __getitem__(self, idx: int) -> np.ndarray:
         """
-        Fetches data for a given index.
-        Returns distributed data based on rank.
-        """
-        current_time = self.get_time_by_index(idx)
-        if is_rank_zero():
-            data = self.get_data(current_time)
-        else:
-            data = np.empty(self.data_size, dtype=self.out_dtype)
+        Fetch one chunk (T <= chunk_len) starting at chunk index `idx` and pad to (chunk_len, N).
 
+        Behavior:
+        - Uses get_time_by_index(idx * chunk_len) to locate the first timestep of the chunk.
+        - Calls get_data(current_time, length=chunk_len), which may return fewer than chunk_len rows.
+        - Pads the tail with zeros to always return shape (chunk_len, N).
+        - For non-rank-0, returns a zero array of the correct shape without reading.
+        """
+        # Compute absolute start index for this chunk
+        base_idx = idx * self.chunk_len
+        N = int(self.data_size)
+        # Non-rank-0: return zeros to keep shapes consistent across ranks
+        if not is_rank_zero():
+            data = np.empty((self.chunk_len, N), dtype=self.out_dtype)
+            return data
+
+        # Rank-0: fetch data and pad if needed
+        current_time = self.get_time_by_index(base_idx)
+        data = self.get_data(current_time, chunk_len=self.chunk_len)
+        if data.ndim != 2 or data.shape[1] != N:
+            raise ValueError(
+                f"get_data must return (T, N) with N={N}, got {tuple(data.shape)}"
+            )
+        T = int(data.shape[0])
+        if T < self.chunk_len:
+            pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
+            data = np.vstack([data, pad]) if data.size else pad
         return data

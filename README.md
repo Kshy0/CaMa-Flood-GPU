@@ -84,7 +84,7 @@ if __name__ == "__main__":
 
 The `target_gpus` parameter specifies the number of GPUs for basin workload distribution.
 In high-resolution cases—especially with `glb_03min` or finer maps—too many bifurcations may merge large basins, causing severe load imbalance on 4+ GPU runs.
-This option lets CaMa-Flood-GPU cut a small number of inter-basin links to improve balance.
+This option lets CaMa-Flood-GPU cut a small number of cross-basin links to improve balance.
 
 - ### 1. Prepare data
 
@@ -110,8 +110,9 @@ This option lets CaMa-Flood-GPU cut a small number of inter-basin links to impro
   This repository includes dataset classes for both binary (`.bin`) and NetCDF (`.nc`) input formats. Each dataset type is defined in its own script under the `./datasets/` directory. For example:
   
   - `./datasets/daily_bin_dataset.py` — for daily binary runoff data
-  - `./datasets/daily_nc_dataset.py` — for NetCDF-based runoff
-  
+  - `./datasets/netcdf_dataset.py` — for NetCDF-based runoff
+  - `./datasets/era5_land_dataset.py` — for ERA5-Land NetCDF-based runoff
+
   These classes include built-in methods such as `generate_runoff_mapping_table()` to create the required mapping `.npz` file.
   
   ```shell
@@ -124,7 +125,7 @@ This option lets CaMa-Flood-GPU cut a small number of inter-basin links to impro
   
   ### 4. Run the model
   
-  Several script templates are provided in the `./scripts` directory, such as `run_daily_bin.py` and `run_daily_nc.py`. You are encouraged to modify or customize these scripts to fit your specific workflow and simulation requirements.
+  Several script templates are provided in the `./scripts` directory, such as `run_daily_bin.py` and `netcdf_nc.py`. You are encouraged to modify or customize these scripts to fit your specific workflow and simulation requirements.
   
   For 1 GPU on a single machine, simply run:
   
@@ -169,13 +170,13 @@ This option lets CaMa-Flood-GPU cut a small number of inter-basin links to impro
 
 ## Disclaimer
 
-CaMa-Flood-GPU is in early-stage development and has not been comprehensively validated for scientific or operational use. It is intended for research, development, and educational purposes. Please verify results independently before relying on them for critical applications.
+CaMa-Flood-GPU is is intended for research, development, and educational purposes. Please verify results independently before relying on them for critical applications.
 
 ---
 
 ## License
 
-Coming soon.
+CaMa-Flood-GPU follows the same Apache 2.0 license as CaMa-Flood, but the datasets are provided under a different license.
 
 ---
 

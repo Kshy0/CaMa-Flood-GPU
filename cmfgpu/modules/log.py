@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """
 Log module for CaMa-Flood-GPU using TensorField / computed_tensor_field helpers.
 """
@@ -50,6 +56,7 @@ class LogModule(AbstractModule):
     _num_steps: int = PrivateAttr()
     _current_time: datetime = PrivateAttr()
     _times: List[datetime] = PrivateAttr(default_factory=list)
+    _log_initialized: bool = PrivateAttr(default=False)
 
     # ------------------------------------------------------------------ #
     # Methods
@@ -102,8 +109,10 @@ class LogModule(AbstractModule):
             dist.reduce(getattr(self, field), dst=0, op=dist.ReduceOp.SUM)
 
     def write_step(self, log_path: Path) -> None:
-        if not log_path.exists():
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._log_initialized:
             self.write_header(log_path)
+            self._log_initialized = True
         with log_path.open("a") as f:
             f.write(
                 f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {self._num_steps}\n"

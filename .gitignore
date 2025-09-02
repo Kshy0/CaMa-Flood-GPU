@@ -1,6 +1,7 @@
 out/
 __pycache__/
 .vscode/
+.github/
 *.egg-info/
 *.npz
 *.json
@@ -8,4 +9,5 @@ __pycache__/
 *.so
 .DS_Store
 tests/
+scripts_hpc/
 inp/

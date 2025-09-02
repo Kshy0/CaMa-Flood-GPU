@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
@@ -43,12 +49,13 @@ class DailyBinDataset(AbstractDataset):
                  shape: List[int],
                  start_date: datetime,
                  end_date: datetime,
-                 unit_factor: float = 1.0,
+                 unit_factor: float = 1.0, # mm/day divided by unit_factor to get m/s
                  bin_dtype: str = "float32",
                  prefix: str = "Roff____",
                  suffix: str = ".one",
+                 out_dtype: str = "float32",
                  *args, **kwargs):
-        
+
         self.base_dir = base_dir
         self.shape = tuple(shape)
         self.start_date = start_date
@@ -58,22 +65,21 @@ class DailyBinDataset(AbstractDataset):
         self.prefix = prefix
         self.suffix = suffix
         self._validate_files_exist()
-        super().__init__(*args, **kwargs)
+        super().__init__(out_dtype=out_dtype, chunk_len=1, *args, **kwargs)
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         lat = np.arange(89.5, -89.5 - 1, -1)
         lon = np.arange(-179.5, 179.5 + 1, 1)
         return lon, lat
 
-    def get_data(self, current_time: datetime) -> np.ndarray:
+    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+        if chunk_len != 1:
+            raise ValueError("DailyBinDataset only supports chunk_len=1 (one day per file)")
         filename = f"{self.prefix}{current_time:%Y%m%d}{self.suffix}"
         file_path = Path(self.base_dir) / filename
-
         data = np.fromfile(file_path, dtype=self.bin_dtype)
-        # data = data.reshape(self.shape, order='C')
         data[~(data >= 0)] = 0.0
-
-        return data.astype(self.out_dtype) / self.unit_factor
+        return (data.astype(self.out_dtype) / self.unit_factor)[None, :]
 
     @cached_property
     def data_mask(self):

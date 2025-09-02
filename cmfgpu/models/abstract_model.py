@@ -1,10 +1,17 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 from __future__ import annotations
 
 from abc import ABC
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Type, Union
+from typing import (Any, ClassVar, Dict, List, Literal, Optional, Self, Type,
+                    Union)
 
 import numpy as np
 import numpy.ma as ma
@@ -132,24 +139,8 @@ class AbstractModel(BaseModel, ABC):
             if self.group_by not in ds.variables:
                 raise ValueError(f"Missing primary group variable '{self.group_by}' in NetCDF file.")
             grp = np.asarray(ds.variables[self.group_by][:])
-        # call the new single-step Numba function
         group_id_to_rank = compute_group_to_rank(self.world_size, grp)
         return group_id_to_rank
-
-    def compute_rank_indices_for_group_var(
-        self, group_var: str, group_id_to_rank: np.ndarray
-    ) -> np.ndarray:
-        """
-        Given a group-variable dataset and a full ID->rank map,
-        return all indices that belong to this process.
-        """
-        with Dataset(self.input_file, 'r') as ds:
-            if group_var not in ds.variables:
-                raise ValueError(f"Group variable '{group_var}' not found in NetCDF file.")
-            data = np.asarray(ds.variables[group_var][:])
-        # boolean mask where assigned rank == current rank
-        mask = (group_id_to_rank[data] == self.rank)
-        return np.nonzero(mask)[0]
 
     def initialize_statistics_aggregator(self) -> None:
         """
@@ -231,12 +222,16 @@ class AbstractModel(BaseModel, ABC):
             variable_ops=var_to_ops
         )
 
-    def update_statistics(self, weight: int, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
+    def update_statistics(self, weight: float, total_weight: float = 0.0, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
         """
-        Call the statistics aggregator to update mean values at current step.
+        Update streaming statistics with a time weight.
+        Args:
+            weight: dt in seconds for this sub-step (time-weighted accumulation)
+            is_first: whether this sub-step is the first of a stats window
+            is_last: whether this sub-step is the last of a stats window
         """
         if self._statistics_aggregator is not None:
-            self._statistics_aggregator.update_statistics(weight, is_first, is_last, BLOCK_SIZE)
+            self._statistics_aggregator.update_statistics(weight, total_weight, is_first, is_last, BLOCK_SIZE)
 
     def finalize_time_step(self, current_time: datetime) -> None:
         """
