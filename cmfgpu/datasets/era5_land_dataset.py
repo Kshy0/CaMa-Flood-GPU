@@ -1,11 +1,11 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Set
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -62,7 +62,7 @@ class ERA5LandDataset(NetCDFDataset):
         prefix: str = "runoff_",
         suffix: str = ".nc",
         out_dtype: str = "float32",
-        time_to_key: Optional[Callable[[datetime], str]] = None,
+        time_to_key: Optional[Callable[[datetime], str]] = monthly_time_to_key,
         *args,
         **kwargs,
     ):
@@ -84,7 +84,7 @@ class ERA5LandDataset(NetCDFDataset):
             suffix=suffix,
             out_dtype=out_dtype,
             chunk_len=chunk_len,
-            time_to_key=time_to_key or monthly_time_to_key,
+            time_to_key=time_to_key,
             *args, **kwargs,
         )
 

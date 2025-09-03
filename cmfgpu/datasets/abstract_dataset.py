@@ -1,5 +1,5 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -119,8 +119,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         out = (flat[:, local_runoff_indices] @ local_runoff_matrix).contiguous()
         return out
 
-    def build_local_runoff_matrix(self, runoff_mapping_file: str, desired_catchment_ids: np.ndarray, 
-                                precision: Literal["float32", "float64"], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def build_local_runoff_matrix(self, 
+                                  runoff_mapping_file: str, 
+                                  desired_catchment_ids: np.ndarray, 
+                                  precision: Literal["float32", "float64"], 
+                                  device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Build PyTorch CSR matrix for mapping runoff data to specified catchments.
         Loads scipy compressed sparse matrix data and converts to PyTorch.
@@ -201,6 +204,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         var_name: str = "runoff",
         dtype: Literal["float32", "float64"] = "float32",
         complevel: int = 4,
+        normalized: bool = False,
+        device: str | torch.device = "cpu",
     ) -> Path:
         """
         Export catchment-aggregated runoff to a NetCDF file readable by MultiRankStatsReader.
@@ -214,6 +219,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         - Inputs: sparse mapping NPZ (CSR matrix + catchment_ids) and a parameter NetCDF (to copy nx/ny attrs).
 
         Time range: uses the dataset's inherent length (e.g., defined by its __len__), no extra arguments.
+
+        GPU acceleration:
+        - Set `device="cuda:0"` (or any CUDA device) to enable GPU-accelerated sparse matmul.
+        - Falls back to CPU if CUDA is not available.
         """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -223,6 +232,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if not mapping_npz.exists():
             raise FileNotFoundError(f"Mapping file not found: {mapping_npz}")
 
+        # Load mapping (SciPy CSR)
         m = np.load(mapping_npz)
         catchment_ids = m["catchment_ids"].astype(np.int64)
         sparse_data = m["sparse_data"].astype(np.float32 if dtype == "float32" else np.float64)
@@ -232,14 +242,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         mapping = csr_matrix((sparse_data, sparse_indices, sparse_indptr), shape=mat_shape)
 
         # Normalize rows by total area to produce area-weighted mean (weights sum to 1 per catchment)
-        mapping = mapping.tocsr(copy=True)
-        row_sums = np.asarray(mapping.sum(axis=1)).ravel()
-        # Avoid division by zero; rows with zero sum remain zeros
-        for i in range(mapping.shape[0]):
-            start, end = mapping.indptr[i], mapping.indptr[i + 1]
-            s = row_sums[i]
-            if s > 0:
-                mapping.data[start:end] /= s
+        if normalized:
+            row_sums = np.asarray(mapping.sum(axis=1)).ravel().astype(mapping.dtype)
+            inv = np.divide(1.0, row_sums, out=np.zeros_like(row_sums), where=row_sums > 0)
+            mapping = mapping.multiply(inv[:, None])
 
         n_catch = int(catchment_ids.shape[0])
         n_cols = int(mat_shape[1])
@@ -248,10 +254,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 f"Mapping columns ({n_cols}) != dataset data_size ({self.data_size})."
             )
 
+        # Prepare device and torch types
+        torch_dtype = torch.float32 if dtype == "float32" else torch.float64
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            print("CUDA not available; falling back to CPU for export_catchment_runoff.")
+            dev = torch.device("cpu")
+
+        # Build torch sparse CSR once on the target device
+        # mapping: (n_catch, n_cols)
+        crow = torch.from_numpy(mapping.indptr.astype(np.int64))
+        ccol = torch.from_numpy(mapping.indices.astype(np.int64))
+        cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64))
+        t_mapping = torch.sparse_csr_tensor(
+            crow, ccol, cval, size=(n_catch, n_cols), dtype=torch_dtype, device=dev
+        )
+
         nc_path = out_dir / f"{var_name}_rank0.nc"
         dtype_nc = "f4" if dtype == "float32" else "f8"
         with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
-
             try:
                 with nc.Dataset(parameter_nc, "r") as pds:
                     if "nx" in pds.ncattrs():
@@ -293,18 +314,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             for ci in range(n_chunks):
                 base_idx = ci * self.chunk_len
                 dt0 = self.get_time_by_index(base_idx)
-                block = self.get_data(dt0, length=self.chunk_len)
+                block = self.get_data(dt0, chunk_len=self.chunk_len)
                 if block.ndim != 2 or block.shape[1] != n_cols:
                     raise ValueError(
                         f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols} at chunk {ci}."
                     )
                 T = int(block.shape[0])
+
+                # Move current block to device and compute in batch:
+                # mapping (n_catch x n_cols) @ block.T (n_cols x T) -> (n_catch x T)
+                block_t = torch.as_tensor(
+                    block, dtype=torch_dtype, device=dev
+                ).T  # shape: (n_cols, T)
+                agg_block = torch.sparse.mm(t_mapping, block_t)  # (n_catch, T)
+                agg_block_np = agg_block.T.contiguous().to("cpu").numpy()  # (T, n_catch)
+
                 # Write each timestep in the block
                 for k in range(T):
                     dt_k = self.get_time_by_index(base_idx + k)
-                    vec = block[k].astype(np.float32 if dtype == "float32" else np.float64, copy=False)
-                    agg = mapping @ vec
-                    out_var[write_idx, :] = np.asarray(agg, dtype=np.float32 if dtype == "float32" else np.float64)
+                    out_var[write_idx, :] = agg_block_np[k, :].astype(np.float32 if dtype == "float32" else np.float64, copy=False)
                     time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
                     time_var[write_idx] = time_val
                     write_idx += 1
@@ -447,11 +475,20 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         Read a contiguous time block starting at current_time.
 
         Inputs:
-        - current_time: start datetime aligned to dataset time grid
-        - chunk_len: positive integer number of steps to read
+        - current_time: start datetime aligned to the dataset time grid
+        - chunk_len: positive integer upper bound of steps to read
 
-        Returns: 2D numpy array with shape (T, N), where T == chunk_len and
-        N equals the number of valid spatial points (sum of data_mask).
+        Returns:
+        - 2D numpy array with shape (T, N), where:
+          * N equals the number of valid spatial points (sum of data_mask)
+          * T ∈ [1, chunk_len]. The final block near the end of the time range
+            may have T < chunk_len.
+
+        Implementation notes:
+        - Do not read beyond the available time range; truncate instead.
+        - Do not pad to chunk_len here; AbstractDataset.__getitem__ will pad with zeros
+          to (chunk_len, N).
+        - Preserve chronological order for the returned timesteps.
         """
         raise NotImplementedError
     
@@ -499,8 +536,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         - For non-rank-0, returns a zero array of the correct shape without reading.
         """
         # Compute absolute start index for this chunk
+        if idx < 0:
+            idx += len(self)
         base_idx = idx * self.chunk_len
-        N = int(self.data_size)
+        N = self.data_size
         # Non-rank-0: return zeros to keep shapes consistent across ranks
         if not is_rank_zero():
             data = np.empty((self.chunk_len, N), dtype=self.out_dtype)
@@ -513,7 +552,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             raise ValueError(
                 f"get_data must return (T, N) with N={N}, got {tuple(data.shape)}"
             )
-        T = int(data.shape[0])
+        T = data.shape[0]
         if T < self.chunk_len:
             pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
             data = np.vstack([data, pad]) if data.size else pad

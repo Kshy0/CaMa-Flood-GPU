@@ -1,5 +1,5 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -17,8 +17,8 @@ from cmfgpu.utils import setup_distributed
 
 def main():
     ### Configuration Start ###
-    resolution = "glb_06min"
-    experiment_name = f"{resolution}_nc_bif"
+    resolution = "glb_15min"
+    experiment_name = f"{resolution}_nc"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "log", "bifurcation"]

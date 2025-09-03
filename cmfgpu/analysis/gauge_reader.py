@@ -1,5 +1,5 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -52,6 +52,85 @@ class GaugeSeries:
             meta=self.meta,
         )
 
+def default_grdc_resolver(gauge_id: str) -> str: 
+    return f"{gauge_id}_Q_Day.Cmd.txt"
+
+def load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
+    file_path = Path(file_path)
+    dates: List[datetime] = []
+    vals: List[float] = []
+    units = "m3/s"
+
+    # Try extract basic meta from header
+    meta: dict = {"source": "GRDC"}
+    with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+        in_data = False
+        for raw in f:
+            line = raw.strip("\n")
+            if not in_data:
+                if line.startswith("#"):
+                    # capture a few optional fields
+                    if "Latitude" in line:
+                        try:
+                            meta["lat"] = float(line.split(":")[-1])
+                        except Exception:
+                            pass
+                    if "Longitude" in line:
+                        try:
+                            meta["lon"] = float(line.split(":")[-1])
+                        except Exception:
+                            pass
+                    if "Unit of measure" in line and ("m3" in line or "m?s" in line):
+                        units = "m3/s"
+                    continue
+                # Switch to data when the header separator or table header has passed
+                if line.upper().startswith("YYYY-") or line.strip().upper() == "# DATA":
+                    in_data = True
+                    continue
+                else:
+                    continue
+
+            # Data section
+            if not line or line.startswith("#"):
+                continue
+            # Support both ';' separated and whitespace
+            parts = [p.strip() for p in line.split(";")]
+            if len(parts) >= 3:
+                date_str, time_str, val_str = parts[:3]
+            else:
+                toks = line.split()
+                if len(toks) < 2:
+                    continue
+                date_str, val_str = toks[0], toks[-1]
+                time_str = "--:--"
+            try:
+                # Some files use --:--, ignore time and parse date only
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+            except Exception:
+                # Try alternative formats
+                try:
+                    dt = datetime.strptime(date_str, "%d.%m.%Y")
+                except Exception:
+                    continue
+
+            val_str = val_str.replace(",", ".")  # safety
+            try:
+                v = float(val_str)
+            except Exception:
+                continue
+            if v in (-999.0, -999.000, -9999.0, -9999.000) or int(v) in (-999, -9999):
+                v = np.nan
+
+            dates.append(dt)
+            vals.append(v)
+
+    return GaugeSeries(
+        gauge_id=gauge_id,
+        dates=dates,
+        values=np.array(vals, dtype=float),
+        units=units,
+        meta=meta if meta else None,
+    )
 
 class GaugeReader:
     """
@@ -68,98 +147,15 @@ class GaugeReader:
       - loader: map (gauge_id, file_path) -> GaugeSeries
     """
 
-    # -----------------------------
-    # Default GRDC Loader
-    # -----------------------------
-    @staticmethod
-    def _load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
-        file_path = Path(file_path)
-        dates: List[datetime] = []
-        vals: List[float] = []
-        units = "m3/s"
-
-        # Try extract basic meta from header
-        meta: dict = {"source": "GRDC"}
-        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
-            in_data = False
-            for raw in f:
-                line = raw.strip("\n")
-                if not in_data:
-                    if line.startswith("#"):
-                        # capture a few optional fields
-                        if "Latitude" in line:
-                            try:
-                                meta["lat"] = float(line.split(":")[-1])
-                            except Exception:
-                                pass
-                        if "Longitude" in line:
-                            try:
-                                meta["lon"] = float(line.split(":")[-1])
-                            except Exception:
-                                pass
-                        if "Unit of measure" in line and ("m3" in line or "m?s" in line):
-                            units = "m3/s"
-                        continue
-                    # Switch to data when the header separator or table header has passed
-                    if line.upper().startswith("YYYY-") or line.strip().upper() == "# DATA":
-                        in_data = True
-                        continue
-                    else:
-                        continue
-
-                # Data section
-                if not line or line.startswith("#"):
-                    continue
-                # Support both ';' separated and whitespace
-                parts = [p.strip() for p in line.split(";")]
-                if len(parts) >= 3:
-                    date_str, time_str, val_str = parts[:3]
-                else:
-                    toks = line.split()
-                    if len(toks) < 2:
-                        continue
-                    date_str, val_str = toks[0], toks[-1]
-                    time_str = "--:--"
-                try:
-                    # Some files use --:--, ignore time and parse date only
-                    dt = datetime.strptime(date_str, "%Y-%m-%d")
-                except Exception:
-                    # Try alternative formats
-                    try:
-                        dt = datetime.strptime(date_str, "%d.%m.%Y")
-                    except Exception:
-                        continue
-
-                val_str = val_str.replace(",", ".")  # safety
-                try:
-                    v = float(val_str)
-                except Exception:
-                    continue
-                if v in (-999.0, -999.000, -9999.0, -9999.000) or int(v) in (-999, -9999):
-                    v = np.nan
-
-                dates.append(dt)
-                vals.append(v)
-
-        return GaugeSeries(
-            gauge_id=gauge_id,
-            dates=dates,
-            values=np.array(vals, dtype=float),
-            units=units,
-            meta=meta if meta else None,
-        )
-
     def __init__(
         self,
         base_dir: Union[str, Path],
-        file_pattern: str = "{gauge_id}_Q_Day.Cmd.txt",
-        file_resolver: Optional[Callable[[str], Union[str, Path]]] = None,
-        loader: Optional[Callable[[str, Union[str, Path]], GaugeSeries]] = None,
+        file_resolver: Optional[Callable[[str], Union[str, Path]]] = default_grdc_resolver,
+        loader: Optional[Callable[[str, Union[str, Path]], GaugeSeries]] = load_grdc,
     ) -> None:
         self.base_dir = Path(base_dir)
-        self.file_pattern = file_pattern
         self._file_resolver = file_resolver
-        self._loader = loader or self._load_grdc
+        self._loader = loader
 
         # Gauge meta state (populated via load_meta)
         self._gauge_ids: List[str] = []
@@ -184,11 +180,8 @@ class GaugeReader:
         self._file_resolver = resolver
 
     def resolve_path(self, gauge_id: str) -> Path:
-        if self._file_resolver is not None:
-            p = Path(self._file_resolver(gauge_id))
-        else:
-            name = self.file_pattern.format(gauge_id=gauge_id)
-            p = self.base_dir / name
+        name_or_path = Path(self._file_resolver(gauge_id))
+        p = name_or_path if name_or_path.is_absolute() else (self.base_dir / name_or_path)
         if not p.exists():
             raise FileNotFoundError(f"Gauge file not found for id={gauge_id}: {p}")
         return p
@@ -391,7 +384,7 @@ class GaugeReader:
     # -----------------------------
     @staticmethod
     def nse(y_obs: np.ndarray, y_sim: np.ndarray) -> float:
-        """Compute Nash–Sutcliffe Efficiency ignoring NaNs; assumes aligned time axis."""
+        """Compute Nash-Sutcliffe Efficiency ignoring NaNs; assumes aligned time axis."""
         if y_obs.size == 0 or y_sim.size == 0:
             return float("nan")
         mask = np.isfinite(y_obs) & np.isfinite(y_sim)

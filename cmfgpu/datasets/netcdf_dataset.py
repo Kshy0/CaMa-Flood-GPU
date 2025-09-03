@@ -1,10 +1,9 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-import math
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
@@ -45,7 +44,7 @@ class NetCDFDataset(AbstractDataset):
         suffix: str = ".nc",
         out_dtype: str = "float32",
         chunk_len: int = 24,
-        time_to_key: Optional[Callable[[datetime], str]] = None,
+        time_to_key: Optional[Callable[[datetime], str]] = yearly_time_to_key,
         *args,
         **kwargs,
     ):
@@ -57,7 +56,7 @@ class NetCDFDataset(AbstractDataset):
         self.var_name = var_name
         self.prefix = prefix
         self.suffix = suffix
-        self.time_to_key = time_to_key or yearly_time_to_key
+        self.time_to_key = time_to_key
 
         # Runtime metadata
         self._file_times = {}
@@ -167,7 +166,7 @@ class NetCDFDataset(AbstractDataset):
         total = len(self._global_times)
         if total == 0:
             return
-        n_chunks = int(math.ceil(total / float(self.chunk_len)))
+        n_chunks = (total + self.chunk_len - 1) // self.chunk_len
         for ci in range(n_chunks):
             a = ci * self.chunk_len
             b = min(a + self.chunk_len, total)
@@ -336,9 +335,7 @@ class NetCDFDataset(AbstractDataset):
     def __len__(self) -> int:
         """Number of samples (chunks). Each item yields up to chunk_len steps."""
         total = len(self._global_times)
-        return int(math.ceil(total / float(self.chunk_len))) if total else 0
-
-    # __getitem__ is inherited from AbstractDataset to ensure unified logic across datasets.
+        return (total + self.chunk_len - 1) // self.chunk_len if total else 0
 
     def close(self) -> None:
         """No persistent open handles are kept; provided for interface completeness."""

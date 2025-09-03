@@ -1,5 +1,5 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -10,7 +10,7 @@ MERIT-based map parameter generation using Pydantic v2.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import ClassVar, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Sequence
 
 import numpy as np
 from netCDF4 import Dataset
@@ -87,9 +87,19 @@ class MERITMap(BaseModel):
         description="Generate basin visualization"
     )
 
-    simulate_gauged_basins_only: bool = Field(
-        default=False,
-        description="If True, only include basins that contain at least one gauge"
+    # Allow selecting a minimal subset of basins via points of interest (POI)
+    # Structure example:
+    # {
+    #   "gauges": "all" | ["1234", "5678"],  # gauge IDs as strings; "all" keeps basins with any loaded gauge
+    #   "coords": [(x, y), ...],               # 0-based grid indices; will be validated and mapped to catchment IDs
+    #   "catchments": [int, int, ...]          # explicit catchment_id list
+    # }
+    points_of_interest: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional POI selector to reduce simulated area: gauges ('all' or string IDs), "
+            "coords as (x,y) pairs, and explicit catchment IDs."
+        ),
     )
 
     target_gpus: int = Field(
@@ -427,25 +437,103 @@ class MERITMap(BaseModel):
 
     def filter_to_gauged_basins(self) -> None:
         """
-        Optionally keep only basins that contain at least one gauge; update all dependent arrays.
+        Restrict simulation to user-provided points of interest (POI) to minimize regions.
+
+        Behavior:
+        - If points_of_interest is not provided: no filtering (keep all basins).
+        - Else: build a target catchment set from POI: gauge IDs (strings or 'all'), coords, and/or catchment IDs.
+          Keep the union of basins that contain any loaded gauge (when gauges='all') and/or contain any target catchment.
+        Note: simulate_gauged_basins_only is deprecated and ignored.
         """
-        if not self.simulate_gauged_basins_only:
+        poi = getattr(self, "points_of_interest", None)
+        if not poi:
             return
 
-        if self.num_gauges ==0:
-            raise ValueError("simulate_gauged_basins_only=True but no gauges were loaded.")
+        # POI-driven selection only
+        target_cids: List[int] = []
 
-        # Build gauge mask in current ordering
-        gauge_mask = np.zeros(self.catchment_id.shape[0], dtype=bool)
-        gi = find_indices_in(self.gauge_id, self.catchment_id)
-        gi = gi[gi >= 0]
-        gauge_mask[gi] = True
+        # 1) Gauges (strings) -> use self.gauge_info keys (parsed as int when loading)
+        gauges_val = poi.get("gauges")
+        if gauges_val is not None:
+            if isinstance(gauges_val, (str, bytes)):
+                if str(gauges_val).lower() != "all":
+                    raise ValueError("If gauges is a string, it must be 'all'.")
+                # Use all loaded gauge catchments as targets; basins will be computed later from target_cids
+                if getattr(self, "num_gauges", 0) == 0:
+                    raise ValueError("gauges='all' specified but no gauges were loaded; provide a gauge_file.")
+                target_cids.extend(self.gauge_id.tolist())
+            else:
+                if not isinstance(gauges_val, Sequence):
+                    raise ValueError("points_of_interest['gauges'] must be a sequence of string IDs or 'all'.")
+                if not hasattr(self, "gauge_info") or len(self.gauge_info) == 0:
+                    raise ValueError("Gauge list provided but no gauge_info available; ensure gauge_file is set and loaded.")
+                for g in gauges_val:
+                    try:
+                        gid_int = int(str(g))
+                    except Exception:
+                        raise ValueError(f"Gauge id '{g}' is not numeric; expected stringified integer.")
+                    if gid_int not in self.gauge_info:
+                        raise ValueError(f"Gauge id '{g}' not found in loaded gauge_info.")
+                    target_cids.extend(self.gauge_info[gid_int]["upstream_id"])  # may include 1-2 catchments
 
-        # Determine basins to keep, preserving their original relative order via first occurrence
-        kept_basin_ids, kept_first_idx = np.unique(self.catchment_basin_id[gauge_mask], return_index=True)
-        order_first = np.argsort(kept_first_idx)
-        kept_basin_ids = kept_basin_ids[order_first]
+        # 2) Coordinates -> map (x,y) to catchment_id and validate
+        coords_val = poi.get("coords")
+        if coords_val is not None:
+            if not isinstance(coords_val, Sequence) or (len(coords_val) > 0 and not isinstance(coords_val[0], (list, tuple))):
+                raise ValueError("points_of_interest['coords'] must be a sequence of (x, y) pairs.")
+            valid_cid_set = set(map(int, self.catchment_id.tolist()))
+            for pair in coords_val:
+                if len(pair) != 2:
+                    raise ValueError(f"Invalid coord {pair}; expected (x, y).")
+                x, y = int(pair[0]), int(pair[1])
+                if not (0 <= x < self.nx and 0 <= y < self.ny):
+                    raise ValueError(f"Coord {(x, y)} out of bounds for grid ({self.nx}, {self.ny}).")
+                cid_xy = int(np.ravel_multi_index((x, y), self.map_shape))
+                if cid_xy not in valid_cid_set:
+                    raise ValueError(f"Coord {(x, y)} is not a valid catchment cell in current map (masked/missing).")
+                target_cids.append(cid_xy)
 
+        # 3) Explicit catchment IDs
+        catches_val = poi.get("catchments")
+        if catches_val is not None:
+            if not isinstance(catches_val, Sequence) or (len(catches_val) > 0 and isinstance(catches_val, (str, bytes))):
+                raise ValueError("points_of_interest['catchments'] must be a sequence of integers.")
+            valid_cid_set = set(map(int, self.catchment_id.tolist()))
+            for c in catches_val:
+                cid = int(c)
+                if cid not in valid_cid_set:
+                    raise ValueError(f"catchment_id {cid} not present in current map.")
+                target_cids.append(cid)
+
+        # Cross-check: if both coords and catchments given, every coord's mapped cid must be present in provided catchments
+        if coords_val is not None and catches_val is not None:
+            cid_from_coords: List[int] = []
+            for pair in coords_val:
+                x, y = int(pair[0]), int(pair[1])
+                cid_from_coords.append(int(np.ravel_multi_index((x, y), self.map_shape)))
+            provided_cids = set(int(c) for c in catches_val)
+            for cc in cid_from_coords:
+                if cc not in provided_cids:
+                    raise ValueError(
+                        f"Coord-derived catchment_id {cc} is not in provided points_of_interest['catchments']."
+                    )
+
+        # Collect basins from explicit target catchments (must be non-empty)
+        target_cids = list(map(int, np.unique(np.array(target_cids, dtype=np.int64))))
+        self.target_cids = np.array(target_cids, dtype=np.int64)
+        if len(target_cids) == 0:
+            raise ValueError("points_of_interest produced an empty target set; nothing to keep.")
+        target_idx = find_indices_in(np.array(target_cids, dtype=np.int64), self.catchment_id)
+        target_idx = target_idx[target_idx >= 0]
+        if target_idx.size == 0:
+            raise ValueError("None of the target catchments are present after ordering.")
+        mask_target = np.zeros(self.catchment_id.shape[0], dtype=bool)
+        mask_target[target_idx] = True
+        kept_basin_ids_t, kept_first_idx_t = np.unique(self.catchment_basin_id[mask_target], return_index=True)
+        order_first_t = np.argsort(kept_first_idx_t)
+        kept_basin_ids = kept_basin_ids_t[order_first_t]
+
+        # Apply common filtering given kept_basin_ids
         keep_mask = np.isin(self.catchment_basin_id, kept_basin_ids)
 
         # Slice catchment-level arrays that depend on catchment dimension
@@ -487,7 +575,6 @@ class MERITMap(BaseModel):
 
         # Filter bifurcation paths to kept basins and remap their basin ids to the new contiguous ids
         if self.num_bifurcation_paths > 0:
-            # kept_basin_ids are in old numbering; select bifurcations within kept basins first
             keep_bif = np.isin(self.bifurcation_basin_id, kept_basin_ids)
 
             for key in [
@@ -666,7 +753,8 @@ class MERITMap(BaseModel):
             (1, 0, 0) # removed paths red
         ]
 
-        basin_map = np.full(self.map_shape, fill_value=-1, dtype=int)
+        # Build a float basin map; use NaN as background so it can be rendered transparent
+        basin_map = np.full(self.map_shape, fill_value=np.nan, dtype=float)
         unique_roots = np.unique(self.root_mouth)
         root_to_basin = {root: i for i, root in enumerate(unique_roots)}
         basin_ids = np.array([root_to_basin[r] for r in self.root_mouth])
@@ -674,13 +762,13 @@ class MERITMap(BaseModel):
 
         num_basins = len(unique_roots)
         basin_colors = generate_random_colors(num_basins, avoid_rgb_colors=special_colors)
-        all_colors = np.vstack(([1, 1, 1], basin_colors))
-        cmap = ListedColormap(all_colors)
-
-        masked_map = np.ma.masked_where(basin_map == -1, basin_map + 1)
+        cmap = ListedColormap(basin_colors)
+        cmap.set_bad(alpha=0.0)
 
         plt.figure(figsize=(12, 10))
-        plt.imshow(masked_map.T, origin='upper', cmap=cmap, interpolation='nearest')
+        # Use vmin/vmax for discrete mapping of integer basin ids
+        plt.imshow(np.ma.masked_invalid(basin_map).T, origin='upper', cmap=cmap, interpolation='nearest',
+                   vmin=-0.5, vmax=num_basins - 0.5)
         plt.title(f"MERIT Global Basins with Bifurcation Paths")
         plt.xlabel("X")
         plt.ylabel("Y")
@@ -700,6 +788,16 @@ class MERITMap(BaseModel):
                 gauge_x = self.catchment_x[gauge_indices]
                 gauge_y = self.catchment_y[gauge_indices]
                 plt.scatter(gauge_x, gauge_y, c='#00FF00', s=0.5, label='Gauges')
+
+        # Plot user points of interest (POIs) in red, possibly overlapping gauges
+        if hasattr(self, "target_cids") and isinstance(getattr(self, "target_cids"), np.ndarray) and self.target_cids.size > 0:
+            # Map target catchment IDs to current ordering; some may be filtered out
+            poi_idx = find_indices_in(self.target_cids, self.catchment_id)
+            poi_idx = poi_idx[poi_idx >= 0]
+            if poi_idx.size > 0:
+                poi_x = self.catchment_x[poi_idx]
+                poi_y = self.catchment_y[poi_idx]
+                plt.scatter(poi_x, poi_y, c='#FF0000', s=0.3, marker='o', linewidths=0, label='Points of Interest')
 
         # Plot kept bifurcation paths (after pruning, arrays contain only kept)
         if self.num_bifurcation_paths > 0 and self.num_bifurcation_paths < 3e6:
@@ -790,7 +888,11 @@ if __name__ == "__main__":
         bifori_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/bifori.txt",
         gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
         visualized=True,
-        simulate_gauged_basins_only=False,
+        # points_of_interest={
+        #     "gauges": "all",
+        #     # "coords": [(200, 100), (300, 400)],
+        #     # "catchments": [123456, 234567],
+        # },
         bif_levels_to_keep=5,
         target_gpus=1,
         out_file="parameters.nc",

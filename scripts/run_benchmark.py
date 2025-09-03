@@ -1,5 +1,5 @@
 # LICENSE HEADER MANAGED BY add-license-header
-# Copyright (c) 2025 Shengyu Kang
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -28,8 +28,7 @@ def benchmark_block_sizes():
     precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360
-    batch_size = 8
-    loader_workers = 2
+    loader_workers = 3
     prefetch_factor = 2
     save_state = False
 
@@ -43,6 +42,7 @@ def benchmark_block_sizes():
     prefix = "Roff____"
     suffix = ".one"
 
+    batch_size = loader_workers
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
 
