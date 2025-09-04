@@ -87,6 +87,10 @@ class MERITMap(BaseModel):
         description="Generate basin visualization"
     )
 
+    only_save_pois: bool = Field(
+        default=False,
+        description="If True, only save catchments that are points of interest (POI); otherwise save all catchments."
+    )
     # Allow selecting a minimal subset of basins via points of interest (POI)
     # Structure example:
     # {
@@ -124,7 +128,7 @@ class MERITMap(BaseModel):
         "catchment_basin_id",
         "basin_sizes",
         "num_basins",
-        "gauge_mask",
+        "catchment_save_mask",
         "river_depth",
         "river_width",
         "river_length",
@@ -206,10 +210,12 @@ class MERITMap(BaseModel):
         self.catchment_y = catchment_y
         self.catchment_id = catchment_id
         self.downstream_id = downstream_id
-        self.river_mouth_id = river_mouth_id
-        self.is_river_mouth = find_indices_in(downstream_id, catchment_id) < 0
-        self.is_reservoir = np.zeros_like(catchment_id, dtype=bool)  # placeholder; set from data if available
         self.num_catchments = len(catchment_id)
+        self.river_mouth_id = river_mouth_id
+        self.is_river_mouth = (self.downstream_id < 0)
+        self.catchment_save_mask = np.ones(self.num_catchments, dtype=bool)
+        self.is_reservoir = np.zeros_like(catchment_id, dtype=bool)  # placeholder; set from data if available
+        
 
         print(f"Loaded {len(catchment_id)} catchments")
 
@@ -305,14 +311,9 @@ class MERITMap(BaseModel):
         # Mouths should point to themselves
         self.downstream_id[self.is_river_mouth] = self.catchment_id[self.is_river_mouth]
 
-        # 5) Reservoir placeholder and gauge mask refresh
-        self.is_reservoir = np.zeros_like(self.catchment_id, dtype=bool)
-
-        self.gauge_mask = np.zeros(self.catchment_id.shape[0], dtype=bool)
-        if self.num_gauges > 0:
-            gi = find_indices_in(self.gauge_id, self.catchment_id)
-            gi = gi[gi >= 0]
-            self.gauge_mask[gi] = True
+        # 5) Mask
+        self.catchment_save_mask = self.catchment_save_mask[sorted_idx]
+        self.is_reservoir = self.is_reservoir[sorted_idx]
 
         # 6) If bifurcation arrays exist, align their basin ids with the new catchment ordering
         if self.num_bifurcation_paths > 0:
@@ -435,7 +436,7 @@ class MERITMap(BaseModel):
         # === Unify the code path: always finalize after planning/pruning
         self._finalize_connectivity(root_mouth=root_mouth)
 
-    def filter_to_gauged_basins(self) -> None:
+    def filter_to_poi_basins(self) -> None:
         """
         Restrict simulation to user-provided points of interest (POI) to minimize regions.
 
@@ -443,9 +444,8 @@ class MERITMap(BaseModel):
         - If points_of_interest is not provided: no filtering (keep all basins).
         - Else: build a target catchment set from POI: gauge IDs (strings or 'all'), coords, and/or catchment IDs.
           Keep the union of basins that contain any loaded gauge (when gauges='all') and/or contain any target catchment.
-        Note: simulate_gauged_basins_only is deprecated and ignored.
         """
-        poi = getattr(self, "points_of_interest", None)
+        poi = self.points_of_interest
         if not poi:
             return
 
@@ -519,14 +519,13 @@ class MERITMap(BaseModel):
                     )
 
         # Collect basins from explicit target catchments (must be non-empty)
-        target_cids = list(map(int, np.unique(np.array(target_cids, dtype=np.int64))))
-        self.target_cids = np.array(target_cids, dtype=np.int64)
-        if len(target_cids) == 0:
+        self.target_cids = target_cids = np.unique(np.array(target_cids, dtype=np.int64))
+        if len(self.target_cids) == 0:
             raise ValueError("points_of_interest produced an empty target set; nothing to keep.")
-        target_idx = find_indices_in(np.array(target_cids, dtype=np.int64), self.catchment_id)
-        target_idx = target_idx[target_idx >= 0]
-        if target_idx.size == 0:
-            raise ValueError("None of the target catchments are present after ordering.")
+        target_idx = find_indices_in(self.target_cids, self.catchment_id)
+        if np.any(target_idx < 0):
+            missing = self.target_cids[target_idx < 0]
+            raise ValueError(f"Internal error: target catchment IDs {missing} not found in current catchment_id array.")
         mask_target = np.zeros(self.catchment_id.shape[0], dtype=bool)
         mask_target[target_idx] = True
         kept_basin_ids_t, kept_first_idx_t = np.unique(self.catchment_basin_id[mask_target], return_index=True)
@@ -567,11 +566,11 @@ class MERITMap(BaseModel):
         self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
         self.downstream_idx[self.is_river_mouth] = -1
 
-        # Refresh gauge_mask after filtering
-        self.gauge_mask = np.zeros(self.num_catchments, dtype=bool)
-        gi = find_indices_in(self.gauge_id, self.catchment_id)
-        gi = gi[gi >= 0]
-        self.gauge_mask[gi] = True
+        # Create catchment_save_mask after filtering (mark target catchments)
+        if self.only_save_pois:
+            self.catchment_save_mask = np.zeros(self.num_catchments, dtype=bool)
+            ti = find_indices_in(self.target_cids, self.catchment_id)
+            self.catchment_save_mask[ti] = True
 
         # Filter bifurcation paths to kept basins and remap their basin ids to the new contiguous ids
         if self.num_bifurcation_paths > 0:
@@ -864,7 +863,7 @@ class MERITMap(BaseModel):
         self.load_catchment_id()
         self.load_gauge_id()
         self.load_bifurcation_parameters()
-        self.filter_to_gauged_basins()
+        self.filter_to_poi_basins()
         self.load_parameters()
         self.check_flow_direction()
         self.init_river_depth()
@@ -881,7 +880,7 @@ class MERITMap(BaseModel):
         return self
 
 if __name__ == "__main__":
-    map_resolution = "glb_15min"
+    map_resolution = "glb_06min"
     merit_map = MERITMap(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
@@ -898,3 +897,5 @@ if __name__ == "__main__":
         out_file="parameters.nc",
     )
     merit_map.build_input()
+
+    
