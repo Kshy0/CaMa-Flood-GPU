@@ -721,8 +721,15 @@ class MERITMap(BaseModel):
             ds.setncattr("ny", int(self.ny))
             ds.setncattr("num_basins", int(self.num_basins))
 
-    def visualize_basins(self) -> None:
-        """Generate basin visualization if requested, including removed bifurcation paths."""
+    def visualize_basins(self, interactive_basin_picker: bool=False) -> None:
+        """Generate basin visualization if requested, including removed bifurcation paths.
+
+        Behavior changes:
+        - Automatically crops the plot to the minimal bounding box of valid catchments
+          (excludes empty/NaN background), improving readability and interaction speed.
+        - In interactive mode, prints both gauge IDs (names) and gauge catchment_ids
+          of the clicked basin to the console.
+        """
         if self.visualized is False:
             return
         try:
@@ -773,6 +780,24 @@ class MERITMap(BaseModel):
         plt.ylabel("Y")
         plt.grid(False)
 
+        # --- Auto-crop to non-empty region ---
+        # Compute minimal bounding box of valid catchments and add a small margin.
+        if interactive_basin_picker:
+            margin = 1  # one-cell padding around the valid bbox
+            x0 = max(0, int(self.catchment_x.min()) - margin)
+            x1 = min(self.nx - 1, int(self.catchment_x.max()) + margin)
+            y0 = max(0, int(self.catchment_y.min()) - margin)
+            y1 = min(self.ny - 1, int(self.catchment_y.max()) + margin)
+            def within_extent(xv: np.ndarray, yv: np.ndarray) -> np.ndarray:
+                return (xv >= x0) & (xv <= x1) & (yv >= y0) & (yv <= y1) 
+        else:
+            x0, x1, y0, y1 = 0, self.nx - 1, 0, self.ny - 1
+            def within_extent(xv: np.ndarray, yv: np.ndarray) -> np.ndarray:
+                return np.ones_like(xv, dtype=bool)
+
+        plt.xlim(x0 - 0.5, x1 + 0.5)
+        plt.ylim(y1 + 0.5, y0 - 0.5)
+
         # Plot gauges if available
         if self.num_gauges > 0:
             gauge_catchment_ids = []
@@ -786,9 +811,11 @@ class MERITMap(BaseModel):
             if gauge_indices:
                 gauge_x = self.catchment_x[gauge_indices]
                 gauge_y = self.catchment_y[gauge_indices]
-                plt.scatter(gauge_x, gauge_y, c='#00FF00', s=0.5, label='Gauges')
+                m = within_extent(gauge_x, gauge_y)
+                if np.any(m):
+                    plt.scatter(gauge_x[m], gauge_y[m], c='#00FF00', s=0.5, label='Gauges')
 
-        # Plot user points of interest (POIs) in red, possibly overlapping gauges
+        # Plot user points of interest (POIs)
         if hasattr(self, "target_cids") and isinstance(getattr(self, "target_cids"), np.ndarray) and self.target_cids.size > 0:
             # Map target catchment IDs to current ordering; some may be filtered out
             poi_idx = find_indices_in(self.target_cids, self.catchment_id)
@@ -796,42 +823,115 @@ class MERITMap(BaseModel):
             if poi_idx.size > 0:
                 poi_x = self.catchment_x[poi_idx]
                 poi_y = self.catchment_y[poi_idx]
-                plt.scatter(poi_x, poi_y, c='#FF0000', s=0.3, marker='o', linewidths=0, label='Points of Interest')
+                m = within_extent(poi_x, poi_y)
+                if np.any(m):
+                    plt.scatter(poi_x[m], poi_y[m], c="#C10000", s=0.3, label='Points of Interest')
 
-        # Plot kept bifurcation paths (after pruning, arrays contain only kept)
-        if self.num_bifurcation_paths > 0 and self.num_bifurcation_paths < 3e6:
-            x1 = self.bifurcation_catchment_x
-            y1 = self.bifurcation_catchment_y
-            x2 = self.bifurcation_downstream_x
-            y2 = self.bifurcation_downstream_y
-            # avoid wrap-around across the dateline
-            mask_keep = np.abs(x1 - x2) <= self.nx / 2
-            x1k = x1[mask_keep]
-            y1k = y1[mask_keep]
-            x2k = x2[mask_keep]
-            y2k = y2[mask_keep]
-            if x1k.size > 0:
-                line_segments_keep = np.array([[[x1k[i], y1k[i]], [x2k[i], y2k[i]]] for i in range(len(x1k))])
-                kept_lines = LineCollection(line_segments_keep, colors='#0000FF', linestyles='--', linewidths=0.5, alpha=0.6)
-                plt.gca().add_collection(kept_lines)
-                plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.6, label='Bifurcation Paths')
+        if not interactive_basin_picker:
+            # Plot kept bifurcation paths (after pruning, arrays contain only kept)
+            if self.num_bifurcation_paths > 0 and self.num_bifurcation_paths < 3e6:
+                x1a = self.bifurcation_catchment_x
+                y1a = self.bifurcation_catchment_y
+                x2a = self.bifurcation_downstream_x
+                y2a = self.bifurcation_downstream_y
+                # Avoid wrap-around across the dateline AND clip to auto extent
+                mask_keep = (np.abs(x1a - x2a) <= self.nx / 2)
+                mask_keep &= (within_extent(x1a, y1a) | within_extent(x2a, y2a))
+                if np.any(mask_keep):
+                    x1k = x1a[mask_keep]; y1k = y1a[mask_keep]; x2k = x2a[mask_keep]; y2k = y2a[mask_keep]
+                    line_segments_keep = np.array([[[x1k[i], y1k[i]], [x2k[i], y2k[i]]] for i in range(len(x1k))])
+                    kept_lines = LineCollection(line_segments_keep, colors='#0000FF', linestyles='--', linewidths=0.5, alpha=0.6)
+                    plt.gca().add_collection(kept_lines)
+                    plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.6, label='Bifurcation Paths')
 
-        # Plot removed bifurcation paths, if any were pruned
-        if hasattr(self, "removed_bifurcation_catchment_x") and self.removed_bifurcation_catchment_x.size > 0:
-            rx1 = self.removed_bifurcation_catchment_x
-            ry1 = self.removed_bifurcation_catchment_y
-            rx2 = self.removed_bifurcation_downstream_x
-            ry2 = self.removed_bifurcation_downstream_y
-            mask_cut = np.abs(rx1 - rx2) <= self.nx / 2
-            rx1 = rx1[mask_cut]
-            ry1 = ry1[mask_cut]
-            rx2 = rx2[mask_cut]
-            ry2 = ry2[mask_cut]
-            if rx1.size > 0:
-                line_segments_removed = np.array([[[rx1[i], ry1[i]], [rx2[i], ry2[i]]] for i in range(len(rx1))])
-                removed_lines = LineCollection(line_segments_removed, colors='#FF0000', linestyles=':', linewidths=1, alpha=0.5)
-                plt.gca().add_collection(removed_lines)
-                plt.plot([], [], color='#FF0000', linestyle=':', linewidth=1, alpha=0.7, label='Bifurcation Paths (removed)')
+            # Plot removed bifurcation paths, if any were pruned
+            if hasattr(self, "removed_bifurcation_catchment_x") and self.removed_bifurcation_catchment_x.size > 0:
+                rx1a = self.removed_bifurcation_catchment_x
+                ry1a = self.removed_bifurcation_catchment_y
+                rx2a = self.removed_bifurcation_downstream_x
+                ry2a = self.removed_bifurcation_downstream_y
+                mask_cut = (np.abs(rx1a - rx2a) <= self.nx / 2)
+                mask_cut &= (within_extent(rx1a, ry1a) | within_extent(rx2a, ry2a))
+                if np.any(mask_cut):
+                    rx1 = rx1a[mask_cut]; ry1 = ry1a[mask_cut]; rx2 = rx2a[mask_cut]; ry2 = ry2a[mask_cut]
+                    line_segments_removed = np.array([[[rx1[i], ry1[i]], [rx2[i], ry2[i]]] for i in range(len(rx1))])
+                    removed_lines = LineCollection(line_segments_removed, colors='#FF0000', linestyles=':', linewidths=1, alpha=0.5)
+                    plt.gca().add_collection(removed_lines)
+                    plt.plot([], [], color='#FF0000', linestyle=':', linewidth=1, alpha=0.7, label='Bifurcation Paths (removed)')
+
+        # --- Interactive basin -> gauge ids picker ---
+        if interactive_basin_picker:
+            ax = plt.gca()
+
+            catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
+            # Map: basin_id -> set of gauge names (IDs)
+            basin_to_gauges: Dict[int, set] = {}
+            # Map: basin_id -> set of gauge catchment IDs (cells hosting gauges) within that basin
+            basin_to_gauge_cids: Dict[int, set] = {}
+            if getattr(self, "num_gauges", 0) > 0 and hasattr(self, "gauge_info"):
+                for gname, info in self.gauge_info.items():
+                    for cid in info.get("upstream_id", []):
+                        idx = catchment_id_to_idx.get(cid, -1)
+                        if idx >= 0:
+                            b = int(self.catchment_basin_id[idx])
+                            basin_to_gauges.setdefault(b, set()).add(int(gname))
+                            basin_to_gauge_cids.setdefault(b, set()).add(int(cid))
+
+            ann = ax.annotate(
+                "",
+                xy=(0, 0),
+                xytext=(5, 5),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.6),
+                fontsize=7,
+                visible=False,
+            )
+
+            # Ignore clicks outside the cropped extent
+            def click_within_extent(xi: int, yi: int) -> bool:
+                return (xi >= x0) and (xi <= x1) and (yi >= y0) and (yi <= y1)
+
+            def on_click(event):
+                if event.inaxes is not ax or event.xdata is None or event.ydata is None:
+                    return
+
+                xi = int(np.clip(round(event.xdata), 0, self.nx - 1))
+                yi = int(np.clip(round(event.ydata), 0, self.ny - 1))
+                if not click_within_extent(xi, yi):
+                    ann.set_visible(False)
+                    plt.draw()
+                    return
+
+                bval = basin_map[xi, yi]
+                if np.isnan(bval):
+                    ann.set_visible(False)
+                    plt.draw()
+                    return
+                b = int(bval)
+                gids = sorted(basin_to_gauges.get(b, []))
+                gcids = sorted(basin_to_gauge_cids.get(b, []))
+                # Console print: basin id, gauge IDs (names), and gauge catchment IDs
+                msg = f"basin={b}, gauges={gids if len(gids) > 0 else '[]'}, gauge_catchment_ids={gcids if len(gcids) > 0 else '[]'}, click=(x={xi}, y={yi})"
+                print(msg)
+                log_path = self.out_dir / f"basin_{b}.txt"
+                if len(gids) > 0:
+                    with open(log_path, "a", encoding="utf-8") as fp:
+                        for gid in gids:
+                            fp.write(f"{gid}\n")
+                ann.set_text(f"basin={b}\ngauges={gids if len(gids) > 0 else '[]'}")
+                ann.xy = (event.xdata, event.ydata)
+                ann.set_visible(True)
+                plt.draw()
+
+            plt.gcf().canvas.mpl_connect("button_press_event", on_click)
+            plt.title(plt.gca().get_title() + "(click to identify basin/gauges)")
+            handles, labels = plt.gca().get_legend_handles_labels()
+            if labels:
+                plt.legend(loc='lower right')
+            plt.tight_layout()
+            plt.show()
+            return
+        # --- end interactive ---
 
         handles, labels = plt.gca().get_legend_handles_labels()
         if labels:  
