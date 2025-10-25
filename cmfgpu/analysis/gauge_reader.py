@@ -257,6 +257,8 @@ class GaugeReader:
                 Callable[[], Tuple[int, int]],
             ]
         ] = None,
+        err_threshold: float = 0.1,
+        skip_multi_catchment: bool = False,
     ) -> None:
         """
         Load gauge metadata from a whitespace-separated text file with columns including:
@@ -270,6 +272,8 @@ class GaugeReader:
             Accepted forms:
               * (nx, ny) tuple
               * str/Path to a NetCDF parameter file (from which nx, ny are inferred)
+          - err_threshold: filter out gauges where abs(err) > err_threshold (default 0.05)
+          - skip_multi_catchment: if True, skip rows where ix2/iy2 indicate a second catchment (default False)
         """
         meta_path = Path(meta_txt)
         if not meta_path.exists():
@@ -337,9 +341,15 @@ class GaugeReader:
         nx_, ny_ = self._map_shape  # type: ignore[misc]
         assert nx_ is not None and ny_ is not None
 
+        # Temp storage for gauges per catchment
+        temp_gauges = {}  # ct_id -> list of (gid, err, xy1, xy2, a1, a2)
+
         for toks in rows:
             gid = str(get_val(toks, "ID", str))
             if gid in ("None", "nan", "NaN"):
+                continue
+            err = get_val(toks, "err", float)
+            if abs(err) > err_threshold:
                 continue
             ix1 = get_val(toks, "ix1", int) - 1
             iy1 = get_val(toks, "iy1", int) - 1
@@ -353,6 +363,22 @@ class GaugeReader:
             xy2: Optional[Tuple[int, int]] = None
             if ix2 is not None and iy2 is not None and (ix2 >= 0) and (iy2 >= 0):
                 xy2 = (int(ix2), int(iy2))
+
+            if skip_multi_catchment and xy2 is not None:
+                continue
+
+            # Compute catchment id for xy1
+            ct1 = int(xy1[0]) * int(ny_) + int(xy1[1])
+            temp_gauges.setdefault(ct1, []).append((gid, err, xy1, xy2, a1, a2))
+
+        # Now select one gauge per catchment with min abs(err)
+        for ct_id, gauges in temp_gauges.items():
+            if len(gauges) == 1:
+                gid, err, xy1, xy2, a1, a2 = gauges[0]
+            else:
+                # Sort by abs(err), select the smallest
+                gauges.sort(key=lambda x: abs(x[1]) if x[1] is not None else float('inf'))
+                gid, err, xy1, xy2, a1, a2 = gauges[0]
 
             self._gauge_ids.append(gid)
             self._gauge_xy[gid] = (xy1, xy2)
@@ -378,6 +404,18 @@ class GaugeReader:
 
     def get_areas(self, gauge_id: str) -> Tuple[float, Optional[float]]:
         return self._gauge_areas[gauge_id]
+
+    def get_available_cids(self) -> List[int]:
+        """Get list of catchment IDs for gauges where the file exists."""
+        available = []
+        for gid in self._gauge_ids:
+            try:
+                self.resolve_path(gid)
+                cts = self.get_catchments(gid)
+                available.extend(cts)
+            except FileNotFoundError:
+                continue
+        return list(set(available))
 
     # -----------------------------
     # Metrics

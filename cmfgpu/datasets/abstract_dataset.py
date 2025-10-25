@@ -200,7 +200,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self,
         out_dir: str | Path,
         mapping_npz: str | Path,
-        parameter_nc: str | Path,
         var_name: str = "runoff",
         dtype: Literal["float32", "float64"] = "float32",
         complevel: int = 4,
@@ -227,7 +226,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         mapping_npz = Path(mapping_npz)
-        parameter_nc = Path(parameter_nc)
 
         if not mapping_npz.exists():
             raise FileNotFoundError(f"Mapping file not found: {mapping_npz}")
@@ -241,11 +239,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         mat_shape = tuple(np.array(m["matrix_shape"]).tolist())
         mapping = csr_matrix((sparse_data, sparse_indices, sparse_indptr), shape=mat_shape)
 
-        # Normalize rows by total area to produce area-weighted mean (weights sum to 1 per catchment)
-        if normalized:
-            row_sums = np.asarray(mapping.sum(axis=1)).ravel().astype(mapping.dtype)
-            inv = np.divide(1.0, row_sums, out=np.zeros_like(row_sums), where=row_sums > 0)
-            mapping = mapping.multiply(inv[:, None])
 
         n_catch = int(catchment_ids.shape[0])
         n_cols = int(mat_shape[1])
@@ -266,28 +259,26 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         crow = torch.from_numpy(mapping.indptr.astype(np.int64))
         ccol = torch.from_numpy(mapping.indices.astype(np.int64))
         cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64))
+        if normalized:
+            row_lengths = crow[1:] - crow[:-1]               # (num_catchment,)
+            row_ids = torch.repeat_interleave(
+                torch.arange(n_catch, device=dev),
+                row_lengths
+            )                                                # (nnz,)
+            row_sums = torch.zeros(n_catch, dtype=torch_dtype, device=dev)
+            row_sums.scatter_add_(0, row_ids, cval)
+            denom = row_sums[row_ids]
+            nz_mask = denom > 0
+            cval_new = torch.zeros_like(cval)
+            cval_new[nz_mask] = cval[nz_mask] / denom[nz_mask]
+            cval = cval_new
+
         t_mapping = torch.sparse_csr_tensor(
             crow, ccol, cval, size=(n_catch, n_cols), dtype=torch_dtype, device=dev
         )
-
         nc_path = out_dir / f"{var_name}_rank0.nc"
         dtype_nc = "f4" if dtype == "float32" else "f8"
         with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
-            try:
-                with nc.Dataset(parameter_nc, "r") as pds:
-                    if "nx" in pds.ncattrs():
-                        ds.setncattr("nx", int(pds.getncattr("nx")))
-                    if "ny" in pds.ncattrs():
-                        ds.setncattr("ny", int(pds.getncattr("ny")))
-                    dims = list(pds.dimensions.keys())
-                    for a, b in [("nx", "ny"), ("x", "y"), ("lon", "lat")]:
-                        if a in dims and b in dims and ("nx" not in ds.ncattrs() or "ny" not in ds.ncattrs()):
-                            ds.setncattr("nx", int(pds.dimensions[a].size))
-                            ds.setncattr("ny", int(pds.dimensions[b].size))
-                            break
-            except Exception:
-                pass
-
             ds.setncattr("title", f"Aggregated catchment runoff ({var_name})")
             ds.createDimension("time", None)
             ds.createDimension("saved_points", n_catch)
@@ -348,11 +339,17 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         hires_map_tag: str = "1min",
         lowres_idx_precision: str = "<i4",
         hires_idx_precision: str = "<i2",
-        map_precision: str = "<f4"
+        map_precision: str = "<f4",
+        parameter_nc: str | Path | None = None,
     ):
         """
         Generate runoff mapping table and save as npz file.
-        The mapping is stored as a sparse matrix format with catchment IDs array.
+                The mapping is stored as a sparse matrix format with catchment IDs array.
+
+                Optional alignment/subsetting:
+                - If parameter_nc is provided, rows (catchments) in the sparse matrix will be
+                    aligned to the 1D catchment list read from that NetCDF. The saved
+                    'catchment_ids' array (in NPZ) will follow the order from parameter_nc.
         """
         
         map_dir = Path(map_dir)
@@ -432,16 +429,60 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         # Filter valid mappings
         valid_mask = (catchment_idx != -1) & (mapped_runoff_idx != -1)
-        row_idx = catchment_idx[valid_mask] 
+        row_idx = catchment_idx[valid_mask]
         col_idx = mapped_runoff_idx[valid_mask]
         data_values = valid_areas[valid_mask]
+
+        # Optionally align/subset catchments to parameter_nc order/region
+        save_catchment_ids = catchment_id.astype(np.int64)
+        if parameter_nc is not None:
+            try:
+                path_nc = Path(parameter_nc)
+                with nc.Dataset(path_nc, "r") as ds:
+                    if "catchment_id" in ds.variables:
+                        desired_ids = np.asarray(ds.variables["catchment_id"][...]).astype(np.int64)
+                    else:
+                        raise KeyError("'catchment_id' not found in parameter_nc")
+                # Map desired ids to current full catchment_id list
+                desired_to_full = find_indices_in(desired_ids, catchment_id)
+                keep_mask_nc = desired_to_full >= 0
+                if not np.all(keep_mask_nc):
+                    n_miss = int((~keep_mask_nc).sum())
+                    print(
+                        f"Warning: {n_miss} IDs from parameter_nc are not present in current map; they will be skipped."
+                    )
+                # Build remap: full-index -> aligned-row
+                base_to_aligned = -np.ones(len(catchment_id), dtype=np.int64)
+                valid_full_idx = desired_to_full[keep_mask_nc]
+                base_to_aligned[valid_full_idx] = np.arange(valid_full_idx.size, dtype=np.int64)
+                # Remap existing row indices to aligned rows and drop negatives
+                aligned_row_idx = base_to_aligned[row_idx]
+                keep_rows = aligned_row_idx >= 0
+                row_idx = aligned_row_idx[keep_rows]
+                col_idx = col_idx[keep_rows]
+                data_values = data_values[keep_rows]
+                # Update outputs
+                save_catchment_ids = desired_ids[keep_mask_nc]
+                matrix_shape = (save_catchment_ids.size, col_mask.sum())
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to read or process parameter_nc: {path_nc}. "
+                    "Ensure it contains 'catchment_id' variable."
+                ) from e
+        else:
+            matrix_shape = (len(catchment_id), col_mask.sum())
+
+        # Report missing mapping rows (relative to selected set)
         unique_row_count = len(np.unique(row_idx))
-        missing_count = len(catchment_id) - unique_row_count
+        baseline_rows = matrix_shape[0]
+        missing_count = baseline_rows - unique_row_count
         if missing_count > 0:
-            print(f"Warning: {missing_count} catchments were not mapped to runoff grids. "
-                "Their runoff input will always be zero.")
+            print(
+                f"Warning: {missing_count} catchments were not mapped to runoff grids. "
+                "Their runoff input will always be zero."
+            )
+
         # Create sparse matrix using scipy and compress it
-        matrix_shape = (len(catchment_id), col_mask.sum())
         sparse_matrix = csr_matrix(
             (data_values.astype(np.float32), (row_idx, col_idx)), 
             shape=matrix_shape,
@@ -453,7 +494,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         
         # Prepare mapping data for saving with compressed sparse matrix
         mapping_data = {
-            'catchment_ids': catchment_id.astype(np.int64),
+            'catchment_ids': save_catchment_ids.astype(np.int64),
             'sparse_data': sparse_matrix.data.astype(np.float32),
             'sparse_indices': sparse_matrix.indices.astype(np.int64),
             'sparse_indptr': sparse_matrix.indptr.astype(np.int64),
@@ -461,11 +502,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         }
 
         output_path = Path(out_dir) / npz_file
-        
+
         np.savez_compressed(output_path, **mapping_data)
-        
+
         print(f"Saved runoff mapping to {output_path}")
-        print(f"Mapping contains {len(catchment_id)} catchments "
+        print(f"Mapping contains {matrix_shape[0]} catchments "
             f"and {len(sparse_matrix.data)} non-zero runoff grid mappings")
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
 

@@ -410,10 +410,11 @@ class MultiRankStatsReader:
             queries = [int(v) for a in arr_list for v in np.asarray(a, dtype=np.int64).ravel()]
 
         N = len(queries)
-        out = np.full((self._time_len, N), fill_value, dtype=dtype or np.float32)
+        if len(set(queries)) != N:
+            raise ValueError("Duplicate points not allowed.")
         col_to_hits: List[Optional[Tuple[int, int]]] = [None] * N
 
-        # Map queries to (rank_idx, local_index)
+        # Map queries to (rank_idx, local_index) and check all found
         if use_xy:
             for r_idx, info in enumerate(self._rank_files):
                 if info["saved_points"] == 0:
@@ -439,11 +440,14 @@ class MultiRankStatsReader:
                     if matches.size:
                         col_to_hits[c] = (r_idx, int(matches[0]))
 
+        if any(hit is None for hit in col_to_hits):
+            raise ValueError("Some points not found in any rank.")
+
+        out = np.full((self._time_len, N), fill_value, dtype=dtype or np.float32)
+
         rank_to_cols: dict[int, List[Tuple[int, int]]] = {}
         for col, hit in enumerate(col_to_hits):
-            if hit is None:
-                continue
-            r_idx, li = hit
+            r_idx, li = hit  # hit is guaranteed not None
             rank_to_cols.setdefault(r_idx, []).append((col, li))
 
         # Fast path: if cached in memory
@@ -751,6 +755,16 @@ class MultiRankStatsReader:
         if not xs:
             return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
         return np.concatenate(xs), np.concatenate(ys)
+
+    def get_all_cids(self) -> Optional[np.ndarray]:
+        cids: List[np.ndarray] = []
+        for info in self._rank_files:
+            if info["saved_points"] == 0 or info["coord_raw"] is None:
+                continue
+            cids.append(info["coord_raw"])
+        if not cids:
+            return None
+        return np.concatenate(cids)
 
     def summary(self) -> str:
         slice_info = f"[{self._slice_start} .. {self._slice_end}] (inclusive)" if self._slice_start is not None else "N/A"

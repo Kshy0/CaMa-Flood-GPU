@@ -18,8 +18,7 @@ from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
 
 from cmfgpu.params.utils import (compute_init_river_depth,
-                                 min_cuts_for_balance, read_bifori,
-                                 reorder_by_basin_size, topological_sort,
+                                 read_bifori, reorder_by_basin_size, topological_sort,
                                  trace_outlets_dict)
 from cmfgpu.utils import binread, find_indices_in, read_map
 
@@ -66,9 +65,23 @@ class MERITMap(BaseModel):
         description="Keep first N levels from bifori; filter out paths with all zero widths in [1..N]"
     )
     
+    basin_use_file: bool = Field(
+        default=False,
+        description="If True, use basin.bin file to cut bifurcations crossing basin boundaries."
+    )
+    
     gauge_file: Optional[FilePath] = Field(
         default=None,
         description="Path to gauge information file"
+    )
+
+    skip_secondary_gauges: bool = Field(
+        default=False,
+        description=(
+            "If True, skip any gauge file row whose secondary coordinates (ix2, iy2) "
+            "are valid. This removes multi-catchment (type 2) gauge entries entirely instead "
+            "of registering their primary cell."
+        )
     )
 
     # === Physical Parameters ===
@@ -111,11 +124,6 @@ class MERITMap(BaseModel):
         description="Desired number of GPUs (MPI ranks) for load-balanced assignment"
     )
 
-    mpi_balance_tolerance: float = Field(
-        default=0.10,
-        description="Allowed relative load deviation per GPU after LPT, e.g., 0.10 means ±10%"
-    )
-
     # === File Mapping ===
     missing_value: ClassVar[float] = -9999.0
     output_required: ClassVar[List[str]] = [
@@ -136,6 +144,7 @@ class MERITMap(BaseModel):
         "flood_depth_table",
         "catchment_elevation",
         "catchment_area",
+        "upstream_area",
         "downstream_distance",
         "river_storage",
         "river_mouth_id",
@@ -244,6 +253,10 @@ class MERITMap(BaseModel):
             ix1, iy1 = int(data[8]) - 1, int(data[9]) - 1
             ix2, iy2 = int(data[10]) - 1, int(data[11]) - 1
 
+            # Option: exclude entire line if secondary coords exist
+            if self.skip_secondary_gauges and (ix2 >= 0 and iy2 >= 0):
+                continue
+
             catchment_ids = []
 
             # Primary catchment
@@ -349,69 +362,32 @@ class MERITMap(BaseModel):
         self.bifurcation_catchment_id = np.ravel_multi_index((self.bifurcation_catchment_x, self.bifurcation_catchment_y), self.map_shape)
         self.bifurcation_downstream_id = np.ravel_multi_index((self.bifurcation_downstream_x, self.bifurcation_downstream_y), self.map_shape)
 
-        # === Mouth-level planning (full-union → binary search minimal breaks if needed) BEFORE basin_sizes
-        tmp_idx_up = find_indices_in(self.bifurcation_catchment_id, self.catchment_id)
-        tmp_idx_dn = find_indices_in(self.bifurcation_downstream_id, self.catchment_id)
-        ori_river_mouth_id = self.river_mouth_id[tmp_idx_up]
-        bif_river_mouth_id = self.river_mouth_id[tmp_idx_dn]
-
-        root_mouth, kept_mouth_pairs, union_report = min_cuts_for_balance(
-            river_mouth_id=self.river_mouth_id,
-            bif_from_mouth=ori_river_mouth_id,
-            bif_to_mouth=bif_river_mouth_id,
-            n_ranks=self.target_gpus,
-            tol=self.mpi_balance_tolerance,
-        )
-        print(
-            f"Cut {union_report['n_edges_removed']}/{union_report['n_edges_initial']} "
-            f"inter-basin bifurcation links ({union_report['removed_ratio']*100:.2f}%)."
-        )
-        print(
-            f"GPU loads (LPT over merged basins, ranks={self.target_gpus}, tol={self.mpi_balance_tolerance:.0%}): "
-            f"{union_report['loads']}  "
-            f"Balanced={union_report['balanced']}"
-        )
-
-        # === Cut the bifurcation paths that should be cut based on kept mouth pairs
-        same_mouth = (ori_river_mouth_id == bif_river_mouth_id)
-
-        mouths_all = np.unique(self.river_mouth_id)
-        mouth_to_idx = {int(m): i for i, m in enumerate(mouths_all)}
-        M = mouths_all.size
-
-        ai = np.array([mouth_to_idx.get(int(x), -1) for x in ori_river_mouth_id], dtype=np.int64)
-        bi = np.array([mouth_to_idx.get(int(x), -1) for x in bif_river_mouth_id], dtype=np.int64)
-        valid_ab = (ai >= 0) & (bi >= 0)
-        uu = np.minimum(ai, bi)
-        vv = np.maximum(ai, bi)
-        key_path = (uu.astype(np.int64) * np.int64(M)) + vv.astype(np.int64)
-
-        if kept_mouth_pairs.shape[0] > 0:
-            ku_full = np.array([mouth_to_idx.get(int(x), -1) for x in kept_mouth_pairs[:, 0]], dtype=np.int64)
-            kv_full = np.array([mouth_to_idx.get(int(x), -1) for x in kept_mouth_pairs[:, 1]], dtype=np.int64)
-            valid_k = (ku_full >= 0) & (kv_full >= 0)
-            ku = np.minimum(ku_full[valid_k], kv_full[valid_k])
-            kv = np.maximum(ku_full[valid_k], kv_full[valid_k])
-            key_kept = (ku.astype(np.int64) * np.int64(M)) + kv.astype(np.int64)
-        else:
-            key_kept = np.zeros((0,), dtype=np.int64)
-
-        keep_inter = np.isin(key_path, key_kept)
-        keep_mask = same_mouth | (valid_ab & keep_inter)
-
-        # Persist keep/cut info for visualization before pruning arrays
+        # Handle basin-based pruning if basin_use_file is True
         n_before = int(self.num_bifurcation_paths)
-        self.bifurcation_keep_mask_full = keep_mask.copy()
-        removed_mask = ~keep_mask
-        self.removed_bifurcation_catchment_x = self.bifurcation_catchment_x[removed_mask]
-        self.removed_bifurcation_catchment_y = self.bifurcation_catchment_y[removed_mask]
-        self.removed_bifurcation_downstream_x = self.bifurcation_downstream_x[removed_mask]
-        self.removed_bifurcation_downstream_y = self.bifurcation_downstream_y[removed_mask]
+        if self.basin_use_file:
+            basin_file = self.map_dir / "basin.bin"
+            # Read basin.bin
+            basin_data = read_map(basin_file, (self.nx, self.ny), precision=self.idx_precision)
+            # Get basin IDs for bifurcation endpoints
+            bifurcation_up_basin = basin_data[self.bifurcation_catchment_x, self.bifurcation_catchment_y]
+            bifurcation_down_basin = basin_data[self.bifurcation_downstream_x, self.bifurcation_downstream_y]
+            # Keep only intra-basin bifurcations
+            keep_mask = (bifurcation_up_basin == bifurcation_down_basin)
+            # Set removed for visualization
+            removed_mask = ~keep_mask
+            self.removed_bifurcation_catchment_x = self.bifurcation_catchment_x[removed_mask]
+            self.removed_bifurcation_catchment_y = self.bifurcation_catchment_y[removed_mask]
+            self.removed_bifurcation_downstream_x = self.bifurcation_downstream_x[removed_mask]
+            self.removed_bifurcation_downstream_y = self.bifurcation_downstream_y[removed_mask]
+        else:
+            keep_mask = np.ones(self.num_bifurcation_paths, dtype=bool)
+            # No removed
+            self.removed_bifurcation_catchment_x = np.array([], dtype=np.int64)
+            self.removed_bifurcation_catchment_y = np.array([], dtype=np.int64)
+            self.removed_bifurcation_downstream_x = np.array([], dtype=np.int64)
+            self.removed_bifurcation_downstream_y = np.array([], dtype=np.int64)
 
         # Apply pruning
-        if keep_mask.shape[0] != n_before:
-            raise ValueError("Internal error: keep_mask length mismatch with bifurcation paths")
-
         for key in [
             "bifurcation_path_id",
             "bifurcation_catchment_id",
@@ -431,10 +407,89 @@ class MERITMap(BaseModel):
         self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
         n_cut = n_before - self.num_bifurcation_paths
         if n_cut > 0:
-            print(f"Pruned {n_cut}/{n_before} bifurcation paths according to union planning ({(n_cut/n_before)*100:.2f}%).")
+            print(f"Pruned {n_cut}/{n_before} bifurcation paths crossing basin boundaries ({(n_cut/n_before)*100:.2f}%).")
 
-        # === Unify the code path: always finalize after planning/pruning
-        self._finalize_connectivity(root_mouth=root_mouth)
+        # Finalize connectivity
+        self.root_mouth = self.river_mouth_id.copy()
+        self._finalize_connectivity(root_mouth=self.root_mouth)
+
+        # Always compute and report load distribution (LPT over basins -> simulated GPU assignment).
+        # If `basin_use_file` was used earlier we already printed pruning info; regardless, always
+        # produce the per-rank loads and warn on imbalance (>10%).
+        def _lpt_schedule(sizes, n_bins):
+            bins = [0] * max(1, int(n_bins))
+            for size in sorted(list(sizes), reverse=True):
+                min_bin = min(range(len(bins)), key=lambda i: bins[i])
+                bins[min_bin] += int(size)
+            return bins
+
+        loads = _lpt_schedule(self.basin_sizes, self.target_gpus)
+        print(f"GPU loads (LPT over basins, ranks={self.target_gpus}): {loads}")
+
+        # Check imbalance relative to average; warn if exceed 10%
+        total_load = sum(loads)
+        if total_load > 0:
+            avg_load = total_load / max(1, int(self.target_gpus))
+            max_dev = max(abs(l - avg_load) / avg_load for l in loads)
+        else:
+            avg_load = 0.0
+            max_dev = 0.0
+
+        imbalance_threshold = 0.10
+        if max_dev > imbalance_threshold:
+            print(
+                f"Warning: Load imbalance detected across {self.target_gpus} ranks. "
+                f"Max deviation = {max_dev:.2%}, loads = {loads}, average = {avg_load:.2f}"
+            )
+
+        # If basin_use_file is True, also compute and report the unpruned case
+        if self.basin_use_file:
+            # Compute unpruned basin sizes (allowing bifurcations to merge basins)
+            def compute_merged_basin_sizes(river_mouth_id, bifurcation_catchment_id, bifurcation_downstream_id, catchment_id):
+                from collections import defaultdict
+                parent = {}
+                def find(x):
+                    if x not in parent:
+                        parent[x] = x
+                    if parent[x] != x:
+                        parent[x] = find(parent[x])
+                    return parent[x]
+                def union(x, y):
+                    px = find(x)
+                    py = find(y)
+                    if px != py:
+                        parent[px] = py
+                catchment_to_basin = {cid: rid for cid, rid in zip(catchment_id, river_mouth_id)}
+                for up_cid, down_cid in zip(bifurcation_catchment_id, bifurcation_downstream_id):
+                    if up_cid in catchment_to_basin and down_cid in catchment_to_basin:
+                        union(catchment_to_basin[up_cid], catchment_to_basin[down_cid])
+                basin_to_size = defaultdict(int)
+                for cid in catchment_id:
+                    root = find(catchment_to_basin[cid])
+                    basin_to_size[root] += 1
+                return list(basin_to_size.values())
+
+            # Use original bifurcation arrays before pruning
+            orig_bif_catchment_id = np.ravel_multi_index((pth_upst[:, 0], pth_upst[:, 1]), self.map_shape)
+            orig_bif_downstream_id = np.ravel_multi_index((pth_down[:, 0], pth_down[:, 1]), self.map_shape)
+            unpruned_basin_sizes = compute_merged_basin_sizes(self.river_mouth_id, orig_bif_catchment_id, orig_bif_downstream_id, self.catchment_id)
+            unpruned_loads = _lpt_schedule(unpruned_basin_sizes, self.target_gpus)
+            print(f"Unpruned GPU loads (LPT over merged basins, ranks={self.target_gpus}): {unpruned_loads}")
+
+            # Check imbalance for unpruned
+            total_unpruned_load = sum(unpruned_loads)
+            if total_unpruned_load > 0:
+                avg_unpruned_load = total_unpruned_load / max(1, int(self.target_gpus))
+                max_unpruned_dev = max(abs(l - avg_unpruned_load) / avg_unpruned_load for l in unpruned_loads)
+            else:
+                avg_unpruned_load = 0.0
+                max_unpruned_dev = 0.0
+
+            if max_unpruned_dev > imbalance_threshold:
+                print(
+                    f"Warning: Load imbalance detected in unpruned case across {self.target_gpus} ranks. "
+                    f"Max deviation = {max_unpruned_dev:.2%}, loads = {unpruned_loads}, average = {avg_unpruned_load:.2f}"
+                )
 
     def filter_to_poi_basins(self) -> None:
         """
@@ -609,6 +664,7 @@ class MERITMap(BaseModel):
         self.river_height = _read_2d_map("rivhgt.bin")
         self.catchment_elevation = _read_2d_map("elevtn.bin")
         self.catchment_area = _read_2d_map("ctmare.bin")
+        self.upstream_area = _read_2d_map("uparea.bin")
         self.downstream_distance = _read_2d_map("nxtdst.bin")
         self.downstream_distance[self.is_river_mouth] = self.river_mouth_distance
 
@@ -980,19 +1036,15 @@ class MERITMap(BaseModel):
         return self
 
 if __name__ == "__main__":
-    map_resolution = "glb_06min"
+    map_resolution = "glb_15min"
     merit_map = MERITMap(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
         bifori_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/bifori.txt",
         gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
         visualized=True,
-        # points_of_interest={
-        #     "gauges": "all",
-        #     # "coords": [(200, 100), (300, 400)],
-        #     # "catchments": [123456, 234567],
-        # },
         bif_levels_to_keep=5,
+        basin_use_file=False,
         target_gpus=1,
         out_file="parameters.nc",
     )

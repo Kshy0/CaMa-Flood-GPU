@@ -65,14 +65,11 @@ class NetCDFDataset(AbstractDataset):
         # Each chunk plan is a list of (file_key, abs_time_indices) operations.
         # We read exact timesteps per file using fancy indexing once per file.
         self._chunk_plan = []
-        self.chunk_len = chunk_len
 
         # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
+        super().__init__(out_dtype=out_dtype, chunk_len=chunk_len, *args, **kwargs)
         self._scan_time_metadata()
         self._build_chunk_plans()
-
-        super().__init__(out_dtype=out_dtype, chunk_len=self.chunk_len, *args, **kwargs)
-
     # -------------------------
     # Metadata & planning
     # -------------------------

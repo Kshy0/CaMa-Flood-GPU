@@ -11,3 +11,4 @@ __pycache__/
 tests/
 scripts_hpc/
 inp/
+etc/

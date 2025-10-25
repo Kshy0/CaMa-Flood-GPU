@@ -34,9 +34,9 @@ def main():
     BLOCK_SIZE = 128
     save_state = False
 
-    start_date = datetime(2000, 1, 1)
-    end_date = datetime(2000, 12, 31)
-    runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_15min_nc"
+    start_date = datetime(1990, 1, 1)
+    end_date = datetime(1999, 12, 31)
+    runoff_dir = "/home/eat/E2O_ecmwf"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_nc.npz"
     runoff_time_interval = timedelta(days=1)
     prefix = "e2o_ecmwf_wrr2_glob15_day_Runoff_"
