@@ -6,12 +6,6 @@
 
 """
 Levee module definitions for CaMa-Flood-GPU.
-
-The module stores levee attributes per levee (num_levees) while keeping
-catchment-aligned tensors for interacting with the hydrodynamic kernels.
-Derived quantities such as levee distance and characteristic storages are
-recomputed at runtime from the levee crown height, relative distance, and the
-catchment geometry provided by the base module.
 """
 
 from __future__ import annotations
