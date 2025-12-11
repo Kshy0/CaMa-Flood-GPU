@@ -69,6 +69,11 @@ class MERITMap(BaseModel):
         default=False,
         description="If True, use basin.bin file to cut bifurcations crossing basin boundaries."
     )
+
+    levee_flag: bool = Field(
+        default=False,
+        description="If True, merge levee data into map parameters."
+    )
     
     gauge_file: Optional[FilePath] = Field(
         default=None,
@@ -165,6 +170,13 @@ class MERITMap(BaseModel):
         "bifurcation_width",
         "bifurcation_length",
         "bifurcation_elevation",
+        "levee_id",
+        "levee_catchment_id",
+        "levee_catchment_x",
+        "levee_catchment_y",
+        "levee_fraction",
+        "levee_crown_height",
+        "levee_basin_id",
     ]
     # === Data Type Configuration ===
     idx_precision: ClassVar[str] = "<i4"
@@ -667,13 +679,21 @@ class MERITMap(BaseModel):
         self.upstream_area = _read_2d_map("uparea.bin")
         self.downstream_distance = _read_2d_map("nxtdst.bin")
         self.downstream_distance[self.is_river_mouth] = self.river_mouth_distance
+        if self.levee_flag:
+            levee_crown_height = _read_2d_map("levhgt.bin")
+            levee_fraction = _read_2d_map("levfrc.bin")
+            levee_mask = (levee_fraction > 0) & (levee_crown_height > 0) & (levee_fraction < 1)
+            self.num_levees = int(np.sum(levee_mask))
+            self.levee_id = np.arange(self.num_levees, dtype=np.int64)
+            self.levee_catchment_id = self.catchment_id[levee_mask]
+            self.levee_catchment_x = self.catchment_x[levee_mask]
+            self.levee_catchment_y = self.catchment_y[levee_mask]
+            self.levee_crown_height = levee_crown_height[levee_mask]
+            self.levee_fraction = levee_fraction[levee_mask]
+            self.levee_basin_id = self.catchment_basin_id[levee_mask]
 
         data = read_map(self.map_dir / "fldhgt.bin", (self.nx, self.ny, self.num_flood_levels), precision=self.map_precision)
-        flood_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
-        self.flood_depth_table = np.hstack([
-            np.zeros((self.num_catchments, 1), dtype=self.numpy_precision),
-            flood_table
-        ])
+        self.flood_depth_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
 
     def check_flow_direction(self) -> None:
         """Validate flow direction consistency."""
@@ -707,11 +727,14 @@ class MERITMap(BaseModel):
             ds.createDimension("basin", self.num_basins)
             ds.createDimension("bifurcation_path", self.num_bifurcation_paths)
 
-            # Flood level dimension (includes the leading zero column)
-            ds.createDimension("flood_level", self.num_flood_levels + 1)
+            # Flood level dimension
+            ds.createDimension("flood_level", self.num_flood_levels)
 
             # Bifurcation level dimension
             ds.createDimension("bifurcation_level", self.bif_levels_to_keep)
+
+            if self.levee_flag:
+                ds.createDimension("levee", self.num_levees)
 
             # Helper to map data shapes to dims
             def infer_dims(arr: np.ndarray):
@@ -725,6 +748,8 @@ class MERITMap(BaseModel):
                         return ("basin",)
                     if shape[0] == self.num_bifurcation_paths:
                         return ("bifurcation_path",)
+                    if self.levee_flag and shape[0] == self.num_levees:
+                        return ("levee",)
                     if shape[0] == self.flood_depth_table.shape[1]:
                         return ("flood_level",)
                 elif len(shape) == 2:
@@ -777,7 +802,14 @@ class MERITMap(BaseModel):
             ds.setncattr("ny", int(self.ny))
             ds.setncattr("num_basins", int(self.num_basins))
 
-    def visualize_basins(self, interactive_basin_picker: bool=False) -> None:
+    def visualize_basins(
+        self,
+        interactive_basin_picker: bool = False,
+        visualize_gauges: bool = True,
+        visualize_bifurcations: bool = True,
+        visualize_removed_bifurcations: bool = True,
+        visualize_levees: bool = False
+    ) -> None:
         """Generate basin visualization if requested, including removed bifurcation paths.
 
         Behavior changes:
@@ -809,11 +841,15 @@ class MERITMap(BaseModel):
 
             return np.array(colors)
 
-        special_colors = [
-            (0, 1, 0),      # gauges pure green
-            (0, 0, 1),      # bifurcations pure blue
-            (1, 0, 0) # removed paths red
-        ]
+        special_colors = []
+        if visualize_gauges:
+            special_colors.append((0, 1, 0))      # gauges pure green
+        if visualize_bifurcations:
+            special_colors.append((0, 0, 1))      # bifurcations pure blue
+        if visualize_removed_bifurcations:
+            special_colors.append((1, 0, 0))      # removed paths red
+        if visualize_levees:
+            special_colors.append((0.5, 0, 0.5))  # levees purple
 
         # Build a float basin map; use NaN as background so it can be rendered transparent
         basin_map = np.full(self.map_shape, fill_value=np.nan, dtype=float)
@@ -855,7 +891,7 @@ class MERITMap(BaseModel):
         plt.ylim(y1 + 0.5, y0 - 0.5)
 
         # Plot gauges if available
-        if self.num_gauges > 0:
+        if visualize_gauges and self.num_gauges > 0:
             gauge_catchment_ids = []
             for info in self.gauge_info.values():
                 gauge_catchment_ids.extend(info["upstream_id"])
@@ -871,6 +907,14 @@ class MERITMap(BaseModel):
                 if np.any(m):
                     plt.scatter(gauge_x[m], gauge_y[m], c='#00FF00', s=0.5, label='Gauges')
 
+        # Plot levees if available
+        if visualize_levees and hasattr(self, 'levee_catchment_x') and self.num_levees > 0:
+            levee_x = self.levee_catchment_x
+            levee_y = self.levee_catchment_y
+            m = within_extent(levee_x, levee_y)
+            if np.any(m):
+                plt.scatter(levee_x[m], levee_y[m], c='#800080', s=0.2, label='Levees')
+
         # Plot user points of interest (POIs)
         if hasattr(self, "target_cids") and isinstance(getattr(self, "target_cids"), np.ndarray) and self.target_cids.size > 0:
             # Map target catchment IDs to current ordering; some may be filtered out
@@ -885,7 +929,7 @@ class MERITMap(BaseModel):
 
         if not interactive_basin_picker:
             # Plot kept bifurcation paths (after pruning, arrays contain only kept)
-            if self.num_bifurcation_paths > 0 and self.num_bifurcation_paths < 3e6:
+            if visualize_bifurcations and self.num_bifurcation_paths > 0 and self.num_bifurcation_paths < 3e6:
                 x1a = self.bifurcation_catchment_x
                 y1a = self.bifurcation_catchment_y
                 x2a = self.bifurcation_downstream_x
@@ -901,7 +945,7 @@ class MERITMap(BaseModel):
                     plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.6, label='Bifurcation Paths')
 
             # Plot removed bifurcation paths, if any were pruned
-            if hasattr(self, "removed_bifurcation_catchment_x") and self.removed_bifurcation_catchment_x.size > 0:
+            if visualize_removed_bifurcations and hasattr(self, "removed_bifurcation_catchment_x") and self.removed_bifurcation_catchment_x.size > 0:
                 rx1a = self.removed_bifurcation_catchment_x
                 ry1a = self.removed_bifurcation_catchment_y
                 rx2a = self.removed_bifurcation_downstream_x
@@ -1004,6 +1048,7 @@ class MERITMap(BaseModel):
         print(f"Number of basins         : {self.num_basins}")
         print(f"Number of catchments     : {self.num_catchments}")
         print(f"Number of reservoirs     : {self.is_reservoir.sum()}")
+        print(f"Number of levees         : {getattr(self, 'num_levees', 0)}")
         print(f"Number of bifurcation paths : {self.num_bifurcation_paths}")
         print(f"Number of gauges         : {self.num_gauges}")
         print(f"Gauge catchments         : {len(self.gauge_id)}")
@@ -1036,12 +1081,13 @@ class MERITMap(BaseModel):
         return self
 
 if __name__ == "__main__":
-    map_resolution = "glb_15min"
+    map_resolution = "jpn_03min"
     merit_map = MERITMap(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
         bifori_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/bifori.txt",
-        gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
+        # gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
+        # levee_flag=True,
         visualized=True,
         bif_levels_to_keep=5,
         basin_use_file=False,

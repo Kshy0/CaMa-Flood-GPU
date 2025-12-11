@@ -43,6 +43,7 @@ def compute_outflow_kernel(
     total_storage_ptr,
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
+    protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
     gravity,                                # f32 scalar gravity acceleration
     time_step,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
@@ -150,7 +151,7 @@ def compute_outflow_kernel(
     # Use exp(log()) for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
                       * tl.exp((-7.0/3.0) * tl.log(river_semi_implicit_flow_depth))
-                      
+
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
 
@@ -189,6 +190,7 @@ def compute_outflow_kernel(
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
     tl.store(water_surface_elevation_ptr + offs, water_surface_elevation, mask=mask)
+    tl.store(protected_water_surface_elevation_ptr + offs, water_surface_elevation, mask=mask)
     tl.store(river_cross_section_depth_ptr + offs, updated_river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_ptr + offs, updated_flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)

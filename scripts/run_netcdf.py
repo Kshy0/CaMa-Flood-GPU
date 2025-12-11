@@ -42,6 +42,7 @@ def main():
     prefix = "e2o_ecmwf_wrr2_glob15_day_Runoff_"
     suffix = ".nc"
     var_name = "Runoff"
+    output_split_by_year = False
     ### Configuration End ###
 
     batch_size = loader_workers
@@ -73,7 +74,8 @@ def main():
         precision=precision,
         output_workers=output_workers,
         output_complevel=4,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
+        output_split_by_year=output_split_by_year
     )
 
     local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(

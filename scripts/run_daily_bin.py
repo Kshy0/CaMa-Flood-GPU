@@ -33,6 +33,7 @@ def main():
     prefetch_factor = 2
     BLOCK_SIZE = 128
     save_state = False
+    output_split_by_year = False
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
@@ -73,7 +74,8 @@ def main():
         precision=precision,
         output_workers=output_workers,
         output_complevel=output_complevel,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
+        output_split_by_year=output_split_by_year
     )
 
     local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(

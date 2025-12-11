@@ -97,7 +97,20 @@ class NetCDFDataset(AbstractDataset):
 
     def _scan_time_metadata(self) -> None:
         """Read only time vars to construct a global time index and lookup map."""
-        keys = self._collect_required_keys()
+        # Build key -> first_dt map to help with date guessing
+        key_to_first_dt: Dict[str, datetime] = {}
+        t = self.start_date
+        while t <= self.end_date:
+            k = self.time_to_key(t)
+            if k not in key_to_first_dt:
+                key_to_first_dt[k] = t
+            t += self.time_interval
+        # Ensure end_date is covered
+        k_end = self.time_to_key(self.end_date)
+        if k_end not in key_to_first_dt:
+            key_to_first_dt[k_end] = self.end_date
+
+        keys = set(key_to_first_dt.keys())
         self._validate_files_exist(keys)
 
         for key in sorted(keys):
@@ -106,10 +119,45 @@ class NetCDFDataset(AbstractDataset):
                 tvar = ds.variables.get("time") or ds.variables.get("valid_time")
                 if tvar is None:
                     raise ValueError(f"Time variable not found in file: {path.name}")
-                dates = num2date(tvar[:], tvar.units, getattr(tvar, "calendar", "standard"))
+
+                try:
+                    raw_dates = num2date(tvar[:], tvar.units, getattr(tvar, "calendar", "standard"))
+                    dates = [
+                        datetime(d.year, d.month, d.day, d.hour, d.minute, d.second)
+                        for d in raw_dates
+                    ]
+                except (ValueError, TypeError):
+                    # Fallback for "days since start" or similar non-standard units
+                    base = None
+                    if key in key_to_first_dt:
+                        sample_dt = key_to_first_dt[key]
+                        # Try to snap to year start
+                        dt_year = datetime(sample_dt.year, 1, 1)
+                        if self.time_to_key(dt_year) == key:
+                            base = dt_year
+                        else:
+                            # Try to snap to month start
+                            dt_month = datetime(sample_dt.year, sample_dt.month, 1)
+                            if self.time_to_key(dt_month) == key:
+                                base = dt_month
+                            else:
+                                # Fallback to the sample date itself
+                                base = sample_dt
+                    
+                    if base is None:
+                        try:
+                            year = int(key)
+                            base = datetime(year, 1, 1)
+                        except ValueError:
+                            pass
+                    
+                    if base is not None:
+                        dates = [base + timedelta(days=float(x)) for x in tvar[:]]
+                    else:
+                        raise ValueError(f"Cannot parse time for key '{key}' with units '{getattr(tvar, 'units', '')}'")
+
                 self._file_times[key] = []
-                for i, dt0 in enumerate(dates):
-                    dt = datetime(dt0.year, dt0.month, dt0.day, dt0.hour, dt0.minute, dt0.second)
+                for i, dt in enumerate(dates):
                     self._file_times[key].append(dt)
                     if self.start_date <= dt <= self.end_date:
                         self._dt_to_loc[dt] = (key, i)
@@ -340,7 +388,6 @@ class NetCDFDataset(AbstractDataset):
 
 
 if __name__ == "__main__":
-    # Tiny smoke test hook (paths are repo/user dependent). Adjust before running.
     resolution = "glb_15min"
     dataset = NetCDFDataset(
         base_dir="/home/eat/cmf_v420_pkg/inp/test_15min_nc",
@@ -353,6 +400,7 @@ if __name__ == "__main__":
     )
     dataset.generate_runoff_mapping_table(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{resolution}",
+        hires_map_tag="1min",
         out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{resolution}",
         npz_file="runoff_mapping_nc.npz",
     )

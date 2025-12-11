@@ -112,14 +112,17 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
     
     Args:
         args: Tuple containing (mean_var_name, metadata, coord_values, 
-              output_dir, complevel, rank)
+              output_dir, complevel, rank, year)
         
     Returns:
         Path to the created NetCDF file
     """
-    (mean_var_name, metadata, coord_values, output_dir, complevel, rank) = args
+    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year) = args
 
-    filename = f"{mean_var_name}_rank{rank}.nc"
+    if year is not None:
+        filename = f"{mean_var_name}_rank{rank}_{year}.nc"
+    else:
+        filename = f"{mean_var_name}_rank{rank}.nc"
     output_path = output_dir / filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -179,7 +182,8 @@ class StatisticsAggregator:
     """
     
     def __init__(self, device: torch.device, output_dir: Path, rank: int, 
-                 num_workers: int = 4, complevel: int = 4, save_kernels: bool = False):
+                 num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
+                 output_split_by_year: bool = False):
         """
         Initialize the statistics aggregator.
         
@@ -189,6 +193,7 @@ class StatisticsAggregator:
             rank: Process rank identifier (int)
             num_workers: Number of worker processes for parallel NetCDF writing
             save_kernels: Whether to save generated kernel files for inspection
+            output_split_by_year: Whether to split output files by year
         """
         self.device = device
         self.output_dir = output_dir
@@ -196,6 +201,8 @@ class StatisticsAggregator:
         self.num_workers = num_workers
         self.complevel = complevel
         self.save_kernels = save_kernels
+        self.output_split_by_year = output_split_by_year
+        self._current_year = None
 
         # Create kernels directory if saving is enabled
         if self.save_kernels:
@@ -282,6 +289,14 @@ class StatisticsAggregator:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor for {name}, got {type(tensor)}")
         
+        # Check if the tensor is marked as intermediate
+        json_schema_extra = getattr(field_info, 'json_schema_extra', {})
+        if json_schema_extra and json_schema_extra.get('intermediate'):
+            raise ValueError(
+                f"Cannot register intermediate tensor '{name}' for statistics aggregation. "
+                f"Intermediate tensors are cleared to save memory."
+            )
+
         self._tensor_registry[name] = tensor
         self._field_registry[name] = field_info
         
@@ -330,12 +345,12 @@ class StatisticsAggregator:
         
         print("Streaming aggregation system initialized successfully")
     
-    def _create_netcdf_files(self) -> None:
+    def _create_netcdf_files(self, year: Optional[int] = None) -> None:
         """Create empty NetCDF files with proper structure for streaming."""
-        if self._files_created:
+        if not self.output_split_by_year and self._files_created:
             return
         
-        print("Creating NetCDF file structure...")
+        print(f"Creating NetCDF file structure...{' (Year: ' + str(year) + ')' if year else ''}")
         
         # Prepare file creation tasks
         creation_futures = {}
@@ -352,7 +367,7 @@ class StatisticsAggregator:
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank)
+                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year)
                 future = executor.submit(_create_netcdf_file_process, args)
                 creation_futures[future] = out_name
             
@@ -928,12 +943,17 @@ class StatisticsAggregator:
         and resetting mean storage for the next time step.
         
         Args:
-            time_step: Time step to finalize
+            dt: Time step to finalize
         """
 
-        # Create NetCDF files if not already created
-        if not self._files_created:
-            self._create_netcdf_files()
+        if self.output_split_by_year:
+            if self._current_year != dt.year:
+                self._create_netcdf_files(year=dt.year)
+                self._current_year = dt.year
+        else:
+            # Create NetCDF files if not already created
+            if not self._files_created:
+                self._create_netcdf_files()
         
         # Write all outputs
         for out_name, tensor in (self._storage if self._storage else self._mean_storage).items():

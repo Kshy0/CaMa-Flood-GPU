@@ -31,6 +31,7 @@ def benchmark_block_sizes():
     loader_workers = 3
     prefetch_factor = 2
     save_state = False
+    output_split_by_year = False
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
@@ -59,6 +60,7 @@ def benchmark_block_sizes():
         output_workers=0,
         output_complevel=0,
         BLOCK_SIZE=BLOCK_SIZE_LIST[0], 
+        output_split_by_year=output_split_by_year
     )
 
     dataset = DailyBinDataset(

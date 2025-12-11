@@ -30,12 +30,9 @@ def compute_flood_stage_kernel(
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
-    river_max_storage_ptr,       # *f32: River max storage
-    total_storage_table_ptr,     # *f32: Lookup table - total storage
+    river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
-    total_width_table_ptr,       # *f32: Lookup table - total width
-    flood_gradient_table_ptr,    # *f32: Lookup table - flood gradient
-    catchment_area_ptr,          # *f32: Catchment area
+    catchment_area_ptr,         # *f32: Catchment area
     river_width_ptr,             # *f32: River width
     river_length_ptr,            # *f32: River length
     # Constants
@@ -74,22 +71,53 @@ def compute_flood_stage_kernel(
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + runoff * time_step, 0.0)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
-    river_max_storage   = tl.load(river_max_storage_ptr   + offs, mask=mask)
+    river_height        = tl.load(river_height_ptr        + offs, mask=mask)
     catchment_area      = tl.load(catchment_area_ptr      + offs, mask=mask)
     river_width         = tl.load(river_width_ptr         + offs, mask=mask)
     river_length        = tl.load(river_length_ptr        + offs, mask=mask)
+    
+    river_max_storage = river_length * river_width * river_height
+    catchment_width = catchment_area / river_length
+    width_increment = catchment_width / num_flood_levels
 
     # Determine flood level by scanning the storage table
-    level = tl.zeros([BLOCK_SIZE], dtype=tl.int32) - 1
-    for i in tl.static_range(num_flood_levels+1):
-        prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + i, mask=mask)
-        level += tl.where(total_storage > prev_total_storage, 1, 0)
+    level = tl.where(total_storage > river_max_storage, 0, -1).to(tl.int32)
+    
+    S_accum = river_max_storage
+    prev_H = 0.0
+    prev_W = river_width
+    
+    prev_total_storage = river_max_storage
+    prev_flood_depth = 0.0
+    next_flood_depth = 0.0
+    
+    for i in tl.static_range(num_flood_levels):
+        H_curr = tl.load(flood_depth_table_ptr + offs * num_flood_levels + i, mask=mask)
+        W_curr = river_width + (i + 1) * width_increment
+        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+        S_curr = S_accum + dS
+        
+        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+        
+        is_above = total_storage > S_curr
+        level += tl.where(is_above, 1, 0)
+        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+
+        S_accum = S_curr
+        prev_H = H_curr
+        prev_W = W_curr
+
     no_flood_cond = level < 0
     level = tl.maximum(level, 0)
-    prev_flood_depth   = tl.load(flood_depth_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
-    prev_total_width   = tl.load(total_width_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
-    prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
-    flood_grad         = tl.load(flood_gradient_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
+    
+    prev_total_width = river_width + level * width_increment
+
+    flood_grad = tl.where(
+        level == num_flood_levels,
+        0.0,
+        (next_flood_depth - prev_flood_depth) / width_increment
+    )
 
     diff_width = tl.sqrt(
         prev_total_width * prev_total_width +
@@ -151,14 +179,12 @@ def compute_flood_stage_log_kernel(
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
-    river_max_storage_ptr,       # *f32: River max storage
-    total_storage_table_ptr,     # *f32: Lookup table - total storage
+    river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
-    total_width_table_ptr,       # *f32: Lookup table - total width
-    flood_gradient_table_ptr,    # *f32: Lookup table - flood gradient
-    catchment_area_ptr,          # *f32: Catchment area
+    catchment_area_ptr,         # *f32: Catchment area
     river_width_ptr,             # *f32: River width
     river_length_ptr,            # *f32: River length
+    is_levee_ptr,                # *bool: Boolean mask for catchments governed by levee physics
     # scalar for log storage
     total_storage_pre_sum_ptr, # *f32
     total_storage_next_sum_ptr, # *f32
@@ -182,6 +208,9 @@ def compute_flood_stage_log_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
 
+    is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=True)
+    non_levee = ~is_levee
+
     # ---- 1. Storage update (from update_storage_kernel) ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
@@ -201,37 +230,64 @@ def compute_flood_stage_log_kernel(
         tl.maximum(river_storage_updated + flood_storage_updated, 0.0),
         river_storage_updated
     )
-    flood_storage_updated = tl.where(
-        flood_storage_updated < 0.0,
-        0.0,
-        flood_storage_updated
-    )
+    flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
     total_storage_next = river_storage_updated + flood_storage_updated
-    tl.atomic_add(total_storage_next_sum_ptr + current_step, tl.sum(total_storage_next) * 1e-9)
+    tl.atomic_add(total_storage_next_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_storage_next, 0)) * 1e-9)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + runoff * time_step, 0.0)
-    tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(total_storage) * 1e-9)
-    tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum((river_inflow + flood_inflow) * time_step) * 1e-9)
-    tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum((river_outflow + flood_outflow) * time_step) * 1e-9)
-    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(total_stage_pre - total_storage_next + (river_inflow + flood_inflow - river_outflow - flood_outflow) * time_step) * 1e-9)
+    tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_storage, 0)) * 1e-9)
+    tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_inflow + flood_inflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow - river_outflow - flood_outflow) * time_step, 0)) * 1e-9)
 
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
-    river_max_storage   = tl.load(river_max_storage_ptr   + offs, mask=mask)
-    catchment_area      = tl.load(catchment_area_ptr      + offs, mask=mask)
+    river_height        = tl.load(river_height_ptr        + offs, mask=mask)
+    catchment_area     = tl.load(catchment_area_ptr     + offs, mask=mask)
     river_width         = tl.load(river_width_ptr         + offs, mask=mask)
     river_length        = tl.load(river_length_ptr        + offs, mask=mask)
+    
+    river_max_storage = river_length * river_width * river_height
+    catchment_width = catchment_area / river_length
+    width_increment = catchment_width / num_flood_levels
 
     # Determine flood level by scanning the storage table
-    level = tl.zeros([BLOCK_SIZE], dtype=tl.int32) - 1
-    for i in tl.static_range(num_flood_levels+1):
-        prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + i, mask=mask)
-        level += tl.where(total_storage > prev_total_storage, 1, 0)
+    level = tl.where(total_storage > river_max_storage, 0, -1).to(tl.int32)
+    
+    S_accum = river_max_storage
+    prev_H = 0.0
+    prev_W = river_width
+    
+    prev_total_storage = river_max_storage
+    prev_flood_depth = 0.0
+    next_flood_depth = 0.0
+    
+    for i in tl.static_range(num_flood_levels):
+        H_curr = tl.load(flood_depth_table_ptr + offs * num_flood_levels + i, mask=mask)
+        W_curr = river_width + (i + 1) * width_increment
+        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+        S_curr = S_accum + dS
+        
+        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+        
+        is_above = total_storage > S_curr
+        level += tl.where(is_above, 1, 0)
+        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+
+        S_accum = S_curr
+        prev_H = H_curr
+        prev_W = W_curr
+
     no_flood_cond = level < 0
     level = tl.maximum(level, 0)
-    prev_flood_depth   = tl.load(flood_depth_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
-    prev_total_width   = tl.load(total_width_table_ptr   + offs * (num_flood_levels+1) + level, mask=mask)
-    prev_total_storage = tl.load(total_storage_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
-    flood_grad         = tl.load(flood_gradient_table_ptr + offs * (num_flood_levels+1) + level, mask=mask)
+    
+    prev_total_width = river_width + level * width_increment
+
+    flood_grad = tl.where(
+        level == num_flood_levels,
+        0.0,
+        (next_flood_depth - prev_flood_depth) / width_increment
+    )
     
     diff_width = tl.sqrt(
         prev_total_width * prev_total_width +
@@ -264,11 +320,10 @@ def compute_flood_stage_log_kernel(
     # log
     total_storage_stage_new = river_storage_final + flood_storage_final
     tl.atomic_add(total_storage_stage_sum_ptr + current_step, tl.sum(total_storage_stage_new) * 1e-9)
-    tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(river_storage_final) * 1e-9)
-    tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(flood_storage_final) * 1e-9)
-    tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(flood_area) * 1e-9)
-    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum((total_storage_stage_new - total_storage) * 1e-9))
-
+    tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(tl.where(non_levee, river_storage_final, 0)) * 1e-9)
+    tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(tl.where(non_levee, flood_storage_final, 0)) * 1e-9)
+    tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(tl.where(non_levee, flood_area, 0)) * 1e-9)
+    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, (total_storage_stage_new - total_storage) * 1e-9, 0)))
     # Return to zero
     tl.store(outgoing_storage_ptr + offs, 0.0, mask=mask)
 

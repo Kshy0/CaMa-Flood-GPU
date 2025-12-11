@@ -28,6 +28,7 @@ def BaseField(
     group_by: Optional[str] = "catchment_basin_id",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
+    intermediate: bool = False,
     **kwargs
 ):
     return TensorField(
@@ -37,6 +38,7 @@ def BaseField(
         group_by=group_by,
         save_idx=save_idx,
         save_coord=save_coord,
+        intermediate=intermediate,
         **kwargs
     )
 
@@ -46,6 +48,7 @@ def computed_base_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
+    intermediate: bool = False,
     **kwargs
 ):
 
@@ -56,6 +59,7 @@ def computed_base_field(
         dtype=dtype,
         save_idx=save_idx,
         save_coord=save_coord,
+        intermediate=intermediate,
         **kwargs
     )
 
@@ -141,6 +145,22 @@ class BaseModule(AbstractModule):
         default=None,
     )
 
+    levee_basin_id: Optional[torch.Tensor] = BaseField(
+        description="Basin ID for each levee",
+        dtype="int",
+        group_by="levee_basin_id",
+        shape=("num_levees",),
+        default=None,
+    )
+
+    levee_catchment_id: Optional[torch.Tensor] = BaseField(
+        description="Catchment ID for each levee",
+        dtype="int",
+        group_by="levee_basin_id",
+        shape=("num_levees",),
+        default=None,
+    )
+
     # Output-control mask
     catchment_save_mask: Optional[torch.Tensor] = BaseField(
         description="Boolean mask of catchments for which output will be saved",
@@ -162,11 +182,11 @@ class BaseModule(AbstractModule):
     )
 
     # --------------------------------------------------------------------- #
-    # Lookup tables (dependent on num_table_columns)
+    # Lookup tables (dependent on num_flood_levels)
     # --------------------------------------------------------------------- #
     flood_depth_table: torch.Tensor = BaseField(
         description="Lookup table: flood depth vs. fraction of catchment area flooded (m)",
-        shape=("num_catchments", "num_table_columns"),
+        shape=("num_catchments", "num_flood_levels"),
     )
 
     # --------------------------------------------------------------------- #
@@ -235,18 +255,18 @@ class BaseModule(AbstractModule):
         return len(self.catchment_save_idx)
     
     @computed_field(
-        description="Number of columns in the flood-depth lookup tables."
-    )
-    @cached_property
-    def num_table_columns(self) -> int:
-        return self.flood_depth_table.shape[1]
-
-    @computed_field(
         description="Number of flood levels represented in the lookup tables."
     )
     @cached_property
     def num_flood_levels(self) -> int:
-        return self.num_table_columns - 1
+        return self.flood_depth_table.shape[1]
+
+    @computed_field(description="Total number of levees")
+    @cached_property
+    def num_levees(self) -> int:
+        if self.levee_catchment_id is None:
+            return 0
+        return self.levee_catchment_id.shape[0]
 
     # ------------------------------------------------------------------ #
     # Computed tensor fields
@@ -299,6 +319,23 @@ class BaseModule(AbstractModule):
         return self.reservoir_mask
 
     @computed_base_field(
+        description="Boolean mask for catchments governed by levee physics",
+        dtype="bool",
+    )
+    @cached_property
+    def is_levee(self) -> torch.Tensor:
+        if "levee" not in self.opened_modules or self.levee_catchment_id is None:
+            return torch.zeros(self.num_catchments, dtype=torch.bool, device=self.device)
+        
+        indices = find_indices_in_torch(self.levee_catchment_id, self.catchment_id)
+        valid_mask = indices >= 0
+        valid_indices = indices[valid_mask]
+        
+        mask = torch.zeros(self.num_catchments, dtype=torch.bool, device=self.device)
+        mask[valid_indices] = True
+        return mask
+    
+    @computed_base_field(
         description="River-bed elevation (m a.s.l.)",
     )
     @cached_property
@@ -312,57 +349,6 @@ class BaseModule(AbstractModule):
     def total_storage(self) -> torch.Tensor:
         return self.river_storage + self.flood_storage
 
-    @computed_base_field(
-        description="Storage capacity of river channels at bankfull (m³)",
-    )
-    @cached_property
-    def river_max_storage(self) -> torch.Tensor:
-        return self.river_length * self.river_width * self.river_height
-
-    @computed_base_field(
-        description="Total flow width for every flood level (m)",
-        shape=("num_catchments", "num_table_columns"),
-    )
-    @cached_property
-    def total_width_table(self) -> torch.Tensor:
-        flood_increments = torch.linspace(
-            0, 1, self.num_table_columns, device=self.device
-        )[None, 1:]
-        flood_widths = self.river_width[:, None] + flood_increments * (
-            self.catchment_area[:, None] / self.river_length[:, None]
-        )
-        return torch.cat([self.river_width[:, None], flood_widths], dim=1)
-
-    @computed_base_field(
-        description="Cumulative storage for every flood level (m³)",
-        shape=("num_catchments", "num_table_columns"),
-    )
-    @cached_property
-    def total_storage_table(self) -> torch.Tensor:
-        area_avg = 0.5 * (
-            self.total_width_table[:, :-1] + self.total_width_table[:, 1:]
-        )
-        depth_diff = self.flood_depth_table[:, 1:] - self.flood_depth_table[:, :-1]
-        flood_storage = torch.cumsum(
-            self.river_length[:, None] * area_avg * depth_diff, dim=1
-        )
-        return torch.cat(
-            [self.river_max_storage[:, None], self.river_max_storage[:, None] + flood_storage],
-            dim=1,
-        )
-
-    @computed_base_field(
-        description="Gradient of flood-depth vs. width relationship",
-        shape=("num_catchments", "num_table_columns"),
-    )
-    @cached_property
-    def flood_gradient_table(self) -> torch.Tensor:
-        grad = (self.flood_depth_table[:, 1:] - self.flood_depth_table[:, :-1]) / (
-            self.total_width_table[:, 1:] - self.total_width_table[:, :-1]
-        )
-        zeros = torch.zeros_like(self.flood_depth_table[:, :1])
-        return torch.cat([grad, zeros], dim=1)
-
     # ---------------- Hidden / intermediate states ------------------- #
     @computed_base_field(
         description="Total outflow via all bifurcation paths (m³ s⁻¹)",
@@ -371,6 +357,13 @@ class BaseModule(AbstractModule):
     def global_bifurcation_outflow(self) -> torch.Tensor:
         return torch.zeros_like(self.river_outflow)
 
+    @computed_base_field(
+        description="Levee surface elevation (m a.s.l.)",
+    )
+    @cached_property
+    def global_levee_surface_elevation(self) -> torch.Tensor:
+        return torch.zeros_like(self.river_outflow)
+    
     @computed_base_field(
         description=("Total outgoing storage from each catchment (m³)"
                      "Can not be saved, as it is a temporary state."),
@@ -385,6 +378,20 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def water_surface_elevation(self) -> torch.Tensor:
+        return torch.zeros_like(self.river_outflow)
+
+    @computed_base_field(
+        description="Protected water-surface elevation (m a.s.l.)",
+    )
+    @cached_property
+    def protected_water_surface_elevation(self) -> torch.Tensor:
+        return torch.zeros_like(self.river_outflow)
+
+    @computed_base_field(
+        description="Water depth on the protected side relative to river bed (m)",
+    )
+    @cached_property
+    def protected_depth(self) -> torch.Tensor:
         return torch.zeros_like(self.river_outflow)
 
     @computed_base_field(
@@ -446,9 +453,31 @@ class BaseModule(AbstractModule):
         return self
 
     @model_validator(mode="after")
+    def validate_num_flood_levels(self) -> Self:
+        if self.num_flood_levels < 1:
+            raise ValueError("num_flood_levels must be at least 1")
+        return self
+
+    @model_validator(mode="after")
+    def validate_levee_catchment_id(self) -> Self:
+        if self.levee_catchment_id is not None:
+            if self.levee_catchment_id.numel() > 0:
+                if torch.any(self.levee_catchment_id < 0):
+                    raise ValueError("levee_catchment_id contains negative values")
+        return self
+
+    @model_validator(mode="after")
     def validate_is_river_mouth(self) -> Self:
         if not torch.all(
             self.catchment_id[self.is_river_mouth] == self.downstream_id[self.is_river_mouth]
         ):
             raise ValueError("is_river_mouth must point to self in downstream_id")
+        return self
+
+    @model_validator(mode="after")
+    def validate_flood_depth_table_monotonicity(self) -> Self:
+        if self.num_flood_levels > 1:
+            diffs = torch.diff(self.flood_depth_table, dim=1)
+            if not torch.all(diffs >= 0):
+                raise ValueError("flood_depth_table must be monotonically increasing along the columns (flood levels)")
         return self

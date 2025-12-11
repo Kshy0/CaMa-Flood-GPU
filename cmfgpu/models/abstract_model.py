@@ -57,6 +57,7 @@ class AbstractModel(BaseModel, ABC):
     BLOCK_SIZE: int = Field(default=256, description="GPU block size for kernels")
     output_workers: int = Field(default=2, description="Number of workers for writing output files")
     output_complevel: int = Field(default=4, description="Compression level for output NetCDF files", ge=0, le=9)
+    output_split_by_year: bool = Field(default=False, description="Whether to split output files by year")
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
@@ -84,7 +85,24 @@ class AbstractModel(BaseModel, ABC):
 
         # Validate that all opened modules are registered
         module_data = self.shard_param()  # reads from NetCDF
+        
+        # Sort modules by dependency
+        from graphlib import TopologicalSorter
+        sorter = TopologicalSorter()
         for module_name in self.opened_modules:
+            if module_name not in self.module_list:
+                raise ValueError(f"Module {module_name} not found in module_list")
+            deps = self.module_list[module_name].dependencies
+            # Only include dependencies that are in opened_modules
+            active_deps = [d for d in deps if d in self.opened_modules]
+            sorter.add(module_name, *active_deps)
+            
+        # Get sorted order
+        sorted_modules = list(sorter.static_order())
+
+        for module_name in sorted_modules:
+            if module_name not in self.opened_modules:
+                continue
 
             # Register the module instance with data
             module_class = self.module_list[module_name]
@@ -94,11 +112,40 @@ class AbstractModel(BaseModel, ABC):
                 device=self.device,
                 world_size=self.world_size,
                 precision=self.dtype,
+                **self._modules,
                 **module_data
             )
             self._modules[module_name] = module_instance
+        
+        # Clear intermediate tensors after all modules are initialized
+        for module_name in sorted_modules:
+            if module_name in self._modules:
+                self._modules[module_name].clear_intermediate_tensors()
+
         self.initialize_statistics_aggregator()
+        self.print_memory_summary()
         print("All modules initialized successfully.")
+
+    def print_memory_summary(self) -> None:
+        """
+        Print a summary of memory usage by module.
+        """
+        total_memory = 0
+        print(f"\n[{self.rank}] Memory Usage Summary (excluding intermediate variables):")
+        print(f"[{self.rank}] {'Module':<30} | {'Memory (MB)':<15}")
+        print(f"[{self.rank}] {'-' * 50}")
+        
+        for module_name in self.opened_modules:
+            if module_name not in self._modules:
+                continue
+            module = self._modules[module_name]
+            mem_bytes = module.get_memory_usage()
+            mem_mb = mem_bytes / (1024 * 1024)
+            total_memory += mem_bytes
+            print(f"[{self.rank}] {module_name:<30} | {mem_mb:<15.2f}")
+            
+        print(f"[{self.rank}] {'-' * 50}")
+        print(f"[{self.rank}] {'Total':<30} | {total_memory / (1024 * 1024):<15.2f} MB\n")
 
     def get_module(self, module_name: str) -> AbstractModule:
         return self._modules[module_name] if module_name in self.opened_modules else None
@@ -156,6 +203,7 @@ class AbstractModel(BaseModel, ABC):
             rank=self.rank,
             num_workers=self.output_workers,
             complevel=self.output_complevel,
+            output_split_by_year=self.output_split_by_year,
         )
 
         registered_vars = set()
@@ -186,6 +234,9 @@ class AbstractModel(BaseModel, ABC):
 
                 tensor = getattr(module_instance, var_name)
                 field_info = module_instance.get_model_fields().get(var_name)
+                if field_info is None:
+                    field_info = module_instance.get_model_computed_fields().get(var_name)
+                
                 if field_info is None:
                     continue
 
@@ -281,11 +332,12 @@ class AbstractModel(BaseModel, ABC):
                     )
 
                 # Pre-compute indices per group var for current rank (single file open)
-                group_vars_needed = {
-                    self.variable_group_mapping[name]
-                    for name in fields_to_load.keys()
-                    if name in self.variable_group_mapping
-                }
+                group_vars_needed = set()
+                for name in fields_to_load.keys():
+                    if name in self.variable_group_mapping:
+                        # Only need group var if the variable itself is in the dataset
+                        if name in ds.variables:
+                            group_vars_needed.add(self.variable_group_mapping[name])
                 group_indices_cache: Dict[str, np.ndarray] = {}
                 for group_var in group_vars_needed:
                     if group_var not in ds.variables:

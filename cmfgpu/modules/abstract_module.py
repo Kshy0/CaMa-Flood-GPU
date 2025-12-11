@@ -26,6 +26,7 @@ def TensorField(
     group_by: Optional[str] = None,
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
+    intermediate: bool = False,
     **kwargs
 ):
     """
@@ -37,6 +38,8 @@ def TensorField(
         dtype: Data type ('float', 'int', 'bool')
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
+        intermediate: If True, the tensor is considered an intermediate variable
+                      that can be cleared after initialization to save memory.
         **kwargs: Additional Field parameters
     """
     if dtype != "float":
@@ -54,6 +57,7 @@ def TensorField(
             "group_by": group_by,
             "save_idx": save_idx,
             "save_coord": save_coord,
+            "intermediate": intermediate,
         }
     )
 
@@ -63,6 +67,7 @@ def computed_tensor_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
+    intermediate: bool = False,
     **kwargs
 ):
     """
@@ -74,7 +79,8 @@ def computed_tensor_field(
         dtype: Data type ('float', 'int', 'bool')
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
-        repr: Whether to include this field in model repr
+        intermediate: If True, the tensor is considered an intermediate variable
+                      that can be cleared after initialization to save memory.
         **kwargs: Additional computed_field parameters
     """
     if dtype != "float":
@@ -90,6 +96,7 @@ def computed_tensor_field(
             "tensor_dtype": dtype,
             "save_idx": save_idx,
             "save_coord": save_coord,
+            "intermediate": intermediate,
         },
         **kwargs
     )
@@ -132,7 +139,6 @@ class AbstractModule(BaseModel, ABC):
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
     precision: torch.dtype = Field(default=torch.float32, description="Data type for tensors")
 
-
     def model_post_init(self, __context: Any):
         if self.module_name not in self.opened_modules:
             raise ValueError(
@@ -142,6 +148,7 @@ class AbstractModule(BaseModel, ABC):
         self.validate_tensors()
         self.init_optional_tensors()
         self.validate_computed_tensors()
+        # self.clear_intermediate_tensors() # Deferred to AbstractModel.model_post_init
 
 
     @classmethod
@@ -161,7 +168,12 @@ class AbstractModule(BaseModel, ABC):
         - If already a tensor -> skip
         """
         for name, field_info in self.get_model_fields().items():
-            if field_info.annotation != torch.Tensor or name in self.model_fields_set:
+            # Check if it is a TensorField by looking for tensor_shape in json_schema_extra
+            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
+            if json_schema_extra is None or 'tensor_shape' not in json_schema_extra:
+                continue
+
+            if name in self.model_fields_set:
                 continue
             value = getattr(self, name, None)
             # shape
@@ -207,6 +219,20 @@ class AbstractModule(BaseModel, ABC):
         # Get current scalar values from instance
         scalar_values = {}
         for dim_name in shape_spec:
+            # Handle dotted notation (e.g., "base.num_flood_levels")
+            if "." in dim_name:
+                parts = dim_name.split(".")
+                if len(parts) != 2:
+                    raise ValueError(f"Invalid dimension format: {dim_name}. Expected 'module.attribute'")
+                module_name, attr_name = parts
+                if not hasattr(self, module_name):
+                    raise ValueError(f"Module {module_name} not found in {self.module_name} for dimension {dim_name}")
+                module_obj = getattr(self, module_name)
+                if not hasattr(module_obj, attr_name):
+                    raise ValueError(f"Attribute {attr_name} not found in module {module_name} for dimension {dim_name}")
+                scalar_values[dim_name] = getattr(module_obj, attr_name)
+                continue
+
             if hasattr(self, dim_name):
                 scalar_values[dim_name] = getattr(self, dim_name)
             else:
@@ -251,8 +277,11 @@ class AbstractModule(BaseModel, ABC):
         """
 
         for field_name, field_info in self.get_model_fields().items():
-            if field_info.annotation != torch.Tensor:
+            # Check if it is a TensorField by looking for tensor_shape in json_schema_extra
+            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
+            if json_schema_extra is None or 'tensor_shape' not in json_schema_extra:
                 continue
+
             tensor = getattr(self, field_name, None)
             
             if tensor is None or not isinstance(tensor, torch.Tensor):
@@ -302,11 +331,12 @@ class AbstractModule(BaseModel, ABC):
                     f"Computed field {field_name} has shape {tensor.shape}, "
                     f"but expected shape is {self.get_expected_shape(field_name)}"
                 )
-            if tensor.dtype != self.get_expected_dtype(field_name):
-                raise ValueError(
-                    f"Computed field {field_name} has dtype {tensor.dtype}, "
-                    f"but expected dtype is {self.get_expected_dtype(field_name)}"
-                )
+            
+            expected_dtype = self.get_expected_dtype(field_name)
+            if tensor.dtype != expected_dtype:
+                print(f"Auto-fixed dtype for computed field {field_name}: {tensor.dtype} -> {expected_dtype}")
+                tensor = tensor.to(expected_dtype)
+                setattr(self, field_name, tensor)
         return True
     
     @model_validator(mode="after")
@@ -334,3 +364,42 @@ class AbstractModule(BaseModel, ABC):
             )
         
         return self
+    
+    def clear_intermediate_tensors(self) -> None:
+        """
+        Clear intermediate tensors to save memory.
+        These tensors are marked with `intermediate=True` in their field definition.
+        """
+        for name, field_info in (self.get_model_fields() | self.get_model_computed_fields()).items():
+            if field_info.json_schema_extra and field_info.json_schema_extra.get("intermediate"):
+                if hasattr(self, name):
+                    setattr(self, name, None)
+                    print(f"Cleared intermediate tensor: {name}")
+
+    def get_memory_usage(self) -> int:
+        """
+        Calculate the memory usage of the module in bytes.
+        Excludes intermediate tensors.
+        """
+        total_bytes = 0
+        
+        # Combine fields and computed fields
+        all_fields = self.get_model_fields().copy()
+        all_fields.update(self.get_model_computed_fields())
+        
+        for name, field_info in all_fields.items():
+            # Check if it's an intermediate variable
+            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
+            if json_schema_extra and json_schema_extra.get('intermediate'):
+                continue
+                
+            # Get the value
+            if not hasattr(self, name):
+                continue
+            value = getattr(self, name)
+            
+            # Check if it's a tensor
+            if isinstance(value, torch.Tensor):
+                total_bytes += value.element_size() * value.nelement()
+                
+        return total_bytes

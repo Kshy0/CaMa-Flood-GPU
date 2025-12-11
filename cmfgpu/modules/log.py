@@ -117,7 +117,6 @@ class LogModule(AbstractModule):
             f.write(
                 f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {self._num_steps}\n"
             )
-        print(f"Processed step at {self._current_time.strftime('%Y-%m-%d %H:%M:%S')}, adaptive_time_step={self._num_steps}")
 
         num_steps = self._num_steps
         time_strs = np.array(

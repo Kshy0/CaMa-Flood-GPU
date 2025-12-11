@@ -53,12 +53,41 @@ class MultiRankStatsReader:
         """Locate rank files and collect basic structural metadata."""
         pattern = f"{self.var_name}_rank*.nc"
         files = sorted(self.base_dir.glob(pattern))
-        rank_infos: List[dict] = []
-        rank_re = re.compile(rf"{re.escape(self.var_name)}_rank(\d+)\.nc$")
+        rank_map: Dict[int, List[Tuple[int, Path]]] = {}
+        
+        # Regex to match rank and optional year: var_rank0.nc or var_rank0_2000.nc
+        if self.split_by_year:
+            rank_re = re.compile(rf"^{re.escape(self.var_name)}_rank(\d+)_(\d{{4}})\.nc$")
+        else:
+            rank_re = re.compile(rf"^{re.escape(self.var_name)}_rank(\d+)\.nc$")
 
         for fp in files:
+            m = rank_re.match(fp.name)
+            if not m:
+                continue
+            rank_id = int(m.group(1))
+            if self.split_by_year:
+                year = int(m.group(2))
+            else:
+                year = -1
+
+            if rank_id not in rank_map:
+                rank_map[rank_id] = []
+            rank_map[rank_id].append((year, fp))
+
+        rank_infos: List[dict] = []
+        
+        for rank_id in sorted(rank_map.keys()):
+            # Sort files by year (or just by name if year is -1, but here we use the tuple)
+            # If year is -1, it means no year suffix.
+            files_with_year = sorted(rank_map[rank_id], key=lambda x: x[0])
+            paths = [p for y, p in files_with_year]
+            
+            # Use the first file to get metadata
+            first_fp = paths[0]
+            
             try:
-                with nc.Dataset(fp, "r") as ds:
+                with nc.Dataset(first_fp, "r") as ds:
                     if self.var_name not in ds.variables:
                         continue
                     var = ds.variables[self.var_name]
@@ -74,7 +103,9 @@ class MultiRankStatsReader:
 
                     rank_infos.append(
                         {
-                            "path": fp,
+                            "rank_id": rank_id,
+                            "paths": paths, # List of paths
+                            "path": first_fp, # Keep for backward compat / metadata
                             "saved_points": saved_points,
                             "has_levels": has_levels,
                             "n_levels": n_levels,
@@ -85,59 +116,71 @@ class MultiRankStatsReader:
                         }
                     )
             except Exception as e:
-                print(f"Warning: skipping file {fp.name}, reason: {e}")
+                print(f"Warning: skipping rank {rank_id} (file {first_fp.name}), reason: {e}")
 
-        def _rank_key(info: dict):
-            m = rank_re.search(info["path"].name)
-            return int(m.group(1)) if m else 1_000_000
-
-        rank_infos.sort(key=_rank_key)
         return rank_infos
 
     def _read_time_axis(self) -> None:
         """
-        Read the time axis from the first rank file; validate / truncate against others.
+        Read the time axis from the first rank's files; validate / truncate against others.
         Produce:
           - self._time_values_num
           - self._time_datetimes (naive)
           - self._time_units / _time_calendar
           - self._time_len
+          - self._file_time_offsets (list of (start, end) indices for each file in the first rank)
         """
         if not self._rank_files:
             raise RuntimeError("No rank files loaded.")
 
-        with nc.Dataset(self._rank_files[0]["path"], "r") as ds0:
-            tvar = ds0.variables["time"]
-            self._time_units = getattr(tvar, "units")
-            self._time_calendar = getattr(tvar, "calendar", "standard")
-            t0 = np.array(tvar[:])
-            dt0 = nc.num2date(t0, units=self._time_units, calendar=self._time_calendar)
-            self._time_datetimes = [
-                datetime(d.year, d.month, d.day, d.hour, d.minute, d.second) for d in dt0
-            ]
-            self._time_values_num = t0
-            self._time_len = len(t0)
+        # Use the first rank to build the master time axis
+        first_rank = self._rank_files[0]
+        all_times = []
+        self._file_time_offsets = [] # For the first rank, but assumed same for all
+        
+        current_offset = 0
+        
+        # Read time from all files of the first rank
+        for fp in first_rank["paths"]:
+            with nc.Dataset(fp, "r") as ds:
+                tvar = ds.variables["time"]
+                if not hasattr(self, "_time_units"):
+                    self._time_units = getattr(tvar, "units")
+                    self._time_calendar = getattr(tvar, "calendar", "standard")
+                
+                t_vals = np.array(tvar[:])
+                all_times.append(t_vals)
+                
+                length = len(t_vals)
+                self._file_time_offsets.append((current_offset, current_offset + length))
+                current_offset += length
 
+        t0 = np.concatenate(all_times)
+        dt0 = nc.num2date(t0, units=self._time_units, calendar=self._time_calendar)
+        self._time_datetimes = [
+            datetime(d.year, d.month, d.day, d.hour, d.minute, d.second) for d in dt0
+        ]
+        self._time_values_num = t0
+        self._time_len = len(t0)
+
+        # Validate other ranks
         for info in self._rank_files[1:]:
-            with nc.Dataset(info["path"], "r") as dsi:
-                tvar = dsi.variables["time"]
-                if len(tvar) != self._time_len:
-                    print(
-                        f"Warning: {info['path'].name} has {len(tvar)} time steps, "
-                        f"mismatch with first file {self._time_len}. Truncating to min length."
-                    )
-                    self._time_len = min(self._time_len, len(tvar))
-                units = getattr(tvar, "units")
-                cal = getattr(tvar, "calendar", "standard")
-                if units != self._time_units or cal != self._time_calendar:
-                    print(
-                        f"Warning: {info['path'].name} time units/calendar mismatch; using first file settings: "
-                        f"units={self._time_units}, calendar={self._time_calendar}"
-                    )
+            rank_len = 0
+            for fp in info["paths"]:
+                with nc.Dataset(fp, "r") as dsi:
+                    rank_len += len(dsi.variables["time"])
+            
+            if rank_len != self._time_len:
+                print(
+                    f"Warning: Rank {info.get('rank_id')} has {rank_len} time steps, "
+                    f"mismatch with first rank {self._time_len}. Truncating to min length."
+                )
+                self._time_len = min(self._time_len, rank_len)
 
         if self._time_len < len(self._time_values_num):
             self._time_values_num = self._time_values_num[: self._time_len]
             self._time_datetimes = self._time_datetimes[: self._time_len]
+            # Re-adjust offsets if needed? For now assume simple truncation at end.
 
     def _compute_all_xy(self, force: bool = False) -> None:
         """Compute (x, y) for each rank (custom converter -> unravel -> None)."""
@@ -177,22 +220,51 @@ class MultiRankStatsReader:
         """Preload only the chosen inclusive slice [self._slice_start, self._slice_end]."""
         if self._slice_start is None or self._slice_end is None:
             raise RuntimeError("Slice indices not set.")
-        start = self._slice_start
-        stop_exclusive = self._slice_end + 1
+        
+        # We need to map global slice to file-specific slices
+        # self._file_time_offsets contains [(0, 366), (366, 731), ...]
+        
         for info in self._rank_files:
             if info["saved_points"] == 0:
                 info["cache"] = None
                 continue
-            try:
-                with nc.Dataset(info["path"], "r") as ds:
-                    var = ds.variables[self.var_name]
-                    if info["has_levels"]:
-                        data = var[start:stop_exclusive, :, :]
-                    else:
-                        data = var[start:stop_exclusive, :]
-                    info["cache"] = np.array(data, copy=True)
-            except Exception as e:
-                print(f"Warning: failed to cache {info['path'].name}: {e}")
+            
+            rank_data_parts = []
+            current_global_idx = 0
+            
+            # Iterate through files and extract relevant parts
+            for i, fp in enumerate(info["paths"]):
+                file_start_global, file_end_global = self._file_time_offsets[i]
+                
+                # Check intersection with requested slice [self._slice_start, self._slice_end]
+                # Intersection: max(start1, start2) to min(end1, end2)
+                req_start = max(self._slice_start, file_start_global)
+                req_end = min(self._slice_end + 1, file_end_global) # exclusive end
+                
+                if req_start < req_end:
+                    # Calculate local indices
+                    local_start = req_start - file_start_global
+                    local_end = req_end - file_start_global
+                    
+                    try:
+                        with nc.Dataset(fp, "r") as ds:
+                            var = ds.variables[self.var_name]
+                            if info["has_levels"]:
+                                data = var[local_start:local_end, :, :]
+                            else:
+                                data = var[local_start:local_end, :]
+                            rank_data_parts.append(np.array(data, copy=True))
+                    except Exception as e:
+                        print(f"Warning: failed to cache {fp.name}: {e}")
+                        # Append zeros or handle error?
+                        shape = (local_end - local_start, info["saved_points"])
+                        if info["has_levels"]:
+                            shape += (info["n_levels"],)
+                        rank_data_parts.append(np.zeros(shape, dtype=np.float32))
+
+            if rank_data_parts:
+                info["cache"] = np.concatenate(rank_data_parts, axis=0)
+            else:
                 info["cache"] = None
 
     # ----------------------------------------------------------------------------------
@@ -213,6 +285,7 @@ class MultiRankStatsReader:
         ] = None,
         time_range: Optional[Tuple[datetime, datetime]] = None,
         cache_enabled: bool = False,
+        split_by_year: bool = False,
     ):
         """
         time_range: CLOSED interval (start_dt, end_dt), both inclusive.
@@ -226,6 +299,7 @@ class MultiRankStatsReader:
 
         self._rank_files: List[dict] = []
         self.cache_enabled = cache_enabled
+        self.split_by_year = split_by_year
 
         self._slice_start: Optional[int] = None
         self._slice_end: Optional[int] = None
@@ -303,6 +377,25 @@ class MultiRankStatsReader:
     # ----------------------------------------------------------------------------------
     # Data getters
     # ----------------------------------------------------------------------------------
+    def _get_data_from_files(self, info: dict, t_index: int, level: Optional[int] = None) -> np.ndarray:
+        """Helper to fetch data for a single time step from the correct file."""
+        orig_time = int(self._t_indices[t_index])
+        
+        # Find which file contains orig_time
+        for i, (start, end) in enumerate(self._file_time_offsets):
+            if start <= orig_time < end:
+                local_time = orig_time - start
+                fp = info["paths"][i]
+                with nc.Dataset(fp, "r") as ds:
+                    var = ds.variables[self.var_name]
+                    if info["has_levels"]:
+                        return var[local_time, :, level if level is not None else 0]
+                    else:
+                        return var[local_time, :]
+        
+        # Should not happen if t_index is valid
+        raise IndexError(f"Time index {orig_time} not found in any file.")
+
     def get_vector(
         self,
         t_index: int,
@@ -311,12 +404,13 @@ class MultiRankStatsReader:
     ) -> np.ndarray:
         if t_index < 0 or t_index >= self._time_len:
             raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
-        orig_time = int(self._t_indices[t_index])
+        
         parts: List[np.ndarray] = []
         for info in self._rank_files:
             if info["saved_points"] == 0:
                 parts.append(np.empty((0,), dtype=dtype or np.float32))
                 continue
+            
             cache_arr = info.get("cache")
             if cache_arr is not None:
                 if info["has_levels"]:
@@ -324,12 +418,8 @@ class MultiRankStatsReader:
                 else:
                     data = cache_arr[t_index, :]
             else:
-                with nc.Dataset(info["path"], "r") as ds:
-                    var = ds.variables[self.var_name]
-                    if info["has_levels"]:
-                        data = var[orig_time, :, level if level is not None else 0]
-                    else:
-                        data = var[orig_time, :]
+                data = self._get_data_from_files(info, t_index, level)
+                
             arr = np.array(data, copy=False)
             if dtype is not None:
                 arr = arr.astype(dtype, copy=False)
@@ -348,7 +438,6 @@ class MultiRankStatsReader:
         if t_index < 0 or t_index >= self._time_len:
             raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
 
-        orig_time = int(self._t_indices[t_index])
         nx_, ny_ = self._map_shape
         grid = np.full((nx_, ny_), fill_value, dtype=dtype or np.float32)
 
@@ -359,6 +448,7 @@ class MultiRankStatsReader:
             y = info.get("y")
             if x is None or y is None:
                 raise RuntimeError(f"{info['path'].name} missing (x,y); set map_shape or coord converter.")
+            
             cache_arr = info.get("cache")
             if cache_arr is not None:
                 if info["has_levels"]:
@@ -368,14 +458,10 @@ class MultiRankStatsReader:
                 else:
                     vals = cache_arr[t_index, :]
             else:
-                with nc.Dataset(info["path"], "r") as ds:
-                    var = ds.variables[self.var_name]
-                    if info["has_levels"]:
-                        if level is None:
-                            raise ValueError("This variable has 'levels'; please specify 'level'.")
-                        vals = var[orig_time, :, level]
-                    else:
-                        vals = var[orig_time, :]
+                if info["has_levels"] and level is None:
+                     raise ValueError("This variable has 'levels'; please specify 'level'.")
+                vals = self._get_data_from_files(info, t_index, level)
+                
             grid[x, y] = np.array(vals, copy=False)
         return grid
 
@@ -387,6 +473,16 @@ class MultiRankStatsReader:
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
         def _as_list(v):
+            # Heuristic: if input is a list/tuple that looks like (N, 2) coordinates, treat as single array
+            if isinstance(v, (list, tuple)):
+                try:
+                    arr = np.array(v)
+                    # If it forms a valid (N, 2) array, wrap it as a single item
+                    # This handles [(x, y)] -> (1, 2) and [[x1, y1], [x2, y2]] -> (2, 2)
+                    if arr.ndim == 2 and arr.shape[1] == 2:
+                        return [arr]
+                except Exception:
+                    pass
             return [np.asarray(a) for a in v] if isinstance(v, (list, tuple)) else [np.asarray(v)]
         arr_list = _as_list(points)
         if not arr_list:
@@ -443,6 +539,27 @@ class MultiRankStatsReader:
         if any(hit is None for hit in col_to_hits):
             raise ValueError("Some points not found in any rank.")
 
+        # Print queried points info
+        print(f"Querying {len(queries)} points:")
+        for c, q in enumerate(queries):
+            r_idx, li = col_to_hits[c]
+            info = self._rank_files[r_idx]
+
+            # Get catchment ID if available
+            cid = "N/A"
+            if info.get("coord_raw") is not None:
+                cid = info["coord_raw"][li]
+
+            if use_xy:
+                qx, qy = q
+                print(f"  Point {c}: (x={qx}, y={qy}) -> Rank {r_idx}, Local Idx {li}, CatchmentID={cid}")
+            else:
+                qid = q
+                # If querying by ID, we might want to print X, Y if available
+                x_val = info["x"][li] if info.get("x") is not None else "N/A"
+                y_val = info["y"][li] if info.get("y") is not None else "N/A"
+                print(f"  Point {c}: ID={qid} -> Rank {r_idx}, Local Idx {li}, (x={x_val}, y={y_val})")
+
         out = np.full((self._time_len, N), fill_value, dtype=dtype or np.float32)
 
         rank_to_cols: dict[int, List[Tuple[int, int]]] = {}
@@ -468,23 +585,41 @@ class MultiRankStatsReader:
             # No cache: minimize I/O by opening once and slicing contiguous time window
             if self._slice_start is None or self._slice_end is None:
                 raise RuntimeError("Internal error: time slice is not set.")
-            t0 = int(self._slice_start)
-            t1 = int(self._slice_end) + 1  # exclusive
+            
             idx = np.array([li for (_, li) in pairs], dtype=np.int64)
-
-            with nc.Dataset(info["path"], "r") as ds:
-                var = ds.variables[self.var_name]
-                if info["has_levels"]:
-                    if level is None:
-                        raise ValueError("This variable has 'levels'; specify `level`.")
-                    # Read (T, K) in one go
-                    vals = np.asarray(var[t0:t1, idx, level])  # shape (T, K)
-                else:
-                    vals = np.asarray(var[t0:t1, idx])         # shape (T, K)
-
-            # Scatter to output columns
-            for k, (col, _) in enumerate(pairs):
-                out[:, col] = vals[:, k].astype(dtype or np.float32, copy=False)
+            
+            # Iterate over files to fill data
+            for i, fp in enumerate(info["paths"]):
+                file_start_global, file_end_global = self._file_time_offsets[i]
+                
+                # Intersection with requested slice [self._slice_start, self._slice_end]
+                req_start = max(self._slice_start, file_start_global)
+                req_end = min(self._slice_end + 1, file_end_global)
+                
+                if req_start < req_end:
+                    local_start = req_start - file_start_global
+                    local_end = req_end - file_start_global
+                    
+                    # Where to put in output array?
+                    # out is indexed 0..self._time_len-1 corresponding to self._slice_start..self._slice_end
+                    out_start = req_start - self._slice_start
+                    out_end = req_end - self._slice_start
+                    
+                    try:
+                        with nc.Dataset(fp, "r") as ds:
+                            var = ds.variables[self.var_name]
+                            if info["has_levels"]:
+                                if level is None:
+                                    raise ValueError("This variable has 'levels'; specify `level`.")
+                                chunk = np.asarray(var[local_start:local_end, idx, level])
+                            else:
+                                chunk = np.asarray(var[local_start:local_end, idx])
+                        
+                        # Scatter chunk to output columns
+                        for k, (col, _) in enumerate(pairs):
+                            out[out_start:out_end, col] = chunk[:, k].astype(dtype or np.float32, copy=False)
+                    except Exception as e:
+                        print(f"Warning: failed to read {fp.name}: {e}")
 
         return out
 
