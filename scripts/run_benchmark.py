@@ -98,6 +98,8 @@ def benchmark_block_sizes():
     for block_size in BLOCK_SIZE_LIST:
         model.BLOCK_SIZE = block_size
         current_time = start_date
+        if rank == 0:
+            print(f"Benchmarking BLOCK_SIZE={block_size}...")
         stream = torch.cuda.Stream(device=device)
         torch.cuda.synchronize()
         start = time.time()

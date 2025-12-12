@@ -43,6 +43,12 @@ def main():
     suffix = ".nc"
     var_name = "ro"
     output_split_by_year = False
+    
+    # Spin-up configuration
+    do_spin_up = False
+    spin_up_start_date = datetime(2000, 1, 1, 0, 0, 0)
+    spin_up_end_date = datetime(2000, 12, 31, 0, 0, 0)
+    spin_up_cycles = 1
     ### Configuration End ###
 
     batch_size = loader_workers
@@ -60,6 +66,9 @@ def main():
         var_name=var_name,
         prefix=prefix,
         suffix=suffix,
+        spin_up_cycles=spin_up_cycles if do_spin_up else 0,
+        spin_up_start_date=spin_up_start_date,
+        spin_up_end_date=spin_up_end_date,
     )
 
     model = CaMaFlood(
@@ -94,7 +103,7 @@ def main():
         prefetch_factor=prefetch_factor, 
     )
 
-    current_time = start_date
+    current_time = dataset.get_virtual_start_time()
     stream = torch.cuda.Stream(device=device)
     for batch_runoff in loader:
         with torch.cuda.stream(stream):

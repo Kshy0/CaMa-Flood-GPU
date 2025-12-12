@@ -46,6 +46,7 @@ class CaMaFlood(AbstractModel):
     }
     group_by: ClassVar[str] = "catchment_basin_id"
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
+    output_start_time: Optional[datetime] = None
 
     @cached_property
     def base(self) -> BaseModule:
@@ -151,6 +152,12 @@ class CaMaFlood(AbstractModel):
             # Reset elapsed time counter at the beginning of a stats window
             self._stats_elapsed_time = 0.0
 
+        # Check if output is enabled
+        output_enabled = True
+        if self.output_start_time is not None and current_time is not None:
+            if current_time < self.output_start_time:
+                output_enabled = False
+
         for sub_step in range(num_sub_steps):
             # Determine flags for the first/last sub-step of this model step
             is_first = stat_is_first and (sub_step == 0)
@@ -161,23 +168,25 @@ class CaMaFlood(AbstractModel):
             # Compute total_weight only when finalizing
             total_weight = self._stats_elapsed_time if is_last else 0.0
             # Update stats after physics for each sub-step
-            self.update_statistics(
-                weight=time_sub_step,
-                total_weight=total_weight,
-                is_first=is_first,
-                is_last=is_last,
-                BLOCK_SIZE=self.BLOCK_SIZE,
-            )
+            if output_enabled:
+                self.update_statistics(
+                    weight=time_sub_step,
+                    total_weight=total_weight,
+                    is_first=is_first,
+                    is_last=is_last,
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                )
 
         # Reset elapsed counter after closing a window
         if stat_is_last:
-            self.finalize_time_step(current_time)
+            if output_enabled:
+                self.finalize_time_step(current_time)
             self._stats_elapsed_time = 0.0
         
         if self.log is not None:
             if self.world_size > 1:
                 self.log.gather_results()
-            if self.rank == 0:
+            if self.rank == 0 and output_enabled:
                 self.log.write_step(self.log_path)
         if self.rank == 0:
             msg = f"Processed step at {current_time.strftime('%Y-%m-%d %H:%M:%S')}, adaptive_time_step={num_sub_steps}"

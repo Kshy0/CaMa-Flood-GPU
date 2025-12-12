@@ -43,20 +43,20 @@ class NetCDFDataset(AbstractDataset):
                 "The following required NetCDF data files are missing:\n" + "\n".join(missing)
             )
 
-    def _scan_time_metadata(self) -> None:
+    def _scan_time_metadata(self, start_dt: datetime, end_dt: datetime) -> None:
         """Read only time vars to construct a global time index and lookup map."""
         # Build key -> first_dt map to help with date guessing
         key_to_first_dt: Dict[str, datetime] = {}
-        t = self.start_date
-        while t <= self.end_date:
+        t = start_dt
+        while t <= end_dt:
             k = self.time_to_key(t)
             if k not in key_to_first_dt:
                 key_to_first_dt[k] = t
             t += self.time_interval
         # Ensure end_date is covered
-        k_end = self.time_to_key(self.end_date)
+        k_end = self.time_to_key(end_dt)
         if k_end not in key_to_first_dt:
-            key_to_first_dt[k_end] = self.end_date
+            key_to_first_dt[k_end] = end_dt
 
         keys = set(key_to_first_dt.keys())
         self._validate_files_exist(keys)
@@ -107,11 +107,11 @@ class NetCDFDataset(AbstractDataset):
                 self._file_times[key] = []
                 for i, dt in enumerate(dates):
                     self._file_times[key].append(dt)
-                    if self.start_date <= dt <= self.end_date:
+                    if start_dt <= dt <= end_dt:
                         self._dt_to_loc[dt] = (key, i)
         expected_times: List[datetime] = []
-        t = self.start_date
-        while t <= self.end_date:
+        t = start_dt
+        while t <= end_dt:
             expected_times.append(t)
             t += self.time_interval
         missing = [dt for dt in expected_times if dt not in self._dt_to_loc]
@@ -154,17 +154,49 @@ class NetCDFDataset(AbstractDataset):
 
         return ops
 
-    def _build_chunk_plans(self) -> None:
-        self._chunk_plan = []
-        total = len(self._global_times)
-        if total == 0:
-            return
-        n_chunks = (total + self.chunk_len - 1) // self.chunk_len
-        for ci in range(n_chunks):
-            a = ci * self.chunk_len
-            b = min(a + self.chunk_len, total)
-            times = self._global_times[a:b]
-            self._chunk_plan.append(self._ops_from_times(times))
+    def _build_simulation_plan(self) -> None:
+        """
+        Builds the sequence of chunks for the entire simulation, including spin-up.
+        self._plan will be a list of (start_time, ops).
+        """
+        self._plan = []
+        
+        # Helper to build chunks for a time range
+        def build_chunks_for_range(start_dt, end_dt):
+            chunks = []
+            times = []
+            t = start_dt
+            while t <= end_dt:
+                times.append(t)
+                t += self.time_interval
+            
+            total = len(times)
+            if total == 0:
+                return []
+            
+            n_chunks = (total + self.chunk_len - 1) // self.chunk_len
+            for ci in range(n_chunks):
+                a = ci * self.chunk_len
+                b = min(a + self.chunk_len, total)
+                chunk_times = times[a:b]
+                ops = self._ops_from_times(chunk_times)
+                # Store the start time of the chunk for reference
+                chunks.append((chunk_times[0], ops))
+            return chunks
+
+        # 1. Spin-up chunks
+        self._spin_up_chunks_template = []
+        if self.spin_up_cycles > 0:
+            if self.spin_up_start_date is None or self.spin_up_end_date is None:
+                raise ValueError("Spin-up dates must be provided if spin_up_cycles > 0")
+            self._spin_up_chunks_template = build_chunks_for_range(self.spin_up_start_date, self.spin_up_end_date)
+            
+            for _ in range(self.spin_up_cycles):
+                self._plan.extend(self._spin_up_chunks_template)
+
+        # 2. Main simulation chunks
+        main_chunks = build_chunks_for_range(self.start_date, self.end_date)
+        self._plan.extend(main_chunks)
 
     def __init__(
         self,
@@ -183,8 +215,6 @@ class NetCDFDataset(AbstractDataset):
         **kwargs,
     ):
         self.base_dir = base_dir
-        self.start_date = start_date
-        self.end_date = end_date
         self.time_interval = time_interval
         self.unit_factor = unit_factor
         self.var_name = var_name
@@ -201,22 +231,25 @@ class NetCDFDataset(AbstractDataset):
         self._chunk_plan = []
 
         # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
-        super().__init__(out_dtype=out_dtype, chunk_len=chunk_len, *args, **kwargs)
-        self._scan_time_metadata()
-        self._build_chunk_plans()
-    # -------------------------
-    # Metadata & planning
-    # -------------------------
-    def _collect_required_keys(self) -> Set[str]:
-        """Collect file keys covering [start_date, end_date] stepping by time_interval."""
-        keys: Set[str] = set()
-        t = self.start_date
-        # + one extra step to ensure inclusive end coverage for non-divisible ranges
-        while t <= self.end_date:
-            keys.add(self.time_to_key(t))
-            t += self.time_interval
-        keys.add(self.time_to_key(self.end_date))
-        return keys
+        super().__init__(out_dtype=out_dtype, chunk_len=chunk_len, time_interval=time_interval, start_date=start_date, end_date=end_date, *args, **kwargs)
+        
+        # Determine full data range needed
+        scan_start = self.start_date
+        scan_end = self.end_date
+        if self.spin_up_cycles > 0:
+            if self.spin_up_start_date is not None and self.spin_up_start_date < scan_start:
+                scan_start = self.spin_up_start_date
+            if self.spin_up_end_date is not None and self.spin_up_end_date > scan_end:
+                scan_end = self.spin_up_end_date
+
+        self._scan_time_metadata(scan_start, scan_end)
+        self._build_simulation_plan()
+
+    @property
+    def num_spin_up_chunks(self) -> int:
+        if self.spin_up_cycles > 0:
+            return len(self._spin_up_chunks_template) * self.spin_up_cycles
+        return 0
 
     # -------------------------
     # Variable shape helpers
@@ -245,20 +278,6 @@ class NetCDFDataset(AbstractDataset):
                 raise ValueError(f"Unsupported extra non-size-1 dims after time/lat/lon: shape={data.shape}")
             data = data.reshape(data.shape[0], data.shape[1], data.shape[2])
         return data
-
-    # -------------------------
-    # Public API
-    # -------------------------
-    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (lon, lat) 1D arrays from the first file."""
-        key = self.time_to_key(self.start_date)
-        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-        with Dataset(path, "r") as ds:
-            lat = ds.variables.get("lat") or ds.variables.get("latitude")
-            lon = ds.variables.get("lon") or ds.variables.get("longitude") or ds.variables.get("long")
-            if lat is None or lon is None:
-                raise ValueError("Unable to find lat/lon variables in the dataset.")
-            return np.array(lon[:]), np.array(lat[:])
 
     @cached_property
     def _mask_2d(self) -> np.ndarray:
@@ -306,11 +325,6 @@ class NetCDFDataset(AbstractDataset):
         m = self._mask_2d
         return np.flatnonzero(m.ravel(order="C")).astype(np.int64)
 
-    @cached_property
-    def data_mask(self) -> np.ndarray:
-        """Expose spatial mask as (Y, X) for mapping utilities."""
-        return self._mask_2d
-
     def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
         """Execute per-file reads using absolute time indices.
 
@@ -355,6 +369,36 @@ class NetCDFDataset(AbstractDataset):
                 chunks.append(out)
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
+    def read_chunk(self, idx: int) -> np.ndarray:
+        """
+        Reads the chunk at the specified index using the pre-computed plan.
+        """
+        if idx < 0 or idx >= len(self._plan):
+            raise IndexError(f"Chunk index {idx} out of range (0-{len(self._plan)-1})")
+        
+        _, ops = self._plan[idx]
+        data = self._read_ops(ops)
+        return data / self.unit_factor
+
+    def get_time_by_index(self, idx: int) -> datetime:
+        """
+        Returns the datetime corresponding to the given absolute timestep index.
+        Note: This is a bit ambiguous with spin-up because times repeat.
+        This implementation assumes idx maps linearly to the plan.
+        """
+        chunk_idx = idx // self.chunk_len
+        offset = idx % self.chunk_len
+        
+        if chunk_idx >= len(self._plan):
+             raise IndexError("time index out of range")
+
+        start_time, _ = self._plan[chunk_idx]
+        return start_time + offset * self.time_interval
+
+    def close(self) -> None:
+        """No persistent open handles are kept; provided for interface completeness."""
+        pass
+
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
         """Read a contiguous block starting at current_time with minimal NetCDF I/O.
 
@@ -371,20 +415,51 @@ class NetCDFDataset(AbstractDataset):
         data = self._read_ops(ops)
         return data / self.unit_factor
 
-    def get_time_by_index(self, idx: int) -> datetime:
-        """Return datetime by absolute timestep index (not chunk index)."""
-        if idx < 0 or idx >= len(self._global_times):
-            raise IndexError("time index out of range")
-        return self._global_times[idx]
+    def get_index_by_time(self, dt: datetime) -> int:
+        """Returns the absolute time index for a given datetime."""
+        try:
+            return self._global_times.index(dt)
+        except ValueError:
+            raise ValueError(f"Time {dt} not found in dataset timeline.")
 
-    def close(self) -> None:
-        """No persistent open handles are kept; provided for interface completeness."""
-        pass
-
-    def __len__(self) -> int:
+    def _real_len(self) -> int:
         """Number of samples (chunks). Each item yields up to chunk_len steps."""
         total = len(self._global_times)
         return (total + self.chunk_len - 1) // self.chunk_len if total else 0
+
+    def _collect_required_keys(self) -> Set[str]:
+        """Collect file keys covering [start_date, end_date] stepping by time_interval."""
+        keys: Set[str] = set()
+        t = self.start_date
+        # + one extra step to ensure inclusive end coverage for non-divisible ranges
+        while t <= self.end_date:
+            keys.add(self.time_to_key(t))
+            t += self.time_interval
+        keys.add(self.time_to_key(self.end_date))
+        return keys
+
+    # -------------------------
+    # Public API
+    # -------------------------
+    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (lon, lat) 1D arrays from the first file."""
+        key = self.time_to_key(self.start_date)
+        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+        with Dataset(path, "r") as ds:
+            lat = ds.variables.get("lat") or ds.variables.get("latitude")
+            lon = ds.variables.get("lon") or ds.variables.get("longitude") or ds.variables.get("long")
+            if lat is None or lon is None:
+                raise ValueError("Unable to find lat/lon variables in the dataset.")
+            return np.array(lon[:]), np.array(lat[:])
+
+    @cached_property
+    def data_mask(self) -> np.ndarray:
+        """Expose spatial mask as (Y, X) for mapping utilities."""
+        return self._mask_2d
+
+    def __len__(self) -> int:
+        return len(self._plan)
+
 
 
 if __name__ == "__main__":

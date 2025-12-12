@@ -132,10 +132,11 @@ class AbstractModule(BaseModel, ABC):
     conflicts: ClassVar[List[str]] = []  # List of modules that cannot co-exist with this module
     group_by: ClassVar[Optional[str]] = None  # Variable indicating basin membership
     nc_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "device", "precision"
+        "opened_modules", "device", "precision", "rank"
     ]  # Fields to exclude from HDF5
 
     opened_modules: List[str] = Field(default_factory=list)
+    rank: int = Field(default=0, description="Current process rank in distributed setup")
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
     precision: torch.dtype = Field(default=torch.float32, description="Data type for tensors")
 

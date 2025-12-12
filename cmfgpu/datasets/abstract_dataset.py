@@ -6,10 +6,10 @@
 
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 import netCDF4 as nc
 import numpy as np
@@ -88,10 +88,116 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     Custom abstract class that inherits from PyTorch Dataset.
     Defines a common interface for accessing data with distributed support.
     """
-    def __init__(self, out_dtype: str = "float32", chunk_len: int = 1, *args, **kwargs):
+    def __init__(self, out_dtype: str = "float32", chunk_len: int = 1, 
+                 start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
+                 spin_up_cycles: int = 0, spin_up_start_date: Optional[datetime] = None, spin_up_end_date: Optional[datetime] = None,
+                 time_interval: Optional[timedelta] = None,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.out_dtype = out_dtype
         self.chunk_len = chunk_len
+        self.start_date = start_date
+        self.end_date = end_date
+        self.spin_up_cycles = spin_up_cycles
+        self.spin_up_start_date = spin_up_start_date
+        self.spin_up_end_date = spin_up_end_date
+        self.time_interval = time_interval
+
+        if is_rank_zero() and self.spin_up_cycles > 0:
+            print(f"[Dataset] Spin-up enabled: {self.spin_up_cycles} cycles.")
+
+    def get_spin_up_duration(self) -> timedelta:
+        """Calculates the total duration of the spin-up period."""
+        if self.spin_up_cycles > 0:
+            if self.time_interval is None:
+                 raise ValueError("time_interval must be provided for spin-up calculation")
+            
+            if self.spin_up_start_date is None or self.spin_up_end_date is None:
+                raise ValueError("spin_up_start_date and spin_up_end_date must be provided if spin_up_cycles > 0")
+
+            # Calculate duration of one cycle
+            # Assuming spin_up_end_date is inclusive, so we add one time_interval
+            cycle_duration = self.spin_up_end_date - self.spin_up_start_date + self.time_interval
+            
+            return cycle_duration * self.spin_up_cycles
+        return timedelta(0)
+
+    def get_virtual_start_time(self) -> datetime:
+        """Calculates the virtual start time including spin-up."""
+        if not hasattr(self, 'start_date'):
+             raise AttributeError("Dataset must have 'start_date' to calculate virtual start time")
+        
+        duration = self.get_spin_up_duration()
+        virtual_start = self.start_date - duration
+        
+        if is_rank_zero() and self.spin_up_cycles > 0:
+             print(f"[Dataset] Spin-up duration: {duration}")
+             print(f"[Dataset] Virtual start time: {virtual_start}")
+             
+        return virtual_start
+
+    def _calc_spin_up_params(self):
+        if self.spin_up_cycles > 0:
+            if self.time_interval is None:
+                 raise ValueError("time_interval must be provided for spin-up calculation")
+            # Calculate number of chunks in spin-up period
+            total_duration = self.spin_up_end_date - self.spin_up_start_date
+            total_steps = int((total_duration.total_seconds() / self.time_interval.total_seconds())) + 1
+            self._spin_up_num_chunks = (total_steps + self.chunk_len - 1) // self.chunk_len
+        else:
+            self._spin_up_num_chunks = 0
+
+    @property
+    def num_spin_up_chunks(self) -> int:
+        if self.spin_up_cycles > 0:
+             if not hasattr(self, '_spin_up_num_chunks'):
+                 self._calc_spin_up_params()
+             return self._spin_up_num_chunks * self.spin_up_cycles
+        return 0
+
+    def read_chunk(self, idx: int) -> np.ndarray:
+        """
+        Default implementation of read_chunk that handles spin-up logic.
+        Requires time_interval to be set.
+        """
+        if self.time_interval is None:
+             raise NotImplementedError("time_interval must be provided for default read_chunk")
+        
+        if self.spin_up_cycles > 0:
+             if not hasattr(self, '_spin_up_num_chunks'):
+                 self._calc_spin_up_params()
+             
+             total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
+             
+             if idx < total_spin_up_chunks:
+                 # In spin-up
+                 cycle_idx = idx % self._spin_up_num_chunks
+                 # Time relative to spin_up_start_date
+                 steps_offset = cycle_idx * self.chunk_len
+                 current_time = self.spin_up_start_date + self.time_interval * steps_offset
+                 return self.get_data(current_time, self.chunk_len)
+             
+             # Main simulation
+             idx -= total_spin_up_chunks
+
+        # Main simulation time
+        steps_offset = idx * self.chunk_len
+        
+        if not hasattr(self, 'start_date'):
+             raise AttributeError("Dataset must have 'start_date' attribute to use default read_chunk")
+
+        current_time = self.start_date + self.time_interval * steps_offset
+        return self.get_data(current_time, self.chunk_len)
+
+    @property
+    def num_spin_up_chunks(self) -> int:
+        if self.spin_up_cycles > 0:
+            if not hasattr(self, '_spin_up_num_chunks'):
+                 self._calc_spin_up_params()
+            return self._spin_up_num_chunks * self.spin_up_cycles
+        return 0
+
+
 
     def shard_forcing(
         self,
@@ -566,20 +672,15 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def data_size(self) -> int:
         return int(self.data_mask.sum())
 
+
     def __getitem__(self, idx: int) -> np.ndarray:
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx` and pad to (chunk_len, N).
-
-        Behavior:
-        - Uses get_time_by_index(idx * chunk_len) to locate the first timestep of the chunk.
-        - Calls get_data(current_time, length=chunk_len), which may return fewer than chunk_len rows.
-        - Pads the tail with zeros to always return shape (chunk_len, N).
-        - For non-rank-0, returns a zero array of the correct shape without reading.
         """
         # Compute absolute start index for this chunk
         if idx < 0:
             idx += len(self)
-        base_idx = idx * self.chunk_len
+        
         N = self.data_size
         # Non-rank-0: return zeros to keep shapes consistent across ranks
         if not is_rank_zero():
@@ -587,14 +688,18 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             return data
 
         # Rank-0: fetch data and pad if needed
-        current_time = self.get_time_by_index(base_idx)
-        data = self.get_data(current_time, chunk_len=self.chunk_len)
+        data = self.read_chunk(idx)
+        
         if data.ndim != 2 or data.shape[1] != N:
             raise ValueError(
-                f"get_data must return (T, N) with N={N}, got {tuple(data.shape)}"
+                f"read_chunk must return (T, N) with N={N}, got {tuple(data.shape)}"
             )
         T = data.shape[0]
         if T < self.chunk_len:
             pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
             data = np.vstack([data, pad]) if data.size else pad
         return data
+
+    def __len__(self) -> int:
+        real_len = self._real_len()
+        return real_len + self.num_spin_up_chunks

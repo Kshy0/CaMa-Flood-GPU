@@ -20,10 +20,7 @@ class DailyBinDataset(AbstractDataset):
     Each bin file contains one day's data.
     """
 
-    def __len__(self):
-        """
-        Returns the total number of samples in the dataset based on the time range.
-        """
+    def _real_len(self):
         return (self.end_date - self.start_date).days + 1
     
     def _validate_files_exist(self):
@@ -31,7 +28,7 @@ class DailyBinDataset(AbstractDataset):
         Validates that all expected files between start_date and end_date exist.
         """
         missing_files = []
-        for idx in range(self.__len__()):
+        for idx in range(self._real_len()):
             date = self.get_time_by_index(idx)
             filename = f"{self.prefix}{date:%Y%m%d}{self.suffix}"
             file_path = Path(self.base_dir) / filename
@@ -58,14 +55,12 @@ class DailyBinDataset(AbstractDataset):
 
         self.base_dir = base_dir
         self.shape = tuple(shape)
-        self.start_date = start_date
-        self.end_date = end_date
         self.unit_factor = unit_factor
         self.bin_dtype = bin_dtype
         self.prefix = prefix
         self.suffix = suffix
+        super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, *args, **kwargs)
         self._validate_files_exist()
-        super().__init__(out_dtype=out_dtype, chunk_len=1, *args, **kwargs)
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         lat = np.arange(89.5, -89.5 - 1, -1)
@@ -93,6 +88,12 @@ class DailyBinDataset(AbstractDataset):
     
     def close(self):
         pass
+
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset based on the time range.
+        """
+        return super().__len__()
 
 if __name__ == "__main__":
     resolution = "glb_15min"

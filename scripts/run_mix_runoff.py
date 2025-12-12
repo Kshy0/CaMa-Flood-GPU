@@ -34,6 +34,12 @@ def main():
     BLOCK_SIZE = 128
     save_state = False
 
+    # Spin-up configuration
+    do_spin_up = True
+    spin_up_start_date = datetime(1950, 1, 1)
+    spin_up_end_date = datetime(1950, 12, 31)
+    spin_up_cycles = 2
+
     start_date = datetime(1950, 1, 1)
     end_date = datetime(1952, 12, 31)
     runoff_dir = "/home/eat/cmf_v420_pkg/map/jpn_runoff"
@@ -62,6 +68,9 @@ def main():
         time_interval=runoff_time_interval,
         prefix=prefix0,
         suffix=suffix,
+        spin_up_cycles=spin_up_cycles if do_spin_up else 0,
+        spin_up_start_date=spin_up_start_date,
+        spin_up_end_date=spin_up_end_date,
     )
     dataset1 = NetCDFDataset(
         base_dir=runoff_dir,
@@ -74,6 +83,9 @@ def main():
         time_interval=runoff_time_interval,
         prefix=prefix1,
         suffix=suffix,
+        spin_up_cycles=spin_up_cycles if do_spin_up else 0,
+        spin_up_start_date=spin_up_start_date,
+        spin_up_end_date=spin_up_end_date,
     )
 
     model = CaMaFlood(
@@ -89,7 +101,8 @@ def main():
         output_workers=output_workers,
         output_complevel=4,
         BLOCK_SIZE=BLOCK_SIZE,
-        output_split_by_year=output_split_by_year
+        output_split_by_year=output_split_by_year,
+        output_start_time=start_date,
     )
     # assume both datasets have the same formatting and mapping
     local_runoff_matrix, local_runoff_indices = dataset0.build_local_runoff_matrix(
@@ -98,7 +111,6 @@ def main():
         precision=precision,
         device=device,
     )
-
     loader0 = DataLoader(
         dataset0,
         batch_size=batch_size,
@@ -116,13 +128,13 @@ def main():
         prefetch_factor=prefetch_factor, 
     )
 
-    current_time = start_date
+    current_time = dataset0.get_virtual_start_time()
+
     stream = torch.cuda.Stream(device=device)
     for batch_runoff0, batch_runoff1 in zip(loader0, loader1):
         with torch.cuda.stream(stream):
             batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
-                # Skip padded steps beyond the configured end_date
                 if current_time > end_date:
                     break
                 model.step_advance(

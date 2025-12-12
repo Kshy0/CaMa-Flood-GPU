@@ -280,8 +280,10 @@ class LeveeModule(AbstractModule):
         num_ones = (self.levee_fraction == 1).sum().item()
         
         if num_zeros > 0 or num_ones > 0:
-            print(f"[LeveeModule] Warning: Found {num_zeros} levees with fraction=0 and {num_ones} with fraction=1. "
-                  "Boundary values are allowed but not expected.")
+            print(
+                f"[rank {self.rank}][LeveeModule] Warning: Found {num_zeros} levees with fraction=0 "
+                f"and {num_ones} with fraction=1. Boundary values are allowed but not expected."
+            )
         return self
 
     @model_validator(mode="after")
@@ -295,6 +297,9 @@ class LeveeModule(AbstractModule):
         invalid = self.levee_base_height >= self.levee_crown_height
         num_invalid = invalid.sum().item()
         if num_invalid > 0:
-            print(f"[LeveeModule] Found {num_invalid} levees with invalid height (base >= crown). Fixing by setting crown = max(crown, base).")
+            print(
+                f"[rank {self.rank}][LeveeModule] Found {num_invalid} levees with invalid height (base >= crown). "
+                "Fixing by setting crown = max(crown, base)."
+            )
             self.levee_crown_height = torch.maximum(self.levee_crown_height, self.levee_base_height)
         return self
