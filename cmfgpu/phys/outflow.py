@@ -21,7 +21,7 @@ def compute_outflow_kernel(
     river_depth_ptr,                        # *f32 river depth
     river_width_ptr,                        # *f32 river width
     river_length_ptr,                       # *f32 river length
-    river_elevation_ptr,                    # *f32 river bed elevation
+    river_height_ptr,                       # *f32 river bank height
     river_storage_ptr,                      # *f32 river storage
 
     # flood variables
@@ -29,6 +29,7 @@ def compute_outflow_kernel(
     flood_outflow_ptr,                      # *f32 in/out flood outflow
     flood_manning_ptr,                      # *f32 flood Manning coefficient
     flood_depth_ptr,                        # *f32 flood depth
+    protected_depth_ptr,                    # *f32 protected depth
     catchment_elevation_ptr,                # *f32 catchment ground elevation
     downstream_distance_ptr,                # *f32 distance to downstream unit
     flood_storage_ptr,                      # *f32 flood storage
@@ -69,13 +70,14 @@ def compute_outflow_kernel(
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0.0)
     river_width = tl.load(river_width_ptr + offs, mask=mask, other=1.0)
     river_length = tl.load(river_length_ptr + offs, mask=mask, other=1.0)
-    river_elevation = tl.load(river_elevation_ptr + offs, mask=mask, other=0.0)
+    river_height = tl.load(river_height_ptr + offs, mask=mask, other=0.0)
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
 
     # flood variables
     flood_outflow = tl.load(flood_outflow_ptr + offs, mask=mask, other=0.0)
     flood_manning = tl.load(flood_manning_ptr + offs, mask=mask, other=1.0)
     flood_depth = tl.load(flood_depth_ptr + offs, mask=mask, other=0.0)
+    protected_depth = tl.load(protected_depth_ptr + offs, mask=mask, other=0.0)
     catchment_elevation = tl.load(catchment_elevation_ptr + offs, mask=mask, other=0.0)
     downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=1.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
@@ -87,11 +89,15 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
     #----------------------------------------------------------------------
+    river_elevation = catchment_elevation - river_height
     water_surface_elevation = river_depth + river_elevation
+    protected_water_surface_elevation = catchment_elevation + protected_depth
     total_storage = river_storage + flood_storage
     # Downstream water surface elevation
     river_depth_downstream = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
-    river_elevation_downstream = tl.load(river_elevation_ptr + downstream_idx, mask=mask, other=0.0)
+    river_height_downstream = tl.load(river_height_ptr + downstream_idx, mask=mask, other=0.0)
+    catchment_elevation_downstream = tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0)
+    river_elevation_downstream = catchment_elevation_downstream - river_height_downstream
     water_surface_elevation_downstream = river_depth_downstream + river_elevation_downstream
     
     # (3) Compute maximum water surface elevation
@@ -190,7 +196,7 @@ def compute_outflow_kernel(
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
     tl.store(water_surface_elevation_ptr + offs, water_surface_elevation, mask=mask)
-    tl.store(protected_water_surface_elevation_ptr + offs, water_surface_elevation, mask=mask)
+    tl.store(protected_water_surface_elevation_ptr + offs, protected_water_surface_elevation, mask=mask)
     tl.store(river_cross_section_depth_ptr + offs, updated_river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_ptr + offs, updated_flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)

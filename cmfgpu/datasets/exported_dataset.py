@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
-from netCDF4 import Dataset
-
 import torch
 import torch.distributed as dist
-from cmfgpu.utils import find_indices_in
+from netCDF4 import Dataset
+
 from cmfgpu.datasets.netcdf_dataset import NetCDFDataset
+from cmfgpu.utils import find_indices_in
 
 
 def exported_time_to_key(dt: datetime) -> str:
@@ -172,22 +172,6 @@ class ExportedDataset(NetCDFDataset):
         data = self._read_ops(ops)
         return data / self.unit_factor
 
-    def __getitem__(self, idx: int) -> np.ndarray:
-        """Each rank reads its own data; no rank-0 gating."""
-        if idx < 0:
-            idx += len(self)
-        base_idx = idx * self.chunk_len
-        N = self.data_size
-        current_time = self.get_time_by_index(base_idx)
-        data = self.get_data(current_time, chunk_len=self.chunk_len)
-        if data.ndim != 2 or data.shape[1] != N:
-            raise ValueError(f"get_data must return (T, N) with N={N}, got {tuple(data.shape)}")
-        T = data.shape[0]
-        if T < self.chunk_len:
-            pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
-            data = np.vstack([data, pad]) if data.size else pad
-        return data
-
     # Override mapping/broadcast to a no-op flatten
     def shard_forcing(
         self,
@@ -250,3 +234,19 @@ class ExportedDataset(NetCDFDataset):
 
     def export_catchment_runoff(self, *args, **kwargs):  # type: ignore[override]
         raise NotImplementedError("ExportedDataset does not export data; use upstream dataset to export.")
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        """Each rank reads its own data; no rank-0 gating."""
+        if idx < 0:
+            idx += len(self)
+        base_idx = idx * self.chunk_len
+        N = self.data_size
+        current_time = self.get_time_by_index(base_idx)
+        data = self.get_data(current_time, chunk_len=self.chunk_len)
+        if data.ndim != 2 or data.shape[1] != N:
+            raise ValueError(f"get_data must return (T, N) with N={N}, got {tuple(data.shape)}")
+        T = data.shape[0]
+        if T < self.chunk_len:
+            pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
+            data = np.vstack([data, pad]) if data.size else pad
+        return data

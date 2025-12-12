@@ -17,8 +17,8 @@ from netCDF4 import Dataset
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
 
-from cmfgpu.params.utils import (compute_init_river_depth,
-                                 read_bifori, reorder_by_basin_size, topological_sort,
+from cmfgpu.params.utils import (compute_init_river_depth, read_bifori,
+                                 reorder_by_basin_size, topological_sort,
                                  trace_outlets_dict)
 from cmfgpu.utils import binread, find_indices_in, read_map
 
@@ -682,7 +682,7 @@ class MERITMap(BaseModel):
         if self.levee_flag:
             levee_crown_height = _read_2d_map("levhgt.bin")
             levee_fraction = _read_2d_map("levfrc.bin")
-            levee_mask = (levee_fraction > 0) & (levee_crown_height > 0) & (levee_fraction < 1)
+            levee_mask = levee_fraction > 0
             self.num_levees = int(np.sum(levee_mask))
             self.levee_id = np.arange(self.num_levees, dtype=np.int64)
             self.levee_catchment_id = self.catchment_id[levee_mask]
@@ -1081,13 +1081,13 @@ class MERITMap(BaseModel):
         return self
 
 if __name__ == "__main__":
-    map_resolution = "jpn_03min"
+    map_resolution = "glb_15min"
     merit_map = MERITMap(
         map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
         bifori_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/bifori.txt",
-        # gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
-        # levee_flag=True,
+        gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
+        levee_flag=True,
         visualized=True,
         bif_levels_to_keep=5,
         basin_use_file=False,

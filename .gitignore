@@ -13,3 +13,4 @@ scripts_hpc/
 temp/
 inp/
 etc/
+*_cpu.py

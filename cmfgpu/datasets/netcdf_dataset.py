@@ -32,58 +32,6 @@ class NetCDFDataset(AbstractDataset):
       and use a linear index list to quickly collapse (Y, X) -> N.
     """
 
-    def __init__(
-        self,
-        base_dir: str,
-        start_date: datetime,
-        end_date: datetime,
-        time_interval: timedelta = timedelta(days=1),
-        unit_factor: float = 1.0,
-        var_name: str = "Runoff",
-        prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
-        suffix: str = ".nc",
-        out_dtype: str = "float32",
-        chunk_len: int = 24,
-        time_to_key: Optional[Callable[[datetime], str]] = yearly_time_to_key,
-        *args,
-        **kwargs,
-    ):
-        self.base_dir = base_dir
-        self.start_date = start_date
-        self.end_date = end_date
-        self.time_interval = time_interval
-        self.unit_factor = unit_factor
-        self.var_name = var_name
-        self.prefix = prefix
-        self.suffix = suffix
-        self.time_to_key = time_to_key
-
-        # Runtime metadata
-        self._file_times = {}
-        self._global_times = []
-        self._dt_to_loc = {}
-        # Each chunk plan is a list of (file_key, abs_time_indices) operations.
-        # We read exact timesteps per file using fancy indexing once per file.
-        self._chunk_plan = []
-
-        # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
-        super().__init__(out_dtype=out_dtype, chunk_len=chunk_len, *args, **kwargs)
-        self._scan_time_metadata()
-        self._build_chunk_plans()
-    # -------------------------
-    # Metadata & planning
-    # -------------------------
-    def _collect_required_keys(self) -> Set[str]:
-        """Collect file keys covering [start_date, end_date] stepping by time_interval."""
-        keys: Set[str] = set()
-        t = self.start_date
-        # + one extra step to ensure inclusive end coverage for non-divisible ranges
-        while t <= self.end_date:
-            keys.add(self.time_to_key(t))
-            t += self.time_interval
-        keys.add(self.time_to_key(self.end_date))
-        return keys
-
     def _validate_files_exist(self, keys: Set[str]) -> None:
         missing: List[str] = []
         for key in sorted(keys):
@@ -217,6 +165,58 @@ class NetCDFDataset(AbstractDataset):
             b = min(a + self.chunk_len, total)
             times = self._global_times[a:b]
             self._chunk_plan.append(self._ops_from_times(times))
+
+    def __init__(
+        self,
+        base_dir: str,
+        start_date: datetime,
+        end_date: datetime,
+        time_interval: timedelta = timedelta(days=1),
+        unit_factor: float = 1.0,
+        var_name: str = "Runoff",
+        prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
+        suffix: str = ".nc",
+        out_dtype: str = "float32",
+        chunk_len: int = 24,
+        time_to_key: Optional[Callable[[datetime], str]] = yearly_time_to_key,
+        *args,
+        **kwargs,
+    ):
+        self.base_dir = base_dir
+        self.start_date = start_date
+        self.end_date = end_date
+        self.time_interval = time_interval
+        self.unit_factor = unit_factor
+        self.var_name = var_name
+        self.prefix = prefix
+        self.suffix = suffix
+        self.time_to_key = time_to_key
+
+        # Runtime metadata
+        self._file_times = {}
+        self._global_times = []
+        self._dt_to_loc = {}
+        # Each chunk plan is a list of (file_key, abs_time_indices) operations.
+        # We read exact timesteps per file using fancy indexing once per file.
+        self._chunk_plan = []
+
+        # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
+        super().__init__(out_dtype=out_dtype, chunk_len=chunk_len, *args, **kwargs)
+        self._scan_time_metadata()
+        self._build_chunk_plans()
+    # -------------------------
+    # Metadata & planning
+    # -------------------------
+    def _collect_required_keys(self) -> Set[str]:
+        """Collect file keys covering [start_date, end_date] stepping by time_interval."""
+        keys: Set[str] = set()
+        t = self.start_date
+        # + one extra step to ensure inclusive end coverage for non-divisible ranges
+        while t <= self.end_date:
+            keys.add(self.time_to_key(t))
+            t += self.time_interval
+        keys.add(self.time_to_key(self.end_date))
+        return keys
 
     # -------------------------
     # Variable shape helpers
@@ -377,14 +377,14 @@ class NetCDFDataset(AbstractDataset):
             raise IndexError("time index out of range")
         return self._global_times[idx]
 
+    def close(self) -> None:
+        """No persistent open handles are kept; provided for interface completeness."""
+        pass
+
     def __len__(self) -> int:
         """Number of samples (chunks). Each item yields up to chunk_len steps."""
         total = len(self._global_times)
         return (total + self.chunk_len - 1) // self.chunk_len if total else 0
-
-    def close(self) -> None:
-        """No persistent open handles are kept; provided for interface completeness."""
-        pass
 
 
 if __name__ == "__main__":

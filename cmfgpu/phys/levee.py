@@ -25,7 +25,6 @@ def compute_levee_stage_kernel(
     river_width_ptr,
     river_length_ptr,
     levee_base_height_ptr,
-    levee_base_storage_ptr,
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
@@ -51,11 +50,13 @@ def compute_levee_stage_kernel(
     levee_crown_height = tl.load(levee_crown_height_ptr + levee_offs, mask=mask, other=0.0)
     levee_fraction = tl.load(levee_fraction_ptr + levee_offs, mask=mask, other=0.0)
     levee_base_height = tl.load(levee_base_height_ptr + levee_offs, mask=mask, other=0.0)
-    levee_base_storage = tl.load(levee_base_storage_ptr + levee_offs, mask=mask, other=0.0)
+    # levee_base_storage calculated below
     
-    # Load current state
+    # Load current state (computed by standard kernel)
     river_storage_curr = tl.load(river_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
     flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    
     total_storage = river_storage_curr + flood_storage_curr
     
     # Derived parameters
@@ -63,167 +64,100 @@ def compute_levee_stage_kernel(
     dwth_inc = (catchment_area / river_length) / num_flood_levels
     levee_distance = levee_fraction * (catchment_area / river_length)
     
-    # Calculate s_top
-    dhgt_dif = levee_crown_height - levee_base_height
-    s_top = levee_base_storage + (levee_distance + river_width) * dhgt_dif * river_length
-    
-    # --- 1. Calculate s_fill ---
-    s_fill = river_max_storage
-    dsto_fil = river_max_storage
-    dwth_fil = river_width
+    # Calculate levee_base_storage and levee_fill_storage
+    s_curr = river_max_storage
     dhgt_pre = 0.0
-    fill_complete = 0
+    dwth_pre = river_width
     
-    for i in tl.static_range(num_flood_levels):
-        depth_val = tl.load(flood_depth_table_ptr + levee_catchment_idx * num_flood_levels + i, mask=mask, other=0.0)
-        gradient = (depth_val - dhgt_pre) / dwth_inc
-        
-        # Conditions
-        cond_full = (fill_complete == 0) & (levee_crown_height > depth_val)
-        cond_part = (fill_complete == 0) & (levee_crown_height <= depth_val)
-        
-        # Update for full
-        dsto_add_full = river_length * (dwth_fil + 0.5 * dwth_inc) * (depth_val - dhgt_pre)
-        
-        # Update for part
-        dhgt_now = levee_crown_height - dhgt_pre
-        dwth_add_part = tl.where(gradient > 1e-6, dhgt_now / gradient, 0.0)
-        dsto_add_part = (dwth_add_part * 0.5 + dwth_fil) * dhgt_now * river_length
-        
-        s_fill = s_fill + tl.where(cond_full, dsto_add_full, tl.where(cond_part, dsto_add_part, 0.0))
-        
-        dsto_fil = tl.where(cond_full, s_fill, dsto_fil)
-        dwth_fil = tl.where(cond_full, dwth_fil + dwth_inc, dwth_fil)
-        dhgt_pre = tl.where(cond_full, depth_val, dhgt_pre)
-        
-        fill_complete = fill_complete | cond_part
-
-    # Extrapolation if not complete
-    cond_extra = (fill_complete == 0)
-    dhgt_now = levee_crown_height - dhgt_pre
-    dsto_add_extra = dwth_fil * dhgt_now * river_length
-    s_fill = s_fill + tl.where(cond_extra, dsto_add_extra, 0.0)
+    levee_base_storage = river_max_storage
+    levee_fill_storage = river_max_storage
     
-    # --- 2. Determine Cases ---
-    is_case0 = total_storage <= river_max_storage
-    is_case1 = (total_storage > river_max_storage) & (total_storage < levee_base_storage)
-    is_case2 = (total_storage >= levee_base_storage) & (total_storage < s_top)
-    is_case3 = (total_storage >= s_top) & (total_storage < s_fill)
-    is_case4 = (total_storage >= s_fill)
+    found_base = 0
+    found_fill = 0
     
-    # --- 3. Search A (Standard Profile) - Used by Case 1 & 4 ---
-    dsto_fil_A = river_max_storage
-    dwth_fil_A = river_width
-    dhgt_fil_A = 0.0
-    gradient_A = 0.0
-    found_A = 0
-    
-    s_prof_curr = river_max_storage
-    dhgt_pre_prof = 0.0
-    dwth_pre_prof = river_width
-    
-    for i in tl.static_range(num_flood_levels):
-        depth_val = tl.load(flood_depth_table_ptr + levee_catchment_idx * num_flood_levels + i, mask=mask, other=0.0)
-        gradient = (depth_val - dhgt_pre_prof) / dwth_inc
-        
-        dsto_seg = river_length * (dwth_pre_prof + 0.5 * dwth_inc) * (depth_val - dhgt_pre_prof)
-        s_prof_next = s_prof_curr + dsto_seg
-        
-        cond_found = (found_A == 0) & (total_storage <= s_prof_next)
-        
-        dsto_fil_A = tl.where(cond_found, s_prof_curr, dsto_fil_A)
-        dwth_fil_A = tl.where(cond_found, dwth_pre_prof, dwth_fil_A)
-        dhgt_fil_A = tl.where(cond_found, dhgt_pre_prof, dhgt_fil_A)
-        gradient_A = tl.where(cond_found, gradient, gradient_A)
-        
-        found_A = found_A | cond_found
-        
-        s_prof_curr = s_prof_next
-        dhgt_pre_prof = depth_val
-        dwth_pre_prof += dwth_inc
-        
-    # Calc results for A
-    dsto_add_A = total_storage - dsto_fil_A
-    
-    # If found
-    term_A = dwth_fil_A * dwth_fil_A + 2.0 * dsto_add_A / river_length / gradient_A
-    dwth_add_A = -dwth_fil_A + tl.sqrt(tl.maximum(term_A, 0.0))
-    f_dph_A_found = dhgt_fil_A + gradient_A * dwth_add_A
-    f_frc_A_found = (-river_width + dwth_fil_A + dwth_add_A) / (dwth_inc * num_flood_levels)
-    
-    # If not found (extrapolate)
-    dwth_add_A_extra = 0.0
-    f_dph_A_extra = dhgt_fil_A + dsto_add_A / dwth_fil_A / river_length
-    f_frc_A_extra = (-river_width + dwth_fil_A) / (dwth_inc * num_flood_levels)
-    
-    f_dph_A = tl.where(found_A != 0, f_dph_A_found, f_dph_A_extra)
-    f_frc_A = tl.where(found_A != 0, f_frc_A_found, f_frc_A_extra)
-    
-    # --- 4. Search B (Case 3) ---
+    # --- Logic for Case 3 (Search B) ---
     ilev = (levee_fraction * num_flood_levels).to(tl.int32)
     
-    dsto_fil_B = s_top
+    dsto_fil_B = 0.0
     dwth_fil_B = 0.0
     ddph_fil_B = 0.0
     gradient_B = 0.0
     found_B = 0
     
-    s_prof_curr = river_max_storage
-    dhgt_pre_prof = 0.0
-    dwth_pre_prof = river_width
-    
     for i in tl.static_range(num_flood_levels):
         depth_val = tl.load(flood_depth_table_ptr + levee_catchment_idx * num_flood_levels + i, mask=mask, other=0.0)
-        gradient = (depth_val - dhgt_pre_prof) / dwth_inc
         
-        dsto_seg = river_length * (dwth_pre_prof + 0.5 * dwth_inc) * (depth_val - dhgt_pre_prof)
-        s_prof_next = s_prof_curr + dsto_seg
+        dhgt_seg = depth_val - dhgt_pre
+        dhgt_seg = tl.maximum(dhgt_seg, 1e-6)
         
-        # Check logic for Case 3
+        dwth_mid = dwth_pre + 0.5 * dwth_inc
+        dsto_seg = river_length * dwth_mid * dhgt_seg
+        s_next = s_curr + dsto_seg
+        gradient = dhgt_seg / dwth_inc
+        
+        # Check Base
+        cond_base = (levee_base_height > dhgt_pre) & (levee_base_height <= depth_val)
+        ratio_base = (levee_base_height - dhgt_pre) / dhgt_seg
+        dsto_base_partial = river_length * (dwth_pre + 0.5 * ratio_base * dwth_inc) * (ratio_base * dhgt_seg)
+        s_base_cand = s_curr + dsto_base_partial
+        levee_base_storage = tl.where(cond_base, s_base_cand, levee_base_storage)
+        found_base = found_base | cond_base
+        
+        # Check Fill
+        cond_fill = (levee_crown_height > dhgt_pre) & (levee_crown_height <= depth_val)
+        ratio_fill = (levee_crown_height - dhgt_pre) / dhgt_seg
+        dsto_fill_partial = river_length * (dwth_pre + 0.5 * ratio_fill * dwth_inc) * (ratio_fill * dhgt_seg)
+        s_fill_cand = s_curr + dsto_fill_partial
+        levee_fill_storage = tl.where(cond_fill, s_fill_cand, levee_fill_storage)
+        found_fill = found_fill | cond_fill
+        
+        # --- Case 3 Search Logic ---
+        # Calculate temporary s_top for current iteration
+        dhgt_dif_loop = levee_crown_height - levee_base_height
+        s_top_loop = levee_base_storage + (levee_distance + river_width) * dhgt_dif_loop * river_length
+        
         dsto_add_wedge = (levee_distance + river_width) * (levee_crown_height - depth_val) * river_length
-        threshold = s_prof_next + dsto_add_wedge
+        threshold = s_next + dsto_add_wedge
         
         cond_check = (i >= ilev) & (found_B == 0)
         cond_found = cond_check & (total_storage < threshold)
         
-        # Update for next step
-        dsto_fil_B_next = threshold
-        dwth_fil_B_next = dwth_inc * (i + 1) - levee_distance
-        ddph_fil_B_next = depth_val - levee_base_height
+        # Determine lower bound for this step
+        current_lower_bound = tl.where(i == ilev, s_top_loop, dsto_fil_B)
         
-        # If found, we don't update dsto_fil_B anymore (it holds the correct base)
-        dsto_fil_B = tl.where(cond_check & (cond_found == 0), dsto_fil_B_next, dsto_fil_B)
+        # Update dsto_fil_B: if found, keep lower bound; if not found, update to current threshold (new lower bound)
+        dsto_fil_B = tl.where(cond_check & (cond_found == 0), threshold, current_lower_bound)
+        
+        dwth_fil_B_next = dwth_inc * (i + 1) - levee_distance
         dwth_fil_B = tl.where(cond_check & (cond_found == 0), dwth_fil_B_next, dwth_fil_B)
+        
+        ddph_fil_B_next = depth_val - levee_base_height
         ddph_fil_B = tl.where(cond_check & (cond_found == 0), ddph_fil_B_next, ddph_fil_B)
         
-        gradient_B = tl.where(cond_found, gradient, gradient_B)
+        gradient_B = tl.where(cond_found != 0, gradient, gradient_B)
         found_B = found_B | cond_found
         
-        s_prof_curr = s_prof_next
-        dhgt_pre_prof = depth_val
-        dwth_pre_prof += dwth_inc
+        s_curr = s_next
+        dhgt_pre = depth_val
+        dwth_pre += dwth_inc
+        
+    # Handle out of bounds
+    s_base_extra = s_curr + river_length * dwth_pre * (levee_base_height - dhgt_pre)
+    levee_base_storage = tl.where(found_base != 0, levee_base_storage, tl.where(levee_base_height > dhgt_pre, s_base_extra, river_max_storage))
+    
+    s_fill_extra = s_curr + river_length * dwth_pre * (levee_crown_height - dhgt_pre)
+    levee_fill_storage = tl.where(found_fill != 0, levee_fill_storage, tl.where(levee_crown_height > dhgt_pre, s_fill_extra, river_max_storage))
 
-    # Calc results for B
-    dsto_add_B = total_storage - dsto_fil_B
-    term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / gradient_B
-    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
-    ddph_add_B = dwth_add_B * gradient_B
-    p_dph_B = levee_base_height + ddph_fil_B + ddph_add_B
-    f_frc_B = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
+    # Calculate s_top
+    dhgt_dif = levee_crown_height - levee_base_height
+    s_top = levee_base_storage + (levee_distance + river_width) * dhgt_dif * river_length
     
-    # --- 5. Assemble Final Results ---
+    # Determine Case
+    is_case4 = total_storage >= levee_fill_storage
+    is_case3 = (is_case4 == 0) & (total_storage >= s_top)
+    is_case2 = (is_case4 == 0) & (is_case3 == 0) & (total_storage >= levee_base_storage)
     
-    # Case 0
-    r_sto_c0 = total_storage
-    r_dph_c0 = total_storage / river_length / river_width
-    
-    # Case 1
-    r_sto_c1 = river_max_storage + river_length * river_width * f_dph_A
-    r_dph_c1 = r_sto_c1 / river_length / river_width
-    f_sto_c1 = tl.maximum(total_storage - r_sto_c1, 0.0)
-    f_frc_c1 = tl.clamp(f_frc_A, 0.0, 1.0)
-    
-    # Case 2
+    # --- Logic for Case 2 ---
     dsto_add_c2 = total_storage - levee_base_storage
     dwth_add_c2 = levee_distance + river_width
     f_dph_c2 = levee_base_height + dsto_add_c2 / dwth_add_c2 / river_length
@@ -232,7 +166,22 @@ def compute_levee_stage_kernel(
     f_sto_c2 = tl.maximum(total_storage - r_sto_c2, 0.0)
     f_frc_c2 = levee_fraction
     
-    # Case 3
+    # --- Logic for Case 3 (Search B Results) ---
+    dsto_add_B = total_storage - dsto_fil_B
+    term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / (gradient_B + 1e-9)
+    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
+    ddph_add_B = dwth_add_B * gradient_B
+    p_dph_B_found = levee_base_height + ddph_fil_B + ddph_add_B
+    f_frc_B_found = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
+    
+    # If not found (extrapolate)
+    ddph_add_B_extra = dsto_add_B / (dwth_fil_B * river_length + 1e-9)
+    p_dph_B_extra = levee_base_height + ddph_fil_B + ddph_add_B_extra
+    f_frc_B_extra = 1.0
+    
+    p_dph_B = tl.where(found_B != 0, p_dph_B_found, p_dph_B_extra)
+    f_frc_B = tl.where(found_B != 0, f_frc_B_found, f_frc_B_extra)
+    
     f_dph_c3 = levee_crown_height
     r_sto_c3 = river_max_storage + river_length * river_width * f_dph_c3
     r_dph_c3 = r_sto_c3 / river_length / river_width
@@ -241,50 +190,46 @@ def compute_levee_stage_kernel(
     p_dph_c3 = p_dph_B
     f_frc_c3 = tl.clamp(f_frc_B, 0.0, 1.0)
     
-    # Case 4
-    r_sto_c4 = river_max_storage + river_length * river_width * f_dph_A
-    r_dph_c4 = r_sto_c4 / river_length / river_width
-    dsto_add_wedge_c4 = (f_dph_A - levee_crown_height) * (levee_distance + river_width) * river_length
+    # --- Logic for Case 4 ---
+    f_dph_c4 = flood_depth_curr
+    r_sto_c4 = river_storage_curr
+    
+    dsto_add_wedge_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
     f_sto_c4 = tl.maximum(s_top + dsto_add_wedge_c4 - r_sto_c4, 0.0)
     p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
-    p_dph_c4 = f_dph_A
-    f_frc_c4 = tl.clamp(f_frc_A, 0.0, 1.0)
+    p_dph_c4 = f_dph_c4
     
-    # Select
-    r_sto = tl.where(is_case0, r_sto_c0,
-             tl.where(is_case1, r_sto_c1,
-              tl.where(is_case2, r_sto_c2,
-               tl.where(is_case3, r_sto_c3, r_sto_c4))))
-               
-    f_sto = tl.where(is_case0, 0.0,
-             tl.where(is_case1, f_sto_c1,
-              tl.where(is_case2, f_sto_c2,
-               tl.where(is_case3, f_sto_c3, f_sto_c4))))
-               
-    p_sto = tl.where(is_case0, 0.0,
-             tl.where(is_case1, 0.0,
-              tl.where(is_case2, 0.0,
-               tl.where(is_case3, p_sto_c3, p_sto_c4))))
-               
-    r_dph = tl.where(is_case0, r_dph_c0,
-             tl.where(is_case1, r_dph_c1,
-              tl.where(is_case2, r_dph_c2,
-               tl.where(is_case3, r_dph_c3, r_dph_c4))))
-               
-    f_dph = tl.where(is_case0, 0.0,
-             tl.where(is_case1, f_dph_A, # f_dph_c1 is same as f_dph_A
-              tl.where(is_case2, f_dph_c2,
-               tl.where(is_case3, f_dph_c3, f_dph_A)))) # f_dph_c4 is f_dph_A
-               
-    p_dph = tl.where(is_case0, 0.0,
-             tl.where(is_case1, 0.0,
-              tl.where(is_case2, 0.0,
-               tl.where(is_case3, p_dph_c3, p_dph_c4))))
-               
-    f_frc = tl.where(is_case0, 0.0,
-             tl.where(is_case1, f_frc_c1,
-              tl.where(is_case2, f_frc_c2,
-               tl.where(is_case3, f_frc_c3, f_frc_c4))))
+    # --- Select Results ---
+    r_dph_curr = tl.load(river_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    
+    r_sto = tl.where(is_case2, r_sto_c2,
+             tl.where(is_case3, r_sto_c3,
+              tl.where(is_case4, r_sto_c4, river_storage_curr)))
+              
+    f_sto = tl.where(is_case2, f_sto_c2,
+             tl.where(is_case3, f_sto_c3,
+              tl.where(is_case4, f_sto_c4, flood_storage_curr)))
+              
+    p_sto = tl.where(is_case2, 0.0,
+             tl.where(is_case3, p_sto_c3,
+              tl.where(is_case4, p_sto_c4, 0.0)))
+              
+    r_dph = tl.where(is_case2, r_dph_c2,
+             tl.where(is_case3, r_dph_c3, r_dph_curr))
+             
+    f_dph = tl.where(is_case2, f_dph_c2,
+             tl.where(is_case3, f_dph_c3, flood_depth_curr))
+             
+    p_dph = tl.where(is_case2, 0.0,
+             tl.where(is_case3, p_dph_c3,
+              tl.where(is_case4, p_dph_c4, 0.0)))
+    
+    # If levee_fraction == 1.0, protected_depth is flood_depth
+    p_dph = tl.where(levee_fraction == 1.0, f_dph, p_dph)
+              
+    f_frc = tl.where(is_case2, f_frc_c2,
+             tl.where(is_case3, f_frc_c3, 
+              tl.load(flood_fraction_ptr + levee_catchment_idx, mask=mask, other=0.0)))
 
     # Store results
     tl.store(river_storage_ptr + levee_catchment_idx, r_sto, mask=mask)
@@ -312,7 +257,6 @@ def compute_levee_stage_log_kernel(
     river_width_ptr,
     river_length_ptr,
     levee_base_height_ptr,
-    levee_base_storage_ptr,
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
@@ -344,11 +288,13 @@ def compute_levee_stage_log_kernel(
     levee_crown_height = tl.load(levee_crown_height_ptr + levee_offs, mask=mask, other=0.0)
     levee_fraction = tl.load(levee_fraction_ptr + levee_offs, mask=mask, other=0.0)
     levee_base_height = tl.load(levee_base_height_ptr + levee_offs, mask=mask, other=0.0)
-    levee_base_storage = tl.load(levee_base_storage_ptr + levee_offs, mask=mask, other=0.0)
+    # levee_base_storage calculated below
     
     # Load current state
     river_storage_curr = tl.load(river_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
     flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    
     total_storage = river_storage_curr + flood_storage_curr
     
     # Derived parameters
@@ -356,167 +302,100 @@ def compute_levee_stage_log_kernel(
     dwth_inc = (catchment_area / river_length) / num_flood_levels
     levee_distance = levee_fraction * (catchment_area / river_length)
     
-    # Calculate s_top
-    dhgt_dif = levee_crown_height - levee_base_height
-    s_top = levee_base_storage + (levee_distance + river_width) * dhgt_dif * river_length
-    
-    # --- 1. Calculate s_fill ---
-    s_fill = river_max_storage
-    dsto_fil = river_max_storage
-    dwth_fil = river_width
+    # Calculate levee_base_storage and levee_fill_storage
+    s_curr = river_max_storage
     dhgt_pre = 0.0
-    fill_complete = 0
+    dwth_pre = river_width
     
-    for i in tl.static_range(num_flood_levels):
-        depth_val = tl.load(flood_depth_table_ptr + levee_catchment_idx * num_flood_levels + i, mask=mask, other=0.0)
-        gradient = (depth_val - dhgt_pre) / dwth_inc
-        
-        # Conditions
-        cond_full = (fill_complete == 0) & (levee_crown_height > depth_val)
-        cond_part = (fill_complete == 0) & (levee_crown_height <= depth_val)
-        
-        # Update for full
-        dsto_add_full = river_length * (dwth_fil + 0.5 * dwth_inc) * (depth_val - dhgt_pre)
-        
-        # Update for part
-        dhgt_now = levee_crown_height - dhgt_pre
-        dwth_add_part = tl.where(gradient > 1e-6, dhgt_now / gradient, 0.0)
-        dsto_add_part = (dwth_add_part * 0.5 + dwth_fil) * dhgt_now * river_length
-        
-        s_fill = s_fill + tl.where(cond_full, dsto_add_full, tl.where(cond_part, dsto_add_part, 0.0))
-        
-        dsto_fil = tl.where(cond_full, s_fill, dsto_fil)
-        dwth_fil = tl.where(cond_full, dwth_fil + dwth_inc, dwth_fil)
-        dhgt_pre = tl.where(cond_full, depth_val, dhgt_pre)
-        
-        fill_complete = fill_complete | cond_part
-
-    # Extrapolation if not complete
-    cond_extra = (fill_complete == 0)
-    dhgt_now = levee_crown_height - dhgt_pre
-    dsto_add_extra = dwth_fil * dhgt_now * river_length
-    s_fill = s_fill + tl.where(cond_extra, dsto_add_extra, 0.0)
+    levee_base_storage = river_max_storage
+    levee_fill_storage = river_max_storage
     
-    # --- 2. Determine Cases ---
-    is_case0 = total_storage <= river_max_storage
-    is_case1 = (total_storage > river_max_storage) & (total_storage < levee_base_storage)
-    is_case2 = (total_storage >= levee_base_storage) & (total_storage < s_top)
-    is_case3 = (total_storage >= s_top) & (total_storage < s_fill)
-    is_case4 = (total_storage >= s_fill)
+    found_base = 0
+    found_fill = 0
     
-    # --- 3. Search A (Standard Profile) - Used by Case 1 & 4 ---
-    dsto_fil_A = river_max_storage
-    dwth_fil_A = river_width
-    dhgt_fil_A = 0.0
-    gradient_A = 0.0
-    found_A = 0
-    
-    s_prof_curr = river_max_storage
-    dhgt_pre_prof = 0.0
-    dwth_pre_prof = river_width
-    
-    for i in tl.static_range(num_flood_levels):
-        depth_val = tl.load(flood_depth_table_ptr + levee_catchment_idx * num_flood_levels + i, mask=mask, other=0.0)
-        gradient = (depth_val - dhgt_pre_prof) / dwth_inc
-        
-        dsto_seg = river_length * (dwth_pre_prof + 0.5 * dwth_inc) * (depth_val - dhgt_pre_prof)
-        s_prof_next = s_prof_curr + dsto_seg
-        
-        cond_found = (found_A == 0) & (total_storage <= s_prof_next)
-        
-        dsto_fil_A = tl.where(cond_found, s_prof_curr, dsto_fil_A)
-        dwth_fil_A = tl.where(cond_found, dwth_pre_prof, dwth_fil_A)
-        dhgt_fil_A = tl.where(cond_found, dhgt_pre_prof, dhgt_fil_A)
-        gradient_A = tl.where(cond_found, gradient, gradient_A)
-        
-        found_A = found_A | cond_found
-        
-        s_prof_curr = s_prof_next
-        dhgt_pre_prof = depth_val
-        dwth_pre_prof += dwth_inc
-        
-    # Calc results for A
-    dsto_add_A = total_storage - dsto_fil_A
-    
-    # If found
-    term_A = dwth_fil_A * dwth_fil_A + 2.0 * dsto_add_A / river_length / gradient_A
-    dwth_add_A = -dwth_fil_A + tl.sqrt(tl.maximum(term_A, 0.0))
-    f_dph_A_found = dhgt_fil_A + gradient_A * dwth_add_A
-    f_frc_A_found = (-river_width + dwth_fil_A + dwth_add_A) / (dwth_inc * num_flood_levels)
-    
-    # If not found (extrapolate)
-    dwth_add_A_extra = 0.0
-    f_dph_A_extra = dhgt_fil_A + dsto_add_A / dwth_fil_A / river_length
-    f_frc_A_extra = (-river_width + dwth_fil_A) / (dwth_inc * num_flood_levels)
-    
-    f_dph_A = tl.where(found_A != 0, f_dph_A_found, f_dph_A_extra)
-    f_frc_A = tl.where(found_A != 0, f_frc_A_found, f_frc_A_extra)
-    
-    # --- 4. Search B (Case 3) ---
+    # --- Logic for Case 3 (Search B) ---
     ilev = (levee_fraction * num_flood_levels).to(tl.int32)
     
-    dsto_fil_B = s_top
+    dsto_fil_B = 0.0
     dwth_fil_B = 0.0
     ddph_fil_B = 0.0
     gradient_B = 0.0
     found_B = 0
     
-    s_prof_curr = river_max_storage
-    dhgt_pre_prof = 0.0
-    dwth_pre_prof = river_width
-    
     for i in tl.static_range(num_flood_levels):
         depth_val = tl.load(flood_depth_table_ptr + levee_catchment_idx * num_flood_levels + i, mask=mask, other=0.0)
-        gradient = (depth_val - dhgt_pre_prof) / dwth_inc
         
-        dsto_seg = river_length * (dwth_pre_prof + 0.5 * dwth_inc) * (depth_val - dhgt_pre_prof)
-        s_prof_next = s_prof_curr + dsto_seg
+        dhgt_seg = depth_val - dhgt_pre
+        dhgt_seg = tl.maximum(dhgt_seg, 1e-6)
         
-        # Check logic for Case 3
+        dwth_mid = dwth_pre + 0.5 * dwth_inc
+        dsto_seg = river_length * dwth_mid * dhgt_seg
+        s_next = s_curr + dsto_seg
+        gradient = dhgt_seg / dwth_inc
+        
+        # Check Base
+        cond_base = (levee_base_height > dhgt_pre) & (levee_base_height <= depth_val)
+        ratio_base = (levee_base_height - dhgt_pre) / dhgt_seg
+        dsto_base_partial = river_length * (dwth_pre + 0.5 * ratio_base * dwth_inc) * (ratio_base * dhgt_seg)
+        s_base_cand = s_curr + dsto_base_partial
+        levee_base_storage = tl.where(cond_base, s_base_cand, levee_base_storage)
+        found_base = found_base | cond_base
+        
+        # Check Fill
+        cond_fill = (levee_crown_height > dhgt_pre) & (levee_crown_height <= depth_val)
+        ratio_fill = (levee_crown_height - dhgt_pre) / dhgt_seg
+        dsto_fill_partial = river_length * (dwth_pre + 0.5 * ratio_fill * dwth_inc) * (ratio_fill * dhgt_seg)
+        s_fill_cand = s_curr + dsto_fill_partial
+        levee_fill_storage = tl.where(cond_fill, s_fill_cand, levee_fill_storage)
+        found_fill = found_fill | cond_fill
+        
+        # --- Case 3 Search Logic ---
+        # Calculate temporary s_top for current iteration
+        dhgt_dif_loop = levee_crown_height - levee_base_height
+        s_top_loop = levee_base_storage + (levee_distance + river_width) * dhgt_dif_loop * river_length
+        
         dsto_add_wedge = (levee_distance + river_width) * (levee_crown_height - depth_val) * river_length
-        threshold = s_prof_next + dsto_add_wedge
+        threshold = s_next + dsto_add_wedge
         
         cond_check = (i >= ilev) & (found_B == 0)
         cond_found = cond_check & (total_storage < threshold)
         
-        # Update for next step
-        dsto_fil_B_next = threshold
-        dwth_fil_B_next = dwth_inc * (i + 1) - levee_distance
-        ddph_fil_B_next = depth_val - levee_base_height
+        # Determine lower bound for this step
+        current_lower_bound = tl.where(i == ilev, s_top_loop, dsto_fil_B)
         
-        # If found, we don't update dsto_fil_B anymore (it holds the correct base)
-        dsto_fil_B = tl.where(cond_check & (cond_found == 0), dsto_fil_B_next, dsto_fil_B)
+        # Update dsto_fil_B: if found, keep lower bound; if not found, update to current threshold (new lower bound)
+        dsto_fil_B = tl.where(cond_check & (cond_found == 0), threshold, current_lower_bound)
+        
+        dwth_fil_B_next = dwth_inc * (i + 1) - levee_distance
         dwth_fil_B = tl.where(cond_check & (cond_found == 0), dwth_fil_B_next, dwth_fil_B)
+        
+        ddph_fil_B_next = depth_val - levee_base_height
         ddph_fil_B = tl.where(cond_check & (cond_found == 0), ddph_fil_B_next, ddph_fil_B)
         
-        gradient_B = tl.where(cond_found, gradient, gradient_B)
+        gradient_B = tl.where(cond_found != 0, gradient, gradient_B)
         found_B = found_B | cond_found
         
-        s_prof_curr = s_prof_next
-        dhgt_pre_prof = depth_val
-        dwth_pre_prof += dwth_inc
+        s_curr = s_next
+        dhgt_pre = depth_val
+        dwth_pre += dwth_inc
+        
+    # Handle out of bounds
+    s_base_extra = s_curr + river_length * dwth_pre * (levee_base_height - dhgt_pre)
+    levee_base_storage = tl.where(found_base != 0, levee_base_storage, tl.where(levee_base_height > dhgt_pre, s_base_extra, river_max_storage))
+    
+    s_fill_extra = s_curr + river_length * dwth_pre * (levee_crown_height - dhgt_pre)
+    levee_fill_storage = tl.where(found_fill != 0, levee_fill_storage, tl.where(levee_crown_height > dhgt_pre, s_fill_extra, river_max_storage))
 
-    # Calc results for B
-    dsto_add_B = total_storage - dsto_fil_B
-    term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / gradient_B
-    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
-    ddph_add_B = dwth_add_B * gradient_B
-    p_dph_B = levee_base_height + ddph_fil_B + ddph_add_B
-    f_frc_B = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
+    # Calculate s_top
+    dhgt_dif = levee_crown_height - levee_base_height
+    s_top = levee_base_storage + (levee_distance + river_width) * dhgt_dif * river_length
     
-    # --- 5. Assemble Final Results ---
+    # Determine Case
+    is_case4 = total_storage >= levee_fill_storage
+    is_case3 = (is_case4 == 0) & (total_storage >= s_top)
+    is_case2 = (is_case4 == 0) & (is_case3 == 0) & (total_storage >= levee_base_storage)
     
-    # Case 0
-    r_sto_c0 = total_storage
-    r_dph_c0 = total_storage / river_length / river_width
-    
-    # Case 1
-    r_sto_c1 = river_max_storage + river_length * river_width * f_dph_A
-    r_dph_c1 = r_sto_c1 / river_length / river_width
-    f_sto_c1 = tl.maximum(total_storage - r_sto_c1, 0.0)
-    f_frc_c1 = tl.clamp(f_frc_A, 0.0, 1.0)
-    
-    # Case 2
+    # --- Logic for Case 2 ---
     dsto_add_c2 = total_storage - levee_base_storage
     dwth_add_c2 = levee_distance + river_width
     f_dph_c2 = levee_base_height + dsto_add_c2 / dwth_add_c2 / river_length
@@ -525,7 +404,22 @@ def compute_levee_stage_log_kernel(
     f_sto_c2 = tl.maximum(total_storage - r_sto_c2, 0.0)
     f_frc_c2 = levee_fraction
     
-    # Case 3
+    # --- Logic for Case 3 (Search B Results) ---
+    dsto_add_B = total_storage - dsto_fil_B
+    term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / (gradient_B + 1e-9)
+    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
+    ddph_add_B = dwth_add_B * gradient_B
+    p_dph_B_found = levee_base_height + ddph_fil_B + ddph_add_B
+    f_frc_B_found = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
+    
+    # If not found (extrapolate)
+    ddph_add_B_extra = dsto_add_B / (dwth_fil_B * river_length + 1e-9)
+    p_dph_B_extra = levee_base_height + ddph_fil_B + ddph_add_B_extra
+    f_frc_B_extra = 1.0
+    
+    p_dph_B = tl.where(found_B != 0, p_dph_B_found, p_dph_B_extra)
+    f_frc_B = tl.where(found_B != 0, f_frc_B_found, f_frc_B_extra)
+    
     f_dph_c3 = levee_crown_height
     r_sto_c3 = river_max_storage + river_length * river_width * f_dph_c3
     r_dph_c3 = r_sto_c3 / river_length / river_width
@@ -534,50 +428,45 @@ def compute_levee_stage_log_kernel(
     p_dph_c3 = p_dph_B
     f_frc_c3 = tl.clamp(f_frc_B, 0.0, 1.0)
     
-    # Case 4
-    r_sto_c4 = river_max_storage + river_length * river_width * f_dph_A
-    r_dph_c4 = r_sto_c4 / river_length / river_width
-    dsto_add_wedge_c4 = (f_dph_A - levee_crown_height) * (levee_distance + river_width) * river_length
+    # --- Logic for Case 4 ---
+    f_dph_c4 = flood_depth_curr
+    r_sto_c4 = river_storage_curr
+    dsto_add_wedge_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
     f_sto_c4 = tl.maximum(s_top + dsto_add_wedge_c4 - r_sto_c4, 0.0)
     p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
-    p_dph_c4 = f_dph_A
-    f_frc_c4 = tl.clamp(f_frc_A, 0.0, 1.0)
+    p_dph_c4 = f_dph_c4
     
-    # Select
-    r_sto = tl.where(is_case0, r_sto_c0,
-             tl.where(is_case1, r_sto_c1,
-              tl.where(is_case2, r_sto_c2,
-               tl.where(is_case3, r_sto_c3, r_sto_c4))))
-               
-    f_sto = tl.where(is_case0, 0.0,
-             tl.where(is_case1, f_sto_c1,
-              tl.where(is_case2, f_sto_c2,
-               tl.where(is_case3, f_sto_c3, f_sto_c4))))
-               
-    p_sto = tl.where(is_case0, 0.0,
-             tl.where(is_case1, 0.0,
-              tl.where(is_case2, 0.0,
-               tl.where(is_case3, p_sto_c3, p_sto_c4))))
-               
-    r_dph = tl.where(is_case0, r_dph_c0,
-             tl.where(is_case1, r_dph_c1,
-              tl.where(is_case2, r_dph_c2,
-               tl.where(is_case3, r_dph_c3, r_dph_c4))))
-               
-    f_dph = tl.where(is_case0, 0.0,
-             tl.where(is_case1, f_dph_A, # f_dph_c1 is same as f_dph_A
-              tl.where(is_case2, f_dph_c2,
-               tl.where(is_case3, f_dph_c3, f_dph_A)))) # f_dph_c4 is f_dph_A
-               
-    p_dph = tl.where(is_case0, 0.0,
-             tl.where(is_case1, 0.0,
-              tl.where(is_case2, 0.0,
-               tl.where(is_case3, p_dph_c3, p_dph_c4))))
-               
-    f_frc = tl.where(is_case0, 0.0,
-             tl.where(is_case1, f_frc_c1,
-              tl.where(is_case2, f_frc_c2,
-               tl.where(is_case3, f_frc_c3, f_frc_c4))))
+    # --- Select Results ---
+    r_dph_curr = tl.load(river_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    
+    r_sto = tl.where(is_case2, r_sto_c2,
+             tl.where(is_case3, r_sto_c3,
+              tl.where(is_case4, r_sto_c4, river_storage_curr)))
+              
+    f_sto = tl.where(is_case2, f_sto_c2,
+             tl.where(is_case3, f_sto_c3,
+              tl.where(is_case4, f_sto_c4, flood_storage_curr)))
+              
+    p_sto = tl.where(is_case2, 0.0,
+             tl.where(is_case3, p_sto_c3,
+              tl.where(is_case4, p_sto_c4, 0.0)))
+              
+    r_dph = tl.where(is_case2, r_dph_c2,
+             tl.where(is_case3, r_dph_c3, r_dph_curr))
+             
+    f_dph = tl.where(is_case2, f_dph_c2,
+             tl.where(is_case3, f_dph_c3, flood_depth_curr))
+             
+    p_dph = tl.where(is_case2, 0.0,
+             tl.where(is_case3, p_dph_c3,
+              tl.where(is_case4, p_dph_c4, 0.0)))
+    
+    # If levee_fraction == 1.0, protected_depth is flood_depth
+    p_dph = tl.where(levee_fraction == 1.0, f_dph, p_dph)
+              
+    f_frc = tl.where(is_case2, f_frc_c2,
+             tl.where(is_case3, f_frc_c3, 
+              tl.load(flood_fraction_ptr + levee_catchment_idx, mask=mask, other=0.0)))
 
     # Log variables
     total_storage_stage_new = r_sto + f_sto + p_sto

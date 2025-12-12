@@ -14,12 +14,13 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from pydantic import computed_field, model_validator, Field
+from pydantic import Field, computed_field, model_validator
 
 from cmfgpu.modules.abstract_module import (AbstractModule, TensorField,
                                             computed_tensor_field)
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.utils import find_indices_in_torch
+
 
 def BifurcationField(
     description: str,

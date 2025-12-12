@@ -14,12 +14,11 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from pydantic import computed_field, model_validator, Field
+from pydantic import Field, computed_field, model_validator
 
 from cmfgpu.modules.abstract_module import (AbstractModule, TensorField,
                                             computed_tensor_field)
 from cmfgpu.modules.base import BaseModule
-
 from cmfgpu.utils import find_indices_in_torch
 
 
@@ -272,12 +271,30 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
     def validate_levee_fraction(self) -> Self:
-        if torch.any((self.levee_fraction <= 0) | (self.levee_fraction >= 1)):
-            raise ValueError("levee_fraction must lie within (0, 1)")
+        # Check for strictly invalid values (outside [0, 1])
+        if torch.any((self.levee_fraction < 0) | (self.levee_fraction > 1)):
+            raise ValueError("levee_fraction must lie within [0, 1]")
+            
+        # Check for boundary values (0 or 1)
+        num_zeros = (self.levee_fraction == 0).sum().item()
+        num_ones = (self.levee_fraction == 1).sum().item()
+        
+        if num_zeros > 0 or num_ones > 0:
+            print(f"[LeveeModule] Warning: Found {num_zeros} levees with fraction=0 and {num_ones} with fraction=1. "
+                  "Boundary values are allowed but not expected.")
         return self
 
     @model_validator(mode="after")
     def validate_levee_catchment_idx(self) -> Self:
         if torch.any(self.levee_catchment_idx < 0):
             raise ValueError("levee_catchment_id contains entries absent from catchment_id")
+        return self
+
+    @model_validator(mode="after")
+    def validate_levee_height(self) -> Self:
+        invalid = self.levee_base_height >= self.levee_crown_height
+        num_invalid = invalid.sum().item()
+        if num_invalid > 0:
+            print(f"[LeveeModule] Found {num_invalid} levees with invalid height (base >= crown). Fixing by setting crown = max(crown, base).")
+            self.levee_crown_height = torch.maximum(self.levee_crown_height, self.levee_base_height)
         return self

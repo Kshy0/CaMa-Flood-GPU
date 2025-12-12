@@ -336,13 +336,6 @@ class BaseModule(AbstractModule):
         return mask
     
     @computed_base_field(
-        description="River-bed elevation (m a.s.l.)",
-    )
-    @cached_property
-    def river_elevation(self) -> torch.Tensor:
-        return self.catchment_elevation - self.river_height
-
-    @computed_base_field(
         description="Total water storage per catchment (m³)",
     )
     @cached_property

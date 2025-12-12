@@ -24,14 +24,13 @@ from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
 from cmfgpu.phys.adaptive_time import compute_adaptive_time_step_kernel
 from cmfgpu.phys.bifurcation import (compute_bifurcation_inflow_kernel,
-                                            compute_bifurcation_outflow_kernel)
-from cmfgpu.phys.outflow import (compute_inflow_kernel,
-                                        compute_outflow_kernel)
+                                     compute_bifurcation_outflow_kernel)
+from cmfgpu.phys.levee import (compute_levee_bifurcation_outflow_kernel,
+                               compute_levee_stage_kernel,
+                               compute_levee_stage_log_kernel)
+from cmfgpu.phys.outflow import compute_inflow_kernel, compute_outflow_kernel
 from cmfgpu.phys.storage import (compute_flood_stage_kernel,
-                                        compute_flood_stage_log_kernel)
-from cmfgpu.phys.levee import (compute_levee_stage_kernel,
-                                      compute_levee_stage_log_kernel,
-                                      compute_levee_bifurcation_outflow_kernel)
+                                 compute_flood_stage_log_kernel)
 
 
 class CaMaFlood(AbstractModel):
@@ -200,11 +199,12 @@ class CaMaFlood(AbstractModel):
             river_depth_ptr=self.base.river_depth,
             river_width_ptr=self.base.river_width,
             river_length_ptr=self.base.river_length,
-            river_elevation_ptr=self.base.river_elevation,
+            river_height_ptr=self.base.river_height,
             river_storage_ptr=self.base.river_storage,
+            flood_depth_ptr=self.base.flood_depth,
+            protected_depth_ptr=self.base.protected_depth,
             catchment_elevation_ptr=self.base.catchment_elevation,
             downstream_distance_ptr=self.base.downstream_distance,
-            flood_depth_ptr=self.base.flood_depth,
             flood_storage_ptr=self.base.flood_storage,
             river_cross_section_depth_ptr=self.base.river_cross_section_depth,
             flood_cross_section_depth_ptr=self.base.flood_cross_section_depth,
@@ -372,7 +372,6 @@ class CaMaFlood(AbstractModel):
                     river_width_ptr=self.base.river_width,
                     river_length_ptr=self.base.river_length,
                     levee_base_height_ptr=self.levee.levee_base_height,
-                    levee_base_storage_ptr=self.levee.levee_base_storage,
                     levee_crown_height_ptr=self.levee.levee_crown_height,
                     levee_fraction_ptr=self.levee.levee_fraction,
                     flood_fraction_ptr=self.base.flood_fraction,
@@ -402,7 +401,6 @@ class CaMaFlood(AbstractModel):
                     river_width_ptr=self.base.river_width,
                     river_length_ptr=self.base.river_length,
                     levee_base_height_ptr=self.levee.levee_base_height,
-                    levee_base_storage_ptr=self.levee.levee_base_storage,
                     levee_crown_height_ptr=self.levee.levee_crown_height,
                     levee_fraction_ptr=self.levee.levee_fraction,
                     flood_fraction_ptr=self.base.flood_fraction,

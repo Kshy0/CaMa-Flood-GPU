@@ -9,11 +9,12 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Sequence
+from typing import List, Optional, Sequence, Tuple, Union
 
-import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.pyplot as plt
 import numpy as np
+
 
 class BinReader:
     """
@@ -22,41 +23,6 @@ class BinReader:
     
     Mimics the interface of MultiRankStatsReader for compatibility.
     """
-    def __init__(
-        self,
-        base_dir: Union[str, Path],
-        var_name: str,
-        nx: Optional[int] = None,
-        ny: Optional[int] = None,
-        dt: int = 86400,  # Default daily (seconds)
-        unit: str = "m3/s",
-    ):
-        self.base_dir = Path(base_dir)
-        self.var_name = var_name
-        self.dt = dt
-        self.unit = unit
-
-        # Try to load dimensions if not provided
-        if nx is None or ny is None:
-            self._load_dims()
-        else:
-            self.nx = nx
-            self.ny = ny
-
-        if self.nx is None or self.ny is None:
-             # Fallback defaults if not found (e.g. 0.25 deg)
-             # But better to warn or raise
-             print("Warning: Map dimensions not found. Please provide nx, ny.")
-        
-        self.map_shape = (self.nx, self.ny) if (self.nx and self.ny) else None
-        self.files = self._scan_files()
-        
-        if not self.files:
-             print(f"Warning: No files found for variable {var_name} in {base_dir}")
-             self.times = []
-             self._time_len = 0
-        else:
-            self._build_time_axis()
 
     def _load_dims(self):
         # Look for mapdim.txt in base_dir or parent directories
@@ -158,6 +124,41 @@ class BinReader:
                      self.times.append(start_date + timedelta(seconds=i*self.dt))
                      
         self._time_len = len(self.times)
+    def __init__(
+        self,
+        base_dir: Union[str, Path],
+        var_name: str,
+        nx: Optional[int] = None,
+        ny: Optional[int] = None,
+        dt: int = 86400,  # Default daily (seconds)
+        unit: str = "m3/s",
+    ):
+        self.base_dir = Path(base_dir)
+        self.var_name = var_name
+        self.dt = dt
+        self.unit = unit
+
+        # Try to load dimensions if not provided
+        if nx is None or ny is None:
+            self._load_dims()
+        else:
+            self.nx = nx
+            self.ny = ny
+
+        if self.nx is None or self.ny is None:
+             # Fallback defaults if not found (e.g. 0.25 deg)
+             # But better to warn or raise
+             print("Warning: Map dimensions not found. Please provide nx, ny.")
+        
+        self.map_shape = (self.nx, self.ny) if (self.nx and self.ny) else None
+        self.files = self._scan_files()
+        
+        if not self.files:
+             print(f"Warning: No files found for variable {var_name} in {base_dir}")
+             self.times = []
+             self._time_len = 0
+        else:
+            self._build_time_axis()
 
     @property
     def time_len(self) -> int:
