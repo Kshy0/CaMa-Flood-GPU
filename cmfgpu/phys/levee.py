@@ -224,9 +224,6 @@ def compute_levee_stage_kernel(
              tl.where(is_case3, p_dph_c3,
               tl.where(is_case4, p_dph_c4, 0.0)))
     
-    # If levee_fraction == 1.0, protected_depth is flood_depth
-    p_dph = tl.where(levee_fraction == 1.0, f_dph, p_dph)
-              
     f_frc = tl.where(is_case2, f_frc_c2,
              tl.where(is_case3, f_frc_c3, 
               tl.load(flood_fraction_ptr + levee_catchment_idx, mask=mask, other=0.0)))
@@ -461,9 +458,6 @@ def compute_levee_stage_log_kernel(
     p_dph = tl.where(is_case2, 0.0,
              tl.where(is_case3, p_dph_c3,
               tl.where(is_case4, p_dph_c4, 0.0)))
-    
-    # If levee_fraction == 1.0, protected_depth is flood_depth
-    p_dph = tl.where(levee_fraction == 1.0, f_dph, p_dph)
               
     f_frc = tl.where(is_case2, f_frc_c2,
              tl.where(is_case3, f_frc_c3, 

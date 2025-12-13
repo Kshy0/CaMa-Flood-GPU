@@ -28,6 +28,7 @@ def compute_flood_stage_kernel(
     protected_storage_ptr,       # *f32: Protected storage (in/out)
     river_depth_ptr,             # *f32: River depth (in/out)
     flood_depth_ptr,             # *f32: Flood depth (in/out)
+    protected_depth_ptr,         # *f32: Protected depth (in/out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
@@ -159,6 +160,7 @@ def compute_flood_stage_kernel(
     tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
+    tl.store(protected_depth_ptr  + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)
     tl.store(flood_area_ptr       + offs, flood_area, mask=mask)
     
@@ -180,6 +182,7 @@ def compute_flood_stage_log_kernel(
     protected_storage_ptr,       # *f32: Protected storage (in/out)
     river_depth_ptr,             # *f32: River depth (in/out)
     flood_depth_ptr,             # *f32: Flood depth (in/out)
+    protected_depth_ptr,         # *f32: Protected depth (in/out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
@@ -338,5 +341,6 @@ def compute_flood_stage_log_kernel(
     tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
+    tl.store(protected_depth_ptr  + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)
     tl.store(flood_area_ptr       + offs, flood_area, mask=mask)

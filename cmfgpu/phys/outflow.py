@@ -93,7 +93,7 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     river_elevation = catchment_elevation - river_height
     water_surface_elevation = river_depth + river_elevation
-    protected_water_surface_elevation = catchment_elevation + protected_depth
+    protected_water_surface_elevation = tl.minimum(catchment_elevation + protected_depth, water_surface_elevation)
     total_storage = river_storage + flood_storage + protected_storage
     # Downstream water surface elevation
     river_depth_downstream = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
