@@ -7,15 +7,16 @@
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
+import cftime
 import numpy as np
 from netCDF4 import Dataset, num2date
 
 from cmfgpu.datasets.abstract_dataset import AbstractDataset
 
 
-def yearly_time_to_key(dt: datetime) -> str:
+def yearly_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
     """Default time-to-file key: one file per year."""
     return f"{dt.year}"
 
@@ -43,10 +44,10 @@ class NetCDFDataset(AbstractDataset):
                 "The following required NetCDF data files are missing:\n" + "\n".join(missing)
             )
 
-    def _scan_time_metadata(self, start_dt: datetime, end_dt: datetime) -> None:
+    def _scan_time_metadata(self, start_dt: Union[datetime, cftime.datetime], end_dt: Union[datetime, cftime.datetime]) -> None:
         """Read only time vars to construct a global time index and lookup map."""
         # Build key -> first_dt map to help with date guessing
-        key_to_first_dt: Dict[str, datetime] = {}
+        key_to_first_dt: Dict[str, Union[datetime, cftime.datetime]] = {}
         t = start_dt
         while t <= end_dt:
             k = self.time_to_key(t)
@@ -70,10 +71,7 @@ class NetCDFDataset(AbstractDataset):
 
                 try:
                     raw_dates = num2date(tvar[:], tvar.units, getattr(tvar, "calendar", "standard"))
-                    dates = [
-                        datetime(d.year, d.month, d.day, d.hour, d.minute, d.second)
-                        for d in raw_dates
-                    ]
+                    dates = list(raw_dates)
                 except (ValueError, TypeError):
                     # Fallback for "days since start" or similar non-standard units
                     base = None
@@ -124,7 +122,7 @@ class NetCDFDataset(AbstractDataset):
             )
         self._global_times = expected_times
 
-    def _ops_from_times(self, times: List[datetime]) -> List[Tuple[str, List[int]]]:
+    def _ops_from_times(self, times: List[Union[datetime, cftime.datetime]]) -> List[Tuple[str, List[int]]]:
         """Group requested datetimes into per-file absolute index ops.
 
         Output format: List of (file_key, abs_indices), where abs_indices are
@@ -201,8 +199,8 @@ class NetCDFDataset(AbstractDataset):
     def __init__(
         self,
         base_dir: str,
-        start_date: datetime,
-        end_date: datetime,
+        start_date: Union[datetime, cftime.datetime],
+        end_date: Union[datetime, cftime.datetime],
         time_interval: timedelta = timedelta(days=1),
         unit_factor: float = 1.0,
         var_name: str = "Runoff",
@@ -210,7 +208,7 @@ class NetCDFDataset(AbstractDataset):
         suffix: str = ".nc",
         out_dtype: str = "float32",
         chunk_len: int = 24,
-        time_to_key: Optional[Callable[[datetime], str]] = yearly_time_to_key,
+        time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
         *args,
         **kwargs,
     ):
@@ -250,6 +248,15 @@ class NetCDFDataset(AbstractDataset):
         if self.spin_up_cycles > 0:
             return len(self._spin_up_chunks_template) * self.spin_up_cycles
         return 0
+
+    def is_valid_time_index(self, idx: int) -> bool:
+        chunk_idx = idx // self.chunk_len
+        offset = idx % self.chunk_len
+        if chunk_idx >= len(self._plan):
+            return False
+        _, ops = self._plan[chunk_idx]
+        valid_len = sum(len(idxs) for _, idxs in ops)
+        return offset < valid_len
 
     # -------------------------
     # Variable shape helpers
@@ -380,7 +387,7 @@ class NetCDFDataset(AbstractDataset):
         data = self._read_ops(ops)
         return data / self.unit_factor
 
-    def get_time_by_index(self, idx: int) -> datetime:
+    def get_time_by_index(self, idx: int) -> Union[datetime, cftime.datetime]:
         """
         Returns the datetime corresponding to the given absolute timestep index.
         Note: This is a bit ambiguous with spin-up because times repeat.
@@ -399,7 +406,7 @@ class NetCDFDataset(AbstractDataset):
         """No persistent open handles are kept; provided for interface completeness."""
         pass
 
-    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+    def get_data(self, current_time: Union[datetime, cftime.datetime], chunk_len: int) -> np.ndarray:
         """Read a contiguous block starting at current_time with minimal NetCDF I/O.
 
         Returns: (T, N) where T <= length and N is the number of valid points.
@@ -415,7 +422,7 @@ class NetCDFDataset(AbstractDataset):
         data = self._read_ops(ops)
         return data / self.unit_factor
 
-    def get_index_by_time(self, dt: datetime) -> int:
+    def get_index_by_time(self, dt: Union[datetime, cftime.datetime]) -> int:
         """Returns the absolute time index for a given datetime."""
         try:
             return self._global_times.index(dt)

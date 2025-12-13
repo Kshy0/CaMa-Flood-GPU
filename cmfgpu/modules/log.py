@@ -13,8 +13,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar, List, Literal, Tuple
+from typing import ClassVar, List, Literal, Tuple, Union
 
+import cftime
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -82,13 +83,7 @@ class LogModule(AbstractModule):
                 + "\n"
             )
 
-    def set_time(self, time_step: float, num_steps: int, current_time: datetime) -> None:
-        if not isinstance(current_time, datetime):
-            raise ValueError(
-                f"`current_time` must be a `datetime.datetime` instance. "
-                f"Got {type(current_time).__name__} instead. "
-                f"This error occurred because the log module is activated "
-            )
+    def set_time(self, time_step: float, num_steps: int, current_time: Union[datetime, cftime.datetime]) -> None:
         self._time_step = time_step
         self._num_steps = num_steps
         self._current_time = current_time

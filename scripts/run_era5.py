@@ -103,15 +103,15 @@ def main():
         prefetch_factor=prefetch_factor, 
     )
 
-    current_time = dataset.get_virtual_start_time()
     stream = torch.cuda.Stream(device=device)
+    time_iter = dataset.time_iter()
     for batch_runoff in loader:
         with torch.cuda.stream(stream):
             batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
-                # Skip padded steps beyond the configured end_date
-                if current_time > end_date:
-                    break
+                current_time, is_valid = next(time_iter)
+                if not is_valid:
+                    continue
                 model.step_advance(
                     runoff=runoff,
                     time_step=time_step,
@@ -120,9 +120,8 @@ def main():
                     stat_is_first=(current_time.hour == 0),
                     stat_is_last=(current_time.hour == 0)
                 )
-                current_time += timedelta(seconds=time_step)           
     if save_state:  
-        model.save_state(current_time)
+        model.save_state(current_time + timedelta(seconds=time_step))
     if world_size > 1:
         dist.destroy_process_group()
 

@@ -15,8 +15,9 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+import cftime
 import netCDF4 as nc
 import numpy as np
 import torch
@@ -112,12 +113,12 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
     
     Args:
         args: Tuple containing (mean_var_name, metadata, coord_values, 
-              output_dir, complevel, rank, year)
+              output_dir, complevel, rank, year, calendar, time_unit)
         
     Returns:
         Path to the created NetCDF file
     """
-    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year) = args
+    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit) = args
 
     if year is not None:
         filename = f"{mean_var_name}_rank{rank}_{year}.nc"
@@ -157,8 +158,6 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
             )
             coord_var[:] = coord_values
 
-        time_unit = "seconds since 1900-01-01 00:00:00"
-        calendar = "standard"
         time_var = ncfile.createVariable('time', 'f8', ('time',))
         time_var.setncattr('units', time_unit)
         time_var.setncattr('calendar', calendar)
@@ -202,6 +201,8 @@ class StatisticsAggregator:
         self.complevel = complevel
         self.save_kernels = save_kernels
         self.output_split_by_year = output_split_by_year
+        self.calendar = None
+        self.time_unit = None
         self._current_year = None
 
         # Create kernels directory if saving is enabled
@@ -367,7 +368,7 @@ class StatisticsAggregator:
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year)
+                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit)
                 future = executor.submit(_create_netcdf_file_process, args)
                 creation_futures[future] = out_name
             
@@ -937,7 +938,7 @@ class StatisticsAggregator:
             raise RuntimeError("Statistics aggregation not initialized. Call initialize_streaming_aggregation() first.")
         self._aggregator_function(self._kernel_states, weight, total_weight, is_first, is_last, BLOCK_SIZE)
     
-    def finalize_time_step(self, dt: datetime) -> None:
+    def finalize_time_step(self, dt: Union[datetime, cftime.datetime]) -> None:
         """
         Finalize the current time step by immediately writing to NetCDF files
         and resetting mean storage for the next time step.
@@ -945,6 +946,15 @@ class StatisticsAggregator:
         Args:
             dt: Time step to finalize
         """
+        # Infer calendar and time_unit if not set
+        if self.calendar is None:
+            if hasattr(dt, 'calendar'):
+                self.calendar = dt.calendar
+            else:
+                self.calendar = 'standard'
+        
+        if self.time_unit is None:
+            self.time_unit = "days since 1900-01-01 00:00:00"
 
         if self.output_split_by_year:
             if self._current_year != dt.year:

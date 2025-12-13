@@ -9,8 +9,9 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, Union
 
+import cftime
 import netCDF4 as nc
 import numpy as np
 import torch
@@ -89,8 +90,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     Defines a common interface for accessing data with distributed support.
     """
     def __init__(self, out_dtype: str = "float32", chunk_len: int = 1, 
-                 start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
-                 spin_up_cycles: int = 0, spin_up_start_date: Optional[datetime] = None, spin_up_end_date: Optional[datetime] = None,
+                 start_date: Optional[Union[datetime, cftime.datetime]] = None, end_date: Optional[Union[datetime, cftime.datetime]] = None,
+                 spin_up_cycles: int = 0, spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None, spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
                  time_interval: Optional[timedelta] = None,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -105,6 +106,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         if is_rank_zero() and self.spin_up_cycles > 0:
             print(f"[Dataset] Spin-up enabled: {self.spin_up_cycles} cycles.")
+
+    def is_valid_time_index(self, idx: int) -> bool:
+        """
+        Checks if the given time index corresponds to a valid data step (not padding).
+        Subclasses with chunking/padding should override this.
+        """
+        return True
+
+    def time_iter(self):
+        """Returns an iterator that yields (time, is_valid) tuples step-by-step."""
+        idx = 0
+        while True:
+            try:
+                dt = self.get_time_by_index(idx)
+                valid = self.is_valid_time_index(idx)
+                yield dt, valid
+                idx += 1
+            except IndexError:
+                break
 
     def get_spin_up_duration(self) -> timedelta:
         """Calculates the total duration of the spin-up period."""
@@ -122,7 +142,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             return cycle_duration * self.spin_up_cycles
         return timedelta(0)
 
-    def get_virtual_start_time(self) -> datetime:
+    def get_virtual_start_time(self, verbose: bool = False) -> datetime:
         """Calculates the virtual start time including spin-up."""
         if not hasattr(self, 'start_date'):
              raise AttributeError("Dataset must have 'start_date' to calculate virtual start time")
@@ -130,7 +150,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         duration = self.get_spin_up_duration()
         virtual_start = self.start_date - duration
         
-        if is_rank_zero() and self.spin_up_cycles > 0:
+        if verbose and is_rank_zero() and self.spin_up_cycles > 0:
              print(f"[Dataset] Spin-up duration: {duration}")
              print(f"[Dataset] Virtual start time: {virtual_start}")
              
@@ -410,8 +430,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             n_chunks = len(self)
             for ci in range(n_chunks):
                 base_idx = ci * self.chunk_len
-                dt0 = self.get_time_by_index(base_idx)
-                block = self.get_data(dt0, chunk_len=self.chunk_len)
+                block = self.read_chunk(ci)
                 if block.ndim != 2 or block.shape[1] != n_cols:
                     raise ValueError(
                         f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols} at chunk {ci}."

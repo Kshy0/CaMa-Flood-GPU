@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import (Any, ClassVar, Dict, List, Literal, Optional, Self, Type,
                     Union)
 
+import cftime
 import numpy as np
 import numpy.ma as ma
 import torch
@@ -284,7 +285,7 @@ class AbstractModel(BaseModel, ABC):
         if self._statistics_aggregator is not None:
             self._statistics_aggregator.update_statistics(weight, total_weight, is_first, is_last, BLOCK_SIZE)
 
-    def finalize_time_step(self, current_time: datetime) -> None:
+    def finalize_time_step(self, current_time: Union[datetime, cftime.datetime]) -> None:
         """
         Finalize time step in aggregator (write current means to disk).
         """
@@ -386,7 +387,7 @@ class AbstractModel(BaseModel, ABC):
 
         return module_data
 
-    def save_state(self, current_time: Optional[datetime]) -> None:
+    def save_state(self, current_time: Optional[Union[datetime, cftime.datetime]]) -> None:
         """
         Save model state to NetCDF files (.nc), handling distributed and global variable logic.
         Variables not in `variable_group_mapping` are saved only by rank 0.

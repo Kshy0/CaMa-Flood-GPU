@@ -9,8 +9,9 @@ Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v
 """
 from datetime import datetime
 from functools import cached_property
-from typing import Callable, ClassVar, Dict, Optional, Type
+from typing import Callable, ClassVar, Dict, Optional, Type, Union
 
+import cftime
 import torch
 import triton
 from pydantic import PrivateAttr, computed_field
@@ -46,7 +47,7 @@ class CaMaFlood(AbstractModel):
     }
     group_by: ClassVar[str] = "catchment_basin_id"
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
-    output_start_time: Optional[datetime] = None
+    output_start_time: Optional[Union[datetime, cftime.datetime]] = None
 
     @cached_property
     def base(self) -> BaseModule:
@@ -95,7 +96,7 @@ class CaMaFlood(AbstractModel):
         runoff: torch.Tensor,
         time_step: float,
         default_num_sub_steps: int,
-        current_time: Optional[datetime],
+        current_time: Optional[Union[datetime, cftime.datetime]],
         stat_is_first: bool = True,
         stat_is_last: bool = True,
     ) -> None:
@@ -189,7 +190,7 @@ class CaMaFlood(AbstractModel):
             if self.rank == 0 and output_enabled:
                 self.log.write_step(self.log_path)
         if self.rank == 0:
-            msg = f"Processed step at {current_time.strftime('%Y-%m-%d %H:%M:%S')}, adaptive_time_step={num_sub_steps}"
+            msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
             print(f"\r{msg:<80}", end="", flush=True)
     def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int) -> None:
         """Execute one sub time step calculation"""

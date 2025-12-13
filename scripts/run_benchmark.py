@@ -108,6 +108,8 @@ def benchmark_block_sizes():
             with torch.cuda.stream(stream):
                 batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
                 for runoff in batch_runoff:
+                    if current_time > end_date:
+                        continue
                     model.step_advance(
                         runoff=runoff,
                         time_step=time_step,
