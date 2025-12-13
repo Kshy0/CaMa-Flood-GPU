@@ -194,8 +194,8 @@ def compute_levee_stage_kernel(
     f_dph_c4 = flood_depth_curr
     r_sto_c4 = river_storage_curr
     
-    dsto_add_wedge_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
-    f_sto_c4 = tl.maximum(s_top + dsto_add_wedge_c4 - r_sto_c4, 0.0)
+    dsto_add_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
+    f_sto_c4 = tl.maximum(s_top + dsto_add_c4 - r_sto_c4, 0.0)
     p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
     p_dph_c4 = f_dph_c4
     
@@ -234,7 +234,7 @@ def compute_levee_stage_kernel(
     # Store results
     tl.store(river_storage_ptr + levee_catchment_idx, r_sto, mask=mask)
     tl.store(flood_storage_ptr + levee_catchment_idx, f_sto, mask=mask)
-    tl.store(protected_storage_ptr + levee_offs, p_sto, mask=mask)
+    tl.store(protected_storage_ptr + levee_catchment_idx, p_sto, mask=mask)
     tl.store(river_depth_ptr + levee_catchment_idx, r_dph, mask=mask)
     tl.store(flood_depth_ptr + levee_catchment_idx, f_dph, mask=mask)
     tl.store(protected_depth_ptr + levee_catchment_idx, p_dph, mask=mask)
@@ -431,8 +431,9 @@ def compute_levee_stage_log_kernel(
     # --- Logic for Case 4 ---
     f_dph_c4 = flood_depth_curr
     r_sto_c4 = river_storage_curr
-    dsto_add_wedge_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
-    f_sto_c4 = tl.maximum(s_top + dsto_add_wedge_c4 - r_sto_c4, 0.0)
+    
+    dsto_add_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
+    f_sto_c4 = tl.maximum(s_top + dsto_add_c4 - r_sto_c4, 0.0)
     p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
     p_dph_c4 = f_dph_c4
     
@@ -479,7 +480,7 @@ def compute_levee_stage_log_kernel(
     # Store results
     tl.store(river_storage_ptr + levee_catchment_idx, r_sto, mask=mask)
     tl.store(flood_storage_ptr + levee_catchment_idx, f_sto, mask=mask)
-    tl.store(protected_storage_ptr + levee_offs, p_sto, mask=mask)
+    tl.store(protected_storage_ptr + levee_catchment_idx, p_sto, mask=mask)
     tl.store(river_depth_ptr + levee_catchment_idx, r_dph, mask=mask)
     tl.store(flood_depth_ptr + levee_catchment_idx, f_dph, mask=mask)
     tl.store(protected_depth_ptr + levee_catchment_idx, p_dph, mask=mask)

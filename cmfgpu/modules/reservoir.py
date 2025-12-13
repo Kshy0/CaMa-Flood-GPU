@@ -138,7 +138,7 @@ class ReservoirModule(AbstractModule):
     )
     @cached_property
     def reservoir_catchment_idx(self) -> torch.Tensor:
-        return find_indices_in_torch(self.reservoir_catchment_id, self.catchment_id).contiguous()
+        return find_indices_in_torch(self.reservoir_catchment_id, self.catchment_id)
 
     @computed_reservoir_field(
         description="Indices of reservoirs saved in output",

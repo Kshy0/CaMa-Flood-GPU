@@ -20,4 +20,4 @@ dependencies = [
 packages = ["cmfgpu"]
 
 [project.optional-dependencies]
-dev = ["ipykernel", "matplotlib", "ipympl", "pandas"]
+dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "meson", "ninja"]

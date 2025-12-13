@@ -33,6 +33,7 @@ def compute_outflow_kernel(
     catchment_elevation_ptr,                # *f32 catchment ground elevation
     downstream_distance_ptr,                # *f32 distance to downstream unit
     flood_storage_ptr,                      # *f32 flood storage
+    protected_storage_ptr,                  # *f32 protected storage
 
     # previous time step variables
     river_cross_section_depth_ptr,     # *f32 previous river cross-section depth
@@ -81,6 +82,7 @@ def compute_outflow_kernel(
     catchment_elevation = tl.load(catchment_elevation_ptr + offs, mask=mask, other=0.0)
     downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=1.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
+    protected_storage = tl.load(protected_storage_ptr + offs, mask=mask, other=0.0)
 
     # cross section variables
     river_cross_section_depth = tl.load(river_cross_section_depth_ptr + offs, mask=mask, other=0.0)
@@ -92,7 +94,7 @@ def compute_outflow_kernel(
     river_elevation = catchment_elevation - river_height
     water_surface_elevation = river_depth + river_elevation
     protected_water_surface_elevation = catchment_elevation + protected_depth
-    total_storage = river_storage + flood_storage
+    total_storage = river_storage + flood_storage + protected_storage
     # Downstream water surface elevation
     river_depth_downstream = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
     river_height_downstream = tl.load(river_height_ptr + downstream_idx, mask=mask, other=0.0)

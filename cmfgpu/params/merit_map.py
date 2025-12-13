@@ -682,7 +682,7 @@ class MERITMap(BaseModel):
         if self.levee_flag:
             levee_crown_height = _read_2d_map("levhgt.bin")
             levee_fraction = _read_2d_map("levfrc.bin")
-            levee_mask = levee_fraction > 0
+            levee_mask = (levee_fraction >= 0) & (levee_fraction < 1.0) & (levee_crown_height > 0)
             self.num_levees = int(np.sum(levee_mask))
             self.levee_id = np.arange(self.num_levees, dtype=np.int64)
             self.levee_catchment_id = self.catchment_id[levee_mask]

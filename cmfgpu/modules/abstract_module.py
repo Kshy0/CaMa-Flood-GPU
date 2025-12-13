@@ -326,7 +326,8 @@ class AbstractModule(BaseModel, ABC):
                 )
 
             if not tensor.is_contiguous():
-                raise ValueError(f"Computed field {field_name} must be contiguous, but is not")
+                tensor = tensor.contiguous()
+                setattr(self, field_name, tensor)
             if tensor.shape != self.get_expected_shape(field_name):
                 raise ValueError(
                     f"Computed field {field_name} has shape {tensor.shape}, "

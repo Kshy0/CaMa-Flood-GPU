@@ -110,14 +110,6 @@ class LeveeModule(AbstractModule):
     )
 
     # ------------------------------------------------------------------ #
-    # Hidden / intermediate states
-    # ------------------------------------------------------------------ #
-    @computed_levee_field(description="Total number of catchments represented in this module")
-    @cached_property
-    def protected_storage(self) -> torch.Tensor:
-        return torch.zeros_like(self.levee_crown_height)
-
-    # ------------------------------------------------------------------ #
     # Computed scalar metadata
     # ------------------------------------------------------------------ #
 
@@ -238,7 +230,7 @@ class LeveeModule(AbstractModule):
         upper_idx_table = torch.clamp(upper_idx_table, max=num_flood_levels - 1)
         upper_val = S_table.gather(1, upper_idx_table.unsqueeze(-1)).squeeze(-1)
         
-        return (lower_val + frac * (upper_val - lower_val)).contiguous()
+        return (lower_val + frac * (upper_val - lower_val))
 
     # ------------------------------------------------------------------ #
     # Save/selection helpers
@@ -272,18 +264,8 @@ class LeveeModule(AbstractModule):
     @model_validator(mode="after")
     def validate_levee_fraction(self) -> Self:
         # Check for strictly invalid values (outside [0, 1])
-        if torch.any((self.levee_fraction < 0) | (self.levee_fraction > 1)):
-            raise ValueError("levee_fraction must lie within [0, 1]")
-            
-        # Check for boundary values (0 or 1)
-        num_zeros = (self.levee_fraction == 0).sum().item()
-        num_ones = (self.levee_fraction == 1).sum().item()
-        
-        if num_zeros > 0 or num_ones > 0:
-            print(
-                f"[rank {self.rank}][LeveeModule] Warning: Found {num_zeros} levees with fraction=0 "
-                f"and {num_ones} with fraction=1. Boundary values are allowed but not expected."
-            )
+        if torch.any((self.levee_fraction < 0) | (self.levee_fraction >= 1)):
+            raise ValueError("levee_fraction must lie within [0, 1)")
         return self
 
     @model_validator(mode="after")

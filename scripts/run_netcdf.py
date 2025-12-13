@@ -21,7 +21,7 @@ def main():
     experiment_name = f"{resolution}_nc"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
-    opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
+    opened_modules = ["base", "adaptive_time","log", "bifurcation"]
     variables_to_save = {"mean": ["river_outflow"], "last": ["river_depth"]}
     precision = "float32"
     time_step = 86400.0
@@ -34,8 +34,8 @@ def main():
     BLOCK_SIZE = 128
     save_state = False
 
-    start_date = datetime(1990, 1, 1)
-    end_date = datetime(1999, 12, 31)
+    start_date = datetime(2000, 1, 1)
+    end_date = datetime(2000, 12, 31)
     runoff_dir = "/home/eat/E2O_ecmwf"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_nc.npz"
     runoff_time_interval = timedelta(days=1)
@@ -46,8 +46,8 @@ def main():
     
     # Spin-up configuration
     do_spin_up = False
-    spin_up_start_date = datetime(1990, 1, 1)
-    spin_up_end_date = datetime(1990, 12, 31)
+    spin_up_start_date = datetime(2000, 1, 1)
+    spin_up_end_date = datetime(2000, 12, 31)
     spin_up_cycles = 1
     ### Configuration End ###
 

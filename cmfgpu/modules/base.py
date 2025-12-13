@@ -202,6 +202,16 @@ class BaseModule(AbstractModule):
         default=0,
     )
 
+    protected_storage: torch.Tensor = BaseField(
+        description="Current water volume stored in protected areas (m³)",
+        default=0,
+    )
+
+    protected_depth: torch.Tensor = BaseField(
+        description="Current water depth on the protected side relative to river bed (m)",
+        default=0,
+    )
+    
     river_depth: torch.Tensor = BaseField(
         description="Current water depth in rivers (m)",
         default=0,
@@ -378,13 +388,6 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def protected_water_surface_elevation(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
-
-    @computed_base_field(
-        description="Water depth on the protected side relative to river bed (m)",
-    )
-    @cached_property
-    def protected_depth(self) -> torch.Tensor:
         return torch.zeros_like(self.river_outflow)
 
     @computed_base_field(

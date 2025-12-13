@@ -353,6 +353,8 @@ class AbstractModel(BaseModel, ABC):
                     t = torch.as_tensor(arr)
                     if t.is_floating_point() and t.dtype != self.dtype:
                         t = t.to(self.dtype)
+                    if not t.is_contiguous():
+                        t = t.contiguous()
                     return t
 
                 for field_name, field_info in fields_to_load.items():
