@@ -26,6 +26,7 @@ def TensorField(
     group_by: Optional[str] = None,
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
+    dim_coords: Optional[str] = None,
     intermediate: bool = False,
     **kwargs
 ):
@@ -38,6 +39,8 @@ def TensorField(
         dtype: Data type ('float', 'int', 'bool')
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
+        dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
+                    Useful for selecting elements by ID (e.g. for parameter changes).
         intermediate: If True, the tensor is considered an intermediate variable
                       that can be cleared after initialization to save memory.
         **kwargs: Additional Field parameters
@@ -57,6 +60,7 @@ def TensorField(
             "group_by": group_by,
             "save_idx": save_idx,
             "save_coord": save_coord,
+            "dim_coords": dim_coords,
             "intermediate": intermediate,
         }
     )
@@ -67,6 +71,7 @@ def computed_tensor_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
+    dim_coords: Optional[str] = None,
     intermediate: bool = False,
     **kwargs
 ):
@@ -79,6 +84,7 @@ def computed_tensor_field(
         dtype: Data type ('float', 'int', 'bool')
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
+        dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
         intermediate: If True, the tensor is considered an intermediate variable
                       that can be cleared after initialization to save memory.
         **kwargs: Additional computed_field parameters
@@ -96,6 +102,7 @@ def computed_tensor_field(
             "tensor_dtype": dtype,
             "save_idx": save_idx,
             "save_coord": save_coord,
+            "dim_coords": dim_coords,
             "intermediate": intermediate,
         },
         **kwargs
@@ -276,6 +283,7 @@ class AbstractModule(BaseModel, ABC):
         - Ensures precision consistency for floating-point tensors
         - Ensures int tensors are int64
         """
+        auto_fix_log = {}
 
         for field_name, field_info in self.get_model_fields().items():
             # Check if it is a TensorField by looking for tensor_shape in json_schema_extra
@@ -306,15 +314,23 @@ class AbstractModule(BaseModel, ABC):
             tensor_dtype = tensor.dtype
             if tensor_dtype != expected_dtype:
                 tensor = tensor.to(expected_dtype)
-                print(f"Auto-fixed dtype for {field_name}: {tensor_dtype} -> {expected_dtype}")   
+                key = f"{tensor_dtype} -> {expected_dtype}"
+                if key not in auto_fix_log:
+                    auto_fix_log[key] = []
+                auto_fix_log[key].append(field_name)
             # Update tensor if it was modified
             setattr(self, field_name, tensor)
+        
+        if auto_fix_log:
+            for key, fields in auto_fix_log.items():
+                print(f"Auto-fixed dtype for fields: {', '.join(fields)} ({key})")
         return True
     
     def validate_computed_tensors(self) -> bool:
         """
         Validate computed tensors to ensure they are correctly defined.
         """
+        auto_fix_log = {}
         for field_name in self.get_model_computed_fields():
             tensor = getattr(self, field_name)
             if not isinstance(tensor, torch.Tensor):
@@ -336,9 +352,16 @@ class AbstractModule(BaseModel, ABC):
             
             expected_dtype = self.get_expected_dtype(field_name)
             if tensor.dtype != expected_dtype:
-                print(f"Auto-fixed dtype for computed field {field_name}: {tensor.dtype} -> {expected_dtype}")
+                key = f"{tensor.dtype} -> {expected_dtype}"
+                if key not in auto_fix_log:
+                    auto_fix_log[key] = []
+                auto_fix_log[key].append(field_name)
                 tensor = tensor.to(expected_dtype)
                 setattr(self, field_name, tensor)
+        
+        if auto_fix_log:
+            for key, fields in auto_fix_log.items():
+                print(f"Auto-fixed dtype for computed fields: {', '.join(fields)} ({key})")
         return True
     
     @model_validator(mode="after")

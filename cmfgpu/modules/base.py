@@ -28,9 +28,11 @@ def BaseField(
     group_by: Optional[str] = "catchment_basin_id",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
+    dim_coords: Optional[str] = "catchment_id",
     intermediate: bool = False,
     **kwargs
 ):
+
     return TensorField(
         description=description,
         shape=shape,
@@ -38,6 +40,7 @@ def BaseField(
         group_by=group_by,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         intermediate=intermediate,
         **kwargs
     )
@@ -48,10 +51,10 @@ def computed_base_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
+    dim_coords: Optional[str] = "catchment_id",
     intermediate: bool = False,
     **kwargs
 ):
-
 
     return computed_tensor_field(
         description=description,
@@ -59,6 +62,7 @@ def computed_base_field(
         dtype=dtype,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         intermediate=intermediate,
         **kwargs
     )
@@ -93,10 +97,6 @@ class BaseModule(AbstractModule):
         dtype="int",
     )
 
-    catchment_basin_id: torch.Tensor = BaseField(
-        description="Basin ID for each catchment",
-        dtype="int",
-    )
 
     downstream_id: torch.Tensor = BaseField(
         description="ID of immediate downstream catchment (points to self at river mouth)",
@@ -145,18 +145,11 @@ class BaseModule(AbstractModule):
         default=None,
     )
 
-    levee_basin_id: Optional[torch.Tensor] = BaseField(
-        description="Basin ID for each levee",
-        dtype="int",
-        group_by="levee_basin_id",
-        shape=("num_levees",),
-        default=None,
-    )
-
     levee_catchment_id: Optional[torch.Tensor] = BaseField(
         description="Catchment ID for each levee",
         dtype="int",
         group_by="levee_basin_id",
+        dim_coords=None,
         shape=("num_levees",),
         default=None,
     )

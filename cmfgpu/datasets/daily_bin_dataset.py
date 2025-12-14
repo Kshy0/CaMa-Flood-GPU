@@ -27,19 +27,13 @@ class DailyBinDataset(AbstractDataset):
         """
         Validates that all expected files between start_date and end_date exist.
         """
-        missing_files = []
+        file_paths = []
         for idx in range(self._real_len()):
             date = self.get_time_by_index(idx)
             filename = f"{self.prefix}{date:%Y%m%d}{self.suffix}"
-            file_path = Path(self.base_dir) / filename
-            if not file_path.exists():
-                missing_files.append(str(file_path))
+            file_paths.append(Path(self.base_dir) / filename)
         
-        if missing_files:
-            raise FileNotFoundError(
-                f"The following required data files are missing:\n" +
-                "\n".join(missing_files)
-            )
+        self.validate_files_exist(file_paths)
         
     def __init__(self,
                  base_dir: str,

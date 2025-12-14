@@ -14,9 +14,6 @@ from typing import Callable, ClassVar, Dict, Optional, Type, Union
 import cftime
 import torch
 import triton
-from pydantic import PrivateAttr, computed_field
-from torch import distributed as dist
-
 from cmfgpu.models.abstract_model import AbstractModel
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
@@ -32,6 +29,8 @@ from cmfgpu.phys.levee import (compute_levee_bifurcation_outflow_kernel,
 from cmfgpu.phys.outflow import compute_inflow_kernel, compute_outflow_kernel
 from cmfgpu.phys.storage import (compute_flood_stage_kernel,
                                  compute_flood_stage_log_kernel)
+from pydantic import PrivateAttr, computed_field
+from torch import distributed as dist
 
 
 class CaMaFlood(AbstractModel):
@@ -125,6 +124,8 @@ class CaMaFlood(AbstractModel):
             stat_is_first (bool): Whether this call starts a new statistics window (resets accumulation).
             stat_is_last (bool): Whether this call ends the current statistics window (finalize average).
         """
+        self.execute_parameter_change_plan(current_time)
+
         if self.adaptive_time is not None:
             self.adaptive_time.min_time_sub_step.fill_(float('inf'))
             compute_adaptive_time_step_kernel[self.base_grid](

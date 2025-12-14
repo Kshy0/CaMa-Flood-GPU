@@ -29,6 +29,7 @@ def BifurcationField(
     group_by: Optional[str] = "bifurcation_basin_id",
     save_idx: Optional[str] = "bifurcation_path_save_idx",
     save_coord: Optional[str] = "bifurcation_path_save_id",
+    dim_coords: Optional[str] = "bifurcation_path_id",
     intermediate: bool = False,
     **kwargs
 ):
@@ -39,6 +40,7 @@ def BifurcationField(
         group_by=group_by,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         intermediate=intermediate,
         **kwargs
     )
@@ -49,6 +51,7 @@ def computed_bifurcation_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = "bifurcation_path_save_idx",
     save_coord: Optional[str] = "bifurcation_path_save_id",
+    dim_coords: Optional[str] = "bifurcation_path_id",
     intermediate: bool = False,
     **kwargs
 ):
@@ -58,6 +61,7 @@ def computed_bifurcation_field(
         dtype=dtype,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         intermediate=intermediate,
         **kwargs
     )

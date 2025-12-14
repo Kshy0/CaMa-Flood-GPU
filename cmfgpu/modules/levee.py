@@ -29,6 +29,7 @@ def LeveeField(
     group_by: Optional[str] = "levee_basin_id",
     save_idx: Optional[str] = "levee_save_idx",
     save_coord: Optional[str] = "levee_save_id",
+    dim_coords: Optional[str] = "base.levee_catchment_id",
     intermediate: bool = False,
     **kwargs,
 ):
@@ -39,6 +40,7 @@ def LeveeField(
         group_by=group_by,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         intermediate=intermediate,
         **kwargs,
     )
@@ -50,6 +52,7 @@ def computed_levee_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = "levee_save_idx",
     save_coord: Optional[str] = "levee_save_id",
+    dim_coords: Optional[str] = "base.levee_catchment_id",
     intermediate: bool = False,
     **kwargs,
 ):
@@ -59,6 +62,7 @@ def computed_levee_field(
         dtype=dtype,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         intermediate=intermediate,
         **kwargs,
     )
@@ -77,10 +81,6 @@ class LeveeModule(AbstractModule):
     # Levee metadata and topology
     # ------------------------------------------------------------------ #
 
-    levee_basin_id: torch.Tensor = LeveeField(
-        description="Basin ID per levee (used for data distribution)",
-        dtype="int",
-    )
 
     levee_save_mask: Optional[torch.Tensor] = LeveeField(
         description="Mask of levees whose diagnostics should be saved",
@@ -90,11 +90,6 @@ class LeveeModule(AbstractModule):
 
     levee_id: torch.Tensor = LeveeField(
         description="Unique ID for each levee",
-        dtype="int",
-    )
-
-    levee_catchment_id: torch.Tensor = LeveeField(
-        description="Catchment ID for each levee",
         dtype="int",
     )
 
@@ -127,7 +122,7 @@ class LeveeModule(AbstractModule):
     @computed_levee_field(description="Indices of catchments hosting each levee", dtype="int")
     @cached_property
     def levee_catchment_idx(self) -> torch.Tensor:
-        return find_indices_in_torch(self.levee_catchment_id, self.base.catchment_id)
+        return find_indices_in_torch(self.base.levee_catchment_id, self.base.catchment_id)
 
     def _interp_lookup(self, table: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
         rows = table[self.levee_catchment_idx]
@@ -256,7 +251,7 @@ class LeveeModule(AbstractModule):
     def levee_save_id(self) -> Optional[torch.Tensor]:
         if self.levee_save_idx is None:
             return None
-        return self.levee_catchment_id[self.levee_save_idx]
+        return self.base.levee_catchment_id[self.levee_save_idx]
 
     # ------------------------------------------------------------------ #
     # Validators

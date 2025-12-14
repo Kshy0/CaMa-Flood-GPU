@@ -27,6 +27,7 @@ def ReservoirField(
     group_by: Optional[str] = "reservoir_basin_id",
     save_idx: Optional[str] = "reservoir_save_idx",
     save_coord: Optional[str] = "reservoir_save_id",
+    dim_coords: Optional[str] = "reservoir_catchment_id",
     **kwargs
 ):
     return TensorField(
@@ -36,6 +37,7 @@ def ReservoirField(
         group_by=group_by,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         **kwargs
     )
 
@@ -45,6 +47,7 @@ def computed_reservoir_field(
     dtype: Literal["float", "int", "bool"] = "float",
     save_idx: Optional[str] = "reservoir_save_idx",
     save_coord: Optional[str] = "reservoir_save_id",
+    dim_coords: Optional[str] = "reservoir_catchment_id",
     **kwargs
 ):
     return computed_tensor_field(
@@ -53,6 +56,7 @@ def computed_reservoir_field(
         dtype=dtype,
         save_idx=save_idx,
         save_coord=save_coord,
+        dim_coords=dim_coords,
         **kwargs
     )
 
@@ -75,11 +79,6 @@ class ReservoirModule(AbstractModule):
 
     reservoir_catchment_id: torch.Tensor = ReservoirField(
         description="Catchment IDs where reservoirs are located",
-        dtype="int",
-    )
-
-    reservoir_basin_id: torch.Tensor = ReservoirField(
-        description="Basin ID for each reservoir (used to group reservoirs by basin)",
         dtype="int",
     )
 

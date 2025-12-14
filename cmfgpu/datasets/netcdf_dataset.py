@@ -34,15 +34,11 @@ class NetCDFDataset(AbstractDataset):
     """
 
     def _validate_files_exist(self, keys: Set[str]) -> None:
-        missing: List[str] = []
+        file_paths = []
         for key in sorted(keys):
-            path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-            if not path.exists():
-                missing.append(str(path))
-        if missing:
-            raise FileNotFoundError(
-                "The following required NetCDF data files are missing:\n" + "\n".join(missing)
-            )
+            file_paths.append(Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}")
+        
+        self.validate_files_exist(file_paths)
 
     def _scan_time_metadata(self, start_dt: Union[datetime, cftime.datetime], end_dt: Union[datetime, cftime.datetime]) -> None:
         """Read only time vars to construct a global time index and lookup map."""

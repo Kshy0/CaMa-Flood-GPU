@@ -104,6 +104,23 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.spin_up_end_date = spin_up_end_date
         self.time_interval = time_interval
 
+    def validate_files_exist(self, file_paths: list[Union[str, Path]]) -> None:
+        """
+        Validates that all files in the provided list exist.
+        Raises FileNotFoundError if any are missing.
+        """
+        missing_files = []
+        for file_path in file_paths:
+            path = Path(file_path)
+            if not path.exists():
+                missing_files.append(str(path))
+        
+        if missing_files:
+            raise FileNotFoundError(
+                f"The following required data files are missing:\n" +
+                "\n".join(missing_files)
+            )
+
         if is_rank_zero() and self.spin_up_cycles > 0:
             print(f"[Dataset] Spin-up enabled: {self.spin_up_cycles} cycles.")
 
