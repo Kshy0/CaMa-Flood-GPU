@@ -22,6 +22,7 @@ import torch.distributed as dist
 from cmfgpu.models.aggregator import StatisticsAggregator
 from cmfgpu.models.utils import compute_group_to_rank
 from cmfgpu.modules.abstract_module import AbstractModule
+from cmfgpu.params.input_proxy import InputProxy
 from cmfgpu.utils import find_indices_in_torch
 from netCDF4 import Dataset
 from pydantic import (BaseModel, ConfigDict, Field, FilePath, PrivateAttr,
@@ -77,7 +78,7 @@ class AbstractModel(BaseModel, ABC):
 
     # Instance fields
     experiment_name: str = Field(default="experiment", description="Name of the experiment")
-    input_file: FilePath = Field(default=..., description="Path to the NetCDF (.nc) data file")
+    input_proxy: InputProxy = Field(default=..., description="InputProxy object containing model data")
     output_dir: Path = Field(default_factory=lambda: Path("./out"), description="Path to the output directory")
     opened_modules: List[str] = Field(default_factory=list, description="List of active modules")
     # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
@@ -699,13 +700,12 @@ class AbstractModel(BaseModel, ABC):
     @cached_property
     def group_id_to_rank(self) -> np.ndarray:
         """
-        Load primary group variable from NetCDF and compute
+        Load primary group variable from InputProxy and compute
         a full ID->rank map using compute_group_to_rank.
         """
-        with Dataset(self.input_file, 'r') as ds:
-            if self.group_by not in ds.variables:
-                raise ValueError(f"Missing primary group variable '{self.group_by}' in NetCDF file.")
-            grp = np.asarray(ds.variables[self.group_by][:])
+        if self.group_by not in self.input_proxy:
+            raise ValueError(f"Missing primary group variable '{self.group_by}' in InputProxy.")
+        grp = self.input_proxy[self.group_by]
         group_id_to_rank = compute_group_to_rank(self.world_size, grp)
         return group_id_to_rank
 
@@ -831,8 +831,7 @@ class AbstractModel(BaseModel, ABC):
 
     def shard_param(self) -> Dict[str, Any]:
         """
-        Load fields by reading full datasets once and slicing in-memory per rank.
-        This implementation reads from a NetCDF (.nc) file via netCDF4.
+        Load fields by reading from InputProxy and slicing in-memory per rank.
         """
         module_data: Dict[str, torch.Tensor] = {}
 
@@ -842,126 +841,113 @@ class AbstractModel(BaseModel, ABC):
             if field_name not in fields_to_load:
                 fields_to_load[field_name] = field_info
 
-        def read_var(ds: Dataset, name: str) -> np.ndarray:
-            v = ds.variables[name][:]
-            if ma.isMaskedArray(v):
-                # Fill masked values conservatively depending on dtype
-                if np.issubdtype(v.dtype, np.floating):
-                    return np.asarray(v.filled(np.nan))
-                else:
-                    return np.asarray(v.filled(-1))
-            return np.asarray(v)
-
         try:
-            with Dataset(self.input_file, "r") as ds:
-                # Validate required fields exist
-                missing_required = [
-                    name for name, info in fields_to_load.items()
-                    if info.is_required() and name not in ds.variables
-                ]
-                if missing_required:
-                    raise KeyError(
-                        f"Required fields missing from NetCDF file: {missing_required}. "
-                        f"Available fields: {list(ds.variables.keys())}"
-                    )
+            # Validate required fields exist
+            missing_required = [
+                name for name, info in fields_to_load.items()
+                if info.is_required() and name not in self.input_proxy
+            ]
+            if missing_required:
+                raise KeyError(
+                    f"Required fields missing from InputProxy: {missing_required}. "
+                    f"Available fields: {list(self.input_proxy.data.keys())}"
+                )
 
-                # Pre-compute indices per group var for current rank (single file open)
-                group_vars_needed = set()
-                for name in fields_to_load.keys():
-                    if name in self.variable_group_mapping:
-                        # Only need group var if the variable itself is in the dataset
-                        if name in ds.variables:
-                            group_vars_needed.add(self.variable_group_mapping[name])
-                group_indices_cache: Dict[str, np.ndarray] = {}
-                for group_var in group_vars_needed:
-                    if group_var not in ds.variables:
-                        raise ValueError(f"Group variable '{group_var}' not found in NetCDF file.")
-                    grp = read_var(ds, group_var)
-                    idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
-                    group_indices_cache[group_var] = idx
+            # Pre-compute indices per group var for current rank
+            group_vars_needed = set()
+            for name in fields_to_load.keys():
+                if name in self.variable_group_mapping:
+                    # Only need group var if the variable itself is in the dataset
+                    if name in self.input_proxy:
+                        group_vars_needed.add(self.variable_group_mapping[name])
+            group_indices_cache: Dict[str, np.ndarray] = {}
+            for group_var in group_vars_needed:
+                if group_var not in self.input_proxy:
+                    raise ValueError(f"Group variable '{group_var}' not found in InputProxy.")
+                grp = self.input_proxy[group_var]
+                idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
+                group_indices_cache[group_var] = idx
 
-                print(f"[rank {self.rank}]: Loading data for modules {self.opened_modules}")
+            print(f"[rank {self.rank}]: Loading data for modules {self.opened_modules}")
 
-                def to_torch(arr: Any) -> torch.Tensor:
-                    # Use as_tensor to avoid unnecessary copy; unify float dtype only
-                    t = torch.as_tensor(arr)
-                    if t.is_floating_point() and t.dtype != self.dtype:
-                        t = t.to(self.dtype)
-                    if not t.is_contiguous():
-                        t = t.contiguous()
-                    return t
+            def to_torch(arr: Any) -> torch.Tensor:
+                # Use as_tensor to avoid unnecessary copy; unify float dtype only
+                t = torch.as_tensor(arr)
+                if t.is_floating_point() and t.dtype != self.dtype:
+                    t = t.to(self.dtype)
+                if not t.is_contiguous():
+                    t = t.contiguous()
+                return t
 
-                # Buckets for logging
-                missing_fields = []
-                no_local_fields: Dict[str, List[str]] = {}
-                distributed_fields: Dict[Tuple[Tuple[int, ...], str], List[str]] = {}
-                full_fields = []
+            # Buckets for logging
+            missing_fields = []
+            no_local_fields: Dict[str, List[str]] = {}
+            distributed_fields: Dict[Tuple[Tuple[int, ...], str], List[str]] = {}
+            full_fields = []
 
-                # Sort fields for deterministic processing order
-                def sort_key(item):
-                    name, _ = item
-                    group = self.variable_group_mapping.get(name, "")
-                    if group is None:
-                        group = ""
-                    return (str(group), name)
+            # Sort fields for deterministic processing order
+            def sort_key(item):
+                name, _ = item
+                group = self.variable_group_mapping.get(name, "")
+                if group is None:
+                    group = ""
+                return (str(group), name)
 
-                sorted_fields = sorted(fields_to_load.items(), key=sort_key)
+            sorted_fields = sorted(fields_to_load.items(), key=sort_key)
 
-                for field_name, field_info in sorted_fields:
-                    if field_name not in ds.variables:
-                        missing_fields.append(field_name)
-                        continue
+            for field_name, field_info in sorted_fields:
+                if field_name not in self.input_proxy:
+                    missing_fields.append(field_name)
+                    continue
 
-                    full_np = read_var(ds, field_name)
+                full_np = self.input_proxy[field_name]
 
-                    group_var = self.variable_group_mapping.get(field_name, None)
-                    if group_var is not None:
-                        idx = group_indices_cache[group_var]
-                        if idx.size == 0:
-                            # Construct empty with correct trailing shape
-                            base_shape = full_np.shape[1:] if isinstance(full_np, np.ndarray) else ()
-                            empty_np = np.empty((0, *base_shape), dtype=getattr(full_np, "dtype", np.float32))
-                            module_data[field_name] = to_torch(empty_np)
-                            
-                            if group_var not in no_local_fields:
-                                no_local_fields[group_var] = []
-                            no_local_fields[group_var].append(field_name)
-                        else:
-                            local_np = full_np[idx]
-                            module_data[field_name] = to_torch(local_np)
-                            
-                            shape = local_np.shape
-                            key = (shape, group_var)
-                            if key not in distributed_fields:
-                                distributed_fields[key] = []
-                            distributed_fields[key].append(field_name)
+                group_var = self.variable_group_mapping.get(field_name, None)
+                if group_var is not None:
+                    idx = group_indices_cache[group_var]
+                    if idx.size == 0:
+                        # Construct empty with correct trailing shape
+                        base_shape = full_np.shape[1:] if isinstance(full_np, np.ndarray) else ()
+                        empty_np = np.empty((0, *base_shape), dtype=getattr(full_np, "dtype", np.float32))
+                        module_data[field_name] = to_torch(empty_np)
+                        
+                        if group_var not in no_local_fields:
+                            no_local_fields[group_var] = []
+                        no_local_fields[group_var].append(field_name)
                     else:
-                        module_data[field_name] = to_torch(full_np)
-                        full_fields.append(field_name)
-                
-                # Flush logs
-                for group_var, fields in no_local_fields.items():
-                    print(f"[rank {self.rank}]: No local data for distributed fields: {', '.join(fields)} (group_by: {group_var})")
-                
-                for (shape, group_var), fields in distributed_fields.items():
-                    print(f"[rank {self.rank}]: Loaded distributed fields: {', '.join(fields)} (shape: {shape}, group_by: {group_var})")
-                
-                if full_fields:
-                    print(f"[rank {self.rank}]: Loaded full fields: {', '.join(full_fields)} (no group_by)")
-                
-                if missing_fields:
-                    print(f"[rank {self.rank}]: Optional fields not in NetCDF, using default: {', '.join(missing_fields)}")
+                        local_np = full_np[idx]
+                        module_data[field_name] = to_torch(local_np)
+                        
+                        shape = local_np.shape
+                        key = (shape, group_var)
+                        if key not in distributed_fields:
+                            distributed_fields[key] = []
+                        distributed_fields[key].append(field_name)
+                else:
+                    module_data[field_name] = to_torch(full_np)
+                    full_fields.append(field_name)
+            
+            # Flush logs
+            for group_var, fields in no_local_fields.items():
+                print(f"[rank {self.rank}]: No local data for distributed fields: {', '.join(fields)} (group_by: {group_var})")
+            
+            for (shape, group_var), fields in distributed_fields.items():
+                print(f"[rank {self.rank}]: Loaded distributed fields: {', '.join(fields)} (shape: {shape}, group_by: {group_var})")
+            
+            if full_fields:
+                print(f"[rank {self.rank}]: Loaded full fields: {', '.join(full_fields)} (no group_by)")
+            
+            if missing_fields:
+                print(f"[rank {self.rank}]: Optional fields not in InputProxy, using default: {', '.join(missing_fields)}")
 
         except Exception as e:
-            raise RuntimeError(f"Error loading data from NetCDF: {e}")
+            raise RuntimeError(f"Error loading data from InputProxy: {e}")
 
         return module_data
 
-    def save_state(self, current_time: Optional[Union[datetime, cftime.datetime]]) -> None:
+    def save_state(self, current_time: Optional[Union[datetime, cftime.datetime]]) -> InputProxy:
         """
-        Save model state to NetCDF files (.nc), handling distributed and global variable logic.
-        Variables not in `variable_group_mapping` are saved only by rank 0.
-        Rank>0 will skip non-distributed variables.
+        Save model state to InputProxy and NetCDF files (.nc).
         """
         timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
 
@@ -971,77 +957,65 @@ class AbstractModel(BaseModel, ABC):
         else:
             nc_path = self.output_full_dir / f"model_state_{timestamp}.nc"
 
-        # Helpers for NetCDF writing
-        def _ensure_dim(ds: Dataset, name: str, size: Optional[int], unlimited: bool = False) -> None:
-            if name in ds.dimensions:
-                # If exists, optionally validate size (skip if unlimited or None)
-                return
-            ds.createDimension(name, None if unlimited else size)
+        # Collect data
+        data = {}
+        visited_fields = set()
+        
+        saved_distributed = []
+        saved_global = []
+        skipped_none = []
 
-        def _infer_and_write_var(ds: Dataset, name: str, data: np.ndarray, output_complevel: int) -> None:
-            arr = np.asarray(data)
-            # netCDF4 does not support bool reliably across libs; write as unsigned byte
-            if arr.dtype == np.bool_:
-                vtype = 'u1'
-                arr_to_write = arr.astype('u1')
-            else:
-                vtype = arr.dtype
-                arr_to_write = arr
+        for module_name in self.opened_modules:
+            module = self._modules[module_name]
+            for field_name, field_info in module.get_model_fields().items():
+                if field_name in module.nc_excluded_fields or field_name in visited_fields:
+                    continue
+                
+                if field_info.exclude:
+                    continue
 
-            # Define dimensions
-            if arr.ndim == 0:
-                dims = ()
-            else:
-                dims = []
-                for ax, sz in enumerate(arr.shape):
-                    dim_name = f"{name}_dim{ax}"
-                    _ensure_dim(ds, dim_name, sz, unlimited=False)
-                    dims.append(dim_name)
+                is_distributed = field_name in self.variable_group_mapping
 
-            # Create variable if missing
-            if name not in ds.variables:
-                kwargs = {}
-                if len(dims) > 0:
-                    kwargs = dict(zlib=True, complevel=output_complevel, shuffle=True)
-                var = ds.createVariable(name, vtype, dims, **kwargs)
-            else:
-                var = ds.variables[name]
+                # Only rank 0 saves non-distributed variables
+                if not is_distributed and self.rank != 0:
+                    continue
 
-            # Write data
-            if arr.ndim == 0:
-                var.assignValue(arr_to_write)
-            else:
-                var[:] = arr_to_write
+                val = getattr(module, field_name)
+                
+                if isinstance(val, torch.Tensor):
+                    val = val.detach().cpu().numpy()
+                
+                if val is None:
+                    skipped_none.append(field_name)
+                    continue
+                    
+                data[field_name] = val
+                visited_fields.add(field_name)
 
-        visited_fields: set[str] = set()
+                if is_distributed:
+                    saved_distributed.append(field_name)
+                else:
+                    saved_global.append(field_name)
+
+        # Create InputProxy
+        proxy = InputProxy(data, attrs={
+            "title": "CaMa-Flood-GPU Model State",
+            "history": f"Created by CaMa-Flood-GPU at {datetime.now().isoformat()}",
+            "source": "AbstractModel.save_state"
+        })
+        
+        # Write to file
         if nc_path.exists():
-            print(f"[rank {self.rank}] Warning: Overwriting existing model state file: {nc_path}")
-        # Write per-rank file
-        with Dataset(nc_path, 'w', format='NETCDF4') as ds:
-            ds.title = "CaMa-Flood-GPU Model State (per-rank)" if self.world_size > 1 else "CaMa-Flood-GPU Model State"
-            ds.history = f"Created by CaMa-Flood-GPU at {datetime.now().isoformat()}"
-            ds.source = "AbstractModel.save_states (netCDF4)"
-            for module_name in self.opened_modules:
-                module = self._modules[module_name]
-                for field_name in module.get_model_fields():
-                    if field_name in module.nc_excluded_fields or field_name in visited_fields:
-                        continue
-
-                    is_distributed = field_name in self.variable_group_mapping
-
-                    # Only rank 0 saves non-distributed variables
-                    if not is_distributed and self.rank != 0:
-                        continue
-
-                    data = getattr(module, field_name)
-                    if isinstance(data, torch.Tensor):
-                        data = data.detach().cpu().numpy()
-
-                    if data is None:
-                        continue
-
-                    _infer_and_write_var(ds, field_name, np.asarray(data), output_complevel=self.output_complevel if self.world_size == 1 else 0)
-                    visited_fields.add(field_name)
+             print(f"[rank {self.rank}] Warning: Overwriting existing model state file: {nc_path}")
+             
+        proxy.to_nc(nc_path, output_complevel=self.output_complevel if self.world_size == 1 else 0)
+        
+        if saved_distributed:
+            print(f"[rank {self.rank}] Saved distributed fields: {', '.join(saved_distributed)}")
+        if saved_global:
+            print(f"[rank {self.rank}] Saved global fields: {', '.join(saved_global)}")
+        if skipped_none:
+            print(f"[rank {self.rank}] Skipped None fields (not saved): {', '.join(skipped_none)}")
 
         if self.world_size > 1:
             dist.barrier()
@@ -1049,82 +1023,101 @@ class AbstractModel(BaseModel, ABC):
         # Merge step only done by rank 0
         if self.rank == 0 and self.world_size > 1:
             merged_path = self.output_full_dir / f"model_state_{timestamp}.nc"
-            offsets: Dict[str, int] = {}
-
-            with Dataset(merged_path, 'w', format='NETCDF4') as merged_ds:
-                merged_ds.title = "CaMa-Flood-GPU Model State (merged)"
-                merged_ds.history = f"Created by CaMa-Flood-GPU at {datetime.now().isoformat()}"
-                merged_ds.source = "AbstractModel.save_states (netCDF4 merge)"
-
-                for r in range(self.world_size):
-                    rank_path = self.output_full_dir / f"model_state_rank{r}_{timestamp}.nc"
-                    if not rank_path.exists():
-                        raise FileNotFoundError(f"Missing file: {rank_path}")
-
-                    with Dataset(rank_path, 'r') as rank_ds:
-                        for var_name, var_in in rank_ds.variables.items():
-                            is_distributed = var_name in self.variable_group_mapping
-                            data = np.asarray(var_in[:])
-
-                            # Define/create dims and variable in merged file
-                            if var_name not in merged_ds.variables:
-                                # Build dims
-                                if data.ndim == 0:
-                                    dims = ()
-                                else:
-                                    dims = []
-                                    for ax, sz in enumerate(data.shape):
-                                        if is_distributed and ax == 0:
-                                            dname = f"{var_name}_n"
-                                            _ensure_dim(merged_ds, dname, None, unlimited=True)
-                                        else:
-                                            dname = f"{var_name}_dim{ax}"
-                                            _ensure_dim(merged_ds, dname, sz, unlimited=False)
-                                        dims.append(dname)
-
-                                # Dtype handling
-                                if data.dtype == np.bool_:
-                                    vtype = 'u1'
-                                else:
-                                    vtype = data.dtype
-
-                                kwargs = {}
-                                if len(dims) > 0:
-                                    kwargs = dict(zlib=True, complevel=self.output_complevel, shuffle=True)
-                                merged_var = merged_ds.createVariable(var_name, vtype, tuple(dims), **kwargs)
-                            else:
-                                merged_var = merged_ds.variables[var_name]
-
-                            # Write/append
-                            if data.ndim == 0:
-                                # Only copy from rank 0 for non-distributed scalars
-                                if r == 0:
-                                    if data.dtype == np.bool_:
-                                        merged_var.assignValue(data.astype('u1'))
-                                    else:
-                                        merged_var.assignValue(data)
-                            else:
-                                if is_distributed:
-                                    off = offsets.get(var_name, 0)
-                                    n = data.shape[0]
-                                    if data.dtype == np.bool_:
-                                        data = data.astype('u1')
-                                    merged_var[off:off + n, ...] = data
-                                    offsets[var_name] = off + n
-                                else:
-                                    # Only copy non-distributed arrays from rank 0
-                                    if r == 0:
-                                        if data.dtype == np.bool_:
-                                            data = data.astype('u1')
-                                        merged_var[:] = data
-
-                    # Remove rank file after merging
-                    try:
-                        rank_path.unlink()
-                    except Exception:
-                        pass
-
+            rank_paths = [self.output_full_dir / f"model_state_rank{r}_{timestamp}.nc" for r in range(self.world_size)]
+            
+            InputProxy.merge(merged_path, rank_paths, self.variable_group_mapping, self.output_complevel)
+            
+            # Remove rank files
+            for p in rank_paths:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            
             print(f"[rank 0] Model state merged to: {merged_path}")
+            
+        return proxy
+
+    def load_state(self, proxy: InputProxy) -> None:
+        """
+        Restore model state from an InputProxy.
+        Supports loading from both global (merged) and local (sharded) proxies.
+        """
+        print(f"[rank {self.rank}] Loading state from InputProxy...")
+        
+        loaded_count = 0
+        
+        # Cache group indices for sharding
+        group_indices_cache: Dict[str, np.ndarray] = {}
+
+        for module_name in self.opened_modules:
+            module = self._modules[module_name]
+            
+            for field_name, field_info in module.get_model_fields().items():
+                if field_name not in proxy:
+                    continue
+                
+                # Skip excluded fields if they happen to be in proxy (unlikely but safe)
+                if field_info.exclude:
+                    continue
+
+                new_val = proxy[field_name]
+                current_val = getattr(module, field_name)
+                
+                # Handle Tensor fields
+                if isinstance(current_val, torch.Tensor):
+                    # Convert new_val to numpy if it's a tensor (InputProxy might hold tensors)
+                    if isinstance(new_val, torch.Tensor):
+                        new_val = new_val.detach().cpu().numpy()
+                    
+                    new_val = np.asarray(new_val)
+                    
+                    # Check 1: Direct shape match (Local file or scalar)
+                    if new_val.shape == tuple(current_val.shape):
+                        current_val.copy_(torch.as_tensor(new_val).to(current_val.device))
+                        loaded_count += 1
+                        continue
+                        
+                    # Check 2: Distributed variable needing sharding (Global file)
+                    if field_name in self.variable_group_mapping:
+                        group_var = self.variable_group_mapping[field_name]
+                        
+                        # We rely on self.input_proxy (static params) for sharding info
+                        if group_var not in self.input_proxy:
+                            print(f"[rank {self.rank}] Warning: Cannot shard '{field_name}' because group var '{group_var}' is missing in static inputs.")
+                            continue
+                            
+                        # Get indices (cached)
+                        if group_var not in group_indices_cache:
+                            grp = self.input_proxy[group_var]
+                            idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
+                            group_indices_cache[group_var] = idx
+                        
+                        idx = group_indices_cache[group_var]
+                        
+                        # Shard the global data
+                        try:
+                            local_val = new_val[idx]
+                        except IndexError:
+                             print(f"[rank {self.rank}] Warning: Indexing error sharding '{field_name}'. Shape: {new_val.shape}, Indices max: {idx.max() if len(idx)>0 else 'N/A'}")
+                             continue
+
+                        if local_val.shape == tuple(current_val.shape):
+                            current_val.copy_(torch.as_tensor(local_val).to(current_val.device))
+                            loaded_count += 1
+                        else:
+                            print(f"[rank {self.rank}] Warning: Shape mismatch for '{field_name}' after sharding. Expected {tuple(current_val.shape)}, got {local_val.shape}.")
+                    else:
+                        print(f"[rank {self.rank}] Warning: Shape mismatch for '{field_name}'. Expected {tuple(current_val.shape)}, got {new_val.shape}.")
+                
+                # Handle Scalar/Other fields
+                else:
+                    # For scalars, we just set the value
+                    # If it's a numpy scalar, convert to python type if needed, or just set
+                    setattr(module, field_name, new_val)
+                    loaded_count += 1
+
+        print(f"[rank {self.rank}] Successfully loaded {loaded_count} variables from InputProxy.")
 
     @field_validator("opened_modules")
     @classmethod

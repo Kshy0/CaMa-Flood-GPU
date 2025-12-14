@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from cmfgpu.datasets.daily_bin_dataset import DailyBinDataset
 from cmfgpu.models.cama_flood_model import CaMaFlood
+from cmfgpu.params.input_proxy import InputProxy
 from cmfgpu.utils import setup_distributed
 
 BLOCK_SIZE_LIST = [64, 128, 256, 512, 1024]
@@ -47,12 +48,14 @@ def benchmark_block_sizes():
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
 
+    input_proxy = InputProxy.from_nc(input_file)
+
     model = CaMaFlood(
         rank=rank,
         world_size=world_size,
         device=device,
         experiment_name=experiment_name,
-        input_file=input_file,
+        input_proxy=input_proxy,
         output_dir=output_dir,
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
@@ -98,6 +101,7 @@ def benchmark_block_sizes():
     for block_size in BLOCK_SIZE_LIST:
         model.BLOCK_SIZE = block_size
         current_time = start_date
+        last_valid_time = start_date
         if rank == 0:
             print(f"Benchmarking BLOCK_SIZE={block_size}...")
         stream = torch.cuda.Stream(device=device)
@@ -110,6 +114,7 @@ def benchmark_block_sizes():
                 for runoff in batch_runoff:
                     if current_time > end_date:
                         continue
+                    last_valid_time = current_time
                     model.step_advance(
                         runoff=runoff,
                         time_step=time_step,
@@ -124,7 +129,7 @@ def benchmark_block_sizes():
         elapsed_ms = (end - start) * 1000
         results.append((block_size, elapsed_ms))
     if save_state:  
-        model.save_state(current_time)
+        model.save_state(last_valid_time + timedelta(seconds=time_step))
     if world_size > 1:
         dist.destroy_process_group()
     if rank == 0:

@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from cmfgpu.datasets.era5_land_dataset import ERA5LandDataset
 from cmfgpu.models.cama_flood_model import CaMaFlood
+from cmfgpu.params.input_proxy import InputProxy
 from cmfgpu.utils import setup_distributed
 
 
@@ -55,6 +56,8 @@ def main():
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
 
+    input_proxy = InputProxy.from_nc(input_file)
+
     dataset = ERA5LandDataset(
         base_dir=runoff_dir,
         start_date=start_date,
@@ -76,7 +79,7 @@ def main():
         world_size=world_size,
         device=device,
         experiment_name=experiment_name,
-        input_file=input_file,
+        input_proxy=input_proxy,
         output_dir=output_dir,
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
@@ -105,6 +108,7 @@ def main():
 
     stream = torch.cuda.Stream(device=device)
     time_iter = dataset.time_iter()
+    last_valid_time = start_date
     for batch_runoff in loader:
         with torch.cuda.stream(stream):
             batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
@@ -112,6 +116,7 @@ def main():
                 current_time, is_valid = next(time_iter)
                 if not is_valid:
                     continue
+                last_valid_time = current_time
                 model.step_advance(
                     runoff=runoff,
                     time_step=time_step,
@@ -121,7 +126,7 @@ def main():
                     stat_is_last=(current_time.hour == 0)
                 )
     if save_state:  
-        model.save_state(current_time + timedelta(seconds=time_step))
+        model.save_state(last_valid_time + timedelta(seconds=time_step))
     if world_size > 1:
         dist.destroy_process_group()
 
