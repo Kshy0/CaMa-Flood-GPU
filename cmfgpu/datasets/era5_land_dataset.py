@@ -88,9 +88,7 @@ class ERA5LandDataset(NetCDFDataset):
             *args, **kwargs,
         )
 
-    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
-        current_time = current_time
-        arr = super().get_data(current_time, chunk_len)
+    def _transform_cumulative_to_incremental(self, arr: np.ndarray) -> np.ndarray:
         # Convert cumulative-per-day to hourly increments along time axis
         # Implement in NumPy to keep return type consistent
         steps_per_day = int(86400 // self.time_interval.total_seconds())
@@ -105,6 +103,15 @@ class ERA5LandDataset(NetCDFDataset):
         # Reset at the start of each day to cumulative value
         inc[0::steps_per_day, :] = arr[0::steps_per_day, :]
         return inc
+
+    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+        arr = super().get_data(current_time, chunk_len)
+        return self._transform_cumulative_to_incremental(arr)
+
+    def read_chunk(self, idx: int) -> np.ndarray:
+        arr = super().read_chunk(idx)
+        return self._transform_cumulative_to_incremental(arr)
+
 
 if __name__ == "__main__":
     resolution = "glb_06min"

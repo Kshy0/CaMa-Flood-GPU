@@ -40,6 +40,22 @@ class NetCDFDataset(AbstractDataset):
         
         self.validate_files_exist(file_paths)
 
+    def is_valid_time_index(self, idx: int) -> bool:
+        """
+        Checks if the given time index corresponds to a valid data step (not padding).
+        """
+        chunk_idx = idx // self.chunk_len
+        offset = idx % self.chunk_len
+        
+        if chunk_idx >= len(self._plan):
+             return False
+
+        _, ops = self._plan[chunk_idx]
+        # Calculate real length of this chunk
+        real_len = sum(len(x[1]) for x in ops)
+        
+        return offset < real_len
+
     def _scan_time_metadata(self, start_dt: Union[datetime, cftime.datetime], end_dt: Union[datetime, cftime.datetime]) -> None:
         """Read only time vars to construct a global time index and lookup map."""
         # Build key -> first_dt map to help with date guessing

@@ -97,8 +97,8 @@ class CaMaFlood(AbstractModel):
         default_num_sub_steps: int,
         current_time: Optional[Union[datetime, cftime.datetime]],
         stat_is_first: bool = True,
-        stat_is_last: bool = True,
-    ) -> None:
+        stat_is_last: bool = True,        
+        output_enabled: bool = True) -> None:
         """
         Advance the model by one time step using the provided runoff input.
 
@@ -155,7 +155,6 @@ class CaMaFlood(AbstractModel):
             self._stats_elapsed_time = 0.0
 
         # Check if output is enabled
-        output_enabled = True
         if self.output_start_time is not None and current_time is not None:
             if current_time < self.output_start_time:
                 output_enabled = False

@@ -41,7 +41,7 @@ def main():
     do_spin_up = True
     spin_up_start_date = cftime.datetime(1950, 1, 1, calendar=calendar)
     spin_up_end_date = cftime.datetime(1950, 12, 31, calendar=calendar)
-    spin_up_cycles = 2
+    spin_up_cycles = 1
 
     start_date = cftime.datetime(1950, 1, 1, calendar=calendar)
     end_date = cftime.datetime(1950, 12, 31, calendar=calendar)
@@ -140,15 +140,17 @@ def main():
         with torch.cuda.stream(stream):
             batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
-                current_time, is_valid = next(time_iter)
+                current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:
                     continue
                 last_valid_time = current_time
+                
                 model.step_advance(
                     runoff=runoff,
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
+                    output_enabled=not is_spin_up
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))

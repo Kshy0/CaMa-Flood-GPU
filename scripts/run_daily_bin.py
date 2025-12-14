@@ -113,7 +113,7 @@ def main():
         with torch.cuda.stream(stream):
             batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
-                current_time, is_valid = next(time_iter)
+                current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:
                     continue
                 last_valid_time = current_time
@@ -122,6 +122,7 @@ def main():
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
+                    output_enabled=not is_spin_up
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))

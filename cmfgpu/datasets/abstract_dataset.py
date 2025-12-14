@@ -132,13 +132,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         return True
 
     def time_iter(self):
-        """Returns an iterator that yields (time, is_valid) tuples step-by-step."""
+        """Returns an iterator that yields (time, is_valid, is_spin_up) tuples step-by-step."""
         idx = 0
+        valid_steps_count = 0
+        
+        # Calculate spin-up steps
+        spin_up_steps = 0
+        if self.spin_up_cycles > 0 and self.time_interval is not None:
+             duration = self.get_spin_up_duration()
+             spin_up_steps = int(duration.total_seconds() / self.time_interval.total_seconds())
+
         while True:
             try:
                 dt = self.get_time_by_index(idx)
                 valid = self.is_valid_time_index(idx)
-                yield dt, valid
+                is_spin_up = valid_steps_count < spin_up_steps
+                yield dt, valid, is_spin_up
+                
+                if valid:
+                    valid_steps_count += 1
                 idx += 1
             except IndexError:
                 break
