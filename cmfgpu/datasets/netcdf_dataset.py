@@ -255,21 +255,6 @@ class NetCDFDataset(AbstractDataset):
         self._scan_time_metadata(scan_start, scan_end)
         self._build_simulation_plan()
 
-    @property
-    def num_spin_up_chunks(self) -> int:
-        if self.spin_up_cycles > 0:
-            return len(self._spin_up_chunks_template) * self.spin_up_cycles
-        return 0
-
-    def is_valid_time_index(self, idx: int) -> bool:
-        chunk_idx = idx // self.chunk_len
-        offset = idx % self.chunk_len
-        if chunk_idx >= len(self._plan):
-            return False
-        _, ops = self._plan[chunk_idx]
-        valid_len = sum(len(idxs) for _, idxs in ops)
-        return offset < valid_len
-
     # -------------------------
     # Variable shape helpers
     # -------------------------
@@ -399,21 +384,6 @@ class NetCDFDataset(AbstractDataset):
         data = self._read_ops(ops)
         return data / self.unit_factor
 
-    def get_time_by_index(self, idx: int) -> Union[datetime, cftime.datetime]:
-        """
-        Returns the datetime corresponding to the given absolute timestep index.
-        Note: This is a bit ambiguous with spin-up because times repeat.
-        This implementation assumes idx maps linearly to the plan.
-        """
-        chunk_idx = idx // self.chunk_len
-        offset = idx % self.chunk_len
-        
-        if chunk_idx >= len(self._plan):
-             raise IndexError("time index out of range")
-
-        start_time, _ = self._plan[chunk_idx]
-        return start_time + offset * self.time_interval
-
     def close(self) -> None:
         """No persistent open handles are kept; provided for interface completeness."""
         pass
@@ -424,7 +394,7 @@ class NetCDFDataset(AbstractDataset):
         Returns: (T, N) where T <= length and N is the number of valid points.
         """
         try:
-            start_abs = self._global_times.index(current_time)
+            start_abs = self.get_index_by_time(current_time)
         except ValueError as e:
             raise ValueError(f"Start time {current_time} not found in global timeline") from e
 
@@ -433,18 +403,6 @@ class NetCDFDataset(AbstractDataset):
         ops = self._ops_from_times(times)
         data = self._read_ops(ops)
         return data / self.unit_factor
-
-    def get_index_by_time(self, dt: Union[datetime, cftime.datetime]) -> int:
-        """Returns the absolute time index for a given datetime."""
-        try:
-            return self._global_times.index(dt)
-        except ValueError:
-            raise ValueError(f"Time {dt} not found in dataset timeline.")
-
-    def _real_len(self) -> int:
-        """Number of samples (chunks). Each item yields up to chunk_len steps."""
-        total = len(self._global_times)
-        return (total + self.chunk_len - 1) // self.chunk_len if total else 0
 
     def _collect_required_keys(self) -> Set[str]:
         """Collect file keys covering [start_date, end_date] stepping by time_interval."""
@@ -475,9 +433,6 @@ class NetCDFDataset(AbstractDataset):
     def data_mask(self) -> np.ndarray:
         """Expose spatial mask as (Y, X) for mapping utilities."""
         return self._mask_2d
-
-    def __len__(self) -> int:
-        return len(self._plan)
 
 
 

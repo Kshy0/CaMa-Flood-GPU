@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
 import cftime
 import netCDF4 as nc
@@ -133,7 +133,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
     def time_iter(self):
         """Returns an iterator that yields (time, is_valid, is_spin_up) tuples step-by-step."""
-        idx = 0
         valid_steps_count = 0
         
         # Calculate spin-up steps
@@ -142,18 +141,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
              duration = self.get_spin_up_duration()
              spin_up_steps = int(duration.total_seconds() / self.time_interval.total_seconds())
 
-        while True:
+        # Iterate exactly as many times as the DataLoader will produce data points
+        # This ensures we handle padding steps at the end of the last chunk correctly
+        total_chunks = len(self)
+        total_items = total_chunks * self.chunk_len
+
+        for idx in range(total_items):
             try:
                 dt = self.get_time_by_index(idx)
                 valid = self.is_valid_time_index(idx)
-                is_spin_up = valid_steps_count < spin_up_steps
-                yield dt, valid, is_spin_up
-                
-                if valid:
-                    valid_steps_count += 1
-                idx += 1
             except IndexError:
-                break
+                # Padding steps (out of bounds)
+                dt = datetime.min
+                valid = False
+            
+            is_spin_up = valid_steps_count < spin_up_steps
+            yield dt, valid, is_spin_up
+            
+            if valid:
+                valid_steps_count += 1
 
     def get_spin_up_duration(self) -> timedelta:
         """Calculates the total duration of the spin-up period."""
@@ -702,12 +708,104 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def get_time_by_index(self, idx: int) -> datetime:
+    def get_time_by_index(self, idx: int) -> Union[datetime, cftime.datetime]:
         """
         Returns the datetime corresponding to the given index.
+        Default implementation handles spin-up and linear time stepping.
         """
-        raise NotImplementedError
+        if self.time_interval is None:
+             raise NotImplementedError("time_interval must be provided for default get_time_by_index")
+
+        if self.spin_up_cycles > 0:
+            if self.spin_up_start_date is None or self.spin_up_end_date is None:
+                 raise ValueError("Spin-up dates must be provided")
+            
+            # Calculate items (including padding) in one spin-up cycle
+            chunks_per_cycle = self.num_spin_up_chunks // self.spin_up_cycles
+            items_per_cycle = chunks_per_cycle * self.chunk_len
+            
+            total_spin_up_items = items_per_cycle * self.spin_up_cycles
+            
+            if idx < total_spin_up_items:
+                # In spin-up
+                # cycle_idx is which repetition of spin-up we are in
+                # idx_in_cycle is the index within that repetition (including padding)
+                idx_in_cycle = idx % items_per_cycle
+                
+                return self.spin_up_start_date + self.time_interval * idx_in_cycle
+            
+            # Main simulation
+            idx -= total_spin_up_items
+
+        if self.start_date is None:
+             raise AttributeError("Dataset must have 'start_date'")
+
+        return self.start_date + self.time_interval * idx
+
+    def get_index_by_time(self, dt: Union[datetime, cftime.datetime]) -> int:
+        """Returns the index in the main simulation timeline for a given datetime."""
+        if self.start_date is None or self.time_interval is None:
+             raise ValueError("start_date and time_interval required")
+        
+        offset = dt - self.start_date
+        return int(offset.total_seconds() / self.time_interval.total_seconds())
+
+    @property
+    def num_main_steps(self) -> int:
+        if self.start_date is None or self.end_date is None or self.time_interval is None:
+            return 0
+        duration = self.end_date - self.start_date
+        return int(duration.total_seconds() / self.time_interval.total_seconds()) + 1
+
+    @property
+    def num_spin_up_steps(self) -> int:
+        if self.spin_up_cycles <= 0:
+            return 0
+        cycle_duration = self.spin_up_end_date - self.spin_up_start_date
+        steps_per_cycle = int(cycle_duration.total_seconds() / self.time_interval.total_seconds()) + 1
+        return steps_per_cycle * self.spin_up_cycles
+
+    @property
+    def total_steps(self) -> int:
+        return self.num_spin_up_steps + self.num_main_steps
+
+    def is_valid_time_index(self, idx: int) -> bool:
+        """
+        Checks if the given time index corresponds to a valid data step.
+        """
+        return 0 <= idx < self.total_steps
+
+    def _real_len(self) -> int:
+        """Number of chunks in main simulation."""
+        total = self.num_main_steps
+        return (total + self.chunk_len - 1) // self.chunk_len
+
+    def validate_files_in_range(self, file_path_gen: Callable[[datetime], Path]) -> None:
+        """
+        Validates that files exist for all time steps in the simulation, including spin-up.
+        file_path_gen: function that takes a datetime and returns a Path to the file.
+        """
+        if self.time_interval is None:
+             raise ValueError("time_interval must be provided for validation")
+
+        file_paths = set()
+        
+        # Main simulation
+        if self.start_date and self.end_date:
+            curr = self.start_date
+            while curr <= self.end_date:
+                file_paths.add(file_path_gen(curr))
+                curr += self.time_interval
+
+        # Spin-up
+        if self.spin_up_cycles > 0:
+            if self.spin_up_start_date and self.spin_up_end_date:
+                curr = self.spin_up_start_date
+                while curr <= self.spin_up_end_date:
+                    file_paths.add(file_path_gen(curr))
+                    curr += self.time_interval
+        
+        self.validate_files_exist(list(file_paths))
 
     @abstractmethod
     def close(self) -> None:

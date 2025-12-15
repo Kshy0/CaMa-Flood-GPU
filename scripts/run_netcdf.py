@@ -43,10 +43,10 @@ def main():
     prefix = "e2o_ecmwf_wrr2_glob15_day_Runoff_"
     suffix = ".nc"
     var_name = "Runoff"
-    output_split_by_year = True
+    output_split_by_year = False
     
     # Spin-up configuration
-    do_spin_up = True
+    do_spin_up = False
     spin_up_start_date = datetime(2000, 1, 1)
     spin_up_end_date = datetime(2000, 12, 31)
     spin_up_cycles = 1

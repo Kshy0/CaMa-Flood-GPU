@@ -177,6 +177,8 @@ class MERITMap(BaseModel):
         "levee_fraction",
         "levee_crown_height",
         "levee_basin_id",
+        "longitude",
+        "latitude",
     ]
     # === Data Type Configuration ===
     idx_precision: ClassVar[str] = "<i4"
@@ -679,6 +681,18 @@ class MERITMap(BaseModel):
         self.upstream_area = _read_2d_map("uparea.bin")
         self.downstream_distance = _read_2d_map("nxtdst.bin")
         self.downstream_distance[self.is_river_mouth] = self.river_mouth_distance
+
+        lonlat_path = self.map_dir / "lonlat.bin"
+        if lonlat_path.exists():
+            print(f"Loading lon/lat from {lonlat_path}")
+            lonlat_data = binread(
+                lonlat_path,
+                (self.nx, self.ny, 2),
+                dtype_str=self.map_precision
+            )
+            self.longitude = lonlat_data[self.catchment_x, self.catchment_y, 0].astype(self.numpy_precision)
+            self.latitude = lonlat_data[self.catchment_x, self.catchment_y, 1].astype(self.numpy_precision)
+
         if self.levee_flag:
             levee_crown_height = _read_2d_map("levhgt.bin")
             levee_fraction = _read_2d_map("levfrc.bin")
@@ -1087,7 +1101,7 @@ if __name__ == "__main__":
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
         bifori_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/bifori.txt",
         gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
-        levee_flag=False,
+        levee_flag=True,
         visualized=True,
         bif_levels_to_keep=5,
         basin_use_file=False,

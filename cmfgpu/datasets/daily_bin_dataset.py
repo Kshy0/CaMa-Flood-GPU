@@ -20,20 +20,15 @@ class DailyBinDataset(AbstractDataset):
     Each bin file contains one day's data.
     """
 
-    def _real_len(self):
-        return (self.end_date - self.start_date).days + 1
-    
     def _validate_files_exist(self):
         """
         Validates that all expected files between start_date and end_date exist.
         """
-        file_paths = []
-        for idx in range(self._real_len()):
-            date = self.get_time_by_index(idx)
-            filename = f"{self.prefix}{date:%Y%m%d}{self.suffix}"
-            file_paths.append(Path(self.base_dir) / filename)
-        
-        self.validate_files_exist(file_paths)
+        def file_path_gen(dt: datetime) -> Path:
+            filename = f"{self.prefix}{dt:%Y%m%d}{self.suffix}"
+            return Path(self.base_dir) / filename
+            
+        self.validate_files_in_range(file_path_gen)
         
     def __init__(self,
                  base_dir: str,
@@ -73,12 +68,6 @@ class DailyBinDataset(AbstractDataset):
     @cached_property
     def data_mask(self):
         return np.ones(np.prod(self.shape), dtype=bool)
-    
-    def get_time_by_index(self, idx: int) -> datetime:
-        """
-        Returns the datetime corresponding to the given index.
-        """
-        return self.start_date + timedelta(days=idx)
     
     def close(self):
         pass
