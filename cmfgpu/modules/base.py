@@ -139,12 +139,6 @@ class BaseModule(AbstractModule):
         dtype="bool",
     )
 
-    reservoir_mask: Optional[torch.Tensor] = BaseField(
-        description="Boolean mask for catchments containing reservoirs",
-        dtype="bool",
-        default=None,
-    )
-
     levee_catchment_id: Optional[torch.Tensor] = BaseField(
         description="Catchment ID for each levee",
         dtype="int",
@@ -311,16 +305,6 @@ class BaseModule(AbstractModule):
             return self.catchment_id
         return self.catchment_id[self.catchment_save_idx]
     
-    @computed_base_field(
-        description="Boolean mask for reservoir catchments",
-        dtype="bool",
-    )
-    @cached_property
-    def is_reservoir(self) -> torch.Tensor:
-        if "reservoir" not in self.opened_modules or self.reservoir_mask is None:
-            return torch.zeros(self.num_catchments, dtype=torch.bool, device=self.device)
-        return self.reservoir_mask
-
     @computed_base_field(
         description="Boolean mask for catchments governed by levee physics",
         dtype="bool",

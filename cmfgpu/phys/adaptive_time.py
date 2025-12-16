@@ -10,8 +10,6 @@ import triton.language as tl
 
 @triton.jit
 def compute_adaptive_time_step_kernel(
-    is_reservoir_ptr,                       # *bool mask: 1 means reservoir
-    downstream_idx_ptr,                     # *i32 downstream index
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
     min_time_sub_step_ptr,
@@ -28,11 +26,6 @@ def compute_adaptive_time_step_kernel(
     #----------------------------------------------------------------------
     # (1) Load input variables
     #----------------------------------------------------------------------
-    downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
-    is_reservoir = tl.load(is_reservoir_ptr + offs, mask=mask, other=0)
-    is_reservoir_downstream = tl.load(is_reservoir_ptr + downstream_idx, mask=mask, other=0)
-    # omit reservoirs grids (reservoir or upstream of reservoir) 
-    mask = ~(is_reservoir_downstream | is_reservoir) & mask 
     downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=float('inf'))
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)

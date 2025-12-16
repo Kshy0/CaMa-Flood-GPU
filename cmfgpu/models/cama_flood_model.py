@@ -129,8 +129,6 @@ class CaMaFlood(AbstractModel):
         if self.adaptive_time is not None:
             self.adaptive_time.min_time_sub_step.fill_(float('inf'))
             compute_adaptive_time_step_kernel[self.base_grid](
-                is_reservoir_ptr=self.base.is_reservoir,
-                downstream_idx_ptr=self.base.downstream_idx,
                 river_depth_ptr=self.base.river_depth,
                 downstream_distance_ptr=self.base.downstream_distance,
                 min_time_sub_step_ptr=self.adaptive_time.min_time_sub_step,
@@ -197,7 +195,6 @@ class CaMaFlood(AbstractModel):
         # Outflow computation
         compute_outflow_kernel[self.base_grid](
             is_river_mouth_ptr=self.base.is_river_mouth,
-            is_reservoir_ptr=self.base.is_reservoir,
             downstream_idx_ptr=self.base.downstream_idx,
             river_inflow_ptr=self.base.river_inflow,
             flood_inflow_ptr=self.base.flood_inflow,

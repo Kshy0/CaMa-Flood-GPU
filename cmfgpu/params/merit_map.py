@@ -154,7 +154,6 @@ class MERITMap(BaseModel):
         "river_storage",
         "river_mouth_id",
         "is_river_mouth",
-        "is_reservoir",
     ]
 
     output_optional: ClassVar[List[str]] = [
@@ -237,7 +236,6 @@ class MERITMap(BaseModel):
         self.river_mouth_id = river_mouth_id
         self.is_river_mouth = (self.downstream_id < 0)
         self.catchment_save_mask = np.ones(self.num_catchments, dtype=bool)
-        self.is_reservoir = np.zeros_like(catchment_id, dtype=bool)  # placeholder; set from data if available
         
 
         print(f"Loaded {len(catchment_id)} catchments")
@@ -340,7 +338,6 @@ class MERITMap(BaseModel):
 
         # 5) Mask
         self.catchment_save_mask = self.catchment_save_mask[sorted_idx]
-        self.is_reservoir = self.is_reservoir[sorted_idx]
 
         # 6) If bifurcation arrays exist, align their basin ids with the new catchment ordering
         if self.num_bifurcation_paths > 0:
@@ -613,7 +610,6 @@ class MERITMap(BaseModel):
             "catchment_y",
             "root_mouth",
             "catchment_basin_id",
-            "is_reservoir",
             "river_mouth_id",
         ]:
             self._slice_arr(key, keep_mask)
@@ -1061,7 +1057,6 @@ class MERITMap(BaseModel):
         print(f"Grid dimensions          : {self.nx} x {self.ny}")
         print(f"Number of basins         : {self.num_basins}")
         print(f"Number of catchments     : {self.num_catchments}")
-        print(f"Number of reservoirs     : {self.is_reservoir.sum()}")
         print(f"Number of levees         : {getattr(self, 'num_levees', 0)}")
         print(f"Number of bifurcation paths : {self.num_bifurcation_paths}")
         print(f"Number of gauges         : {self.num_gauges}")

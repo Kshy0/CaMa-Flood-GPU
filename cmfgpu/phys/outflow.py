@@ -11,7 +11,6 @@ import triton.language as tl
 @triton.jit
 def compute_outflow_kernel(
     is_river_mouth_ptr,                     # *bool mask: 1 means river mouth 
-    is_reservoir_ptr,                       # *bool mask: 1 means reservoir
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
@@ -60,10 +59,6 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     is_river_mouth = tl.load(is_river_mouth_ptr + offs, mask=mask, other=0)
     downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
-    is_reservoir = tl.load(is_reservoir_ptr + offs, mask=mask, other=0)
-    is_reservoir_downstream = tl.load(is_reservoir_ptr + downstream_idx, mask=mask, other=0)
-    # omit reservoirs grids (reservoir or upstream of reservoir) 
-    mask = ~(is_reservoir_downstream | is_reservoir) & mask 
 
     # river variables
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
