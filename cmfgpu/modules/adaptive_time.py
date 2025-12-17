@@ -28,6 +28,7 @@ class AdaptiveTimeModule(AbstractModule):
     @computed_tensor_field(
         description="Minimum time step across all processes",
         shape=("one",),
+        category="shared_state",
     )
     @cached_property
     def min_time_sub_step(self) -> torch.Tensor:

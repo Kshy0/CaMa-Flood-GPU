@@ -35,3 +35,42 @@ def compute_adaptive_time_step_kernel(
     
     min_time_sub_step = tl.min(dt_clamped)
     tl.atomic_min(min_time_sub_step_ptr, min_time_sub_step)
+
+
+@triton.jit
+def compute_adaptive_time_step_batched_kernel(
+    river_depth_ptr,                        # *f32 river depth
+    downstream_distance_ptr,                # *f32 distance to downstream unit
+    min_time_sub_step_ptr,                  # *f32 (size num_trials)
+    time_step,
+    adaptive_time_factor: tl.constexpr ,
+    gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
+    num_catchments: tl.constexpr,           # total number of elements
+    num_trials: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,                # block size
+    # Batch flags
+    batched_downstream_distance: tl.constexpr
+):
+    pid_x = tl.program_id(0)
+    idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # Calculate trial and catchment indices
+    trial_idx = idx // num_catchments
+    offs = idx % num_catchments
+    
+    mask = idx < (num_catchments * num_trials)
+    
+    trial_offset = trial_idx * num_catchments
+
+    #----------------------------------------------------------------------
+    # (1) Load input variables
+    #----------------------------------------------------------------------
+    downstream_distance = tl.load(downstream_distance_ptr + (trial_offset if batched_downstream_distance else 0) + offs, mask=mask, other=float('inf'))
+    # Clamp river depth to minimum 0.01 for stability
+    river_depth = tl.load(river_depth_ptr + trial_offset + offs, mask=mask, other=0)
+    depth = tl.maximum(river_depth, 0.01)
+    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
+    dt_clamped = tl.minimum(dt, time_step)
+    
+    min_time_sub_step = tl.min(dt_clamped)
+    tl.atomic_min(min_time_sub_step_ptr + trial_idx, min_time_sub_step)

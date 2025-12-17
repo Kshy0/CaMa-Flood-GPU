@@ -14,8 +14,8 @@ from abc import ABC
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Tuple
 
 import torch
-from pydantic import (BaseModel, ConfigDict, Field, computed_field,
-                      model_validator)
+from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr, computed_field,
+                      field_validator, model_validator)
 from pydantic.fields import FieldInfo
 
 
@@ -27,7 +27,7 @@ def TensorField(
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
-    intermediate: bool = False,
+    category: Literal["topology", "param", "init_state"] = "param",
     **kwargs
 ):
     """
@@ -41,8 +41,10 @@ def TensorField(
                        If None, the full data will be loaded without distribution.
         dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
                     Useful for selecting elements by ID (e.g. for parameter changes).
-        intermediate: If True, the tensor is considered an intermediate variable
-                      that can be cleared after initialization to save memory.
+        category: Category of the variable:
+                  - 'topology': Static structure (NEVER batched)
+                  - 'param': Input parameter (can be batched)
+                  - 'init_state': Initializable state variable (ALWAYS batched if num_trials > 1)
         **kwargs: Additional Field parameters
     """
     if dtype != "float":
@@ -61,7 +63,7 @@ def TensorField(
             "save_idx": save_idx,
             "save_coord": save_coord,
             "dim_coords": dim_coords,
-            "intermediate": intermediate,
+            "category": category,
         }
     )
 
@@ -72,7 +74,7 @@ def computed_tensor_field(
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
-    intermediate: bool = False,
+    category: Literal["topology", "derived_param", "state", "shared_state"] = "derived_param",
     **kwargs
 ):
     """
@@ -85,8 +87,11 @@ def computed_tensor_field(
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
         dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
-        intermediate: If True, the tensor is considered an intermediate variable
-                      that can be cleared after initialization to save memory.
+        category: Category of the variable:
+                  - 'topology': Static structure (NEVER batched)
+                  - 'derived_param': Computed parameter (can be batched)
+                  - 'state': Computed state variable (ALWAYS batched if num_trials > 1)
+                  - 'shared_state': Computed state variable (NEVER batched)
         **kwargs: Additional computed_field parameters
     """
     if dtype != "float":
@@ -103,7 +108,7 @@ def computed_tensor_field(
             "save_idx": save_idx,
             "save_coord": save_coord,
             "dim_coords": dim_coords,
-            "intermediate": intermediate,
+            "category": category,
         },
         **kwargs
     )
@@ -146,6 +151,16 @@ class AbstractModule(BaseModel, ABC):
     rank: int = Field(default=0, description="Current process rank in distributed setup")
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
     precision: torch.dtype = Field(default=torch.float32, description="Data type for tensors")
+    num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
+
+    @field_validator('num_trials')
+    @classmethod
+    def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 1:
+            raise ValueError("num_trials must be greater than 1 if specified. For single trial, use None.")
+        return v
+    
+    _expanded_params: set = PrivateAttr(default_factory=set)
 
     def model_post_init(self, __context: Any):
         if self.module_name not in self.opened_modules:
@@ -156,8 +171,6 @@ class AbstractModule(BaseModel, ABC):
         self.validate_tensors()
         self.init_optional_tensors()
         self.validate_computed_tensors()
-        # self.clear_intermediate_tensors() # Deferred to AbstractModel.model_post_init
-
 
     @classmethod
     def get_model_fields(cls) -> Dict[str, FieldInfo]:
@@ -246,8 +259,17 @@ class AbstractModule(BaseModel, ABC):
             else:
                 raise ValueError(f"Dimension {dim_name} not found in module")
         
-        return tuple(scalar_values[dim] for dim in shape_spec)
+        shape = tuple(scalar_values[dim] for dim in shape_spec)
+        
+        category = json_schema_extra.get('category', 'param')
+        if self.num_trials is not None:
+             if category in ('state', 'init_state') or \
+                (category in ('param', 'derived_param') and field_name in self._expanded_params):
+                 return (self.num_trials,) + shape
+        
+        return shape
     
+
     def get_expected_dtype(self, field_name: str) -> torch.dtype:
         """
         Get the expected data type for a tensor field based on its definition.
@@ -299,7 +321,28 @@ class AbstractModule(BaseModel, ABC):
             # 1. Shape validation (fail fast)
             expected_shape = self.get_expected_shape(field_name)
             if tensor.shape != expected_shape:
-                raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
+                # Try to expand if it's a state/init_state variable and shape matches without batch dim
+                category = json_schema_extra.get('category', 'param')
+                if category in ('state', 'init_state') and self.num_trials is not None:
+                    # Check if it matches expected shape excluding the first dim (num_trials)
+                    if tensor.shape == expected_shape[1:]:
+                        tensor = tensor.unsqueeze(0).expand(expected_shape).clone()
+                        setattr(self, field_name, tensor)
+                    else:
+                        raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
+                elif category in ('param', 'derived_param') and self.num_trials is not None:
+                    # Check if it is already batched but not marked as expanded
+                    if tensor.shape[0] == self.num_trials and tensor.shape[1:] == expected_shape:
+                        # It is batched, so we should mark it as expanded
+                        self._expanded_params.add(field_name)
+                        # Re-check expected shape now that it is marked expanded
+                        expected_shape = self.get_expected_shape(field_name)
+                        if tensor.shape != expected_shape:
+                             raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
+                    else:
+                        raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
+                else:
+                    raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
             
             # 2. Auto-fix contiguity
             if not tensor.is_contiguous():
@@ -344,11 +387,18 @@ class AbstractModule(BaseModel, ABC):
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
                 setattr(self, field_name, tensor)
-            if tensor.shape != self.get_expected_shape(field_name):
-                raise ValueError(
-                    f"Computed field {field_name} has shape {tensor.shape}, "
-                    f"but expected shape is {self.get_expected_shape(field_name)}"
-                )
+            
+            expected_shape = self.get_expected_shape(field_name)
+            if tensor.shape != expected_shape:
+                # Check if it is batched (num_trials > 1)
+                if self.num_trials is not None and tensor.shape == (self.num_trials,) + expected_shape:
+                    # Mark as expanded so get_expected_shape returns the correct batched shape
+                    self._expanded_params.add(field_name)
+                else:
+                    raise ValueError(
+                        f"Computed field {field_name} has shape {tensor.shape}, "
+                        f"but expected shape is {expected_shape}"
+                    )
             
             expected_dtype = self.get_expected_dtype(field_name)
             if tensor.dtype != expected_dtype:
@@ -390,16 +440,6 @@ class AbstractModule(BaseModel, ABC):
         
         return self
     
-    def clear_intermediate_tensors(self) -> None:
-        """
-        Clear intermediate tensors to save memory.
-        These tensors are marked with `intermediate=True` in their field definition.
-        """
-        for name, field_info in (self.get_model_fields() | self.get_model_computed_fields()).items():
-            if field_info.json_schema_extra and field_info.json_schema_extra.get("intermediate"):
-                if hasattr(self, name):
-                    setattr(self, name, None)
-                    print(f"Cleared intermediate tensor: {name}")
 
     def get_memory_usage(self) -> int:
         """
@@ -413,10 +453,6 @@ class AbstractModule(BaseModel, ABC):
         all_fields.update(self.get_model_computed_fields())
         
         for name, field_info in all_fields.items():
-            # Check if it's an intermediate variable
-            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
-            if json_schema_extra and json_schema_extra.get('intermediate'):
-                continue
                 
             # Get the value
             if not hasattr(self, name):
@@ -428,3 +464,63 @@ class AbstractModule(BaseModel, ABC):
                 total_bytes += value.element_size() * value.nelement()
                 
         return total_bytes
+
+    def gather_tensor(self, tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Gather values from a tensor using indices, handling potential batch dimensions.
+        
+        If tensor is (N, ...), returns (L, ...) where L = len(indices).
+        If tensor is (T, N, ...), returns (T, L, ...).
+        """
+        if self.num_trials is not None and tensor.shape[0] == self.num_trials:
+            # Batched tensor (T, N, ...)
+            # We want to gather along the second dimension (N)
+            # indices is (L,)
+            # Result should be (T, L, ...)
+            # We can use tensor[:, indices]
+            return tensor[:, indices]
+        else:
+            # Shared tensor (N, ...)
+            # Result should be (L, ...)
+            return tensor[indices]
+
+
+    def _is_batched(self, tensor: torch.Tensor) -> bool:
+        """
+        Check if a tensor is batched (has num_trials as first dimension).
+        """
+        if self.num_trials is None:
+            return False
+        return tensor.ndim > 0 and tensor.shape[0] == self.num_trials
+
+    @property
+    def batched_params(self) -> Dict[str, bool]:
+        """
+        Returns a dictionary mapping parameter names to whether they are batched.
+        Checks both fields and computed fields.
+        """
+        res = {}
+        # Helper to check a field
+        def check_field(name, field_info):
+            # Skip state variables and topology
+            category = field_info.json_schema_extra.get("category", "param") if field_info.json_schema_extra else "param"
+            if category == "state" or category == "topology":
+                return
+            
+            if not hasattr(self, name):
+                return
+                
+            val = getattr(self, name)
+            if isinstance(val, torch.Tensor):
+                # Check if batched: (num_trials, ...) and num_trials > 1
+                # Note: We assume that if shape[0] == num_trials and num_trials > 1, it is batched.
+                is_batched = (self.num_trials is not None and val.ndim > 0 and val.shape[0] == self.num_trials)
+                res[name] = is_batched
+
+        for name, field in self.get_model_fields().items():
+            check_field(name, field)
+            
+        for name, field in self.get_model_computed_fields().items():
+            check_field(name, field)
+                
+        return res

@@ -20,14 +20,23 @@ from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
 from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
-from cmfgpu.phys.adaptive_time import compute_adaptive_time_step_kernel
-from cmfgpu.phys.bifurcation import (compute_bifurcation_inflow_kernel,
+from cmfgpu.phys.adaptive_time import (compute_adaptive_time_step_batched_kernel,
+                                       compute_adaptive_time_step_kernel)
+from cmfgpu.phys.bifurcation import (compute_bifurcation_inflow_batched_kernel,
+                                     compute_bifurcation_inflow_kernel,
+                                     compute_bifurcation_outflow_batched_kernel,
                                      compute_bifurcation_outflow_kernel)
-from cmfgpu.phys.levee import (compute_levee_bifurcation_outflow_kernel,
+from cmfgpu.phys.levee import (compute_levee_bifurcation_outflow_batched_kernel,
+                               compute_levee_bifurcation_outflow_kernel,
+                               compute_levee_stage_batched_kernel,
                                compute_levee_stage_kernel,
                                compute_levee_stage_log_kernel)
-from cmfgpu.phys.outflow import compute_inflow_kernel, compute_outflow_kernel
-from cmfgpu.phys.storage import (compute_flood_stage_kernel,
+from cmfgpu.phys.outflow import (compute_inflow_batched_kernel,
+                                 compute_inflow_kernel,
+                                 compute_outflow_batched_kernel,
+                                 compute_outflow_kernel)
+from cmfgpu.phys.storage import (compute_flood_stage_batched_kernel,
+                                 compute_flood_stage_kernel,
                                  compute_flood_stage_log_kernel)
 from pydantic import PrivateAttr, computed_field
 from torch import distributed as dist
@@ -78,17 +87,21 @@ class CaMaFlood(AbstractModel):
     def levee_flag(self) -> bool:
         return self.levee is not None
 
-    @property
+    @cached_property
     def base_grid(self) -> Callable:
-        return lambda META: (triton.cdiv(self.base.num_catchments, META["BLOCK_SIZE"]),)
+        return lambda META: (triton.cdiv(self.base.num_catchments * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
-    @property
+    @cached_property
     def bifurcation_grid(self) -> Callable:
-        return lambda META: (triton.cdiv(self.bifurcation.num_bifurcation_paths, META["BLOCK_SIZE"]),) if self.bifurcation_flag else None
+        if not self.bifurcation_flag:
+            return None
+        return lambda META: (triton.cdiv(self.bifurcation.num_bifurcation_paths * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
-    @property
+    @cached_property
     def levee_grid(self) -> Callable:
-        return lambda META: (triton.cdiv(self.base.num_levees, META["BLOCK_SIZE"]),) if self.levee_flag else None
+        if not self.levee_flag:
+            return None
+        return lambda META: (triton.cdiv(self.base.num_levees * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
     def step_advance(
         self,
@@ -128,19 +141,36 @@ class CaMaFlood(AbstractModel):
 
         if self.adaptive_time is not None:
             self.adaptive_time.min_time_sub_step.fill_(float('inf'))
-            compute_adaptive_time_step_kernel[self.base_grid](
-                river_depth_ptr=self.base.river_depth,
-                downstream_distance_ptr=self.base.downstream_distance,
-                min_time_sub_step_ptr=self.adaptive_time.min_time_sub_step,
-                time_step=time_step,
-                adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
-                gravity=self.base.gravity,
-                num_catchments=self.base.num_catchments,
-                BLOCK_SIZE=self.BLOCK_SIZE
-            )
+            if self.num_trials is not None:
+                compute_adaptive_time_step_batched_kernel[self.base_grid](
+                    river_depth_ptr=self.base.river_depth,
+                    downstream_distance_ptr=self.base.downstream_distance,
+                    min_time_sub_step_ptr=self.adaptive_time.min_time_sub_step,
+                    time_step=time_step,
+                    adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
+                    gravity=self.base.gravity,
+                    num_catchments=self.base.num_catchments,
+                    num_trials=self.num_trials,
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                    batched_downstream_distance=False,
+                )
+            else:
+                compute_adaptive_time_step_kernel[self.base_grid](
+                    river_depth_ptr=self.base.river_depth,
+                    downstream_distance_ptr=self.base.downstream_distance,
+                    min_time_sub_step_ptr=self.adaptive_time.min_time_sub_step,
+                    time_step=time_step,
+                    adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
+                    gravity=self.base.gravity,
+                    num_catchments=self.base.num_catchments,
+                    BLOCK_SIZE=self.BLOCK_SIZE
+                )
             if self.world_size > 1:
                 dist.all_reduce(self.adaptive_time.min_time_sub_step, op=dist.ReduceOp.MIN)
-            num_sub_steps = int(round(time_step / self.adaptive_time.min_time_sub_step.item() - 0.01) + 1)
+            
+            # Take the minimum across all trials if batched
+            min_dt = self.adaptive_time.min_time_sub_step.min().item()
+            num_sub_steps = int(round(time_step / min_dt - 0.01) + 1)
             time_sub_step = time_step / num_sub_steps
         else:
             num_sub_steps = default_num_sub_steps
@@ -193,113 +223,272 @@ class CaMaFlood(AbstractModel):
     def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int) -> None:
         """Execute one sub time step calculation"""
         # Outflow computation
-        compute_outflow_kernel[self.base_grid](
-            is_river_mouth_ptr=self.base.is_river_mouth,
-            downstream_idx_ptr=self.base.downstream_idx,
-            river_inflow_ptr=self.base.river_inflow,
-            flood_inflow_ptr=self.base.flood_inflow,
-            global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            river_manning_ptr=self.base.river_manning,
-            flood_manning_ptr=self.base.flood_manning,
-            river_depth_ptr=self.base.river_depth,
-            river_width_ptr=self.base.river_width,
-            river_length_ptr=self.base.river_length,
-            river_height_ptr=self.base.river_height,
-            river_storage_ptr=self.base.river_storage,
-            flood_depth_ptr=self.base.flood_depth,
-            protected_depth_ptr=self.base.protected_depth,
-            catchment_elevation_ptr=self.base.catchment_elevation,
-            downstream_distance_ptr=self.base.downstream_distance,
-            flood_storage_ptr=self.base.flood_storage,
-            protected_storage_ptr=self.base.protected_storage,
-            river_cross_section_depth_ptr=self.base.river_cross_section_depth,
-            flood_cross_section_depth_ptr=self.base.flood_cross_section_depth,
-            flood_cross_section_area_ptr=self.base.flood_cross_section_area,
-            total_storage_ptr=self.base.total_storage,
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            water_surface_elevation_ptr=self.base.water_surface_elevation,
-            protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
-            gravity=self.base.gravity,
-            time_step=time_sub_step,
-            num_catchments=self.base.num_catchments,
-            BLOCK_SIZE=self.BLOCK_SIZE
-        )
+        if self.num_trials is not None:
+            compute_outflow_batched_kernel[self.base_grid](
+                is_river_mouth_ptr=self.base.is_river_mouth,
+                downstream_idx_ptr=self.base.downstream_idx,
+                river_inflow_ptr=self.base.river_inflow,
+                flood_inflow_ptr=self.base.flood_inflow,
+                global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+                river_outflow_ptr=self.base.river_outflow,
+                flood_outflow_ptr=self.base.flood_outflow,
+                river_manning_ptr=self.base.river_manning,
+                flood_manning_ptr=self.base.flood_manning,
+                river_depth_ptr=self.base.river_depth,
+                river_width_ptr=self.base.river_width,
+                river_length_ptr=self.base.river_length,
+                river_height_ptr=self.base.river_height,
+                river_storage_ptr=self.base.river_storage,
+                flood_depth_ptr=self.base.flood_depth,
+                protected_depth_ptr=self.base.protected_depth,
+                catchment_elevation_ptr=self.base.catchment_elevation,
+                downstream_distance_ptr=self.base.downstream_distance,
+                flood_storage_ptr=self.base.flood_storage,
+                protected_storage_ptr=self.base.protected_storage,
+                river_cross_section_depth_ptr=self.base.river_cross_section_depth,
+                flood_cross_section_depth_ptr=self.base.flood_cross_section_depth,
+                flood_cross_section_area_ptr=self.base.flood_cross_section_area,
+                total_storage_ptr=self.base.total_storage,
+                outgoing_storage_ptr=self.base.outgoing_storage,
+                water_surface_elevation_ptr=self.base.water_surface_elevation,
+                protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
+                gravity=self.base.gravity,
+                time_step=time_sub_step,
+                num_catchments=self.base.num_catchments,
+                num_trials=self.num_trials,
+                BLOCK_SIZE=self.BLOCK_SIZE,
+                batched_river_manning=self.base.batched_river_manning,
+                batched_flood_manning=self.base.batched_flood_manning,
+                batched_river_width=self.base.batched_river_width,
+                batched_river_length=self.base.batched_river_length,
+                batched_river_height=self.base.batched_river_height,
+                batched_catchment_elevation=self.base.batched_catchment_elevation,
+            )
+        else:
+            compute_outflow_kernel[self.base_grid](
+                is_river_mouth_ptr=self.base.is_river_mouth,
+                downstream_idx_ptr=self.base.downstream_idx,
+                river_inflow_ptr=self.base.river_inflow,
+                flood_inflow_ptr=self.base.flood_inflow,
+                global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+                river_outflow_ptr=self.base.river_outflow,
+                flood_outflow_ptr=self.base.flood_outflow,
+                river_manning_ptr=self.base.river_manning,
+                flood_manning_ptr=self.base.flood_manning,
+                river_depth_ptr=self.base.river_depth,
+                river_width_ptr=self.base.river_width,
+                river_length_ptr=self.base.river_length,
+                river_height_ptr=self.base.river_height,
+                river_storage_ptr=self.base.river_storage,
+                flood_depth_ptr=self.base.flood_depth,
+                protected_depth_ptr=self.base.protected_depth,
+                catchment_elevation_ptr=self.base.catchment_elevation,
+                downstream_distance_ptr=self.base.downstream_distance,
+                flood_storage_ptr=self.base.flood_storage,
+                protected_storage_ptr=self.base.protected_storage,
+                river_cross_section_depth_ptr=self.base.river_cross_section_depth,
+                flood_cross_section_depth_ptr=self.base.flood_cross_section_depth,
+                flood_cross_section_area_ptr=self.base.flood_cross_section_area,
+                total_storage_ptr=self.base.total_storage,
+                outgoing_storage_ptr=self.base.outgoing_storage,
+                water_surface_elevation_ptr=self.base.water_surface_elevation,
+                protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
+                gravity=self.base.gravity,
+                time_step=time_sub_step,
+                num_catchments=self.base.num_catchments,
+                BLOCK_SIZE=self.BLOCK_SIZE
+            )
         
         # Bifurcation outflow computation
         if self.bifurcation_flag:
             if self.levee_flag:
-                compute_levee_bifurcation_outflow_kernel[self.bifurcation_grid](
-                    bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
-                    bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
-                    bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
-                    bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
-                    bifurcation_width_ptr=self.bifurcation.bifurcation_width,
-                    bifurcation_length_ptr=self.bifurcation.bifurcation_length,
-                    bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
-                    bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
-                    water_surface_elevation_ptr=self.base.water_surface_elevation,
-                    protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
-                    total_storage_ptr=self.base.total_storage,
-                    outgoing_storage_ptr=self.base.outgoing_storage,
-                    gravity=self.base.gravity,
-                    time_step=time_sub_step,
-                    num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
-                    num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
-                    BLOCK_SIZE=self.BLOCK_SIZE
-                )
+                if self.num_trials is not None:
+                    compute_levee_bifurcation_outflow_batched_kernel[self.bifurcation_grid](
+                        bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
+                        bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
+                        bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
+                        bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
+                        bifurcation_width_ptr=self.bifurcation.bifurcation_width,
+                        bifurcation_length_ptr=self.bifurcation.bifurcation_length,
+                        bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
+                        bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
+                        water_surface_elevation_ptr=self.base.water_surface_elevation,
+                        protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
+                        total_storage_ptr=self.base.total_storage,
+                        outgoing_storage_ptr=self.base.outgoing_storage,
+                        gravity=self.base.gravity,
+                        time_step=time_sub_step,
+                        num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
+                        num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
+                        num_trials=self.num_trials,
+                        BLOCK_SIZE=self.BLOCK_SIZE,
+                        num_catchments=self.base.num_catchments,
+                        batched_bifurcation_manning=self.bifurcation.batched_bifurcation_manning,
+                        batched_bifurcation_width=self.bifurcation.batched_bifurcation_width,
+                        batched_bifurcation_length=self.bifurcation.batched_bifurcation_length,
+                        batched_bifurcation_elevation=self.bifurcation.batched_bifurcation_elevation,
+                    )
+                else:
+                    compute_levee_bifurcation_outflow_kernel[self.bifurcation_grid](
+                        bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
+                        bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
+                        bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
+                        bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
+                        bifurcation_width_ptr=self.bifurcation.bifurcation_width,
+                        bifurcation_length_ptr=self.bifurcation.bifurcation_length,
+                        bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
+                        bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
+                        water_surface_elevation_ptr=self.base.water_surface_elevation,
+                        protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
+                        total_storage_ptr=self.base.total_storage,
+                        outgoing_storage_ptr=self.base.outgoing_storage,
+                        gravity=self.base.gravity,
+                        time_step=time_sub_step,
+                        num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
+                        num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
+                        BLOCK_SIZE=self.BLOCK_SIZE
+                    )
             else:
-                compute_bifurcation_outflow_kernel[self.bifurcation_grid](
-                    bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
-                    bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
-                    bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
-                    bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
-                    bifurcation_width_ptr=self.bifurcation.bifurcation_width,
-                    bifurcation_length_ptr=self.bifurcation.bifurcation_length,
-                    bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
-                    bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
-                    water_surface_elevation_ptr=self.base.water_surface_elevation,
-                    total_storage_ptr=self.base.total_storage,
-                    outgoing_storage_ptr=self.base.outgoing_storage,
-                    gravity=self.base.gravity,
-                    time_step=time_sub_step,
-                    num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
-                    num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
-                    BLOCK_SIZE=self.BLOCK_SIZE
-                )
+                if self.num_trials is not None:
+                    compute_bifurcation_outflow_batched_kernel[self.bifurcation_grid](
+                        bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
+                        bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
+                        bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
+                        bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
+                        bifurcation_width_ptr=self.bifurcation.bifurcation_width,
+                        bifurcation_length_ptr=self.bifurcation.bifurcation_length,
+                        bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
+                        bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
+                        water_surface_elevation_ptr=self.base.water_surface_elevation,
+                        total_storage_ptr=self.base.total_storage,
+                        outgoing_storage_ptr=self.base.outgoing_storage,
+                        gravity=self.base.gravity,
+                        time_step=time_sub_step,
+                        num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
+                        num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
+                        num_trials=self.num_trials,
+                        BLOCK_SIZE=self.BLOCK_SIZE,
+                        num_catchments=self.base.num_catchments,
+                        batched_bifurcation_manning=self.bifurcation.batched_bifurcation_manning,
+                        batched_bifurcation_width=self.bifurcation.batched_bifurcation_width,
+                        batched_bifurcation_length=self.bifurcation.batched_bifurcation_length,
+                        batched_bifurcation_elevation=self.bifurcation.batched_bifurcation_elevation,
+                    )
+                else:
+                    compute_bifurcation_outflow_kernel[self.bifurcation_grid](
+                        bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
+                        bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
+                        bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
+                        bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
+                        bifurcation_width_ptr=self.bifurcation.bifurcation_width,
+                        bifurcation_length_ptr=self.bifurcation.bifurcation_length,
+                        bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
+                        bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
+                        water_surface_elevation_ptr=self.base.water_surface_elevation,
+                        total_storage_ptr=self.base.total_storage,
+                        outgoing_storage_ptr=self.base.outgoing_storage,
+                        gravity=self.base.gravity,
+                        time_step=time_sub_step,
+                        num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
+                        num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
+                        BLOCK_SIZE=self.BLOCK_SIZE
+                    )
 
 
         # Inflow computation
-        compute_inflow_kernel[self.base_grid](
-            is_river_mouth_ptr=self.base.is_river_mouth,
-            downstream_idx_ptr=self.base.downstream_idx,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            total_storage_ptr=self.base.total_storage,
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            river_inflow_ptr=self.base.river_inflow,
-            flood_inflow_ptr=self.base.flood_inflow,
-            limit_rate_ptr=self.base.limit_rate,
-            num_catchments=self.base.num_catchments,
-            BLOCK_SIZE=self.BLOCK_SIZE
-        )
+        if self.num_trials is not None:
+            compute_inflow_batched_kernel[self.base_grid](
+                is_river_mouth_ptr=self.base.is_river_mouth,
+                downstream_idx_ptr=self.base.downstream_idx,
+                river_outflow_ptr=self.base.river_outflow,
+                flood_outflow_ptr=self.base.flood_outflow,
+                total_storage_ptr=self.base.total_storage,
+                outgoing_storage_ptr=self.base.outgoing_storage,
+                river_inflow_ptr=self.base.river_inflow,
+                flood_inflow_ptr=self.base.flood_inflow,
+                limit_rate_ptr=self.base.limit_rate,
+                num_catchments=self.base.num_catchments,
+                num_trials=self.num_trials,
+                BLOCK_SIZE=self.BLOCK_SIZE,
+            )
+        else:
+            compute_inflow_kernel[self.base_grid](
+                is_river_mouth_ptr=self.base.is_river_mouth,
+                downstream_idx_ptr=self.base.downstream_idx,
+                river_outflow_ptr=self.base.river_outflow,
+                flood_outflow_ptr=self.base.flood_outflow,
+                total_storage_ptr=self.base.total_storage,
+                outgoing_storage_ptr=self.base.outgoing_storage,
+                river_inflow_ptr=self.base.river_inflow,
+                flood_inflow_ptr=self.base.flood_inflow,
+                limit_rate_ptr=self.base.limit_rate,
+                num_catchments=self.base.num_catchments,
+                BLOCK_SIZE=self.BLOCK_SIZE
+            )
         
         # Bifurcation inflow computation (if enabled)
         if self.bifurcation_flag:
-            compute_bifurcation_inflow_kernel[self.bifurcation_grid](
-                bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
-                bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
-                limit_rate_ptr=self.base.limit_rate,
-                bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
-                global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
-                num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
-                num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
-                BLOCK_SIZE=self.BLOCK_SIZE
-            )
+            if self.num_trials is not None:
+                compute_bifurcation_inflow_batched_kernel[self.bifurcation_grid](
+                    bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
+                    bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
+                    limit_rate_ptr=self.base.limit_rate,
+                    bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
+                    global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+                    num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
+                    num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
+                    num_trials=self.num_trials,
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                    num_catchments=self.base.num_catchments,
+                )
+            else:
+                compute_bifurcation_inflow_kernel[self.bifurcation_grid](
+                    bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
+                    bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
+                    limit_rate_ptr=self.base.limit_rate,
+                    bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
+                    global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+                    num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
+                    num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
+                    BLOCK_SIZE=self.BLOCK_SIZE
+                )
 
         # Flood stage computation for non-levee catchments
-        if self.log is not None:
+        if self.num_trials is not None:
+            compute_flood_stage_batched_kernel[self.base_grid](
+                river_inflow_ptr=self.base.river_inflow,
+                flood_inflow_ptr=self.base.flood_inflow,
+                river_outflow_ptr=self.base.river_outflow,
+                flood_outflow_ptr=self.base.flood_outflow,
+                global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+                runoff_ptr=runoff, 
+                time_step=time_sub_step,
+                outgoing_storage_ptr=self.base.outgoing_storage,
+                river_storage_ptr=self.base.river_storage,
+                flood_storage_ptr=self.base.flood_storage,
+                protected_storage_ptr=self.base.protected_storage,
+                river_depth_ptr=self.base.river_depth,
+                flood_depth_ptr=self.base.flood_depth,
+                protected_depth_ptr=self.base.protected_depth,
+                flood_fraction_ptr=self.base.flood_fraction,
+                flood_area_ptr=self.base.flood_area,
+                river_height_ptr=self.base.river_height,
+                flood_depth_table_ptr=self.base.flood_depth_table,
+                catchment_area_ptr=self.base.catchment_area,
+                river_width_ptr=self.base.river_width,
+                river_length_ptr=self.base.river_length,
+                num_catchments=self.base.num_catchments,
+                num_flood_levels=self.base.num_flood_levels,
+                num_trials=self.num_trials,
+                BLOCK_SIZE=self.BLOCK_SIZE,
+                batched_runoff=(runoff.ndim > 1 and runoff.shape[0] == self.num_trials),
+                batched_river_height=self.base.batched_river_height,
+                batched_flood_depth_table=self.base.batched_flood_depth_table,
+                batched_catchment_area=self.base.batched_catchment_area,
+                batched_river_width=self.base.batched_river_width,
+                batched_river_length=self.base.batched_river_length,
+            )
+        elif self.log is not None:
             compute_flood_stage_log_kernel[self.base_grid](
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
@@ -369,7 +558,40 @@ class CaMaFlood(AbstractModel):
 
         # Levee stage computation (if enabled)
         if self.levee_flag:
-            if self.log is not None:
+            if self.num_trials is not None:
+                compute_levee_stage_batched_kernel[self.levee_grid](
+                    levee_catchment_idx_ptr=self.levee.levee_catchment_idx,
+                    river_storage_ptr=self.base.river_storage,
+                    flood_storage_ptr=self.base.flood_storage,
+                    protected_storage_ptr=self.base.protected_storage,
+                    river_depth_ptr=self.base.river_depth,
+                    flood_depth_ptr=self.base.flood_depth,
+                    protected_depth_ptr=self.base.protected_depth,
+                    river_height_ptr=self.base.river_height,
+                    flood_depth_table_ptr=self.base.flood_depth_table,
+                    catchment_area_ptr=self.base.catchment_area,
+                    river_width_ptr=self.base.river_width,
+                    river_length_ptr=self.base.river_length,
+                    levee_base_height_ptr=self.levee.levee_base_height,
+                    levee_crown_height_ptr=self.levee.levee_crown_height,
+                    levee_fraction_ptr=self.levee.levee_fraction,
+                    flood_fraction_ptr=self.base.flood_fraction,
+                    flood_area_ptr=self.base.flood_area,
+                    num_levees=self.base.num_levees,
+                    num_flood_levels=self.base.num_flood_levels,
+                    num_trials=self.num_trials,
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                    num_catchments=self.base.num_catchments,
+                    batched_river_height=self.base.batched_river_height,
+                    batched_flood_depth_table=self.base.batched_flood_depth_table,
+                    batched_catchment_area=self.base.batched_catchment_area,
+                    batched_river_width=self.base.batched_river_width,
+                    batched_river_length=self.base.batched_river_length,
+                    batched_levee_base_height=self.levee.batched_levee_base_height,
+                    batched_levee_crown_height=self.levee.batched_levee_crown_height,
+                    batched_levee_fraction=self.levee.batched_levee_fraction,
+                )
+            elif self.log is not None:
                 compute_levee_stage_log_kernel[self.levee_grid](
                     levee_catchment_idx_ptr=self.levee.levee_catchment_idx,
                     river_storage_ptr=self.base.river_storage,

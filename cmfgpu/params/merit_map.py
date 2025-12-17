@@ -391,6 +391,39 @@ class MERITMap(BaseModel):
             self.removed_bifurcation_downstream_x = self.bifurcation_downstream_x[removed_mask]
             self.removed_bifurcation_downstream_y = self.bifurcation_downstream_y[removed_mask]
         else:
+            # Calculate river mouths for bifurcation endpoints to allow basin merging
+            tmp_idx_up = find_indices_in(self.bifurcation_catchment_id, self.catchment_id)
+            tmp_idx_dn = find_indices_in(self.bifurcation_downstream_id, self.catchment_id)
+            
+            # Filter valid indices (though they should be valid if loaded correctly)
+            valid_bif = (tmp_idx_up >= 0) & (tmp_idx_dn >= 0)
+            
+            if np.any(valid_bif):
+                ori_river_mouth_id = self.river_mouth_id[tmp_idx_up[valid_bif]]
+                bif_river_mouth_id = self.river_mouth_id[tmp_idx_dn[valid_bif]]
+                
+                # Merge basins using Union-Find
+                parent = {m: m for m in np.unique(self.river_mouth_id)}
+                
+                def find(x):
+                    if parent[x] != x:
+                        parent[x] = find(parent[x])
+                    return parent[x]
+                
+                def union(x, y):
+                    rootX = find(x)
+                    rootY = find(y)
+                    if rootX != rootY:
+                        parent[rootX] = rootY
+                
+                for m1, m2 in zip(ori_river_mouth_id, bif_river_mouth_id):
+                    union(m1, m2)
+                
+                # Update root_mouth based on merged results
+                self.root_mouth = np.array([find(m) for m in self.river_mouth_id], dtype=np.int64)
+            else:
+                self.root_mouth = self.river_mouth_id.copy()
+
             keep_mask = np.ones(self.num_bifurcation_paths, dtype=bool)
             # No removed
             self.removed_bifurcation_catchment_x = np.array([], dtype=np.int64)
@@ -421,7 +454,6 @@ class MERITMap(BaseModel):
             print(f"Pruned {n_cut}/{n_before} bifurcation paths crossing basin boundaries ({(n_cut/n_before)*100:.2f}%).")
 
         # Finalize connectivity
-        self.root_mouth = self.river_mouth_id.copy()
         self._finalize_connectivity(root_mouth=self.root_mouth)
 
         # Always compute and report load distribution (LPT over basins -> simulated GPU assignment).
@@ -597,6 +629,8 @@ class MERITMap(BaseModel):
         kept_basin_ids_t, kept_first_idx_t = np.unique(self.catchment_basin_id[mask_target], return_index=True)
         order_first_t = np.argsort(kept_first_idx_t)
         kept_basin_ids = kept_basin_ids_t[order_first_t]
+
+
 
         # Apply common filtering given kept_basin_ids
         keep_mask = np.isin(self.catchment_basin_id, kept_basin_ids)
@@ -818,7 +852,7 @@ class MERITMap(BaseModel):
         visualize_gauges: bool = True,
         visualize_bifurcations: bool = True,
         visualize_removed_bifurcations: bool = True,
-        visualize_levees: bool = False
+        visualize_levees: bool = True
     ) -> None:
         """Generate basin visualization if requested, including removed bifurcation paths.
 
@@ -827,6 +861,7 @@ class MERITMap(BaseModel):
           (excludes empty/NaN background), improving readability and interaction speed.
         - In interactive mode, prints both gauge IDs (names) and gauge catchment_ids
           of the clicked basin to the console.
+        - Supports plotting in Longitude/Latitude if available.
         """
         if self.visualized is False:
             return
@@ -840,6 +875,41 @@ class MERITMap(BaseModel):
         if self.num_catchments > 1e7:
             print("Too many catchments to visualize, skipping.")
             return
+
+        # Check if we can use Lat/Lon
+        use_lonlat = hasattr(self, 'longitude') and hasattr(self, 'latitude')
+        
+        if use_lonlat:
+            # Estimate grid parameters: lon = slope * x + intercept
+            if len(self.catchment_x) > 1:
+                slope_x, intercept_x = np.polyfit(self.catchment_x, self.longitude, 1)
+                slope_y, intercept_y = np.polyfit(self.catchment_y, self.latitude, 1)
+            else:
+                use_lonlat = False
+        
+        if use_lonlat:
+            # Calculate extent for imshow [left, right, bottom, top]
+            # Pixel centers are at integer indices. Edges are +/- 0.5.
+            left = intercept_x + slope_x * (-0.5)
+            right = intercept_x + slope_x * (self.nx - 0.5)
+            # For Y, index 0 is usually top (max lat), so slope_y is negative.
+            # bottom (min lat) corresponds to max index (ny-0.5)
+            bottom = intercept_y + slope_y * (self.ny - 0.5)
+            top = intercept_y + slope_y * (-0.5)
+            
+            extent = [left, right, bottom, top]
+            xlabel = "Longitude"
+            ylabel = "Latitude"
+            
+            def idx_to_lon(x): return intercept_x + slope_x * x
+            def idx_to_lat(y): return intercept_y + slope_y * y
+        else:
+            extent = None
+            xlabel = "X Index"
+            ylabel = "Y Index"
+            def idx_to_lon(x): return x
+            def idx_to_lat(y): return y
+
         def generate_random_colors(N, avoid_rgb_colors):
             colors = []
             avoid_rgb_colors = np.array(avoid_rgb_colors)
@@ -876,29 +946,38 @@ class MERITMap(BaseModel):
         plt.figure(figsize=(12, 10))
         # Use vmin/vmax for discrete mapping of integer basin ids
         plt.imshow(np.ma.masked_invalid(basin_map).T, origin='upper', cmap=cmap, interpolation='nearest',
-                   vmin=-0.5, vmax=num_basins - 0.5)
+                   vmin=-0.5, vmax=num_basins - 0.5, extent=extent)
         plt.title(f"MERIT Global Basins with Bifurcation Paths")
-        plt.xlabel("X")
-        plt.ylabel("Y")
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
         plt.grid(False)
 
         # --- Auto-crop to non-empty region ---
-        # Compute minimal bounding box of valid catchments and add a small margin.
-        if interactive_basin_picker:
-            margin = 1  # one-cell padding around the valid bbox
-            x0 = max(0, int(self.catchment_x.min()) - margin)
-            x1 = min(self.nx - 1, int(self.catchment_x.max()) + margin)
-            y0 = max(0, int(self.catchment_y.min()) - margin)
-            y1 = min(self.ny - 1, int(self.catchment_y.max()) + margin)
-            def within_extent(xv: np.ndarray, yv: np.ndarray) -> np.ndarray:
-                return (xv >= x0) & (xv <= x1) & (yv >= y0) & (yv <= y1) 
-        else:
-            x0, x1, y0, y1 = 0, self.nx - 1, 0, self.ny - 1
-            def within_extent(xv: np.ndarray, yv: np.ndarray) -> np.ndarray:
-                return np.ones_like(xv, dtype=bool)
+        margin = 1
+        x0_idx = max(0, int(self.catchment_x.min()) - margin)
+        x1_idx = min(self.nx - 1, int(self.catchment_x.max()) + margin)
+        y0_idx = max(0, int(self.catchment_y.min()) - margin)
+        y1_idx = min(self.ny - 1, int(self.catchment_y.max()) + margin)
 
-        plt.xlim(x0 - 0.5, x1 + 0.5)
-        plt.ylim(y1 + 0.5, y0 - 0.5)
+        if use_lonlat:
+            # Convert indices to coordinates for limits
+            # Note: y0_idx is min index (North), y1_idx is max index (South)
+            xlim_min = idx_to_lon(x0_idx - 0.5)
+            xlim_max = idx_to_lon(x1_idx + 0.5)
+            ylim_min = idx_to_lat(y1_idx + 0.5)
+            ylim_max = idx_to_lat(y0_idx - 0.5)
+            
+            plt.xlim(xlim_min, xlim_max)
+            plt.ylim(ylim_min, ylim_max)
+            
+            def within_extent(xv, yv):
+                return (xv >= min(xlim_min, xlim_max)) & (xv <= max(xlim_min, xlim_max)) & \
+                       (yv >= min(ylim_min, ylim_max)) & (yv <= max(ylim_min, ylim_max))
+        else:
+            plt.xlim(x0_idx - 0.5, x1_idx + 0.5)
+            plt.ylim(y1_idx + 0.5, y0_idx - 0.5)
+            def within_extent(xv, yv):
+                return (xv >= x0_idx) & (xv <= x1_idx) & (yv >= y0_idx) & (yv <= y1_idx)
 
         # Plot gauges if available
         if visualize_gauges and self.num_gauges > 0:
@@ -911,61 +990,90 @@ class MERITMap(BaseModel):
             gauge_indices = [catchment_id_to_idx[cid] for cid in gauge_catchment_ids if cid in catchment_id_to_idx]
 
             if gauge_indices:
-                gauge_x = self.catchment_x[gauge_indices]
-                gauge_y = self.catchment_y[gauge_indices]
+                if use_lonlat:
+                    gauge_x = self.longitude[gauge_indices]
+                    gauge_y = self.latitude[gauge_indices]
+                else:
+                    gauge_x = self.catchment_x[gauge_indices]
+                    gauge_y = self.catchment_y[gauge_indices]
+                
                 m = within_extent(gauge_x, gauge_y)
                 if np.any(m):
-                    plt.scatter(gauge_x[m], gauge_y[m], c='#00FF00', s=0.5, label='Gauges')
+                    plt.scatter(gauge_x[m], gauge_y[m], c='#00FF00', s=0.5, label='Gauges', zorder=5)
 
         # Plot levees if available
         if visualize_levees and hasattr(self, 'levee_catchment_x') and self.num_levees > 0:
-            levee_x = self.levee_catchment_x
-            levee_y = self.levee_catchment_y
+            if use_lonlat:
+                levee_x = idx_to_lon(self.levee_catchment_x)
+                levee_y = idx_to_lat(self.levee_catchment_y)
+            else:
+                levee_x = self.levee_catchment_x
+                levee_y = self.levee_catchment_y
+            
             m = within_extent(levee_x, levee_y)
             if np.any(m):
-                plt.scatter(levee_x[m], levee_y[m], c='#800080', s=0.2, label='Levees')
+                plt.scatter(levee_x[m], levee_y[m], c='#800080', s=0.2, label='Levees', zorder=4)
 
         # Plot user points of interest (POIs)
         if hasattr(self, "target_cids") and isinstance(getattr(self, "target_cids"), np.ndarray) and self.target_cids.size > 0:
-            # Map target catchment IDs to current ordering; some may be filtered out
             poi_idx = find_indices_in(self.target_cids, self.catchment_id)
             poi_idx = poi_idx[poi_idx >= 0]
             if poi_idx.size > 0:
-                poi_x = self.catchment_x[poi_idx]
-                poi_y = self.catchment_y[poi_idx]
+                if use_lonlat:
+                    poi_x = self.longitude[poi_idx]
+                    poi_y = self.latitude[poi_idx]
+                else:
+                    poi_x = self.catchment_x[poi_idx]
+                    poi_y = self.catchment_y[poi_idx]
+                
                 m = within_extent(poi_x, poi_y)
                 if np.any(m):
-                    plt.scatter(poi_x[m], poi_y[m], c="#C10000", s=0.3, label='Points of Interest')
+                    plt.scatter(poi_x[m], poi_y[m], c="#C10000", s=0.3, label='Points of Interest', zorder=6)
 
         if not interactive_basin_picker:
-            # Plot kept bifurcation paths (after pruning, arrays contain only kept)
+            # Plot kept bifurcation paths
             if visualize_bifurcations and self.num_bifurcation_paths > 0 and self.num_bifurcation_paths < 3e6:
-                x1a = self.bifurcation_catchment_x
-                y1a = self.bifurcation_catchment_y
-                x2a = self.bifurcation_downstream_x
-                y2a = self.bifurcation_downstream_y
-                # Avoid wrap-around across the dateline AND clip to auto extent
-                mask_keep = (np.abs(x1a - x2a) <= self.nx / 2)
+                if use_lonlat:
+                    x1a = idx_to_lon(self.bifurcation_catchment_x)
+                    y1a = idx_to_lat(self.bifurcation_catchment_y)
+                    x2a = idx_to_lon(self.bifurcation_downstream_x)
+                    y2a = idx_to_lat(self.bifurcation_downstream_y)
+                    mask_keep = (np.abs(x1a - x2a) <= 180.0)
+                else:
+                    x1a = self.bifurcation_catchment_x
+                    y1a = self.bifurcation_catchment_y
+                    x2a = self.bifurcation_downstream_x
+                    y2a = self.bifurcation_downstream_y
+                    mask_keep = (np.abs(x1a - x2a) <= self.nx / 2)
+                
                 mask_keep &= (within_extent(x1a, y1a) | within_extent(x2a, y2a))
                 if np.any(mask_keep):
                     x1k = x1a[mask_keep]; y1k = y1a[mask_keep]; x2k = x2a[mask_keep]; y2k = y2a[mask_keep]
                     line_segments_keep = np.array([[[x1k[i], y1k[i]], [x2k[i], y2k[i]]] for i in range(len(x1k))])
-                    kept_lines = LineCollection(line_segments_keep, colors='#0000FF', linestyles='--', linewidths=0.5, alpha=0.6)
+                    kept_lines = LineCollection(line_segments_keep, colors='#0000FF', linestyles='--', linewidths=0.5, alpha=0.6, zorder=3)
                     plt.gca().add_collection(kept_lines)
                     plt.plot([], [], color='#0000FF', linestyle='--', linewidth=0.5, alpha=0.6, label='Bifurcation Paths')
 
-            # Plot removed bifurcation paths, if any were pruned
+            # Plot removed bifurcation paths
             if visualize_removed_bifurcations and hasattr(self, "removed_bifurcation_catchment_x") and self.removed_bifurcation_catchment_x.size > 0:
-                rx1a = self.removed_bifurcation_catchment_x
-                ry1a = self.removed_bifurcation_catchment_y
-                rx2a = self.removed_bifurcation_downstream_x
-                ry2a = self.removed_bifurcation_downstream_y
-                mask_cut = (np.abs(rx1a - rx2a) <= self.nx / 2)
+                if use_lonlat:
+                    rx1a = idx_to_lon(self.removed_bifurcation_catchment_x)
+                    ry1a = idx_to_lat(self.removed_bifurcation_catchment_y)
+                    rx2a = idx_to_lon(self.removed_bifurcation_downstream_x)
+                    ry2a = idx_to_lat(self.removed_bifurcation_downstream_y)
+                    mask_cut = (np.abs(rx1a - rx2a) <= 180.0)
+                else:
+                    rx1a = self.removed_bifurcation_catchment_x
+                    ry1a = self.removed_bifurcation_catchment_y
+                    rx2a = self.removed_bifurcation_downstream_x
+                    ry2a = self.removed_bifurcation_downstream_y
+                    mask_cut = (np.abs(rx1a - rx2a) <= self.nx / 2)
+                
                 mask_cut &= (within_extent(rx1a, ry1a) | within_extent(rx2a, ry2a))
                 if np.any(mask_cut):
                     rx1 = rx1a[mask_cut]; ry1 = ry1a[mask_cut]; rx2 = rx2a[mask_cut]; ry2 = ry2a[mask_cut]
                     line_segments_removed = np.array([[[rx1[i], ry1[i]], [rx2[i], ry2[i]]] for i in range(len(rx1))])
-                    removed_lines = LineCollection(line_segments_removed, colors='#FF0000', linestyles=':', linewidths=1, alpha=0.5)
+                    removed_lines = LineCollection(line_segments_removed, colors='#FF0000', linestyles=':', linewidths=1, alpha=0.5, zorder=3)
                     plt.gca().add_collection(removed_lines)
                     plt.plot([], [], color='#FF0000', linestyle=':', linewidth=1, alpha=0.7, label='Bifurcation Paths (removed)')
 
@@ -974,9 +1082,7 @@ class MERITMap(BaseModel):
             ax = plt.gca()
 
             catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
-            # Map: basin_id -> set of gauge names (IDs)
             basin_to_gauges: Dict[int, set] = {}
-            # Map: basin_id -> set of gauge catchment IDs (cells hosting gauges) within that basin
             basin_to_gauge_cids: Dict[int, set] = {}
             if getattr(self, "num_gauges", 0) > 0 and hasattr(self, "gauge_info"):
                 for gname, info in self.gauge_info.items():
@@ -997,20 +1103,28 @@ class MERITMap(BaseModel):
                 visible=False,
             )
 
-            # Ignore clicks outside the cropped extent
-            def click_within_extent(xi: int, yi: int) -> bool:
-                return (xi >= x0) and (xi <= x1) and (yi >= y0) and (yi <= y1)
-
             def on_click(event):
                 if event.inaxes is not ax or event.xdata is None or event.ydata is None:
                     return
 
-                xi = int(np.clip(round(event.xdata), 0, self.nx - 1))
-                yi = int(np.clip(round(event.ydata), 0, self.ny - 1))
-                if not click_within_extent(xi, yi):
-                    ann.set_visible(False)
-                    plt.draw()
-                    return
+                if use_lonlat:
+                    # Convert back to indices
+                    xi_f = (event.xdata - intercept_x) / slope_x
+                    yi_f = (event.ydata - intercept_y) / slope_y
+                    xi = int(np.clip(round(xi_f), 0, self.nx - 1))
+                    yi = int(np.clip(round(yi_f), 0, self.ny - 1))
+                    
+                    if not within_extent(event.xdata, event.ydata):
+                        ann.set_visible(False)
+                        plt.draw()
+                        return
+                else:
+                    xi = int(np.clip(round(event.xdata), 0, self.nx - 1))
+                    yi = int(np.clip(round(event.ydata), 0, self.ny - 1))
+                    if not within_extent(event.xdata, event.ydata):
+                        ann.set_visible(False)
+                        plt.draw()
+                        return
 
                 bval = basin_map[xi, yi]
                 if np.isnan(bval):
@@ -1020,7 +1134,6 @@ class MERITMap(BaseModel):
                 b = int(bval)
                 gids = sorted(basin_to_gauges.get(b, []))
                 gcids = sorted(basin_to_gauge_cids.get(b, []))
-                # Console print: basin id, gauge IDs (names), and gauge catchment IDs
                 msg = f"basin={b}, gauges={gids if len(gids) > 0 else '[]'}, gauge_catchment_ids={gcids if len(gcids) > 0 else '[]'}, click=(x={xi}, y={yi})"
                 print(msg)
                 log_path = self.out_dir / f"basin_{b}.txt"

@@ -94,6 +94,15 @@ class AbstractModel(BaseModel, ABC):
     output_workers: int = Field(default=2, description="Number of workers for writing output files")
     output_complevel: int = Field(default=4, description="Compression level for output NetCDF files", ge=0, le=9)
     output_split_by_year: bool = Field(default=False, description="Whether to split output files by year")
+    num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
+    save_kernels: bool = Field(default=False, description="Whether to save generated Triton kernels")
+
+    @field_validator('num_trials')
+    @classmethod
+    def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 1:
+            raise ValueError("num_trials must be greater than 1 if specified. For single trial, use None.")
+        return v
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
@@ -609,15 +618,11 @@ class AbstractModel(BaseModel, ABC):
                 device=self.device,
                 world_size=self.world_size,
                 precision=self.dtype,
+                num_trials=self.num_trials,
                 **self._modules,
                 **module_data
             )
             self._modules[module_name] = module_instance
-        
-        # Clear intermediate tensors after all modules are initialized
-        for module_name in sorted_modules:
-            if module_name in self._modules:
-                self._modules[module_name].clear_intermediate_tensors()
 
         self.initialize_statistics_aggregator()
         self.print_memory_summary()
@@ -628,7 +633,7 @@ class AbstractModel(BaseModel, ABC):
         Print a summary of memory usage by module.
         """
         total_memory = 0
-        print(f"\n[rank {self.rank}] Memory Usage Summary (excluding intermediate variables):")
+        print(f"\n[rank {self.rank}] Memory Usage Summary:")
         print(f"{'Module':<30} | {'Memory (MB)':<15}")
         print(f"{'-' * 50}")
         
@@ -724,6 +729,8 @@ class AbstractModel(BaseModel, ABC):
             num_workers=self.output_workers,
             complevel=self.output_complevel,
             output_split_by_year=self.output_split_by_year,
+            num_trials=self.num_trials or 1,
+            save_kernels=self.save_kernels,
         )
 
         registered_vars = set()
@@ -761,6 +768,12 @@ class AbstractModel(BaseModel, ABC):
                 
                 if field_info is None:
                     continue
+
+                # Check category
+                category = field_info.json_schema_extra.get("category", "param")
+                if category not in ("state", "shared_state", "init_state"):
+                     print(f"[rank {self.rank}] Warning: Variable '{var_name}' is category '{category}', skipping output (only state/shared_state/init_state allowed).")
+                     continue
 
                 # Register the main tensor if not already done
                 if var_name not in registered_vars:
@@ -915,7 +928,17 @@ class AbstractModel(BaseModel, ABC):
                             no_local_fields[group_var] = []
                         no_local_fields[group_var].append(field_name)
                     else:
-                        local_np = full_np[idx]
+                        # Handle batched parameters (num_trials, num_catchments, ...)
+                        # If the first dimension is num_trials, we need to index the second dimension
+                        if full_np.ndim > 1 and self.num_trials is not None and full_np.shape[0] == self.num_trials:
+                            # Batched parameter: (T, N, ...)
+                            # We want to select indices from the second dimension (N)
+                            # Result should be (T, L, ...) where L is len(idx)
+                            local_np = full_np[:, idx]
+                        else:
+                            # Standard parameter: (N, ...)
+                            local_np = full_np[idx]
+                            
                         module_data[field_name] = to_torch(local_np)
                         
                         shape = local_np.shape
@@ -949,6 +972,10 @@ class AbstractModel(BaseModel, ABC):
         """
         Save model state to InputProxy and NetCDF files (.nc).
         """
+        if self.num_trials is not None:
+            print(f"[rank {self.rank}] Warning: save_state is not supported for multi-trial simulations.")
+            return None
+
         timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
 
         # Determine file path per-rank
@@ -963,7 +990,7 @@ class AbstractModel(BaseModel, ABC):
         
         saved_distributed = []
         saved_global = []
-        skipped_none = []
+        skipped_none = set()
 
         for module_name in self.opened_modules:
             module = self._modules[module_name]
@@ -986,11 +1013,12 @@ class AbstractModel(BaseModel, ABC):
                     val = val.detach().cpu().numpy()
                 
                 if val is None:
-                    skipped_none.append(field_name)
+                    skipped_none.add(field_name)
                     continue
                     
                 data[field_name] = val
                 visited_fields.add(field_name)
+                skipped_none.discard(field_name)
 
                 if is_distributed:
                     saved_distributed.append(field_name)
@@ -1015,7 +1043,7 @@ class AbstractModel(BaseModel, ABC):
         if saved_global:
             print(f"[rank {self.rank}] Saved global fields: {', '.join(saved_global)}")
         if skipped_none:
-            print(f"[rank {self.rank}] Skipped None fields (not saved): {', '.join(skipped_none)}")
+            print(f"[rank {self.rank}] Skipped None fields (not saved): {', '.join(sorted(list(skipped_none)))}")
 
         if self.world_size > 1:
             dist.barrier()

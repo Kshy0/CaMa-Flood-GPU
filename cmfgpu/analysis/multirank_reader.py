@@ -92,8 +92,13 @@ class MultiRankStatsReader:
                         continue
                     var = ds.variables[self.var_name]
                     dims = var.dimensions
-                    has_levels = len(dims) == 3 and dims[-1] == "levels"
+                    
+                    has_trials = "trial" in ds.dimensions
+                    n_trials = int(ds.dimensions["trial"].size) if has_trials else 0
+                    
+                    has_levels = "levels" in ds.dimensions
                     n_levels = int(ds.dimensions["levels"].size) if has_levels else 0
+                    
                     saved_points = int(ds.dimensions["saved_points"].size)
 
                     coord_name = self._select_coord_name(ds, saved_points)
@@ -107,6 +112,8 @@ class MultiRankStatsReader:
                             "paths": paths, # List of paths
                             "path": first_fp, # Keep for backward compat / metadata
                             "saved_points": saved_points,
+                            "has_trials": has_trials,
+                            "n_trials": n_trials,
                             "has_levels": has_levels,
                             "n_levels": n_levels,
                             "coord_name": coord_name,
@@ -249,18 +256,20 @@ class MultiRankStatsReader:
                     try:
                         with nc.Dataset(fp, "r") as ds:
                             var = ds.variables[self.var_name]
-                            if info["has_levels"]:
-                                data = var[local_start:local_end, :, :]
-                            else:
-                                data = var[local_start:local_end, :]
+                            # Slicing logic: always take all spatial/trial dims
+                            # Dimensions are (time, [trial], saved_points, [levels])
+                            data = var[local_start:local_end, ...]
                             rank_data_parts.append(np.array(data, copy=True))
                     except Exception as e:
                         print(f"Warning: failed to cache {fp.name}: {e}")
                         # Append zeros or handle error?
-                        shape = (local_end - local_start, info["saved_points"])
+                        shape = [local_end - local_start]
+                        if info["has_trials"]:
+                            shape.append(info["n_trials"])
+                        shape.append(info["saved_points"])
                         if info["has_levels"]:
-                            shape += (info["n_levels"],)
-                        rank_data_parts.append(np.zeros(shape, dtype=np.float32))
+                            shape.append(info["n_levels"])
+                        rank_data_parts.append(np.zeros(tuple(shape), dtype=np.float32))
 
             if rank_data_parts:
                 info["cache"] = np.concatenate(rank_data_parts, axis=0)
@@ -377,7 +386,7 @@ class MultiRankStatsReader:
     # ----------------------------------------------------------------------------------
     # Data getters
     # ----------------------------------------------------------------------------------
-    def _get_data_from_files(self, info: dict, t_index: int, level: Optional[int] = None) -> np.ndarray:
+    def _get_data_from_files(self, info: dict, t_index: int, level: Optional[int] = None, trial: int = 0) -> np.ndarray:
         """Helper to fetch data for a single time step from the correct file."""
         orig_time = int(self._t_indices[t_index])
         
@@ -388,10 +397,23 @@ class MultiRankStatsReader:
                 fp = info["paths"][i]
                 with nc.Dataset(fp, "r") as ds:
                     var = ds.variables[self.var_name]
+                    
+                    # Build index tuple
+                    # 1. time
+                    indices = [local_time]
+                    
+                    # 2. trial
+                    if info["has_trials"]:
+                        indices.append(trial)
+                        
+                    # 3. saved_points (all)
+                    indices.append(slice(None))
+                    
+                    # 4. levels
                     if info["has_levels"]:
-                        return var[local_time, :, level if level is not None else 0]
-                    else:
-                        return var[local_time, :]
+                        indices.append(level if level is not None else 0)
+                        
+                    return var[tuple(indices)]
         
         # Should not happen if t_index is valid
         raise IndexError(f"Time index {orig_time} not found in any file.")
@@ -400,6 +422,7 @@ class MultiRankStatsReader:
         self,
         t_index: int,
         level: Optional[int] = None,
+        trial: int = 0,
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
         if t_index < 0 or t_index >= self._time_len:
@@ -413,12 +436,17 @@ class MultiRankStatsReader:
             
             cache_arr = info.get("cache")
             if cache_arr is not None:
+                # cache_arr shape: (time, [trial], saved_points, [levels])
+                indices = [t_index]
+                if info["has_trials"]:
+                    indices.append(trial)
+                indices.append(slice(None))
                 if info["has_levels"]:
-                    data = cache_arr[t_index, :, level if level is not None else 0]
-                else:
-                    data = cache_arr[t_index, :]
+                    indices.append(level if level is not None else 0)
+                
+                data = cache_arr[tuple(indices)]
             else:
-                data = self._get_data_from_files(info, t_index, level)
+                data = self._get_data_from_files(info, t_index, level, trial)
                 
             arr = np.array(data, copy=False)
             if dtype is not None:
@@ -430,6 +458,7 @@ class MultiRankStatsReader:
         self,
         t_index: int,
         level: Optional[int] = None,
+        trial: int = 0,
         fill_value: float = np.nan,
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
@@ -451,16 +480,21 @@ class MultiRankStatsReader:
             
             cache_arr = info.get("cache")
             if cache_arr is not None:
+                # cache_arr shape: (time, [trial], saved_points, [levels])
+                indices = [t_index]
+                if info["has_trials"]:
+                    indices.append(trial)
+                indices.append(slice(None))
                 if info["has_levels"]:
                     if level is None:
                         raise ValueError("This variable has 'levels'; please specify 'level'.")
-                    vals = cache_arr[t_index, :, level]
-                else:
-                    vals = cache_arr[t_index, :]
+                    indices.append(level)
+                
+                vals = cache_arr[tuple(indices)]
             else:
                 if info["has_levels"] and level is None:
                      raise ValueError("This variable has 'levels'; please specify 'level'.")
-                vals = self._get_data_from_files(info, t_index, level)
+                vals = self._get_data_from_files(info, t_index, level, trial)
                 
             grid[x, y] = np.array(vals, copy=False)
         return grid
@@ -469,6 +503,7 @@ class MultiRankStatsReader:
         self,
         points: Union[np.ndarray, Sequence[np.ndarray]],
         level: Optional[int] = None,
+        trial: int = 0,
         fill_value: float = np.nan,
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
@@ -572,14 +607,35 @@ class MultiRankStatsReader:
             info = self._rank_files[r_idx]
             cache_arr = info.get("cache")
             if cache_arr is not None:
+                # cache_arr shape: (time, [trial], saved_points, [levels])
+                indices = [slice(None)] # time: all
+                if info["has_trials"]:
+                    indices.append(trial)
+                indices.append(slice(None)) # saved_points: placeholder, will index later
                 if info["has_levels"]:
                     if level is None:
                         raise ValueError("This variable has 'levels'; specify `level`.")
-                    for col, li in pairs:
-                        out[:, col] = np.asarray(cache_arr[:, li, level], dtype=dtype or np.float32)
-                else:
-                    for col, li in pairs:
-                        out[:, col] = np.asarray(cache_arr[:, li], dtype=dtype or np.float32)
+                    indices.append(level)
+                
+                # We need to be careful with indexing. 
+                # cache_arr[indices] gives us (time, saved_points) or similar.
+
+                # Construct base indices tuple
+                base_indices = [slice(None)] # time
+                if info["has_trials"]:
+                    base_indices.append(trial)
+                
+                # saved_points dim is next.
+                # levels dim is last.
+                
+                for col, li in pairs:
+                    # Construct specific indices for this point
+                    pt_indices = list(base_indices)
+                    pt_indices.append(li) # saved_points index
+                    if info["has_levels"]:
+                        pt_indices.append(level)
+                    
+                    out[:, col] = np.asarray(cache_arr[tuple(pt_indices)], dtype=dtype or np.float32)
                 continue
 
             # No cache: minimize I/O by opening once and slicing contiguous time window
@@ -608,14 +664,28 @@ class MultiRankStatsReader:
                     try:
                         with nc.Dataset(fp, "r") as ds:
                             var = ds.variables[self.var_name]
+                            
+                            # Build slicing tuple
+                            # 1. time
+                            slices = [slice(local_start, local_end)]
+                            
+                            # 2. trial
+                            if info["has_trials"]:
+                                slices.append(trial)
+                                
+                            # 3. saved_points (using advanced indexing with `idx`)
+                            slices.append(idx)
+                            
+                            # 4. levels
                             if info["has_levels"]:
                                 if level is None:
                                     raise ValueError("This variable has 'levels'; specify `level`.")
-                                chunk = np.asarray(var[local_start:local_end, idx, level])
-                            else:
-                                chunk = np.asarray(var[local_start:local_end, idx])
+                                slices.append(level)
+                                
+                            chunk = np.asarray(var[tuple(slices)])
                         
                         # Scatter chunk to output columns
+                        # chunk shape should be (time_len, num_points)
                         for k, (col, _) in enumerate(pairs):
                             out[out_start:out_end, col] = chunk[:, k].astype(dtype or np.float32, copy=False)
                     except Exception as e:
@@ -703,6 +773,7 @@ class MultiRankStatsReader:
         self,
         t_index: int = 0,
         level: Optional[int] = None,
+        trial: int = 0,
         vmin: Optional[float] = None,
         vmax: Optional[float] = None,
         cmap: str = "viridis",
@@ -716,7 +787,7 @@ class MultiRankStatsReader:
 
         fig, ax = plt.subplots(figsize=figsize)
         if self.map_shape is not None:
-            grid = self.get_grid(t_index, level=level)
+            grid = self.get_grid(t_index, level=level, trial=trial)
             im = ax.imshow(grid.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             ax.set_title(f"{self.var_name} @ {t_str}")
@@ -735,18 +806,35 @@ class MultiRankStatsReader:
                 ys.append(info["y"])
                 cache_arr = info.get("cache")
                 if cache_arr is not None:
+                    # cache_arr shape: (time, [trial], saved_points, [levels])
+                    indices = [t_index]
+                    if info["has_trials"]:
+                        indices.append(trial)
+                    indices.append(slice(None))
                     if info["has_levels"]:
-                        vv = cache_arr[t_index, :, level if level is not None else 0]
-                    else:
-                        vv = cache_arr[t_index, :]
+                        indices.append(level if level is not None else 0)
+                    vv = cache_arr[tuple(indices)]
                 else:
                     orig_t = int(self._t_indices[t_index])
                     with nc.Dataset(info["path"], "r") as ds:
                         var = ds.variables[self.var_name]
+                        
+                        # Build slicing tuple
+                        # 1. time
+                        indices = [orig_t]
+                        
+                        # 2. trial
+                        if info["has_trials"]:
+                            indices.append(trial)
+                            
+                        # 3. saved_points (all)
+                        indices.append(slice(None))
+                        
+                        # 4. levels
                         if info["has_levels"]:
-                            vv = var[orig_t, :, level] if level is not None else var[orig_t, :, 0]
-                        else:
-                            vv = var[orig_t, :]
+                            indices.append(level if level is not None else 0)
+                            
+                        vv = var[tuple(indices)]
                 vals.append(np.array(vv))
             x_all = np.concatenate(xs) if xs else np.array([])
             y_all = np.concatenate(ys) if ys else np.array([])
@@ -764,6 +852,7 @@ class MultiRankStatsReader:
         self,
         out_path: Union[str, Path],
         level: Optional[int] = None,
+        trial: int = 0,
         x_range: Optional[Tuple[int, int]] = None,
         y_range: Optional[Tuple[int, int]] = None,
         t_range: Optional[Tuple[int, int]] = None,
@@ -788,7 +877,7 @@ class MultiRankStatsReader:
         if xmin > xmax or ymin > ymax:
             raise ValueError("Invalid x_range or y_range")
 
-        first_grid = self.get_grid(t_start, level=level)
+        first_grid = self.get_grid(t_start, level=level, trial=trial)
         window = first_grid[xmin:xmax + 1, ymin:ymax + 1]
         if vmin is None:
             vmin = np.nanmin(window) if np.isfinite(window).any() else 0.0
@@ -807,7 +896,7 @@ class MultiRankStatsReader:
 
         def _update(frame_idx: int):
             ti = t_start + frame_idx
-            grid = self.get_grid(ti, level=level)
+            grid = self.get_grid(ti, level=level, trial=trial)
             win = grid[xmin:xmax + 1, ymin:ymax + 1]
             im.set_data(win.T)
             ttl.set_text(f"{self.var_name} @ {self.times[ti].isoformat()}")
@@ -840,6 +929,7 @@ class MultiRankStatsReader:
         out_dir: Union[str, Path],
         out_var_name: str,
         t_range: Optional[Tuple[int, int]] = None,
+        trial: int = 0,
         fill_value: float = 1e20,
         dtype: np.dtype = np.float32,
         progress: bool = True,
@@ -870,7 +960,7 @@ class MultiRankStatsReader:
                 print(f"[BIN] writing year {year} -> {year_path.name} ({len(year_to_indices[year])} frames)")
             with open(year_path, "wb") as fw:
                 for ti in year_to_indices[year]:
-                    grid = self.get_grid(ti, level=None, fill_value=fill_value, dtype=dtype)
+                    grid = self.get_grid(ti, level=None, trial=trial, fill_value=fill_value, dtype=dtype)
                     grid = np.where(np.isfinite(grid), grid, fill_value).astype(dtype, copy=False)
                     fw.write(np.asfortranarray(grid).tobytes(order="F"))
 
@@ -917,6 +1007,8 @@ class MultiRankStatsReader:
         for i, info in enumerate(self._rank_files):
             lines.append(
                 f"  - rank[{i}]: file={info['path'].name}, saved_points={info['saved_points']}, "
-                f"levels={'yes' if info['has_levels'] else 'no'}, coord={info['coord_name'] or 'N/A'}"
+                f"trials={'yes (' + str(info['n_trials']) + ')' if info['has_trials'] else 'no'}, "
+                f"levels={'yes (' + str(info['n_levels']) + ')' if info['has_levels'] else 'no'}, "
+                f"coord={info['coord_name'] or 'N/A'}"
             )
         print("\n".join(lines))

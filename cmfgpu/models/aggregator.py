@@ -56,12 +56,12 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
     
     Args:
         args: Tuple containing (mean_var_name, metadata, coord_values, 
-              output_dir, complevel, rank, year, calendar, time_unit)
+              output_dir, complevel, rank, year, calendar, time_unit, num_trials)
         
     Returns:
         Path to the created NetCDF file
     """
-    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit) = args
+    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials) = args
 
     if year is not None:
         filename = f"{mean_var_name}_rank{rank}_{year}.nc"
@@ -84,15 +84,26 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
         # Create spatial/vertical dimensions based on actual shape
         dim_names = ['time']  # Always start with time
         
-        if len(actual_shape) == 1:
-            # 1D spatial: time + saved points
+        if num_trials > 1:
+            dim_names.append('trial')
+            ncfile.createDimension('trial', num_trials)
+            
             dim_names.append('saved_points')
-            ncfile.createDimension('saved_points', actual_shape[0])
-        elif len(actual_shape) == 2:
-            # 2D: time + saved points + levels
-            dim_names.extend(['saved_points', 'levels'])
-            ncfile.createDimension('saved_points', actual_shape[0])
-            ncfile.createDimension('levels', actual_shape[1])
+            ncfile.createDimension('saved_points', actual_shape[1])
+            
+            if len(actual_shape) > 2:
+                dim_names.append('levels')
+                ncfile.createDimension('levels', actual_shape[2])
+        else:
+            if len(actual_shape) == 1:
+                # 1D spatial: time + saved points
+                dim_names.append('saved_points')
+                ncfile.createDimension('saved_points', actual_shape[0])
+            elif len(actual_shape) == 2:
+                # 2D: time + saved points + levels
+                dim_names.extend(['saved_points', 'levels'])
+                ncfile.createDimension('saved_points', actual_shape[0])
+                ncfile.createDimension('levels', actual_shape[1])
         if coord_name and coord_values is not None:
             coord_var = ncfile.createVariable(
                 coord_name,
@@ -125,7 +136,7 @@ class StatisticsAggregator:
     
     def __init__(self, device: torch.device, output_dir: Path, rank: int, 
                  num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
-                 output_split_by_year: bool = False):
+                 output_split_by_year: bool = False, num_trials: int = 1):
         """
         Initialize the statistics aggregator.
         
@@ -136,6 +147,7 @@ class StatisticsAggregator:
             num_workers: Number of worker processes for parallel NetCDF writing
             save_kernels: Whether to save generated kernel files for inspection
             output_split_by_year: Whether to split output files by year
+            num_trials: Number of parallel simulations
         """
         self.device = device
         self.output_dir = output_dir
@@ -144,6 +156,7 @@ class StatisticsAggregator:
         self.complevel = complevel
         self.save_kernels = save_kernels
         self.output_split_by_year = output_split_by_year
+        self.num_trials = num_trials
         self.calendar = None
         self.time_unit = None
         self._current_year = None
@@ -233,13 +246,6 @@ class StatisticsAggregator:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor for {name}, got {type(tensor)}")
         
-        # Check if the tensor is marked as intermediate
-        json_schema_extra = getattr(field_info, 'json_schema_extra', {})
-        if json_schema_extra and json_schema_extra.get('intermediate'):
-            raise ValueError(
-                f"Cannot register intermediate tensor '{name}' for statistics aggregation. "
-                f"Intermediate tensors are cleared to save memory."
-            )
 
         self._tensor_registry[name] = tensor
         self._field_registry[name] = field_info
@@ -309,7 +315,7 @@ class StatisticsAggregator:
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit)
+                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials)
                 future = executor.submit(_create_netcdf_file_process, args)
                 creation_futures[future] = out_name
             
@@ -511,8 +517,12 @@ class StatisticsAggregator:
                                    save_idx: str, var_list: List[str],
                                    tensor_info: Dict[str, Dict[str, Any]]) -> None:
         """Generate kernel code for a specific save_idx group supporting ops."""
-        dims_1d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 1]
-        dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
+        if self.num_trials > 1:
+            dims_1d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
+            dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 3]
+        else:
+            dims_1d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 1]
+            dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
 
         # Header
         kernel_code_lines.extend([
@@ -543,6 +553,8 @@ class StatisticsAggregator:
             kernel_code_lines.append("    n_levels: tl.constexpr,")
         kernel_code_lines.extend([
             "    BLOCK_SIZE: tl.constexpr,",
+            "    num_trials: tl.constexpr,",
+            "    stride_input: tl.constexpr,",
             "):",
             "    pid = tl.program_id(0)",
             "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
@@ -552,154 +564,167 @@ class StatisticsAggregator:
             "",
         ])
 
+        # Loop over trials
+        kernel_code_lines.append("    for t in range(num_trials):")
+        indent = "        "
+        indent2 = indent + "    "
+        indent3 = indent2 + "    "
+
         # 1D processing
         if dims_1d:
             kernel_code_lines.extend([
-                "    # 1D variables",
+                f"{indent}# 1D variables",
             ])
             for var in dims_1d:
                 ops = self._variable_ops[var]
+                # Adjust pointers
+                in_ptr = f"{var}_ptr + t * stride_input + idx"
+                out_offset = f"t * n_saved_points + offs"
+
                 if len(ops) == 1 and ops[0] == 'last':
                     # last-only: load only when needed
                     kernel_code_lines.extend([
-                        "    if is_last:",
-                        f"        val = tl.load({var}_ptr + idx, mask=mask, other=0.0)",
-                        f"        tl.store({var}_last_ptr + offs, val, mask=mask)",
+                        f"{indent}if is_last:",
+                        f"{indent2}val = tl.load({in_ptr}, mask=mask, other=0.0)",
+                        f"{indent2}tl.store({var}_last_ptr + {out_offset}, val, mask=mask)",
                     ])
                 else:
-                    kernel_code_lines.append(f"    val = tl.load({var}_ptr + idx, mask=mask, other=0.0)")
+                    kernel_code_lines.append(f"{indent}val = tl.load({in_ptr}, mask=mask, other=0.0)")
                     for op in ops:
+                        out_ptr = f"{var}_{op}_ptr + {out_offset}"
                         if op == 'mean':
                             kernel_code_lines.extend([
-                                "    if is_first:",
-                                f"        old = tl.zeros_like(val)",
-                                "    else:",
-                                f"        old = tl.load({var}_mean_ptr + offs, mask=mask, other=0.0)",
-                                f"    new = old + val * weight",
-                                "    if is_last:",
-                                f"        new = new / total_weight",
-                                f"    tl.store({var}_mean_ptr + offs, new, mask=mask)",
+                                f"{indent}if is_first:",
+                                f"{indent2}old = tl.zeros_like(val)",
+                                f"{indent}else:",
+                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                f"{indent}new = old + val * weight",
+                                f"{indent}if is_last:",
+                                f"{indent2}new = new / total_weight",
+                                f"{indent}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'max':
                             kernel_code_lines.extend([
-                                "    if is_first:",
-                                f"        tl.store({var}_max_ptr + offs, val, mask=mask)",
-                                "    else:",
-                                f"        old = tl.load({var}_max_ptr + offs, mask=mask, other=val)",
-                                "        new = tl.maximum(old, val)",
-                                f"        tl.store({var}_max_ptr + offs, new, mask=mask)",
+                                f"{indent}if is_first:",
+                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
+                                f"{indent}else:",
+                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=val)",
+                                f"{indent2}new = tl.maximum(old, val)",
+                                f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'min':
                             kernel_code_lines.extend([
-                                "    if is_first:",
-                                f"        tl.store({var}_min_ptr + offs, val, mask=mask)",
-                                "    else:",
-                                f"        old = tl.load({var}_min_ptr + offs, mask=mask, other=val)",
-                                "        new = tl.minimum(old, val)",
-                                f"        tl.store({var}_min_ptr + offs, new, mask=mask)",
+                                f"{indent}if is_first:",
+                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
+                                f"{indent}else:",
+                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=val)",
+                                f"{indent2}new = tl.minimum(old, val)",
+                                f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'last':
                             kernel_code_lines.extend([
-                                "    if is_last:",
-                                f"        tl.store({var}_last_ptr + offs, val, mask=mask)",
+                                f"{indent}if is_last:",
+                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
                             ])
                 kernel_code_lines.append("")
 
-    # 2D processing
+        # 2D processing
         if dims_2d:
             non_last_only = [v for v in dims_2d if not (len(self._variable_ops[v]) == 1 and self._variable_ops[v][0] == 'last')]
             last_only_vars = [v for v in dims_2d if (len(self._variable_ops[v]) == 1 and self._variable_ops[v][0] == 'last')]
 
             if non_last_only:
                 kernel_code_lines.extend([
-                    "    # 2D variables (mean/min/max and mixed)",
-                    "    for level in tl.static_range(n_levels):",
+                    f"{indent}# 2D variables (mean/min/max and mixed)",
+                    f"{indent}for level in tl.static_range(n_levels):",
                 ])
                 for var in non_last_only:
-                    kernel_code_lines.append(f"        val = tl.load({var}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+                    in_ptr = f"{var}_ptr + (t * stride_input + idx) * n_levels + level"
+                    out_offset = f"(t * n_saved_points + offs) * n_levels + level"
+                    
+                    kernel_code_lines.append(f"{indent2}val = tl.load({in_ptr}, mask=mask, other=0.0)")
                     for op in self._variable_ops[var]:
+                        out_ptr = f"{var}_{op}_ptr + {out_offset}"
                         if op == 'mean':
                             kernel_code_lines.extend([
-                                "        if is_first:",
-                                f"            old = tl.zeros_like(val)",
-                                "        else:",
-                                f"            old = tl.load({var}_mean_ptr + offs * n_levels + level, mask=mask, other=0.0)",
-                                f"        new = old + val * weight",
-                                "        if is_last:",
-                                f"            new = new / total_weight",
-                                f"        tl.store({var}_mean_ptr + offs * n_levels + level, new, mask=mask)",
+                                f"{indent2}if is_first:",
+                                f"{indent3}old = tl.zeros_like(val)",
+                                f"{indent2}else:",
+                                f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                f"{indent2}new = old + val * weight",
+                                f"{indent2}if is_last:",
+                                f"{indent3}new = new / total_weight",
+                                f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'max':
                             kernel_code_lines.extend([
-                                "        if is_first:",
-                                f"            tl.store({var}_max_ptr + offs * n_levels + level, val, mask=mask)",
-                                "        else:",
-                                f"            old = tl.load({var}_max_ptr + offs * n_levels + level, mask=mask, other=val)",
-                                "            new = tl.maximum(old, val)",
-                                f"            tl.store({var}_max_ptr + offs * n_levels + level, new, mask=mask)",
+                                f"{indent2}if is_first:",
+                                f"{indent3}tl.store({out_ptr}, val, mask=mask)",
+                                f"{indent2}else:",
+                                f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
+                                f"{indent3}new = tl.maximum(old, val)",
+                                f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'min':
                             kernel_code_lines.extend([
-                                "        if is_first:",
-                                f"            tl.store({var}_min_ptr + offs * n_levels + level, val, mask=mask)",
-                                "        else:",
-                                f"            old = tl.load({var}_min_ptr + offs * n_levels + level, mask=mask, other=val)",
-                                "            new = tl.minimum(old, val)",
-                                f"            tl.store({var}_min_ptr + offs * n_levels + level, new, mask=mask)",
+                                f"{indent2}if is_first:",
+                                f"{indent3}tl.store({out_ptr}, val, mask=mask)",
+                                f"{indent2}else:",
+                                f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
+                                f"{indent3}new = tl.minimum(old, val)",
+                                f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'last':
                             kernel_code_lines.extend([
-                                "        if is_last:",
-                                f"            tl.store({var}_last_ptr + offs * n_levels + level, val, mask=mask)",
+                                f"{indent2}if is_last:",
+                                f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                             ])
                 kernel_code_lines.append("")
 
             if last_only_vars:
                 kernel_code_lines.extend([
-                    "    # 2D variables (last-only)",
-                    "    if is_last:",
-                    "        for level in tl.static_range(n_levels):",
+                    f"{indent}# 2D variables (last-only)",
+                    f"{indent}if is_last:",
+                    f"{indent2}for level in tl.static_range(n_levels):",
                 ])
                 for var in last_only_vars:
+                    in_ptr = f"{var}_ptr + (t * stride_input + idx) * n_levels + level"
+                    out_offset = f"(t * n_saved_points + offs) * n_levels + level"
                     kernel_code_lines.extend([
-                        f"            val = tl.load({var}_ptr + idx * n_levels + level, mask=mask, other=0.0)",
-                        f"            tl.store({var}_last_ptr + offs * n_levels + level, val, mask=mask)",
+                        f"{indent3}val = tl.load({in_ptr}, mask=mask, other=0.0)",
+                        f"{indent3}tl.store({var}_last_ptr + {out_offset}, val, mask=mask)",
                     ])
-                kernel_code_lines.append("")
-    
+        kernel_code_lines.append("")
+
     def _generate_main_function(self, kernel_code_lines: List[str],
                                 grouped_by_save_idx: Dict[str, List[str]],
                                 tensor_info: Dict[str, Dict[str, Any]]) -> None:
-        """Generate the main aggregation function."""
+        """Generate the main python function that calls kernels."""
         kernel_code_lines.extend([
-            "",
-            "# ============================================================================",
-            "# Main aggregation function",
-            "# ============================================================================",
-            "",
+            "# Main update function",
             "def internal_update_statistics(states, weight, total_weight, is_first, is_last, BLOCK_SIZE):",
-            '    """',
-            '    Update statistics for all registered variables (mean/max/min/last).',
-            '    ',
-            '    Args:',
-            '        states: Dictionary of tensor states',
-            '        weight: dt (seconds) for this sub-step',
-            '        total_weight: total dt (seconds) for the window; used only when is_last==1',
-            '        is_first: 1 on first sub-step, 0 otherwise',
-            '        is_last: 1 on final sub-step of the time step, else 0',
-            '        BLOCK_SIZE: GPU block size',
-            '    """',
         ])
+        
+        if self.num_trials > 1:
+             kernel_code_lines.append(f"    num_trials = {self.num_trials}")
+        else:
+             kernel_code_lines.append(f"    num_trials = 1")
+
         for save_idx, var_list in grouped_by_save_idx.items():
             kernel_name = f"kernel_{save_idx}"
             
-            # Check if any 2D variables exist in this group
-            dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
+            # Get stride_input from metadata of first variable
+            first_var = var_list[0]
+            stride_input = 0
+            for out_name, meta in self._metadata.items():
+                if meta['original_variable'] == first_var:
+                    stride_input = meta.get('stride_input', 0)
+                    break
             
             kernel_code_lines.extend([
-                f"    # Process variables with save_idx: {save_idx}",
-                f"    # Variables: {', '.join(var_list)}",
-                f"    save_idx_len = states['{save_idx}'].shape[0]",
+                f"    # Launch kernel for {save_idx}",
+                f"    save_idx_len = len(states['{save_idx}'])",
+                f"    stride_input = {stride_input}",
                 f"    grid_{save_idx} = lambda meta: (triton.cdiv(save_idx_len, meta['BLOCK_SIZE']),)",
                 f"    {kernel_name}[grid_{save_idx}](",
                 f"        {save_idx}_ptr=states['{save_idx}'],",
@@ -720,14 +745,21 @@ class StatisticsAggregator:
             ])
             
             # Add second dimension if needed (use actual shape)
+            if self.num_trials > 1:
+                dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 3]
+            else:
+                dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
+
             if dims_2d:
                 var_2d = dims_2d[0]
                 actual_shape = tensor_info[var_2d]['actual_shape']
-                n_levels = actual_shape[1]
+                n_levels = actual_shape[-1]
                 kernel_code_lines.append(f"        n_levels={n_levels},")
             
             kernel_code_lines.extend([
-                "        BLOCK_SIZE=BLOCK_SIZE",
+                "        BLOCK_SIZE=BLOCK_SIZE,",
+                "        num_trials=num_trials,",
+                "        stride_input=stride_input,",
                 "    )",
                 "",
             ])
@@ -825,12 +857,16 @@ class StatisticsAggregator:
                 raise ValueError(f"Variable '{var_name}' must have save_idx in json_schema_extra")
 
             if save_idx in self._tensor_registry:
-                actual_shape = (len(self._tensor_registry[save_idx]),) + tensor.shape[1:]
+                if self.num_trials > 1:
+                    actual_shape = (self.num_trials, len(self._tensor_registry[save_idx])) + tensor.shape[2:]
+                else:
+                    actual_shape = (len(self._tensor_registry[save_idx]),) + tensor.shape[1:]
             else:
                 raise ValueError(f"Save index '{save_idx}' not registered in tensor registry")
             actual_ndim = tensor.ndim
-            if actual_ndim > 2:
-                raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only 1D and 2D variables are supported.")
+            max_ndim = 3 if self.num_trials > 1 else 2
+            if actual_ndim > max_ndim:
+                raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only up to {max_ndim}D variables are supported.")
 
             # Track
             self._variables.add(var_name)
@@ -860,6 +896,7 @@ class StatisticsAggregator:
                     'actual_ndim': actual_ndim,
                     'save_coord': save_coord,
                     'description': f"{description} ({op})",
+                    'stride_input': tensor.shape[1] if self.num_trials > 1 else 0,
                 }
                 self._metadata[out_name] = meta
 
