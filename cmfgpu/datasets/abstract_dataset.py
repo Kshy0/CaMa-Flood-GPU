@@ -264,20 +264,35 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         Map grid runoff to catchments and handle distributed sync.
 
-        Expected input shape: (B, T, N). We'll flatten the first two
-        dimensions into a single time-like dimension before mapping to catchments.
-        Output shape: ((B*T), C) where C = number of catchments mapped.
+        Expected input shape: 
+          - (B, T, N) for single trial
+          - (B, T, K, N) for K trials
+        
+        We'll flatten the non-spatial dimensions into a single dimension before mapping.
+        Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
         if batch_runoff.dim() == 3:
             B, T, N = batch_runoff.shape
             flat = batch_runoff.reshape(B * T, N)
+        elif batch_runoff.dim() == 4:
+            B, T, K, N = batch_runoff.shape
+            flat = batch_runoff.reshape(B * T * K, N)
         else:
-            raise ValueError(f"batch_runoff must be 3D, got shape {tuple(batch_runoff.shape)}")
+            raise ValueError(f"batch_runoff must be 3D or 4D, got shape {tuple(batch_runoff.shape)}")
 
         if world_size > 1:
             dist.broadcast(flat, src=0)
 
         out = (flat[:, local_runoff_indices] @ local_runoff_matrix).contiguous()
+        
+        # If input was 4D (B, T, K, N), reshape output to (B*T, K, C)
+        # This makes it ready for step-by-step slicing in the main loop
+        if batch_runoff.dim() == 4:
+            B, T, K, N = batch_runoff.shape
+            # out is currently (B*T*K, C)
+            # Reshape to (B*T, K, C) so that out[step] gives (K, C) for all trials
+            out = out.view(B * T, K, -1)
+            
         return out
 
     def build_local_runoff_matrix(self, 
