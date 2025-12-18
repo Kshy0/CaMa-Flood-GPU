@@ -21,8 +21,9 @@ import cftime
 import netCDF4 as nc
 import numpy as np
 import torch
-from cmfgpu.models.utils import torch_to_numpy_dtype
 from pydantic.fields import FieldInfo
+
+from cmfgpu.models.utils import torch_to_numpy_dtype
 
 
 def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:

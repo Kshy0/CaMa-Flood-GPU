@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, List
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import numpy.ma as ma
@@ -202,12 +202,6 @@ class InputProxy:
                                         data = data.astype("u1")
                                     merged_var[:] = data
 
-    def __getitem__(self, key: str) -> Any:
-        return self.data[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.data[key] = value
-
     def set_variable(self, name: str, value: Any, indices: Optional[Any] = None) -> None:
         """
         Set or update a variable.
@@ -234,6 +228,12 @@ class InputProxy:
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.data[key] = value
 
     def __contains__(self, key: str) -> bool:
         return key in self.data

@@ -40,22 +40,6 @@ class NetCDFDataset(AbstractDataset):
         
         self.validate_files_exist(file_paths)
 
-    def is_valid_time_index(self, idx: int) -> bool:
-        """
-        Checks if the given time index corresponds to a valid data step (not padding).
-        """
-        chunk_idx = idx // self.chunk_len
-        offset = idx % self.chunk_len
-        
-        if chunk_idx >= len(self._plan):
-             return False
-
-        _, ops = self._plan[chunk_idx]
-        # Calculate real length of this chunk
-        real_len = sum(len(x[1]) for x in ops)
-        
-        return offset < real_len
-
     def _scan_time_metadata(self, start_dt: Union[datetime, cftime.datetime], end_dt: Union[datetime, cftime.datetime]) -> None:
         """Read only time vars to construct a global time index and lookup map."""
         # Build key -> first_dt map to help with date guessing
@@ -81,8 +65,16 @@ class NetCDFDataset(AbstractDataset):
                 if tvar is None:
                     raise ValueError(f"Time variable not found in file: {path.name}")
 
+                # Auto-detect calendar if not provided by user
+                file_calendar = getattr(tvar, "calendar", "standard")
+                if self.calendar != file_calendar:
+                    self.update_calendar(file_calendar)
+                    # Also update local loop bounds to match the new calendar
+                    start_dt = self._convert_to_calendar(start_dt)
+                    end_dt = self._convert_to_calendar(end_dt)
+
                 try:
-                    raw_dates = num2date(tvar[:], tvar.units, getattr(tvar, "calendar", "standard"))
+                    raw_dates = num2date(tvar[:], tvar.units, file_calendar)
                     dates = list(raw_dates)
                 except (ValueError, TypeError):
                     # Fallback for "days since start" or similar non-standard units
@@ -214,18 +206,16 @@ class NetCDFDataset(AbstractDataset):
         start_date: Union[datetime, cftime.datetime],
         end_date: Union[datetime, cftime.datetime],
         time_interval: timedelta = timedelta(days=1),
+        chunk_len: int = 24,
         unit_factor: float = 1.0,
         var_name: str = "Runoff",
         prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
         suffix: str = ".nc",
-        out_dtype: str = "float32",
-        chunk_len: int = 24,
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
         *args,
         **kwargs,
     ):
         self.base_dir = base_dir
-        self.time_interval = time_interval
         self.unit_factor = unit_factor
         self.var_name = var_name
         self.prefix = prefix
@@ -241,7 +231,14 @@ class NetCDFDataset(AbstractDataset):
         self._chunk_plan = []
 
         # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
-        super().__init__(out_dtype=out_dtype, chunk_len=chunk_len, time_interval=time_interval, start_date=start_date, end_date=end_date, *args, **kwargs)
+        super().__init__(
+            time_interval=time_interval,
+            start_date=start_date,
+            end_date=end_date,
+            chunk_len=chunk_len,
+            *args,
+            **kwargs,
+        )
         
         # Determine full data range needed
         scan_start = self.start_date
@@ -254,6 +251,22 @@ class NetCDFDataset(AbstractDataset):
 
         self._scan_time_metadata(scan_start, scan_end)
         self._build_simulation_plan()
+
+    def is_valid_time_index(self, idx: int) -> bool:
+        """
+        Checks if the given time index corresponds to a valid data step (not padding).
+        """
+        chunk_idx = idx // self.chunk_len
+        offset = idx % self.chunk_len
+        
+        if chunk_idx >= len(self._plan):
+             return False
+
+        _, ops = self._plan[chunk_idx]
+        # Calculate real length of this chunk
+        real_len = sum(len(x[1]) for x in ops)
+        
+        return offset < real_len
 
     # -------------------------
     # Variable shape helpers

@@ -40,6 +40,7 @@ class DailyBinDataset(AbstractDataset):
                  prefix: str = "Roff____",
                  suffix: str = ".one",
                  out_dtype: str = "float32",
+                 calendar: str = "standard",
                  *args, **kwargs):
 
         self.base_dir = base_dir
@@ -48,7 +49,7 @@ class DailyBinDataset(AbstractDataset):
         self.bin_dtype = bin_dtype
         self.prefix = prefix
         self.suffix = suffix
-        super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, *args, **kwargs)
+        super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, calendar=calendar, *args, **kwargs)
         self._validate_files_exist()
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:

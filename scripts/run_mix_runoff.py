@@ -4,9 +4,8 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-import cftime
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -35,16 +34,15 @@ def main():
     prefetch_factor = 2
     BLOCK_SIZE = 128
     save_state = False
-    calendar = "standard"
 
     # Spin-up configuration
     do_spin_up = True
-    spin_up_start_date = cftime.datetime(1950, 1, 1, calendar=calendar)
-    spin_up_end_date = cftime.datetime(1950, 12, 31, calendar=calendar)
+    spin_up_start_date = datetime(1950, 1, 1)
+    spin_up_end_date = datetime(1950, 12, 31)
     spin_up_cycles = 1
 
-    start_date = cftime.datetime(1950, 1, 1, calendar=calendar)
-    end_date = cftime.datetime(1950, 12, 31, calendar=calendar)
+    start_date = datetime(1950, 1, 1)
+    end_date = datetime(1950, 12, 31)
     runoff_dir = "/home/eat/cmf_v420_pkg/map/jpn_runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_nc.npz"
     runoff_time_interval = timedelta(days=1)

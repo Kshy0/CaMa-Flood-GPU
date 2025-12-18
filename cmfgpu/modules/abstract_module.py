@@ -14,8 +14,8 @@ from abc import ABC
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Tuple
 
 import torch
-from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr, computed_field,
-                      field_validator, model_validator)
+from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
+                      computed_field, field_validator, model_validator)
 from pydantic.fields import FieldInfo
 
 
@@ -152,6 +152,8 @@ class AbstractModule(BaseModel, ABC):
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
     precision: torch.dtype = Field(default=torch.float32, description="Data type for tensors")
     num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
+    
+    _expanded_params: set = PrivateAttr(default_factory=set)
 
     @field_validator('num_trials')
     @classmethod
@@ -159,8 +161,6 @@ class AbstractModule(BaseModel, ABC):
         if v is not None and v <= 1:
             raise ValueError("num_trials must be greater than 1 if specified. For single trial, use None.")
         return v
-    
-    _expanded_params: set = PrivateAttr(default_factory=set)
 
     def model_post_init(self, __context: Any):
         if self.module_name not in self.opened_modules:

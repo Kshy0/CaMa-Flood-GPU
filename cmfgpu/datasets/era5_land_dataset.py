@@ -55,14 +55,14 @@ class ERA5LandDataset(NetCDFDataset):
         base_dir: str,
         start_date: datetime,
         end_date: datetime,
-        unit_factor: float = 1.0, # mm/day divided by unit_factor to get m/s
         time_interval: timedelta = timedelta(hours=1),
         chunk_len: int = 24,
         var_name: str = "ro",
         prefix: str = "runoff_",
         suffix: str = ".nc",
-        out_dtype: str = "float32",
         time_to_key: Optional[Callable[[datetime], str]] = monthly_time_to_key,
+        spin_up_start_date: Optional[datetime] = None,
+        spin_up_end_date: Optional[datetime] = None,
         *args,
         **kwargs,
     ):
@@ -73,19 +73,26 @@ class ERA5LandDataset(NetCDFDataset):
                 f"length must be a positive multiple of num_daily_steps ({self.num_daily_steps}), got {chunk_len}"
             )
 
+        # Shift spin-up dates if provided, similar to main simulation dates
+        if spin_up_start_date is not None:
+            spin_up_start_date += time_interval
+        if spin_up_end_date is not None:
+            spin_up_end_date += time_interval
+
         super().__init__(
             base_dir=base_dir,
             start_date=start_date + time_interval,
             end_date=end_date + time_interval,
-            unit_factor=unit_factor,
             time_interval=time_interval,
+            chunk_len=chunk_len,
             var_name=var_name,
             prefix=prefix,
             suffix=suffix,
-            out_dtype=out_dtype,
-            chunk_len=chunk_len,
             time_to_key=time_to_key,
-            *args, **kwargs,
+            spin_up_start_date=spin_up_start_date,
+            spin_up_end_date=spin_up_end_date,
+            *args,
+            **kwargs,
         )
 
     def _transform_cumulative_to_incremental(self, arr: np.ndarray) -> np.ndarray:

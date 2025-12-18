@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+import cftime
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import netCDF4 as nc
@@ -164,9 +165,14 @@ class MultiRankStatsReader:
 
         t0 = np.concatenate(all_times)
         dt0 = nc.num2date(t0, units=self._time_units, calendar=self._time_calendar)
-        self._time_datetimes = [
-            datetime(d.year, d.month, d.day, d.hour, d.minute, d.second) for d in dt0
-        ]
+        
+        if self._time_calendar in ["standard", "gregorian"]:
+            self._time_datetimes = [
+                datetime(d.year, d.month, d.day, d.hour, d.minute, d.second) for d in dt0
+            ]
+        else:
+            self._time_datetimes = list(dt0)
+
         self._time_values_num = t0
         self._time_len = len(t0)
 
@@ -292,7 +298,7 @@ class MultiRankStatsReader:
                 Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]],
             ]
         ] = None,
-        time_range: Optional[Tuple[datetime, datetime]] = None,
+        time_range: Optional[Tuple[Union[datetime, cftime.datetime], Union[datetime, cftime.datetime]]] = None,
         cache_enabled: bool = False,
         split_by_year: bool = False,
     ):

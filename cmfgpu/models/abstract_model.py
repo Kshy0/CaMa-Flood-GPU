@@ -16,17 +16,16 @@ from typing import (Any, ClassVar, Dict, Iterator, List, Literal, Optional,
 
 import cftime
 import numpy as np
-import numpy.ma as ma
 import torch
 import torch.distributed as dist
+from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
+                      field_validator, model_validator)
+
 from cmfgpu.models.aggregator import StatisticsAggregator
 from cmfgpu.models.utils import compute_group_to_rank
 from cmfgpu.modules.abstract_module import AbstractModule
 from cmfgpu.params.input_proxy import InputProxy
 from cmfgpu.utils import find_indices_in_torch
-from netCDF4 import Dataset
-from pydantic import (BaseModel, ConfigDict, Field, FilePath, PrivateAttr,
-                      field_validator, model_validator)
 
 
 @dataclass
@@ -97,13 +96,6 @@ class AbstractModel(BaseModel, ABC):
     num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
     save_kernels: bool = Field(default=False, description="Whether to save generated Triton kernels")
 
-    @field_validator('num_trials')
-    @classmethod
-    def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None and v <= 1:
-            raise ValueError("num_trials must be greater than 1 if specified. For single trial, use None.")
-        return v
-
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
     
@@ -112,6 +104,13 @@ class AbstractModel(BaseModel, ABC):
     _active_plans: List[ActivePlan] = PrivateAttr(default_factory=list)
     _next_plan_idx: int = PrivateAttr(default=0)
     _cached_grouped_plans: Optional[Dict[Tuple[int, str], List[ActivePlan]]] = PrivateAttr(default=None)
+
+    @field_validator('num_trials')
+    @classmethod
+    def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 1:
+            raise ValueError("num_trials must be greater than 1 if specified. For single trial, use None.")
+        return v
 
     def _iter_all_fields(self, include_computed: bool = True) -> Iterator[Tuple[str, Type[AbstractModule], str, Any]]:
         """

@@ -14,23 +14,28 @@ from typing import Callable, ClassVar, Dict, Optional, Type, Union
 import cftime
 import torch
 import triton
+from pydantic import PrivateAttr, computed_field
+from torch import distributed as dist
+
 from cmfgpu.models.abstract_model import AbstractModel
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
 from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
-from cmfgpu.phys.adaptive_time import (compute_adaptive_time_step_batched_kernel,
-                                       compute_adaptive_time_step_kernel)
-from cmfgpu.phys.bifurcation import (compute_bifurcation_inflow_batched_kernel,
-                                     compute_bifurcation_inflow_kernel,
-                                     compute_bifurcation_outflow_batched_kernel,
-                                     compute_bifurcation_outflow_kernel)
-from cmfgpu.phys.levee import (compute_levee_bifurcation_outflow_batched_kernel,
-                               compute_levee_bifurcation_outflow_kernel,
-                               compute_levee_stage_batched_kernel,
-                               compute_levee_stage_kernel,
-                               compute_levee_stage_log_kernel)
+from cmfgpu.phys.adaptive_time import (
+    compute_adaptive_time_step_batched_kernel,
+    compute_adaptive_time_step_kernel)
+from cmfgpu.phys.bifurcation import (
+    compute_bifurcation_inflow_batched_kernel,
+    compute_bifurcation_inflow_kernel,
+    compute_bifurcation_outflow_batched_kernel,
+    compute_bifurcation_outflow_kernel)
+from cmfgpu.phys.levee import (
+    compute_levee_bifurcation_outflow_batched_kernel,
+    compute_levee_bifurcation_outflow_kernel,
+    compute_levee_stage_batched_kernel, compute_levee_stage_kernel,
+    compute_levee_stage_log_kernel)
 from cmfgpu.phys.outflow import (compute_inflow_batched_kernel,
                                  compute_inflow_kernel,
                                  compute_outflow_batched_kernel,
@@ -38,8 +43,6 @@ from cmfgpu.phys.outflow import (compute_inflow_batched_kernel,
 from cmfgpu.phys.storage import (compute_flood_stage_batched_kernel,
                                  compute_flood_stage_kernel,
                                  compute_flood_stage_log_kernel)
-from pydantic import PrivateAttr, computed_field
-from torch import distributed as dist
 
 
 class CaMaFlood(AbstractModel):

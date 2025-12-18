@@ -89,11 +89,32 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     Custom abstract class that inherits from PyTorch Dataset.
     Defines a common interface for accessing data with distributed support.
     """
-    def __init__(self, out_dtype: str = "float32", chunk_len: int = 1, 
-                 start_date: Optional[Union[datetime, cftime.datetime]] = None, end_date: Optional[Union[datetime, cftime.datetime]] = None,
-                 spin_up_cycles: int = 0, spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None, spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
-                 time_interval: Optional[timedelta] = None,
-                 *args, **kwargs):
+
+    def _convert_to_calendar(self, dt: Union[datetime, cftime.datetime]) -> Union[datetime, cftime.datetime]:
+        if dt is None:
+            return None
+        if self.calendar == "standard":
+            if isinstance(dt, cftime.datetime):
+                return datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+            return dt
+        else:
+            # Convert to cftime with self.calendar
+            # If it's already cftime, we recreate it to ensure the calendar attribute matches
+            return cftime.datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, calendar=self.calendar)
+    def __init__(
+        self,
+        start_date: Union[datetime, cftime.datetime],
+        end_date: Union[datetime, cftime.datetime],
+        time_interval: timedelta,
+        out_dtype: str = "float32",
+        chunk_len: int = 1,
+        spin_up_cycles: int = 0,
+        spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None,
+        spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
+        calendar: str = "standard",
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.out_dtype = out_dtype
         self.chunk_len = chunk_len
@@ -103,6 +124,23 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.spin_up_start_date = spin_up_start_date
         self.spin_up_end_date = spin_up_end_date
         self.time_interval = time_interval
+        self.calendar = calendar
+        
+        # Convert dates to the specified calendar immediately
+        self.start_date = self._convert_to_calendar(start_date)
+        self.end_date = self._convert_to_calendar(end_date)
+        self.spin_up_start_date = self._convert_to_calendar(spin_up_start_date)
+        self.spin_up_end_date = self._convert_to_calendar(spin_up_end_date)
+
+    def update_calendar(self, calendar: str):
+        """
+        Updates the calendar and converts all date attributes to the new calendar.
+        """
+        self.calendar = calendar
+        self.start_date = self._convert_to_calendar(self.start_date)
+        self.end_date = self._convert_to_calendar(self.end_date)
+        self.spin_up_start_date = self._convert_to_calendar(self.spin_up_start_date)
+        self.spin_up_end_date = self._convert_to_calendar(self.spin_up_end_date)
 
     def validate_files_exist(self, file_paths: list[Union[str, Path]]) -> None:
         """
