@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import numpy as np
 import numpy.ma as ma
@@ -26,20 +26,41 @@ class InputProxy:
         data: Dict[str, Union[np.ndarray, torch.Tensor, float, int]],
         attrs: Optional[Dict[str, Any]] = None,
         dims: Optional[Dict[str, int]] = None,
+        lazy: bool = True,
+        file_path: Optional[Union[str, Path]] = None,
+        available_vars: Optional[Set[str]] = None,
     ):
         self.data = data
         self.attrs = attrs or {}
         self.dims = dims or {}
+        self.lazy = lazy
+        self.file_path = file_path
+        self.available_vars = available_vars or set(data.keys())
+
+    @staticmethod
+    def _read_var_from_ds(ds: Dataset, var_name: str) -> np.ndarray:
+        var = ds.variables[var_name]
+        v = var[:]
+        if ma.isMaskedArray(v):
+            # Fill masked values conservatively
+            if np.issubdtype(v.dtype, np.floating):
+                return np.asarray(v.filled(np.nan))
+            else:
+                return np.asarray(v.filled(-1))
+        else:
+            return np.asarray(v)
 
     @classmethod
-    def from_nc(cls, file_path: Union[str, Path]) -> InputProxy:
+    def from_nc(cls, file_path: Union[str, Path], lazy: bool = False) -> InputProxy:
         """
         Create an InputProxy from a NetCDF file.
         Reads all variables, dimensions, and attributes into memory.
+        If lazy=True, variables are not read until accessed.
         """
         data = {}
         attrs = {}
         dims = {}
+        available_vars = set()
 
         try:
             with Dataset(file_path, "r") as ds:
@@ -50,23 +71,34 @@ class InputProxy:
                 # Read dimensions
                 for dim_name, dim in ds.dimensions.items():
                     dims[dim_name] = dim.size
+                
+                available_vars = set(ds.variables.keys())
 
-                # Read variables
-                for var_name, var in ds.variables.items():
-                    v = var[:]
-                    if ma.isMaskedArray(v):
-                        # Fill masked values conservatively
-                        if np.issubdtype(v.dtype, np.floating):
-                            data[var_name] = np.asarray(v.filled(np.nan))
-                        else:
-                            data[var_name] = np.asarray(v.filled(-1))
-                    else:
-                        data[var_name] = np.asarray(v)
+                if not lazy:
+                    # Read variables
+                    for var_name in available_vars:
+                        data[var_name] = cls._read_var_from_ds(ds, var_name)
 
         except Exception as e:
             raise RuntimeError(f"Error loading data from NetCDF {file_path}: {e}")
 
-        return cls(data, attrs, dims)
+        return cls(data, attrs, dims, lazy=lazy, file_path=file_path, available_vars=available_vars)
+
+    def _load_var(self, key: str) -> np.ndarray:
+        if not self.file_path:
+            raise RuntimeError("Cannot lazy load variable: file_path is not set.")
+        try:
+            with Dataset(self.file_path, "r") as ds:
+                if key not in ds.variables:
+                     raise KeyError(f"Variable '{key}' not found in {self.file_path}")
+                return self._read_var_from_ds(ds, key)
+        except Exception as e:
+            raise RuntimeError(f"Error lazy loading variable '{key}' from {self.file_path}: {e}")
+
+        except Exception as e:
+            raise RuntimeError(f"Error loading data from NetCDF {file_path}: {e}")
+
+        return cls(data, attrs, dims, lazy=lazy, file_path=file_path, available_vars=available_vars)
 
     def to_nc(self, file_path: Union[str, Path], output_complevel: int = 4) -> None:
         """
@@ -115,7 +147,8 @@ class InputProxy:
                 var[:] = arr_to_write
 
             # Write variables
-            for name, val in self.data.items():
+            for name in self.keys():
+                val = self[name]
                 _infer_and_write_var(name, val)
 
     @staticmethod
@@ -213,6 +246,10 @@ class InputProxy:
                      If None, replaces the entire variable.
         """
         if indices is not None:
+            # If lazy and not in memory yet, try to load it first so we can update it
+            if name not in self.data and self.lazy and name in self.available_vars:
+                self.data[name] = self._load_var(name)
+
             if name not in self.data:
                 raise KeyError(f"Variable '{name}' not found in InputProxy, cannot update indices.")
             
@@ -227,13 +264,25 @@ class InputProxy:
             self.data[name] = value
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self.data.get(key, default)
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
     def __getitem__(self, key: str) -> Any:
-        return self.data[key]
+        if key in self.data:
+            return self.data[key]
+        
+        if self.lazy and key in self.available_vars:
+            return self._load_var(key)
+            
+        raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
     def __setitem__(self, key: str, value: Any) -> None:
         self.data[key] = value
 
     def __contains__(self, key: str) -> bool:
-        return key in self.data
+        return key in self.data or (self.lazy and key in self.available_vars)
+
+    def keys(self) -> Set[str]:
+        return self.available_vars.union(self.data.keys())
