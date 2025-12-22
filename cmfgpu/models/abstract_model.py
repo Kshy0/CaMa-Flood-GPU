@@ -95,6 +95,7 @@ class AbstractModel(BaseModel, ABC):
     output_split_by_year: bool = Field(default=False, description="Whether to split output files by year")
     num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
     save_kernels: bool = Field(default=False, description="Whether to save generated Triton kernels")
+    max_pending_steps: int = Field(default=10, description="Maximum number of pending time steps for output buffering")
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
@@ -730,6 +731,7 @@ class AbstractModel(BaseModel, ABC):
             output_split_by_year=self.output_split_by_year,
             num_trials=self.num_trials or 1,
             save_kernels=self.save_kernels,
+            max_pending_steps=self.max_pending_steps,
         )
 
         registered_vars = set()

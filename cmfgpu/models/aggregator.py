@@ -12,6 +12,7 @@ import os
 import random
 import sys
 import tempfile
+import fcntl
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -26,26 +27,58 @@ from pydantic.fields import FieldInfo
 from cmfgpu.models.utils import torch_to_numpy_dtype
 
 
+def _is_wsl() -> bool:
+    """Check if the current system is Windows Subsystem for Linux (WSL)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open("/proc/version", "r") as f:
+            version_info = f.read().lower()
+            return "microsoft" in version_info or "wsl" in version_info
+    except Exception:
+        return False
+
+
 def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
     (mean_var_name, time_step_data, output_path, time_datetime) = args
     
-    with nc.Dataset(output_path, 'a') as ncfile:
-        nc_var = ncfile.variables[mean_var_name]
-        time_var = ncfile.variables['time']
-        
-        current_len = len(nc_var)
-        
-        # Append data
-        if time_step_data.ndim == 1:
-            nc_var[current_len, :] = time_step_data
-        elif time_step_data.ndim == 2:
-            nc_var[current_len, :, :] = time_step_data
-        
-        # Append datetime
-        time_unit = time_var.getncattr("units")
-        calendar = time_var.getncattr("calendar")
-        time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
-        time_var[current_len] = time_val
+    # Use a separate lock file to ensure sequential writes to the same NetCDF file
+    # This allows multiple time steps to be queued safely
+    lock_path = output_path.with_suffix(output_path.suffix + '.lock')
+    
+    with open(lock_path, 'w') as lock_file:
+        # Acquire exclusive lock (blocking)
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            with nc.Dataset(output_path, 'a') as ncfile:
+                nc_var = ncfile.variables[mean_var_name]
+                time_var = ncfile.variables['time']
+                
+                current_len = len(nc_var)
+                
+                # Append data
+                if time_step_data.ndim == 1:
+                    nc_var[current_len, :] = time_step_data
+                elif time_step_data.ndim == 2:
+                    nc_var[current_len, :, :] = time_step_data
+                
+                # Append datetime
+                time_unit = time_var.getncattr("units")
+                calendar = time_var.getncattr("calendar")
+                time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
+                time_var[current_len] = time_val
+        finally:
+            # Release lock
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    
+    # WSL optimization: Clear page cache for the written file to prevent memory bloat
+    # Windows does not automatically reclaim WSL page cache memory effectively
+    if _is_wsl() and hasattr(os, 'posix_fadvise'):
+        try:
+            with open(output_path, 'rb') as f:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except Exception:
+            pass
     
     return (mean_var_name, current_len)
 
@@ -137,7 +170,8 @@ class StatisticsAggregator:
     
     def __init__(self, device: torch.device, output_dir: Path, rank: int, 
                  num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
-                 output_split_by_year: bool = False, num_trials: int = 1):
+                 output_split_by_year: bool = False, num_trials: int = 1,
+                 max_pending_steps: int = 10):
         """
         Initialize the statistics aggregator.
         
@@ -146,9 +180,12 @@ class StatisticsAggregator:
             output_dir: Output directory for NetCDF files
             rank: Process rank identifier (int)
             num_workers: Number of worker processes for parallel NetCDF writing
+            complevel: Compression level (1-9)
             save_kernels: Whether to save generated kernel files for inspection
             output_split_by_year: Whether to split output files by year
             num_trials: Number of parallel simulations
+            max_pending_steps: Maximum number of time steps to buffer in memory before blocking.
+                               Increase this to allow GPU to run ahead of disk I/O.
         """
         self.device = device
         self.output_dir = output_dir
@@ -158,6 +195,7 @@ class StatisticsAggregator:
         self.save_kernels = save_kernels
         self.output_split_by_year = output_split_by_year
         self.num_trials = num_trials
+        self.max_pending_steps = max(1, max_pending_steps)
         self.calendar = None
         self.time_unit = None
         self._current_year = None
@@ -952,17 +990,27 @@ class StatisticsAggregator:
             future = self._write_executor.submit(_write_time_step_netcdf_process, args)
             self._write_futures.append(future)
         
-        # Wait for this batch to complete before continuing
-        # This ensures time steps are written in order
-        completed_count = 0
+        # Manage backlog: Wait if too many steps are pending
         batch_n = len(self._storage) if self._storage else len(self._mean_storage)
-        for future in self._write_futures[-batch_n:]:  # Only wait for current batch
+        max_futures = self.max_pending_steps * batch_n
+        
+        while len(self._write_futures) > max_futures:
+            # Pop the oldest future and wait for it
+            future = self._write_futures.pop(0)
             try:
-                var_name, written_time_step = future.result()
-                completed_count += 1
+                future.result()
             except Exception as exc:
-                print(f"  Failed to write time step {dt}: {exc}")
+                print(f"  Failed to write time step (backlog): {exc}")
                 raise exc
         
-        # Clear futures to prevent memory buildup
-        self._write_futures.clear()
+        # If we are strictly synchronous (max_pending_steps=1), we can clear the list
+        # to keep it perfectly clean, although the loop above handles it too.
+        if self.max_pending_steps == 1 and len(self._write_futures) >= batch_n:
+             # Wait for the current batch completely (old behavior)
+             for future in self._write_futures:
+                 try:
+                     future.result()
+                 except Exception as exc:
+                     print(f"  Failed to write time step {dt}: {exc}")
+                     raise exc
+             self._write_futures.clear()

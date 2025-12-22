@@ -108,5 +108,5 @@ def find_indices_in_torch(a, b):
     hit_mask[valid_mask] = (sorted_b[pos[valid_mask]] == a[valid_mask])
     index = torch.full_like(pos, -1, dtype=torch.int64)
     index[hit_mask] = order[pos[hit_mask]]
-    
+
     return index
