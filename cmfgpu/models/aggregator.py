@@ -248,6 +248,19 @@ class StatisticsAggregator:
                 os.unlink(self._temp_kernel_file)
             except Exception:
                 pass
+
+    def _cleanup_lock_files(self):
+        """Remove lock files associated with NetCDF outputs."""
+        if not hasattr(self, '_netcdf_files'):
+            return
+            
+        for output_path in self._netcdf_files.values():
+            lock_path = output_path.with_suffix(output_path.suffix + '.lock')
+            if lock_path.exists():
+                try:
+                    os.unlink(lock_path)
+                except Exception:
+                    pass
     
     def _cleanup_executor(self):
         """Clean up the write executor."""
@@ -265,6 +278,7 @@ class StatisticsAggregator:
         """Clean up temporary files and executor when the object is destroyed."""
         self._cleanup_temp_files()
         self._cleanup_executor()
+        self._cleanup_lock_files()
     
     def _generate_unique_name(self) -> str:
         """Generate a unique name for kernel files using timestamp + rank + hash."""
