@@ -963,3 +963,6 @@ class StatisticsAggregator:
             except Exception as exc:
                 print(f"  Failed to write time step {dt}: {exc}")
                 raise exc
+        
+        # Clear futures to prevent memory buildup
+        self._write_futures.clear()

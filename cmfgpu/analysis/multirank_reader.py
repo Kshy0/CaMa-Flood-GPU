@@ -532,7 +532,7 @@ class MultiRankStatsReader:
         def _kind(a: np.ndarray) -> str:
             if a.ndim == 2 and a.shape[1] == 2:
                 return "xy"
-            if a.ndim == 1:
+            if a.ndim == 1 or a.ndim == 0:
                 return "id"
             raise ValueError(f"Unsupported points shape: {a.shape}")
 
