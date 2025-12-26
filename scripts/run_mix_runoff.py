@@ -91,6 +91,8 @@ def main():
         spin_up_end_date=spin_up_end_date,
     )
 
+    dataset = dataset0 + dataset1
+
     model = CaMaFlood(
         rank=rank,
         world_size=world_size,
@@ -108,22 +110,14 @@ def main():
         output_start_time=start_date,
     )
     # assume both datasets have the same formatting and mapping
-    local_runoff_matrix, local_runoff_indices = dataset0.build_local_runoff_matrix(
+    local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         precision=precision,
         device=device,
     )
-    loader0 = DataLoader(
-        dataset0,
-        batch_size=batch_size,
-        shuffle=False, # must be False
-        num_workers=loader_workers,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor, 
-    )
-    loader1 = DataLoader(
-        dataset1,
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=False, # must be False
         num_workers=loader_workers,
@@ -132,11 +126,11 @@ def main():
     )
 
     stream = torch.cuda.Stream(device=device)
-    time_iter = dataset0.time_iter()
+    time_iter = dataset.time_iter()
     last_valid_time = start_date
-    for batch_runoff0, batch_runoff1 in zip(loader0, loader1):
+    for batch_runoff_combined in loader:
         with torch.cuda.stream(stream):
-            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_runoff_matrix, local_runoff_indices, world_size)
+            batch_runoff = dataset.shard_forcing(batch_runoff_combined.to(device), local_runoff_matrix, local_runoff_indices, world_size)
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:
