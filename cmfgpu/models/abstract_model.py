@@ -364,6 +364,13 @@ class AbstractModel(BaseModel, ABC):
         self._next_plan_idx = 0
         self._active_plans.clear()
 
+    def get_variable(self, variable_name: str) -> Any:
+        if variable_name not in self.variable_map:
+            raise ValueError(f"Variable '{variable_name}' not found in model.")
+            
+        module, attr, _ = self.variable_map[variable_name]
+        return getattr(module, attr)
+
     def set_variable_value(
         self,
         variable_name: str,
