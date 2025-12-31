@@ -212,6 +212,7 @@ class NetCDFDataset(AbstractDataset):
         prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
         suffix: str = ".nc",
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
+        mask: Optional[np.ndarray] = None,
         *args,
         **kwargs,
     ):
@@ -221,6 +222,7 @@ class NetCDFDataset(AbstractDataset):
         self.prefix = prefix
         self.suffix = suffix
         self.time_to_key = time_to_key
+        self._user_mask = mask
 
         # Runtime metadata
         self._file_times = {}
@@ -299,6 +301,9 @@ class NetCDFDataset(AbstractDataset):
     @cached_property
     def _mask_2d(self) -> np.ndarray:
         """Compute a boolean (Y, X) mask of valid spatial points from the first timestep."""
+        if self._user_mask is not None:
+            return self._user_mask
+
         key = self.time_to_key(self.start_date)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         with Dataset(path, "r") as ds:

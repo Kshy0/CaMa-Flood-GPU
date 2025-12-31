@@ -419,11 +419,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         complevel: int = 4,
         normalized: bool = False,
         device: str | torch.device = "cpu",
-    ) -> Path:
+        split_by_year: bool = False,
+        units: str = "mm",
+        description: Optional[str] = None,
+    ) -> Union[Path, List[Path]]:
         """
         Export catchment-aggregated runoff to a NetCDF file readable by MultiRankStatsReader.
 
-        - Output filename: {var_name}_rank0.nc
+        - Output filename: {var_name}_rank0.nc (or {var_name}_rank0_{year}.nc if split_by_year)
         - Dimensions: time (unlimited), saved_points
         - Variables:
             * time: numeric with units and calendar
@@ -490,9 +493,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         t_mapping = torch.sparse_csr_tensor(
             crow, ccol, cval, size=(n_catch, n_cols), dtype=torch_dtype, device=dev
         )
-        nc_path = out_dir / f"{var_name}_rank0.nc"
+        
         dtype_nc = "f4" if dtype == "float32" else "f8"
-        with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
+        
+        def _init_nc(path):
+            ds = nc.Dataset(path, "w", format="NETCDF4")
             ds.setncattr("title", f"Aggregated catchment runoff ({var_name})")
             ds.createDimension("time", None)
             ds.createDimension("saved_points", n_catch)
@@ -511,10 +516,24 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 zlib=True,
                 complevel=int(complevel),
             )
-            out_var.setncattr("description", f"Catchment-aggregated {var_name} (area-weighted mean)")
-            out_var.setncattr("units", "mm")
+            desc = description if description else f"Catchment-aggregated {var_name} (area-weighted mean)"
+            out_var.setncattr("description", desc)
+            out_var.setncattr("units", units)
+            return ds, time_var, out_var
 
-            write_idx = 0
+        created_files = []
+        ds = None
+        time_var = None
+        out_var = None
+        current_year = None
+        write_idx = 0
+
+        try:
+            if not split_by_year:
+                nc_path = out_dir / f"{var_name}_rank0.nc"
+                ds, time_var, out_var = _init_nc(nc_path)
+                created_files.append(nc_path)
+
             n_chunks = len(self)
             for ci in range(n_chunks):
                 base_idx = ci * self.chunk_len
@@ -536,12 +555,27 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 # Write each timestep in the block
                 for k in range(T):
                     dt_k = self.get_time_by_index(base_idx + k)
+                    
+                    if split_by_year:
+                        year = dt_k.year
+                        if year != current_year:
+                            if ds:
+                                ds.close()
+                            current_year = year
+                            nc_path = out_dir / f"{var_name}_rank0_{year}.nc"
+                            ds, time_var, out_var = _init_nc(nc_path)
+                            created_files.append(nc_path)
+                            write_idx = 0
+                    
                     out_var[write_idx, :] = agg_block_np[k, :].astype(np.float32 if dtype == "float32" else np.float64, copy=False)
                     time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
                     time_var[write_idx] = time_val
                     write_idx += 1
+        finally:
+            if ds:
+                ds.close()
 
-        return nc_path
+        return created_files if split_by_year else created_files[0]
     
     def generate_runoff_mapping_table(
         self,
@@ -929,3 +963,507 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         real_len = self._real_len()
         return real_len + self.num_spin_up_chunks
 
+    def _combine(self, other, operation, reverse=False):
+        is_dataset = isinstance(other, AbstractDataset)
+        is_scalar = isinstance(other, (int, float, np.number))
+        
+        if not (is_dataset or is_scalar):
+            return NotImplemented
+
+        operands = [self, other] if not reverse else [other, self]
+        return MixedDataset(operands, operation=operation)
+
+    def __add__(self, other):
+        return self._combine(other, "add")
+    
+    def __radd__(self, other):
+        return self._combine(other, "add", reverse=True)
+
+    def __sub__(self, other):
+        return self._combine(other, "sub")
+    
+    def __rsub__(self, other):
+        return self._combine(other, "sub", reverse=True)
+
+    def __mul__(self, other):
+        return self._combine(other, "mul")
+    
+    def __rmul__(self, other):
+        return self._combine(other, "mul", reverse=True)
+
+    def __truediv__(self, other):
+        return self._combine(other, "div")
+    
+    def __rtruediv__(self, other):
+        return self._combine(other, "div", reverse=True)
+
+
+class MixedDataset(AbstractDataset):
+    """
+    A dataset that combines multiple datasets (or scalars) by applying an operation.
+    """
+    def __init__(self, operands: List[Union[AbstractDataset, float, int]], operation: str = "add"):
+        if not operands:
+            raise ValueError("operands list cannot be empty")
+        
+        base = None
+        for op in operands:
+            if isinstance(op, AbstractDataset):
+                base = op
+                break
+        
+        if base is None:
+            raise ValueError("MixedDataset requires at least one AbstractDataset operand")
+        
+        self.base_dataset = base
+        self.operands = []
+        
+        can_flatten = operation in ["add", "mul"]
+        
+        for op in operands:
+            if can_flatten and isinstance(op, MixedDataset) and op.operation == operation:
+                self.operands.extend(op.operands)
+            else:
+                self.operands.append(op)
+
+        for i, op in enumerate(self.operands):
+            if isinstance(op, AbstractDataset) and op is not base:
+                if op.start_date != base.start_date:
+                    raise ValueError(f"Operand {i} has different start_date")
+                if op.end_date != base.end_date:
+                    raise ValueError(f"Operand {i} has different end_date")
+                if op.time_interval != base.time_interval:
+                    raise ValueError(f"Operand {i} has different time_interval")
+                if op.chunk_len != base.chunk_len:
+                    raise ValueError(f"Operand {i} has different chunk_len")
+                if op.data_size != base.data_size:
+                    raise ValueError(f"Operand {i} has different data_size")
+
+        # Initialize AbstractDataset using the base dataset's attributes
+        super().__init__(
+            start_date=base.start_date,
+            end_date=base.end_date,
+            time_interval=base.time_interval,
+            out_dtype=base.out_dtype,
+            chunk_len=base.chunk_len,
+            spin_up_cycles=base.spin_up_cycles,
+            spin_up_start_date=base.spin_up_start_date,
+            spin_up_end_date=base.spin_up_end_date,
+            calendar=base.calendar
+        )
+        self.operation = operation
+
+    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+        def _fetch(op):
+            if isinstance(op, AbstractDataset):
+                return op.get_data(current_time, chunk_len)
+            return op
+
+        data = _fetch(self.operands[0])
+        
+        for op in self.operands[1:]:
+            val = _fetch(op)
+            if self.operation == "add":
+                data = data + val
+            elif self.operation == "sub":
+                data = data - val
+            elif self.operation == "mul":
+                data = data * val
+            elif self.operation == "div":
+                data = data / val
+            else:
+                raise NotImplementedError(f"Operation {self.operation} not implemented")
+        
+        return data
+
+    @property
+    def data_mask(self) -> np.ndarray:
+        return self.base_dataset.data_mask
+
+    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.base_dataset.get_coordinates()
+
+    def close(self) -> None:
+        for op in self.operands:
+            if hasattr(op, 'close'):
+                op.close()
+
+class StaticParameterDataset:
+    """
+    A dataset class for static or climatological parameter files (NetCDF).
+    Does not inherit from torch.utils.data.Dataset.
+    Supports generating mapping tables and exporting remapped data.
+    """
+
+    def __init__(
+        self,
+        nc_path: Union[str, Path],
+        var_name: str,
+        lat_name: str = "lat",
+        lon_name: str = "lon",
+        mask: Optional[np.ndarray] = None,
+    ):
+        self.nc_path = Path(nc_path)
+        self.var_name = var_name
+        self.lat_name = lat_name
+        self.lon_name = lon_name
+        self._user_mask = mask
+
+        if not self.nc_path.exists():
+            raise FileNotFoundError(f"File not found: {self.nc_path}")
+
+        with nc.Dataset(self.nc_path, "r") as ds:
+            if self.var_name not in ds.variables:
+                raise ValueError(f"Variable {self.var_name} not found in {self.nc_path}")
+            
+            self.lat = ds.variables[self.lat_name][:]
+            self.lon = ds.variables[self.lon_name][:]
+            var = ds.variables[self.var_name]
+            self.shape = var.shape
+            self.ndim = var.ndim
+            
+            # Determine if it has a time/month dimension
+            # Assuming (lat, lon) or (time, lat, lon)
+            if self.ndim == 2:
+                self.has_time = False
+                self._len = 1
+            elif self.ndim == 3:
+                self.has_time = True
+                self._len = self.shape[0]
+            else:
+                raise ValueError(f"Unsupported dimensions for variable {self.var_name}: {self.shape}")
+
+    @property
+    def data_mask(self) -> Optional[np.ndarray]:
+        return self._user_mask
+
+    @property
+    def data_size(self) -> int:
+        return len(self.lat) * len(self.lon)
+
+    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.lon, self.lat
+
+    def __len__(self) -> int:
+        return self._len
+
+    def read_chunk(self, idx: int) -> np.ndarray:
+        """
+        Reads data. For static data (ndim=2), idx is ignored (returns the single map).
+        For climatology (ndim=3), returns the data at time index idx.
+        Returns shape (1, lat*lon) or (1, N).
+        """
+        with nc.Dataset(self.nc_path, "r") as ds:
+            var = ds.variables[self.var_name]
+            if not self.has_time:
+                data = var[:]
+            else:
+                data = var[idx]
+            
+            # Handle MaskedArray
+            if isinstance(data, np.ma.MaskedArray):
+                data = data.filled(np.nan)
+            
+            # Flatten to (N,)
+            data = data.flatten()
+            
+            # Apply mask if exists (to match AbstractDataset behavior, though here we usually just return flattened data)
+            # AbstractDataset.read_chunk returns (T, N_valid)
+            # Here we return (1, N_valid)
+            
+            if self._user_mask is not None:
+                # _user_mask should be boolean array of shape (lat, lon) or flattened
+                if self._user_mask.shape != data.shape:
+                     flat_mask = self._user_mask.flatten()
+                else:
+                     flat_mask = self._user_mask
+                
+                data = data[flat_mask]
+            
+            return data.reshape(1, -1)
+
+    def generate_runoff_mapping_table(
+        self,
+        map_dir: str,
+        out_dir: str,
+        npz_file: str = "runoff_mapping.npz",
+        mapinfo_txt: str = "location.txt",
+        hires_map_tag: str = "1min",
+        lowres_idx_precision: str = "<i4",
+        hires_idx_precision: str = "<i2",
+        map_precision: str = "<f4",
+        parameter_nc: Union[str, Path, None] = None,
+    ):
+        """
+        Generate runoff mapping table and save as npz file.
+        Copied and adapted from AbstractDataset.
+        """
+        map_dir = Path(map_dir)
+        hires_map_dir = map_dir / hires_map_tag
+        mapdim_path = map_dir / "mapdim.txt"
+        
+        with open(mapdim_path, "r") as f:
+            lines = f.readlines()
+            nx = int(lines[0].split('!!')[0].strip())
+            ny = int(lines[1].split('!!')[0].strip())
+
+        nextxy_path = map_dir / "nextxy.bin"
+            
+        nextxy_data = binread(
+            nextxy_path,
+            (nx, ny, 2),
+            dtype_str=lowres_idx_precision
+        )
+        catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != -9999)
+        catchment_id = np.ravel_multi_index((catchment_x, catchment_y), (nx, ny))
+
+        # Load location info
+        with open(hires_map_dir/ mapinfo_txt, "r") as f:
+            lines = f.readlines()
+        data = lines[2].split()
+        Nx, Ny = int(data[6]), int(data[7])
+        West, East = float(data[2]), float(data[3])
+        South, North = float(data[4]), float(data[5])
+        Csize = float(data[8])
+
+        hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
+        hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
+        lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
+        hires_lon_2D = lon2D.T
+        hires_lat_2D = lat2D.T
+
+        # Load high-resolution maps
+        HighResGridArea = read_map(
+            hires_map_dir / f"{hires_map_tag}.grdare.bin", (Nx, Ny), precision=map_precision
+        ) * 1E6
+        HighResCatchmentId = read_map(
+            hires_map_dir / f"{hires_map_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
+        )
+
+        valid_mask = HighResCatchmentId[:, :, 0] > 0
+        x_idx, y_idx = np.where(valid_mask)
+        HighResCatchmentId -= 1  # convert from 1-based to 0-based
+        valid_x = HighResCatchmentId[x_idx, y_idx, 0]
+        valid_y = HighResCatchmentId[x_idx, y_idx, 1]
+        valid_areas = HighResGridArea[x_idx, y_idx]
+        catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
+
+        # Get runoff coordinates
+        ro_lon, ro_lat = self.get_coordinates()
+        valid_lon = hires_lon_2D[x_idx, y_idx]
+        valid_lat = hires_lat_2D[x_idx, y_idx]
+
+        # Compute catchment and runoff IDs
+        catchment_idx = find_indices_in(catchment_id_hires, catchment_id)
+        if np.any(catchment_idx == -1):
+            print(
+                f"Warning: Some high-resolution catchments ({np.sum(catchment_idx == -1)}) were not found in the low-resolution map."
+            )
+        runoff_idx = compute_runoff_id(ro_lon, ro_lat, valid_lon, valid_lat)
+
+        # Handle mask if available
+        col_mask = self.data_mask
+        if col_mask is not None:
+            col_mask = np.ravel(col_mask, order="C")
+        else:
+            col_mask = np.ones((len(ro_lat) * len(ro_lon)), dtype=bool)
+
+        col_mapping = -np.ones_like(col_mask, dtype=np.int64)
+        col_mapping[np.flatnonzero(col_mask)] = np.arange(col_mask.sum())
+        mapped_runoff_idx = col_mapping[runoff_idx]
+
+        # Filter valid mappings
+        valid_mask = (catchment_idx != -1) & (mapped_runoff_idx != -1)
+        row_idx = catchment_idx[valid_mask]
+        col_idx = mapped_runoff_idx[valid_mask]
+        data_values = valid_areas[valid_mask]
+
+        # Optionally align/subset catchments to parameter_nc order/region
+        save_catchment_ids = catchment_id.astype(np.int64)
+        matrix_shape = (len(catchment_id), int(col_mask.sum()))
+
+        if parameter_nc is not None:
+            try:
+                with nc.Dataset(parameter_nc, "r") as pnc:
+                    param_cx = pnc.variables["catchment_x"][:]
+                    param_cy = pnc.variables["catchment_y"][:]
+                    param_cids = np.ravel_multi_index((param_cx, param_cy), (nx, ny))
+                
+                # First, get the actual catchment IDs for the sparse entries
+                actual_cids = catchment_id[row_idx]
+                
+                # Now find where these actual_cids are in param_cids
+                new_row_idx = find_indices_in(actual_cids, param_cids)
+                
+                # Filter out those not in param_cids
+                keep = new_row_idx != -1
+                row_idx = new_row_idx[keep]
+                col_idx = col_idx[keep]
+                data_values = data_values[keep]
+                
+                save_catchment_ids = param_cids.astype(np.int64)
+                matrix_shape = (len(param_cids), int(col_mask.sum()))
+                
+            except Exception as e:
+                print(f"Warning: Failed to align with parameter_nc: {e}")
+                print("Proceeding with default catchment list from nextxy.")
+
+        # Create sparse matrix using scipy and compress it
+        sparse_matrix = csr_matrix(
+            (data_values.astype(np.float32), (row_idx, col_idx)), 
+            shape=matrix_shape,
+            dtype=np.float32
+        )
+        
+        # Eliminate zeros and compress
+        sparse_matrix.eliminate_zeros()
+        
+        # Prepare mapping data for saving with compressed sparse matrix
+        mapping_data = {
+            'catchment_ids': save_catchment_ids.astype(np.int64),
+            'sparse_data': sparse_matrix.data.astype(np.float32),
+            'sparse_indices': sparse_matrix.indices.astype(np.int64),
+            'sparse_indptr': sparse_matrix.indptr.astype(np.int64),
+            'matrix_shape': np.array(matrix_shape, dtype=np.int64)
+        }
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output_path = out_dir / npz_file
+
+        np.savez_compressed(output_path, **mapping_data)
+
+        print(f"Saved runoff mapping to {output_path}")
+        print(f"Mapping contains {matrix_shape[0]} catchments "
+            f"and {len(sparse_matrix.data)} non-zero runoff grid mappings")
+        print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
+
+    def export_catchment_runoff(
+        self,
+        out_dir: Union[str, Path],
+        mapping_npz: Union[str, Path],
+        var_name: Optional[str] = None,
+        dtype: Literal["float32", "float64"] = "float32",
+        complevel: int = 4,
+        normalized: bool = False,
+        device: Union[str, torch.device] = "cpu",
+        description: Optional[str] = None,
+        units: str = "mm",
+    ) -> Path:
+        """
+        Export catchment-aggregated data to a NetCDF file.
+        """
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        mapping_npz = Path(mapping_npz)
+        
+        if var_name is None:
+            var_name = self.var_name
+
+        if not mapping_npz.exists():
+            raise FileNotFoundError(f"Mapping file not found: {mapping_npz}")
+
+        # Load mapping (SciPy CSR)
+        m = np.load(mapping_npz)
+        catchment_ids = m["catchment_ids"].astype(np.int64)
+        sparse_data = m["sparse_data"].astype(np.float32 if dtype == "float32" else np.float64)
+        sparse_indices = m["sparse_indices"].astype(np.int64)
+        sparse_indptr = m["sparse_indptr"].astype(np.int64)
+        mat_shape = tuple(np.array(m["matrix_shape"]).tolist())
+        mapping = csr_matrix((sparse_data, sparse_indices, sparse_indptr), shape=mat_shape)
+
+        n_catch = int(catchment_ids.shape[0])
+        n_cols = int(mat_shape[1])
+        
+        # Check data size
+        # Note: self.data_size is total pixels. If mask is used, n_cols should match mask.sum()
+        # But here we assume self.read_chunk returns masked data if mask is set.
+        # Let's verify with a dummy read or trust the user/logic.
+        # In generate_runoff_mapping_table, we used self.data_mask to determine n_cols.
+        
+        # Prepare device and torch types
+        torch_dtype = torch.float32 if dtype == "float32" else torch.float64
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            print("CUDA not available; falling back to CPU.")
+            dev = torch.device("cpu")
+
+        # Build torch sparse CSR once on the target device
+        crow = torch.from_numpy(mapping.indptr.astype(np.int64))
+        ccol = torch.from_numpy(mapping.indices.astype(np.int64))
+        cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64))
+        
+        if normalized:
+            row_lengths = crow[1:] - crow[:-1]
+            row_ids = torch.repeat_interleave(
+                torch.arange(n_catch, device=dev),
+                row_lengths
+            )
+            row_sums = torch.zeros(n_catch, dtype=torch_dtype, device=dev)
+            row_sums.scatter_add_(0, row_ids, cval)
+            denom = row_sums[row_ids]
+            nz_mask = denom > 0
+            cval_new = torch.zeros_like(cval)
+            cval_new[nz_mask] = cval[nz_mask] / denom[nz_mask]
+            cval = cval_new
+
+        t_mapping = torch.sparse_csr_tensor(
+            crow, ccol, cval, size=(n_catch, n_cols), dtype=torch_dtype, device=dev
+        )
+        
+        dtype_nc = "f4" if dtype == "float32" else "f8"
+        
+        nc_path = out_dir / f"{var_name}_rank0.nc"
+        
+        with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
+            ds.setncattr("title", f"Aggregated catchment parameter ({var_name})")
+            if self.has_time:
+                ds.createDimension("time", None)
+            ds.createDimension("saved_points", n_catch)
+
+            if self.has_time:
+                time_var = ds.createVariable("time", "f8", ("time",))
+                time_var.setncattr("units", "months" if self.ndim==3 else "unknown") # Simplified
+            
+            save_coord = ds.createVariable("save_coord", "i8", ("saved_points",))
+            save_coord[:] = catchment_ids
+
+            dims = ("time", "saved_points") if self.has_time else ("saved_points",)
+            out_var = ds.createVariable(
+                var_name,
+                dtype_nc,
+                dims,
+                zlib=True,
+                complevel=int(complevel),
+            )
+            desc = description if description else f"Catchment-aggregated {var_name}"
+            out_var.setncattr("description", desc)
+            out_var.setncattr("units", units)
+
+            # Process data
+            # If static, just one chunk (idx=0)
+            # If monthly, loop over len(self)
+            
+            for idx in range(len(self)):
+                block = self.read_chunk(idx) # (1, N)
+                
+                if block.shape[1] != n_cols:
+                     raise ValueError(
+                        f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols}."
+                    )
+                
+                # block is (1, N). mapping is (C, N).
+                # We want (C, 1).
+                # mapping @ block.T -> (C, 1)
+                
+                block_t = torch.as_tensor(block, dtype=torch_dtype, device=dev).T
+                agg_block = torch.sparse.mm(t_mapping, block_t) # (C, 1)
+                agg_block_np = agg_block.T.contiguous().to("cpu").numpy() # (1, C)
+                
+                if self.has_time:
+                    out_var[idx, :] = agg_block_np[0, :]
+                    # time_var[idx] = idx + 1 # Dummy time
+                else:
+                    out_var[:] = agg_block_np[0, :]
+
+        return nc_path

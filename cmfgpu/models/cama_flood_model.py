@@ -143,12 +143,12 @@ class CaMaFlood(AbstractModel):
         self.execute_parameter_change_plan(current_time)
 
         if self.adaptive_time is not None:
-            self.adaptive_time.min_time_sub_step.fill_(float('inf'))
+            self.adaptive_time.max_sub_steps.fill_(0)
             if self.num_trials is not None:
                 compute_adaptive_time_step_batched_kernel[self.base_grid](
                     river_depth_ptr=self.base.river_depth,
                     downstream_distance_ptr=self.base.downstream_distance,
-                    min_time_sub_step_ptr=self.adaptive_time.min_time_sub_step,
+                    max_sub_steps_ptr=self.adaptive_time.max_sub_steps,
                     time_step=time_step,
                     adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
                     gravity=self.base.gravity,
@@ -161,7 +161,7 @@ class CaMaFlood(AbstractModel):
                 compute_adaptive_time_step_kernel[self.base_grid](
                     river_depth_ptr=self.base.river_depth,
                     downstream_distance_ptr=self.base.downstream_distance,
-                    min_time_sub_step_ptr=self.adaptive_time.min_time_sub_step,
+                    max_sub_steps_ptr=self.adaptive_time.max_sub_steps,
                     time_step=time_step,
                     adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
                     gravity=self.base.gravity,
@@ -169,14 +169,15 @@ class CaMaFlood(AbstractModel):
                     BLOCK_SIZE=self.BLOCK_SIZE
                 )
             if self.world_size > 1:
-                dist.all_reduce(self.adaptive_time.min_time_sub_step, op=dist.ReduceOp.MIN)
+                dist.all_reduce(self.adaptive_time.max_sub_steps, op=dist.ReduceOp.MAX)
             
-            # Take the minimum across all trials if batched
-            min_dt = self.adaptive_time.min_time_sub_step.min().item()
-            num_sub_steps = int(round(time_step / min_dt - 0.01) + 1)
+            # Take the maximum across all trials if batched
+            num_sub_steps = int(self.adaptive_time.max_sub_steps.max().item())
+            if num_sub_steps < 1:
+                num_sub_steps = 1
             time_sub_step = time_step / num_sub_steps
         else:
-            num_sub_steps = default_num_sub_steps
+            num_sub_steps = int(default_num_sub_steps)
             time_sub_step = time_step / num_sub_steps
         if self.log is not None:
             self.log.set_time(time_sub_step, num_sub_steps, current_time)

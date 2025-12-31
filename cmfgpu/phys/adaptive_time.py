@@ -12,7 +12,7 @@ import triton.language as tl
 def compute_adaptive_time_step_kernel(
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
-    min_time_sub_step_ptr,
+    max_sub_steps_ptr,                      # *i64 max sub steps
     time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
@@ -33,15 +33,21 @@ def compute_adaptive_time_step_kernel(
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
     
-    min_time_sub_step = tl.min(dt_clamped)
-    tl.atomic_min(min_time_sub_step_ptr, min_time_sub_step)
+    min_dt = tl.min(dt_clamped)
+    
+    # Calculate num_sub_steps
+    # Align with int(round(time_step / min_dt - 0.01) + 1)
+    n_steps_float = tl.floor(time_step / min_dt + 0.49) + 1.0
+    n_steps = n_steps_float.to(tl.int32)
+    
+    tl.atomic_max(max_sub_steps_ptr, n_steps)
 
 
 @triton.jit
 def compute_adaptive_time_step_batched_kernel(
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
-    min_time_sub_step_ptr,                  # *f32 (size num_trials)
+    max_sub_steps_ptr,                      # *i64 (size num_trials)
     time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
@@ -72,5 +78,11 @@ def compute_adaptive_time_step_batched_kernel(
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
     
-    min_time_sub_step = tl.min(dt_clamped)
-    tl.atomic_min(min_time_sub_step_ptr + trial_idx, min_time_sub_step)
+    min_dt = tl.min(dt_clamped)
+    
+    # Calculate num_sub_steps
+    # Align with int(round(time_step / min_dt - 0.01) + 1)
+    n_steps_float = tl.floor(time_step / min_dt + 0.49) + 1.0
+    n_steps = n_steps_float.to(tl.int32)
+    
+    tl.atomic_max(max_sub_steps_ptr + trial_idx, n_steps)
