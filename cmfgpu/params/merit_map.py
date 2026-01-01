@@ -384,6 +384,10 @@ class MERITMap(BaseModel):
             bifurcation_down_basin = basin_data[self.bifurcation_downstream_x, self.bifurcation_downstream_y]
             # Keep only intra-basin bifurcations
             keep_mask = (bifurcation_up_basin == bifurcation_down_basin)
+            
+            # When using basin file, we respect original basins (no merging)
+            self.root_mouth = self.river_mouth_id.copy()
+
             # Set removed for visualization
             removed_mask = ~keep_mask
             self.removed_bifurcation_catchment_x = self.bifurcation_catchment_x[removed_mask]
@@ -694,6 +698,23 @@ class MERITMap(BaseModel):
             self.num_bifurcation_paths = int(np.sum(keep_bif))
             self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
             idx_in_sorted_bif = np.searchsorted(old_sorted, self.bifurcation_basin_id)
+            self.bifurcation_basin_id = pos[idx_in_sorted_bif].astype(np.int64)
+
+        # Also filter removed bifurcations (for visualization) to kept basins
+        if hasattr(self, 'removed_bifurcation_catchment_x') and len(self.removed_bifurcation_catchment_x) > 0:
+            # self.catchment_id now contains only catchments in kept basins.
+            
+            rem_up_cid = np.ravel_multi_index((self.removed_bifurcation_catchment_x, self.removed_bifurcation_catchment_y), self.map_shape)
+            rem_dn_cid = np.ravel_multi_index((self.removed_bifurcation_downstream_x, self.removed_bifurcation_downstream_y), self.map_shape)
+            
+            # Check if upstream or downstream is in kept catchments
+            # Using isin is efficient enough
+            keep_rem = np.isin(rem_up_cid, self.catchment_id) | np.isin(rem_dn_cid, self.catchment_id)
+            
+            self.removed_bifurcation_catchment_x = self.removed_bifurcation_catchment_x[keep_rem]
+            self.removed_bifurcation_catchment_y = self.removed_bifurcation_catchment_y[keep_rem]
+            self.removed_bifurcation_downstream_x = self.removed_bifurcation_downstream_x[keep_rem]
+            self.removed_bifurcation_downstream_y = self.removed_bifurcation_downstream_y[keep_rem]
             self.bifurcation_basin_id = pos[idx_in_sorted_bif].astype(np.int64)
 
     def load_parameters(self) -> None:

@@ -445,6 +445,14 @@ class BaseModule(AbstractModule):
     def flood_inflow(self) -> torch.Tensor:
         return torch.zeros_like(self.river_outflow)
 
+    @computed_base_field(
+        description="Total outflow from catchment (river + flood) (m³ s⁻¹)",
+        category="state",
+    )
+    @cached_property
+    def total_outflow(self) -> torch.Tensor:
+        return torch.zeros_like(self.river_outflow)
+
     # ------------------------------------------------------------------ #
     # Post-init validation
     # ------------------------------------------------------------------ #

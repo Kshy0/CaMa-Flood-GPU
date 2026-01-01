@@ -1377,9 +1377,6 @@ class StaticParameterDataset:
         
         # Check data size
         # Note: self.data_size is total pixels. If mask is used, n_cols should match mask.sum()
-        # But here we assume self.read_chunk returns masked data if mask is set.
-        # Let's verify with a dummy read or trust the user/logic.
-        # In generate_runoff_mapping_table, we used self.data_mask to determine n_cols.
         
         # Prepare device and torch types
         torch_dtype = torch.float32 if dtype == "float32" else torch.float64

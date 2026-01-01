@@ -559,47 +559,65 @@ class MultiRankStatsReader:
                 x, y = info.get("x"), info.get("y")
                 if x is None or y is None:
                     continue
+                
+                # Build lookup map for this rank: (x, y) -> local_index
+                if all(hit is not None for hit in col_to_hits):
+                    break
+
+                # Create a dictionary for O(1) lookup
+                rank_lookup = { (int(xi), int(yi)): i for i, (xi, yi) in enumerate(zip(x, y)) }
+                
                 for c, (qx, qy) in enumerate(queries):
                     if col_to_hits[c] is not None:
                         continue
-                    matches = np.nonzero((x == qx) & (y == qy))[0]
-                    if matches.size:
-                        col_to_hits[c] = (r_idx, int(matches[0]))
+                    
+                    if (qx, qy) in rank_lookup:
+                        col_to_hits[c] = (r_idx, rank_lookup[(qx, qy)])
+
         else:
             for r_idx, info in enumerate(self._rank_files):
                 if info["saved_points"] == 0 or info["coord_raw"] is None:
                     continue
+                
+                if all(hit is not None for hit in col_to_hits):
+                    break
+
                 raw = np.asarray(info["coord_raw"]).ravel()
+                rank_lookup = { int(val): i for i, val in enumerate(raw) }
+
                 for c, qid in enumerate(queries):
                     if col_to_hits[c] is not None:
                         continue
-                    matches = np.nonzero(raw == qid)[0]
-                    if matches.size:
-                        col_to_hits[c] = (r_idx, int(matches[0]))
+                    
+                    if qid in rank_lookup:
+                        col_to_hits[c] = (r_idx, rank_lookup[qid])
 
         if any(hit is None for hit in col_to_hits):
             raise ValueError("Some points not found in any rank.")
 
-        # Print queried points info
-        print(f"Querying {len(queries)} points:")
-        for c, q in enumerate(queries):
-            r_idx, li = col_to_hits[c]
-            info = self._rank_files[r_idx]
+        # Print queried points info (Verbose: only if small number of points)
+        if len(queries) <= 20:
+            print(f"Querying {len(queries)} points:")
+            for c, q in enumerate(queries):
+                r_idx, li = col_to_hits[c]
+                info = self._rank_files[r_idx]
 
-            # Get catchment ID if available
-            cid = "N/A"
-            if info.get("coord_raw") is not None:
-                cid = info["coord_raw"][li]
+                # Get catchment ID if available
+                cid = "N/A"
+                if info.get("coord_raw") is not None:
+                    cid = info["coord_raw"][li]
 
-            if use_xy:
-                qx, qy = q
-                print(f"  Point {c}: (x={qx}, y={qy}) -> Rank {r_idx}, Local Idx {li}, CatchmentID={cid}")
-            else:
-                qid = q
-                # If querying by ID, we might want to print X, Y if available
-                x_val = info["x"][li] if info.get("x") is not None else "N/A"
-                y_val = info["y"][li] if info.get("y") is not None else "N/A"
-                print(f"  Point {c}: ID={qid} -> Rank {r_idx}, Local Idx {li}, (x={x_val}, y={y_val})")
+                if use_xy:
+                    qx, qy = q
+                    print(f"  Point {c}: (x={qx}, y={qy}) -> Rank {r_idx}, Local Idx {li}, CatchmentID={cid}")
+                else:
+                    qid = q
+                    # If querying by ID, we might want to print X, Y if available
+                    x_val = info["x"][li] if info.get("x") is not None else "N/A"
+                    y_val = info["y"][li] if info.get("y") is not None else "N/A"
+                    print(f"  Point {c}: ID={qid} -> Rank {r_idx}, Local Idx {li}, (x={x_val}, y={y_val})")
+        else:
+            print(f"Querying {len(queries)} points (verbose output suppressed for >20 points)...")
 
         out = np.full((self._time_len, N), fill_value, dtype=dtype or np.float32)
 
@@ -659,10 +677,10 @@ class MultiRankStatsReader:
                 req_end = min(self._slice_end + 1, file_end_global)
                 
                 if req_start < req_end:
+                    print(f"    Reading {fp.name} (indices: {len(idx)})...")
                     local_start = req_start - file_start_global
                     local_end = req_end - file_start_global
                     
-                    # Where to put in output array?
                     # out is indexed 0..self._time_len-1 corresponding to self._slice_start..self._slice_end
                     out_start = req_start - self._slice_start
                     out_end = req_end - self._slice_start
