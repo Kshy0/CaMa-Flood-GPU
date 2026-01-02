@@ -42,7 +42,6 @@ def compute_outflow_kernel(
     # other 
     global_bifurcation_outflow_ptr,          # *f32 global bifurcation outflow (turn to zero)
     total_storage_ptr,
-    total_outflow_ptr,                      # *f32 total outflow (river + flood)
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
@@ -199,7 +198,6 @@ def compute_outflow_kernel(
     tl.store(flood_cross_section_depth_ptr + offs, updated_flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)
     tl.store(total_storage_ptr + offs, total_storage, mask=mask)
-    tl.store(total_outflow_ptr + offs, updated_river_outflow + updated_flood_outflow, mask=mask)
     
     tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
@@ -227,6 +225,7 @@ def compute_inflow_kernel(
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
+    total_outflow_ptr,             # *f32: Total outflow (output)
     total_storage_ptr,             # *f32: Total storage
     outgoing_storage_ptr,          # *f32: Outgoing storage
     river_inflow_ptr,              # *f32: River inflow (output, atomic add)
@@ -261,6 +260,7 @@ def compute_inflow_kernel(
     # Write back limited values
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
+    tl.store(total_outflow_ptr + offs, updated_river_outflow + updated_flood_outflow, mask=mask)
     tl.store(limit_rate_ptr + offs, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
@@ -303,7 +303,6 @@ def compute_outflow_batched_kernel(
     # other 
     global_bifurcation_outflow_ptr,          # *f32 global bifurcation outflow (turn to zero)
     total_storage_ptr,
-    total_outflow_ptr,                      # *f32 total outflow (river + flood)
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
@@ -476,7 +475,6 @@ def compute_outflow_batched_kernel(
     tl.store(flood_cross_section_depth_ptr + idx, updated_flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_ptr + idx, updated_flood_cross_section_area, mask=mask)
     tl.store(total_storage_ptr + idx, total_storage, mask=mask)
-    tl.store(total_outflow_ptr + idx, updated_river_outflow + updated_flood_outflow, mask=mask)
     
     tl.store(river_inflow_ptr + idx, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + idx, 0.0, mask=mask)
@@ -503,6 +501,7 @@ def compute_inflow_batched_kernel(
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
+    total_outflow_ptr,             # *f32: Total outflow (output)
     total_storage_ptr,             # *f32: Total storage
     outgoing_storage_ptr,          # *f32: Outgoing storage
     river_inflow_ptr,              # *f32: River inflow (output, atomic add)
@@ -546,6 +545,7 @@ def compute_inflow_batched_kernel(
     # Write back limited values
     tl.store(river_outflow_ptr + idx, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + idx, updated_flood_outflow, mask=mask)
+    tl.store(total_outflow_ptr + idx, updated_river_outflow + updated_flood_outflow, mask=mask)
     tl.store(limit_rate_ptr + idx, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
