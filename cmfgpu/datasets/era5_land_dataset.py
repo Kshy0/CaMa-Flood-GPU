@@ -134,4 +134,5 @@ if __name__ == "__main__":
         map_dir=f"/home/eat/cmf_v420_pkg/map/{resolution}",
         out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{resolution}",
         npz_file="runoff_mapping_era5.npz",
+        parameter_nc=f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc",
     )

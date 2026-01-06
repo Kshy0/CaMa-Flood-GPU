@@ -22,14 +22,14 @@ def main():
     experiment_name = f"{resolution}_era5"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
-    opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
-    variables_to_save = {"mean": ["river_outflow"], "last": ["river_depth"]}
+    opened_modules = ["base", "adaptive_time", "bifurcation"]
+    variables_to_save = {"mean": ["river_outflow", "total_outflow"]}
     precision = "float32"
     runoff_time_interval_hour = 24
     time_step = runoff_time_interval_hour * 3600
     default_num_sub_steps = 360
 
-    loader_workers = 4
+    loader_workers = 1
     output_workers = 2
     runoff_chunk_len = 24
     unit_factor = 3600 * runoff_time_interval_hour

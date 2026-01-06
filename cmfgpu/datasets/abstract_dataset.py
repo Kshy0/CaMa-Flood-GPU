@@ -1228,9 +1228,6 @@ class StaticParameterDataset:
 
         hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
         hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
-        lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
-        hires_lon_2D = lon2D.T
-        hires_lat_2D = lat2D.T
 
         # Load high-resolution maps
         HighResGridArea = read_map(
@@ -1250,8 +1247,8 @@ class StaticParameterDataset:
 
         # Get runoff coordinates
         ro_lon, ro_lat = self.get_coordinates()
-        valid_lon = hires_lon_2D[x_idx, y_idx]
-        valid_lat = hires_lat_2D[x_idx, y_idx]
+        valid_lon = hires_lon[x_idx]
+        valid_lat = hires_lat[y_idx]
 
         # Compute catchment and runoff IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)

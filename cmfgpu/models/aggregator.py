@@ -221,6 +221,7 @@ class StatisticsAggregator:
 
         # Streaming mode support
         self._netcdf_files: Dict[str, Path] = {}  # out_name -> NetCDF file path
+        self._all_created_files: Set[Path] = set()
         self._files_created: bool = False
 
         # Thread pool for background writing
@@ -251,16 +252,19 @@ class StatisticsAggregator:
 
     def _cleanup_lock_files(self):
         """Remove lock files associated with NetCDF outputs."""
-        if not hasattr(self, '_netcdf_files'):
-            return
+        # Use _all_created_files if available, fallback to _netcdf_files
+        paths = getattr(self, '_all_created_files', None)
+        if paths is None and hasattr(self, '_netcdf_files'):
+            paths = self._netcdf_files.values()
             
-        for output_path in self._netcdf_files.values():
-            lock_path = output_path.with_suffix(output_path.suffix + '.lock')
-            if lock_path.exists():
-                try:
-                    os.unlink(lock_path)
-                except Exception:
-                    pass
+        if paths:
+            for output_path in paths:
+                lock_path = output_path.with_suffix(output_path.suffix + '.lock')
+                if lock_path.exists():
+                    try:
+                        os.unlink(lock_path)
+                    except Exception:
+                        pass
     
     def _cleanup_executor(self):
         """Clean up the write executor."""
@@ -378,6 +382,7 @@ class StatisticsAggregator:
                 try:
                     output_path = future.result()
                     self._netcdf_files[mean_var_name] = output_path
+                    self._all_created_files.add(output_path)
                     print(f"  Created {output_path.name}")
                 except Exception as exc:
                     print(f"  Failed to create file for {mean_var_name}: {exc}")

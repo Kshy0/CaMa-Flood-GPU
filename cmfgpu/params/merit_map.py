@@ -1230,7 +1230,7 @@ if __name__ == "__main__":
         out_dir=Path(f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"),
         bifori_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/bifori.txt",
         gauge_file=f"/home/eat/cmf_v420_pkg/map/{map_resolution}/GRDC_alloc.txt",
-        levee_flag=True,
+        levee_flag=False,
         visualized=True,
         bif_levels_to_keep=5,
         basin_use_file=False,
