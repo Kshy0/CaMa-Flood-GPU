@@ -58,7 +58,6 @@ class CaMaFlood(AbstractModel):
     }
     group_by: ClassVar[str] = "catchment_basin_id"
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
-    output_start_time: Optional[Union[datetime, cftime.datetime]] = None
 
     @cached_property
     def base(self) -> BaseModule:

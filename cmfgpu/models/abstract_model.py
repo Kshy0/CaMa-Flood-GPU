@@ -96,8 +96,41 @@ class AbstractModel(BaseModel, ABC):
     num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
     save_kernels: bool = Field(default=False, description="Whether to save generated Triton kernels")
     max_pending_steps: int = Field(default=10, description="Maximum number of pending time steps for output buffering")
+    output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(default=None, description="Time to start saving output")
+    calendar: str = Field(default="standard", description="Calendar type for time handling (e.g., standard, noleap)")
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode='after')
+    def align_output_start_time(self) -> Self:
+        """
+        Ensures output_start_time matches the specified calendar type.
+        """
+        if self.output_start_time is None or self.calendar == "standard":
+            return self
+
+        # If output_start_time is standard datetime but calendar is not standard (e.g. noleap)
+        # we try to convert it to the appropriate cftime object.
+        if isinstance(self.output_start_time, datetime) and not isinstance(self.output_start_time, cftime.datetime):
+            try:
+                # Create a dummy object to get the class type for this calendar
+                dummy = cftime.num2date([0], units="days since 1900-01-01", calendar=self.calendar)[0]
+                Cls = dummy.__class__
+                
+                kwargs = {}
+                if hasattr(dummy, "has_year_zero"):
+                    kwargs["has_year_zero"] = dummy.has_year_zero
+
+                self.output_start_time = Cls(
+                    self.output_start_time.year, self.output_start_time.month, self.output_start_time.day,
+                    self.output_start_time.hour, self.output_start_time.minute, self.output_start_time.second,
+                    self.output_start_time.microsecond, **kwargs
+                )
+            except Exception:
+                # If conversion fails, we leave it as is and hope for the best or fail later
+                pass
+        return self
+
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
     
     # Parameter Change Plan State

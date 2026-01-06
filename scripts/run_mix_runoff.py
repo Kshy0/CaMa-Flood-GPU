@@ -106,6 +106,7 @@ def main():
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year,
         output_start_time=start_date,
+        calendar=dataset0.calendar,
     )
     # assume both datasets have the same formatting and mapping
     local_runoff_matrix, local_runoff_indices = dataset0.build_local_runoff_matrix(
