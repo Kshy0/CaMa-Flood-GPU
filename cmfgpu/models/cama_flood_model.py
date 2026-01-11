@@ -194,7 +194,7 @@ class CaMaFlood(AbstractModel):
             # Determine flags for the first/last sub-step of this model step
             is_first = stat_is_first and (sub_step == 0)
             is_last = stat_is_last and (sub_step == num_sub_steps - 1)
-            self.do_one_sub_step(time_sub_step, runoff, sub_step)
+            self.do_one_sub_step(time_sub_step, runoff, sub_step, output_enabled)
             # Accumulate elapsed time in seconds for the current window
             self._stats_elapsed_time += time_sub_step
             # Compute total_weight only when finalizing
@@ -223,7 +223,7 @@ class CaMaFlood(AbstractModel):
         if self.rank == 0:
             msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
             print(f"\r{msg:<80}", end="", flush=True)
-    def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int) -> None:
+    def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int, output_enabled: bool = True) -> None:
         """Execute one sub time step calculation"""
         # Outflow computation
         if self.num_trials is not None:
@@ -493,7 +493,7 @@ class CaMaFlood(AbstractModel):
                 batched_river_width=self.base.batched_river_width,
                 batched_river_length=self.base.batched_river_length,
             )
-        elif self.log is not None:
+        elif self.log is not None and output_enabled:
             compute_flood_stage_log_kernel[self.base_grid](
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
@@ -596,7 +596,7 @@ class CaMaFlood(AbstractModel):
                     batched_levee_crown_height=self.levee.batched_levee_crown_height,
                     batched_levee_fraction=self.levee.batched_levee_fraction,
                 )
-            elif self.log is not None:
+            elif self.log is not None and output_enabled:
                 compute_levee_stage_log_kernel[self.levee_grid](
                     levee_catchment_idx_ptr=self.levee.levee_catchment_idx,
                     river_storage_ptr=self.base.river_storage,

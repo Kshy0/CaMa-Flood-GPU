@@ -12,7 +12,6 @@ import os
 import random
 import sys
 import tempfile
-import fcntl
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -42,34 +41,23 @@ def _is_wsl() -> bool:
 def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
     (mean_var_name, time_step_data, output_path, time_datetime) = args
     
-    # Use a separate lock file to ensure sequential writes to the same NetCDF file
-    # This allows multiple time steps to be queued safely
-    lock_path = output_path.with_suffix(output_path.suffix + '.lock')
-    
-    with open(lock_path, 'w') as lock_file:
-        # Acquire exclusive lock (blocking)
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            with nc.Dataset(output_path, 'a') as ncfile:
-                nc_var = ncfile.variables[mean_var_name]
-                time_var = ncfile.variables['time']
-                
-                current_len = len(nc_var)
-                
-                # Append data
-                if time_step_data.ndim == 1:
-                    nc_var[current_len, :] = time_step_data
-                elif time_step_data.ndim == 2:
-                    nc_var[current_len, :, :] = time_step_data
-                
-                # Append datetime
-                time_unit = time_var.getncattr("units")
-                calendar = time_var.getncattr("calendar")
-                time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
-                time_var[current_len] = time_val
-        finally:
-            # Release lock
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    with nc.Dataset(output_path, 'a') as ncfile:
+        nc_var = ncfile.variables[mean_var_name]
+        time_var = ncfile.variables['time']
+        
+        current_len = len(nc_var)
+        
+        # Append data
+        if time_step_data.ndim == 1:
+            nc_var[current_len, :] = time_step_data
+        elif time_step_data.ndim == 2:
+            nc_var[current_len, :, :] = time_step_data
+        
+        # Append datetime
+        time_unit = time_var.getncattr("units")
+        calendar = time_var.getncattr("calendar")
+        time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
+        time_var[current_len] = time_val
     
     # WSL optimization: Clear page cache for the written file to prevent memory bloat
     # Windows does not automatically reclaim WSL page cache memory effectively
@@ -225,7 +213,7 @@ class StatisticsAggregator:
         self._files_created: bool = False
 
         # Thread pool for background writing
-        self._write_executor: Optional[ProcessPoolExecutor] = None
+        self._write_executors: List[ProcessPoolExecutor] = []
         self._write_futures: List = []
 
         # Kernel state (mean fast-path)
@@ -268,15 +256,17 @@ class StatisticsAggregator:
     
     def _cleanup_executor(self):
         """Clean up the write executor."""
-        if self._write_executor:
+        if self._write_executors:
             # Wait for pending writes to complete
             for future in self._write_futures:
                 try:
                     future.result(timeout=30)  # Wait up to 30 seconds
                 except:
                     pass
-            self._write_executor.shutdown(wait=True)
-            self._write_executor = None
+            for executor in self._write_executors:
+                executor.shutdown(wait=True)
+            self._write_executors = []
+            self._write_futures = []
     
     def __del__(self):
         """Clean up temporary files and executor when the object is destroyed."""
@@ -344,11 +334,11 @@ class StatisticsAggregator:
         # Initialize single time step aggregation (generic)
         self.initialize_statistics(variable_ops)
         
-        # Start the write executor
-        self._write_executor = ProcessPoolExecutor(max_workers=self.num_workers)
+        # Start the write executors (one per worker to guarantee serialization per variable)
+        self._write_executors = [ProcessPoolExecutor(max_workers=1) for _ in range(self.num_workers)]
         self._write_futures = []
         
-        print("Streaming aggregation system initialized successfully")
+        print(f"Streaming aggregation system initialized successfully ({len(self._write_executors)} partitioned executors)")
     
     def _create_netcdf_files(self, year: Optional[int] = None) -> None:
         """Create empty NetCDF files with proper structure for streaming."""
@@ -1005,8 +995,15 @@ class StatisticsAggregator:
         for out_name, tensor in (self._storage if self._storage else self._mean_storage).items():
             output_path = self._netcdf_files[out_name]
             time_step_data = tensor.detach().cpu().numpy()
+            
+            # Select executor based on variable name hash to ensure serialization
+            # This avoids the need for file locks, as all writes for a specific variable
+            # will always go to the same single-threaded executor.
+            idx = abs(hash(out_name)) % len(self._write_executors)
+            executor = self._write_executors[idx]
+            
             args = (out_name, time_step_data, output_path, dt)
-            future = self._write_executor.submit(_write_time_step_netcdf_process, args)
+            future = executor.submit(_write_time_step_netcdf_process, args)
             self._write_futures.append(future)
         
         # Manage backlog: Wait if too many steps are pending
