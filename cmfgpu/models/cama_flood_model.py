@@ -58,6 +58,8 @@ class CaMaFlood(AbstractModel):
     }
     group_by: ClassVar[str] = "catchment_basin_id"
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
+    _stats_start_time: Optional[Union[datetime, cftime.datetime]] = PrivateAttr(default=None)
+    _stats_macro_step: int = PrivateAttr(default=0)
 
     @cached_property
     def base(self) -> BaseModule:
@@ -112,7 +114,9 @@ class CaMaFlood(AbstractModel):
         default_num_sub_steps: int,
         current_time: Optional[Union[datetime, cftime.datetime]],
         stat_is_first: bool = True,
-        stat_is_last: bool = True,        
+        stat_is_last: bool = True,
+        stat_is_outer_first: Optional[bool] = None,
+        stat_is_outer_last: Optional[bool] = None,
         output_enabled: bool = True) -> None:
         """
         Advance the model by one time step using the provided runoff input.
@@ -120,16 +124,9 @@ class CaMaFlood(AbstractModel):
         Notes on time-weighted statistics:
           - Time-weighted accumulation is performed every sub-step with weight = dt (seconds).
           - If stat_is_first is True, the accumulation window is reset at the first sub-step.
-          - If stat_is_last is True, the window is finalized at the last sub-step: all accumulated
-            sums are divided by the total elapsed time (total_weight) to yield means.
+          - If stat_is_last is True, the window is finalized at the last sub-step.
           - By default (stat_is_first=True, stat_is_last=True), each call to step_advance forms an
             independent window and is saved once at the end of this call.
-
-        Example: If you want to save daily statistics while the input runoff is hourly:
-          - At 00:00-01:00:    call step_advance(..., stat_is_first=True,  stat_is_last=False)
-          - At 01:00-23:00:    call step_advance(..., stat_is_first=False, stat_is_last=False)
-          - At 23:00-24:00:    call step_advance(..., stat_is_first=False, stat_is_last=True)
-          This makes the whole day one averaging window; only the last hour finalizes the mean.
 
         Args:
             runoff (torch.Tensor): Input runoff tensor for this time step.
@@ -138,8 +135,16 @@ class CaMaFlood(AbstractModel):
             current_time (Optional[datetime]): Current simulation time. Used for logging.
             stat_is_first (bool): Whether this call starts a new statistics window (resets accumulation).
             stat_is_last (bool): Whether this call ends the current statistics window (finalize average).
+            stat_is_outer_first (bool, optional): Explicit start of outer window. Defaults to None.
+            stat_is_outer_last (bool, optional): Explicit end of outer window. Defaults to None.
         """
         self.execute_parameter_change_plan(current_time)
+
+        # Handle defaults for outer stats (default to False, only running inner stats)
+        if stat_is_outer_first is None:
+            stat_is_outer_first = False
+        if stat_is_outer_last is None:
+            stat_is_outer_last = False
 
         if self.adaptive_time is not None:
             self.adaptive_time.max_sub_steps.fill_(0)
@@ -184,6 +189,11 @@ class CaMaFlood(AbstractModel):
         if stat_is_first:
             # Reset elapsed time counter at the beginning of a stats window
             self._stats_elapsed_time = 0.0
+            self._stats_start_time = current_time
+            # Keep _stats_macro_step cumulative across inner windows
+            
+        if stat_is_outer_first:
+            self._stats_macro_step = 0
 
         # Check if output is enabled
         if self.output_start_time is not None and current_time is not None:
@@ -194,6 +204,11 @@ class CaMaFlood(AbstractModel):
             # Determine flags for the first/last sub-step of this model step
             is_first = stat_is_first and (sub_step == 0)
             is_last = stat_is_last and (sub_step == num_sub_steps - 1)
+            is_middle = (sub_step == num_sub_steps // 2)
+            
+            is_outer_first = stat_is_outer_first
+            is_outer_last = stat_is_outer_last
+
             self.do_one_sub_step(time_sub_step, runoff, sub_step, output_enabled)
             # Accumulate elapsed time in seconds for the current window
             self._stats_elapsed_time += time_sub_step
@@ -204,16 +219,23 @@ class CaMaFlood(AbstractModel):
                 self.update_statistics(
                     weight=time_sub_step,
                     total_weight=total_weight,
-                    is_first=is_first,
-                    is_last=is_last,
+                    is_inner_first=is_first,
+                    is_inner_last=is_last,
+                    is_outer_first=is_outer_first,
+                    is_outer_last=is_outer_last,
+                    is_middle=is_middle,
+                    is_macro_step_end=is_last, # Count every inner step for correct mean normalization
                     BLOCK_SIZE=self.BLOCK_SIZE,
+                    custom_step_index=self._stats_macro_step
                 )
 
         # Reset elapsed counter after closing a window
         if stat_is_last:
             if output_enabled:
-                self.finalize_time_step(current_time)
+                self.finalize_time_step(self._stats_start_time if self._stats_start_time is not None else current_time)
             self._stats_elapsed_time = 0.0
+            self._stats_start_time = None
+            self._stats_macro_step += 1
         
         if self.log is not None:
             if self.world_size > 1:

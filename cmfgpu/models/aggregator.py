@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import os
 import random
+import re
 import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -52,6 +53,11 @@ def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
             nc_var[current_len, :] = time_step_data
         elif time_step_data.ndim == 2:
             nc_var[current_len, :, :] = time_step_data
+        elif time_step_data.ndim == 3:
+            # e.g. (saved_points, levels, k) or (saved_points, k) ??
+            # time_step_data is (saved_points, k) or (saved_points, levels)
+            # If K is present, shape is (saved_points, k) -> 1D var with K
+            nc_var[current_len, :, :, :] = time_step_data
         
         # Append datetime
         time_unit = time_var.getncattr("units")
@@ -126,6 +132,18 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
                 dim_names.extend(['saved_points', 'levels'])
                 ncfile.createDimension('saved_points', actual_shape[0])
                 ncfile.createDimension('levels', actual_shape[1])
+        
+        # Add Rank/K dimension if needed
+        k_val = metadata.get('k', 1)
+        if k_val > 1:
+            dim_names.append('rank')
+            if 'rank' not in ncfile.dimensions:
+                ncfile.createDimension('rank', k_val) 
+            elif len(ncfile.dimensions['rank']) != k_val:
+                # Fallback if different K used in same file (unlikely for now)
+                # But to be safe, maybe use rank_{k}
+                pass 
+                
         if coord_name and coord_values is not None:
             coord_var = ncfile.createVariable(
                 coord_name,
@@ -187,6 +205,8 @@ class StatisticsAggregator:
         self.calendar = None
         self.time_unit = None
         self._current_year = None
+        
+        self._step_count = 0
 
         # Create kernels directory if saving is enabled
         if self.save_kernels:
@@ -198,12 +218,10 @@ class StatisticsAggregator:
         self._variables: Set[str] = set()  # original variable names
         self._variable_ops: Dict[str, List[str]] = {}  # var -> list[ops]
         self._storage: Dict[str, torch.Tensor] = {}  # out_name -> tensor
+        self._output_keys: List[str] = [] # list of keys in storage that are outputs
         self._metadata: Dict[str, Dict[str, Any]] = {}  # out_name -> meta
         self._coord_cache: Dict[str, np.ndarray] = {}
-        # Backward-compat mean-only state (used by Triton path)
-        self._mean_variables: Set[str] = set()
-        self._mean_storage: Dict[str, torch.Tensor] = {}
-        self._mean_metadata: Dict[str, Dict[str, Any]] = {}
+        
         self._tensor_registry: Dict[str, torch.Tensor] = {}
         self._field_registry: Dict[str, FieldInfo] = {}
 
@@ -225,6 +243,7 @@ class StatisticsAggregator:
         self._temp_kernel_file = None
         self._kernel_module = None
         self._saved_kernel_file = None
+        self._dirty_outputs: Set[str] = set()
         
         print(f"Initialized StreamingStatisticsAggregator for rank {self.rank} with {self.num_workers} workers")
         if self.save_kernels:
@@ -350,15 +369,11 @@ class StatisticsAggregator:
         # Prepare file creation tasks
         creation_futures = {}
         # Use number of outputs instead of variables (supports multiple ops)
-        n_outputs = len(self._metadata) if self._metadata else len(self._mean_metadata)
+        n_outputs = len(self._metadata)
         actual_workers = max(1, min(self.num_workers, n_outputs))
         
         with ProcessPoolExecutor(max_workers=actual_workers) as executor:
-            if self._metadata:
-                items = list(self._metadata.items())
-            else:
-                # fallback for mean-only path
-                items = list(self._mean_metadata.items())
+            items = list(self._metadata.items())
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
@@ -391,6 +406,19 @@ class StatisticsAggregator:
             for op in ops:
                 out_name = f"{var_name}_{op}"
                 required_tensors[out_name] = self._storage[out_name]
+                
+                # Add inner states for compound ops
+                if '_' in op:
+                    parts = op.split('_')
+                    inner = parts[1]
+                    inner_name = f"{var_name}_{inner}_inner_state"
+                    if inner_name in self._storage:
+                        required_tensors[inner_name] = self._storage[inner_name]
+                        # Also add weight state if needed
+                        if inner == 'mean':
+                            w_name = f"{var_name}_{inner}_weight_state"
+                            if w_name in self._storage:
+                                required_tensors[w_name] = self._storage[w_name]
 
         # Collect required dimensions and save indices
         required_dims: Set[str] = set()
@@ -442,6 +470,9 @@ class StatisticsAggregator:
             '- Load save_idx values to get original grid indices',
             '- Use idx to access original data: data[idx]',
             '- Store outputs using sequential indexing: out[offs]',
+            '- For argmax: stores current_step when a new max is found',
+            '- For argmin: stores current_step when a new min is found',
+            '- For mid: stores val when is_middle is True',
             '"""',
             "",
             "import triton",
@@ -589,12 +620,28 @@ class StatisticsAggregator:
             kernel_code_lines.append(f"    {var}_ptr,")
             for op in self._variable_ops[var]:
                 kernel_code_lines.append(f"    {var}_{op}_ptr,")
+            
+            # Inner state pointers
+            added_inner = set()
+            for op in self._variable_ops[var]:
+                if '_' in op:
+                    inner = op.split('_')[1]
+                    if inner not in added_inner:
+                        kernel_code_lines.append(f"    {var}_{inner}_inner_state_ptr,")
+                        if inner == 'mean':
+                            kernel_code_lines.append(f"    {var}_{inner}_weight_state_ptr,")
+                        added_inner.add(inner)
 
         kernel_code_lines.extend([
             "    weight,",
             "    total_weight,",
-            "    is_first,",
-            "    is_last,",
+            "    num_macro_steps,",
+            "    is_inner_first,",
+            "    is_inner_last,",
+            "    is_middle,",
+            "    is_outer_first,",
+            "    is_outer_last,",
+            "    current_step,",
             "    n_saved_points: tl.constexpr,",
         ])
         if dims_2d:
@@ -617,6 +664,8 @@ class StatisticsAggregator:
         indent = "        "
         indent2 = indent + "    "
         indent3 = indent2 + "    "
+        indent4 = indent3 + "    "
+        indent5 = indent4 + "    "
 
         # 1D processing
         if dims_1d:
@@ -632,28 +681,299 @@ class StatisticsAggregator:
                 if len(ops) == 1 and ops[0] == 'last':
                     # last-only: load only when needed
                     kernel_code_lines.extend([
-                        f"{indent}if is_last:",
+                        f"{indent}if is_inner_last:",
                         f"{indent2}val = tl.load({in_ptr}, mask=mask, other=0.0)",
                         f"{indent2}tl.store({var}_last_ptr + {out_offset}, val, mask=mask)",
                     ])
                 else:
                     kernel_code_lines.append(f"{indent}val = tl.load({in_ptr}, mask=mask, other=0.0)")
+
+                    # Inner states update
+                    inner_ops = set(op.split('_')[1] for op in ops if '_' in op)
+                    for inner in inner_ops:
+                        kernel_code_lines.append(f"{indent}val_for_{inner} = tl.zeros_like(val)")
+                        inner_ptr = f"{var}_{inner}_inner_state_ptr + {out_offset}"
+                        if inner == 'mean':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                                 f"{indent}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent}inner_{inner}_new = inner_{inner}_old + val * weight",
+                                 f"{indent}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}tl.store({inner_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 # Avoid DBZ
+                                 f"{indent2}val_for_{inner} = inner_{inner}_new / (weight_{inner}_new)",
+                                 f"{indent}else:",
+                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                                 f"{indent2}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'sum':
+                             kernel_code_lines.extend([
+                                 f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                                 f"{indent}inner_{inner}_new = inner_{inner}_old + val * weight",
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}tl.store({inner_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent}else:",
+                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'max':
+                             kernel_code_lines.extend([
+                                 f"{indent}if is_inner_first and current_step==0:",
+                                 f"{indent2}inner_{inner}_new = val",
+                                 f"{indent}else:",
+                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
+                                 f"{indent2}inner_{inner}_new = tl.maximum(inner_{inner}_old, val)",
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}tl.store({inner_ptr}, -float('inf'), mask=mask)",
+                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent}else:",
+                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'min':
+                             kernel_code_lines.extend([
+                                 f"{indent}if is_inner_first and current_step==0:",
+                                 f"{indent2}inner_{inner}_new = val",
+                                 f"{indent}else:",
+                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
+                                 f"{indent2}inner_{inner}_new = tl.minimum(inner_{inner}_old, val)",
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}tl.store({inner_ptr}, float('inf'), mask=mask)",
+                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent}else:",
+                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'mid':
+                             kernel_code_lines.extend([
+                                 f"{indent}if is_middle:",
+                                 f"{indent2}tl.store({inner_ptr}, val, mask=mask)",
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}val_for_{inner} = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                             ])
+                        elif inner == 'last':
+                             kernel_code_lines.extend([
+                                 f"{indent}inner_{inner}_new = val",
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
+                             ])
+
                     for op in ops:
                         out_ptr = f"{var}_{op}_ptr + {out_offset}"
+                        op_parts = op.split('_')
+                        if len(op_parts) > 1:
+                            outer = op_parts[0]
+                            
+                            # Parse K
+                            k_val = 1
+                            match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer)
+                            if match_k:
+                                outer = match_k.group(1) # normalize
+                                k_val = int(match_k.group(2))
+                            
+                            inner = op_parts[1]
+                            val_var = f"val_for_{inner}"
+                            kernel_code_lines.append(f"{indent}if is_inner_last:")
+                            
+                            if outer == 'max':
+                                if k_val == 1:
+                                    kernel_code_lines.extend([
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                        f"{indent3}new = tl.maximum(old, {val_var})",
+                                        f"{indent3}tl.store({out_ptr}, new, mask=mask)",
+                                    ])
+                                else:
+                                    # Bubble Insert for maxK
+                                    kernel_code_lines.extend([
+                                        f"{indent2}# Bubble Insert Max K={k_val}",
+                                        f"{indent2}new_val = {val_var}",
+                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent2}base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
+                                        f"{indent3}for k in range(1, {k_val}):",
+                                        f"{indent4}tl.store(base_ptr + k, -float('inf'), mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}for k in range({k_val}):",
+                                        f"{indent4}old_k = tl.load(base_ptr + k, mask=mask, other=-float('inf'))",
+                                        f"{indent4}swap_mask = new_val > old_k",
+                                        f"{indent4}val_to_store = tl.where(swap_mask, new_val, old_k)",
+                                        f"{indent4}new_val = tl.where(swap_mask, old_k, new_val)",
+                                        f"{indent4}tl.store(base_ptr + k, val_to_store, mask=mask)",
+                                    ])
+
+                            elif outer == 'argmax':
+                                if k_val == 1:
+                                    comp_ptr = f"{var}_max_{inner}_ptr + {out_offset}"
+                                    kernel_code_lines.extend([
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}curr_max = tl.load({comp_ptr}, mask=mask, other={val_var})",
+                                        f"{indent3}cond_mask = {val_var} > curr_max",
+                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                                    ])
+                                else:
+                                    # Argmax K
+                                    # We duplicate the bubble logic here, reading maxK values. 
+                                    # argmaxK reads OLD maxK values (before update), decides swaps, updates indices.
+                                    # Then maxK runs, reads OLD maxK values, updates values.
+                                    
+                                    comp_op = f"max{k_val}_{inner}"
+                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    
+                                    kernel_code_lines.extend([
+                                        f"{indent2}# Bubble Insert Argmax K={k_val}",
+                                        f"{indent2}comp_val = {val_var}",
+                                        f"{indent2}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
+                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
+                                        # Pointer to values (read-only for comparison)
+                                        f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
+                                        # Pointer to indices (read-write)
+                                        f"{indent2}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
+                                        # others initialized to 0 (default)
+                                        f"{indent2}else:",
+                                        f"{indent3}for k in range({k_val}):",
+                                        f"{indent4}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=-float('inf'))",
+                                        f"{indent4}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)", # 0 or -1?
+                                        f"{indent4}swap_mask = comp_val > old_val_k",
+                                        # Swap indices based on value comparison
+                                        f"{indent4}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
+                                        f"{indent4}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
+                                        # Must also start swapping value component for next iterations comparison
+                                        f"{indent4}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
+                                        f"{indent4}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
+                                    ])
+
+                            elif outer == 'min':
+                                if k_val == 1:
+                                    kernel_code_lines.extend([
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                        f"{indent3}new = tl.minimum(old, {val_var})",
+                                        f"{indent3}tl.store({out_ptr}, new, mask=mask)",
+                                    ])
+                                else:
+                                    # Min K
+                                    kernel_code_lines.extend([
+                                        f"{indent2}# Bubble Insert Min K={k_val}",
+                                        f"{indent2}new_val = {val_var}",
+                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent2}base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
+                                        f"{indent3}for k in range(1, {k_val}):",
+                                        f"{indent3}    tl.store(base_ptr + k, float('inf'), mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}for k in range({k_val}):",
+                                        f"{indent4}old_k = tl.load(base_ptr + k, mask=mask, other=float('inf'))",
+                                        f"{indent4}swap_mask = new_val < old_k",
+                                        f"{indent4}val_to_store = tl.where(swap_mask, new_val, old_k)",
+                                        f"{indent4}new_val = tl.where(swap_mask, old_k, new_val)",
+                                        f"{indent4}tl.store(base_ptr + k, val_to_store, mask=mask)",
+                                    ])
+                                    
+                            elif outer == 'argmin':
+                                if k_val == 1:
+                                    comp_ptr = f"{var}_min_{inner}_ptr + {out_offset}"
+                                    kernel_code_lines.extend([
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}curr_min = tl.load({comp_ptr}, mask=mask, other={val_var})",
+                                        f"{indent3}cond_mask = {val_var} < curr_min",
+                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                                    ])
+                                else:
+                                    # Argmin K
+                                    # Assume argminK runs before minK
+                                    comp_op = f"min{k_val}_{inner}"
+                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    
+                                    kernel_code_lines.extend([
+                                        f"{indent2}# Bubble Insert Argmin K={k_val}",
+                                        f"{indent2}comp_val = {val_var}",
+                                        f"{indent2}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
+                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
+                                        f"{indent2}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
+                                        f"{indent2}else:",
+                                        f"{indent3}for k in range({k_val}):",
+                                        f"{indent4}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=float('inf'))",
+                                        f"{indent4}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
+                                        f"{indent4}swap_mask = comp_val < old_val_k",
+                                        f"{indent4}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
+                                        f"{indent4}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
+                                        f"{indent4}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
+                                        f"{indent4}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
+                                    ])
+                                    
+                            elif outer == 'mean':
+                                # Outer mean implementation
+                                kernel_code_lines.extend([
+                                    f"{indent2}if is_outer_first and current_step==0:",
+                                    f"{indent3}new = {val_var}",
+                                    f"{indent2}else:",
+                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                    f"{indent3}new = old + {val_var}",
+                                    f"{indent2}if is_outer_last:",
+                                    f"{indent3}new = new / (num_macro_steps)",
+                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
+                                    f"{indent2}else:",
+                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
+                                ])
+                            elif outer == 'sum':
+                                kernel_code_lines.extend([
+                                    f"{indent2}if is_outer_first and current_step==0:",
+                                    f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                    f"{indent2}else:",
+                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                    f"{indent3}new = old + {val_var}",
+                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
+                                ])
+                            continue
+
                         if op == 'mean':
                             kernel_code_lines.extend([
-                                f"{indent}if is_first:",
+                                f"{indent}if is_inner_first:",
                                 f"{indent2}old = tl.zeros_like(val)",
                                 f"{indent}else:",
                                 f"{indent2}old = tl.load({out_ptr}, mask=mask, other=0.0)",
                                 f"{indent}new = old + val * weight",
-                                f"{indent}if is_last:",
+                                f"{indent}if is_inner_last:",
                                 f"{indent2}new = new / total_weight",
+                                f"{indent}tl.store({out_ptr}, new, mask=mask)",
+                            ])
+                        elif op == 'sum':
+                            kernel_code_lines.extend([
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}old = tl.zeros_like(val)",
+                                f"{indent}else:",
+                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                # Simple sum accumulation (integral if input is scaled)
+                                # Assuming val is already scaled if needed, or if it's simple accumulation.
+                                # Consistent with mean: mean is sum(val*weight)/sum(weight).
+                                # So sum should be sum(val*weight).
+                                f"{indent}new = old + val * weight",
                                 f"{indent}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'max':
                             kernel_code_lines.extend([
-                                f"{indent}if is_first:",
+                                f"{indent}if is_inner_first:",
                                 f"{indent2}tl.store({out_ptr}, val, mask=mask)",
                                 f"{indent}else:",
                                 f"{indent2}old = tl.load({out_ptr}, mask=mask, other=val)",
@@ -662,16 +982,47 @@ class StatisticsAggregator:
                             ])
                         elif op == 'min':
                             kernel_code_lines.extend([
-                                f"{indent}if is_first:",
+                                f"{indent}if is_inner_first:",
                                 f"{indent2}tl.store({out_ptr}, val, mask=mask)",
                                 f"{indent}else:",
                                 f"{indent2}old = tl.load({out_ptr}, mask=mask, other=val)",
                                 f"{indent2}new = tl.minimum(old, val)",
                                 f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
+                        elif op == 'argmax':
+                            max_ptr = f"{var}_max_ptr + {out_offset}"
+                            kernel_code_lines.extend([
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask)",
+                                f"{indent2}if is_inner_last:", 
+                                f"{indent}else:",
+                                f"{indent2}curr_max = tl.load({max_ptr}, mask=mask, other=val)",
+                                f"{indent2}cond_mask = val > curr_max",
+                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                            ])
+                        elif op == 'argmin':
+                            min_ptr = f"{var}_min_ptr + {out_offset}"
+                            kernel_code_lines.extend([
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask)",
+                                f"{indent}else:",
+                                f"{indent2}curr_min = tl.load({min_ptr}, mask=mask, other=val)",
+                                f"{indent2}cond_mask = val < curr_min",
+                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                            ])
                         elif op == 'last':
                             kernel_code_lines.extend([
-                                f"{indent}if is_last:",
+                                f"{indent}if is_inner_last:",
+                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
+                            ])
+                        elif op == 'first':
+                            kernel_code_lines.extend([
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
+                            ])
+                        elif op == 'mid':
+                            kernel_code_lines.extend([
+                                f"{indent}if is_middle:",
                                 f"{indent2}tl.store({out_ptr}, val, mask=mask)",
                             ])
                 kernel_code_lines.append("")
@@ -691,22 +1042,320 @@ class StatisticsAggregator:
                     out_offset = f"(t * n_saved_points + offs) * n_levels + level"
                     
                     kernel_code_lines.append(f"{indent2}val = tl.load({in_ptr}, mask=mask, other=0.0)")
+
+                    # Inner states update
+                    ops = self._variable_ops[var]
+                    inner_ops = set(op.split('_')[1] for op in ops if '_' in op)
+                    for inner in inner_ops:
+                        # Initialize val_for_inner to avoid UnboundLocalError/NameError in generated code
+                        # This value is used if is_update_outer is True, where it gets overwritten.
+                        kernel_code_lines.append(f"{indent2}val_for_{inner} = tl.zeros_like(val)")
+
+                        inner_ptr = f"{var}_{inner}_inner_state_ptr + {out_offset}"
+                        if inner == 'mean':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}inner_{inner}_new = inner_{inner}_old + val * weight",
+                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
+                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 f"{indent3}val_for_{inner} = inner_{inner}_new / (weight_{inner}_new)",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'sum':
+                             kernel_code_lines.extend([
+                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}inner_{inner}_new = inner_{inner}_old + val * weight",
+                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
+                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'max':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent2}if is_first and current_step==0:", 
+                                 f"{indent3}inner_{inner}_new = val",
+                                 f"{indent2}else:",
+                                 f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
+                                 f"{indent3}inner_{inner}_new = tl.maximum(inner_{inner}_old, val)",
+                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent3}tl.store({inner_ptr}, -float('inf'), mask=mask)",
+                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
+                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'min':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent2}if is_first and current_step==0:",
+                                 f"{indent3}inner_{inner}_new = val",
+                                 f"{indent2}else:",
+                                 f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
+                                 f"{indent3}inner_{inner}_new = tl.minimum(inner_{inner}_old, val)",
+                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent3}tl.store({inner_ptr}, float('inf'), mask=mask)",
+                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
+                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'first':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent2}val_stored = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}if weight_{inner}_old == 0.0:",
+                                 f"{indent3}inner_{inner}_new = val",
+                                 f"{indent2}else:",
+                                 f"{indent3}inner_{inner}_new = val_stored",
+                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
+                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
+                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
+                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'last':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent3}val_for_{inner} = val",
+                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
+                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+                        elif inner == 'mid':
+                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             kernel_code_lines.extend([
+                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
+                                 f"{indent2}if is_middle:",
+                                 f"{indent3}tl.store({inner_ptr}, val, mask=mask)",
+                                 f"{indent2}if is_inner_last:",
+                                 f"{indent3}val_for_{inner} = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
+                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
+                                 f"{indent2}else:",
+                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
+                             ])
+
                     for op in self._variable_ops[var]:
                         out_ptr = f"{var}_{op}_ptr + {out_offset}"
+                        op_parts = op.split('_')
+                        if len(op_parts) > 1:
+                            outer = op_parts[0]
+                            inner = op_parts[1]
+                            
+                            # Parse K
+                            k_val = 1
+                            match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer)
+                            if match_k:
+                                outer = match_k.group(1) # normalize
+                                k_val = int(match_k.group(2))
+
+                            val_var = f"val_for_{inner}"
+                            kernel_code_lines.append(f"{indent2}if is_macro_step_end:")
+                            
+                            if outer == 'max':
+                                if k_val == 1:
+                                    kernel_code_lines.extend([
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                        f"{indent4}new = tl.maximum(old, {val_var})",
+                                        f"{indent4}tl.store({out_ptr}, new, mask=mask)",
+                                    ])
+                                else:
+                                    # Bubble Insert Max K
+                                    kernel_code_lines.extend([
+                                        f"{indent3}# Bubble Insert Max K={k_val}",
+                                        f"{indent3}new_val = {val_var}",
+                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent3}base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
+                                        f"{indent4}for k in range(1, {k_val}):",
+                                        f"{indent4}    tl.store(base_ptr + k, -float('inf'), mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}for k in range({k_val}):",
+                                        f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=-float('inf'))",
+                                        f"{indent5}swap_mask = new_val > old_k",
+                                        f"{indent5}val_to_store = tl.where(swap_mask, new_val, old_k)",
+                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
+                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
+                                    ])
+
+                            elif outer == 'argmax':
+                                if k_val == 1:
+                                    comp_ptr = f"{var}_max_{inner}_ptr + {out_offset}"
+                                    kernel_code_lines.extend([
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}curr_max = tl.load({comp_ptr}, mask=mask, other={val_var})",
+                                        f"{indent4}cond_mask = {val_var} > curr_max",
+                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                                    ])
+                                else:
+                                    # Argmax K
+                                    comp_op = f"max{k_val}_{inner}"
+                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    kernel_code_lines.extend([
+                                        f"{indent3}# Bubble Insert Argmax K={k_val}",
+                                        f"{indent3}comp_val = {val_var}",
+                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
+                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent3}val_base_ptr = {comp_ptr_base} + k_offset",
+                                        f"{indent3}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}for k in range({k_val}):",
+                                        f"{indent5}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=-float('inf'))",
+                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
+                                        f"{indent5}swap_mask = comp_val > old_val_k",
+                                        f"{indent5}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
+                                        f"{indent5}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
+                                        f"{indent5}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
+                                        f"{indent5}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
+                                    ])
+
+                            elif outer == 'min':
+                                if k_val == 1:
+                                    kernel_code_lines.extend([
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                        f"{indent4}new = tl.minimum(old, {val_var})",
+                                        f"{indent4}tl.store({out_ptr}, new, mask=mask)",
+                                    ])
+                                else:
+                                    # Min K
+                                    kernel_code_lines.extend([
+                                        f"{indent3}# Bubble Insert Min K={k_val}",
+                                        f"{indent3}new_val = {val_var}",
+                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent3}base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
+                                        f"{indent4}for k in range(1, {k_val}):",
+                                        f"{indent4}    tl.store(base_ptr + k, float('inf'), mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}for k in range({k_val}):",
+                                        f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=float('inf'))",
+                                        f"{indent5}swap_mask = new_val < old_k",
+                                        f"{indent5}val_to_store = tl.where(swap_mask, new_val, old_k)",
+                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
+                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
+                                    ])
+
+                            elif outer == 'argmin':
+                                if k_val == 1:
+                                    comp_ptr = f"{var}_min_{inner}_ptr + {out_offset}"
+                                    kernel_code_lines.extend([
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}curr_min = tl.load({comp_ptr}, mask=mask, other={val_var})",
+                                        f"{indent4}cond_mask = {val_var} < curr_min",
+                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                                    ])
+                                else:
+                                    # Argmin K
+                                    comp_op = f"min{k_val}_{inner}"
+                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    kernel_code_lines.extend([
+                                        f"{indent3}# Bubble Insert Argmin K={k_val}",
+                                        f"{indent3}comp_val = {val_var}",
+                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
+                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
+                                        f"{indent3}val_base_ptr = {comp_ptr_base} + k_offset",
+                                        f"{indent3}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        
+                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
+                                        f"{indent3}else:",
+                                        f"{indent4}for k in range({k_val}):",
+                                        f"{indent5}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=float('inf'))",
+                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
+                                        f"{indent5}swap_mask = comp_val < old_val_k",
+                                        f"{indent5}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
+                                        f"{indent5}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
+                                        f"{indent5}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
+                                        f"{indent5}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
+                                    ])
+                            elif outer == 'sum':
+                                kernel_code_lines.extend([
+                                    f"{indent3}if is_outer_first and current_step==0:",
+                                    f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                    f"{indent3}else:",
+                                    f"{indent4}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                    f"{indent4}tl.store({out_ptr}, old + {val_var}, mask=mask)",
+                                ])
+                            elif outer == 'mean':
+                                term = f"{val_var}"
+                                kernel_code_lines.extend([
+                                    f"{indent3}if is_outer_first and current_step==0:",
+                                    f"{indent4}tl.store({out_ptr}, {term}, mask=mask)",
+                                    f"{indent3}else:",
+                                    f"{indent4}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                    f"{indent4}tl.store({out_ptr}, old + {term}, mask=mask)",
+                                    f"{indent3}if is_outer_last:",
+                                    f"{indent4}chk = tl.load({out_ptr}, mask=mask)",
+                                    f"{indent4}tl.store({out_ptr}, chk / num_macro_steps, mask=mask)",
+                                ])
+                            continue
+
                         if op == 'mean':
                             kernel_code_lines.extend([
-                                f"{indent2}if is_first:",
+                                f"{indent2}if is_inner_first:",
                                 f"{indent3}old = tl.zeros_like(val)",
                                 f"{indent2}else:",
                                 f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
                                 f"{indent2}new = old + val * weight",
-                                f"{indent2}if is_last:",
+                                f"{indent2}if is_inner_last:",
                                 f"{indent3}new = new / total_weight",
+                                f"{indent2}tl.store({out_ptr}, new, mask=mask)",
+                            ])
+                        elif op == 'sum':
+                            kernel_code_lines.extend([
+                                f"{indent2}if is_inner_first:",
+                                f"{indent3}old = tl.zeros_like(val)",
+                                f"{indent2}else:",
+                                f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                                f"{indent2}new = old + val * weight",
                                 f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'max':
                             kernel_code_lines.extend([
-                                f"{indent2}if is_first:",
+                                f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                                 f"{indent2}else:",
                                 f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
@@ -715,16 +1364,47 @@ class StatisticsAggregator:
                             ])
                         elif op == 'min':
                             kernel_code_lines.extend([
-                                f"{indent2}if is_first:",
+                                f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                                 f"{indent2}else:",
                                 f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
                                 f"{indent3}new = tl.minimum(old, val)",
                                 f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
+                        elif op == 'argmax':
+                            # 2D argmax logic
+                            max_ptr = f"{var}_max_ptr + {out_offset}"
+                            kernel_code_lines.extend([
+                                f"{indent2}if is_inner_first:",
+                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
+                                f"{indent2}else:",
+                                f"{indent3}curr_max = tl.load({max_ptr}, mask=mask, other=val)",
+                                f"{indent3}cond_mask = val > curr_max",
+                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                            ])
+                        elif op == 'argmin':
+                            min_ptr = f"{var}_min_ptr + {out_offset}"
+                            kernel_code_lines.extend([
+                                f"{indent2}if is_inner_first:",
+                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
+                                f"{indent2}else:",
+                                f"{indent3}curr_min = tl.load({min_ptr}, mask=mask, other=val)",
+                                f"{indent3}cond_mask = val < curr_min",
+                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                            ])
                         elif op == 'last':
                             kernel_code_lines.extend([
-                                f"{indent2}if is_last:",
+                                f"{indent2}if is_inner_last:",
+                                f"{indent3}tl.store({out_ptr}, val, mask=mask)",
+                            ])
+                        elif op == 'first':
+                            kernel_code_lines.extend([
+                                f"{indent2}if is_inner_first:",
+                                f"{indent3}tl.store({out_ptr}, val, mask=mask)",
+                            ])
+                        elif op == 'mid':
+                            kernel_code_lines.extend([
+                                f"{indent2}if is_middle:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                             ])
                 kernel_code_lines.append("")
@@ -732,7 +1412,7 @@ class StatisticsAggregator:
             if last_only_vars:
                 kernel_code_lines.extend([
                     f"{indent}# 2D variables (last-only)",
-                    f"{indent}if is_last:",
+                    f"{indent}if is_inner_last:",
                     f"{indent2}for level in tl.static_range(n_levels):",
                 ])
                 for var in last_only_vars:
@@ -750,7 +1430,7 @@ class StatisticsAggregator:
         """Generate the main python function that calls kernels."""
         kernel_code_lines.extend([
             "# Main update function",
-            "def internal_update_statistics(states, weight, total_weight, is_first, is_last, BLOCK_SIZE):",
+            "def internal_update_statistics(states, weight, total_weight, num_macro_steps, is_inner_first, is_inner_last, is_middle, is_outer_first, is_outer_last, current_step, BLOCK_SIZE):",
         ])
         
         if self.num_trials > 1:
@@ -783,12 +1463,28 @@ class StatisticsAggregator:
                 kernel_code_lines.append(f"        {var}_ptr=states['{var}'],")
                 for op in self._variable_ops[var]:
                     kernel_code_lines.append(f"        {var}_{op}_ptr=states['{var}_{op}'],")
+                
+                # Inner state pointers
+                added_inner = set()
+                for op in self._variable_ops[var]:
+                    if '_' in op:
+                        inner = op.split('_')[1]
+                        if inner not in added_inner:
+                             kernel_code_lines.append(f"        {var}_{inner}_inner_state_ptr=states['{var}_{inner}_inner_state'],")
+                             if inner in ('mean', 'max', 'min', 'first', 'last', 'mid'):
+                                 kernel_code_lines.append(f"        {var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
+                             added_inner.add(inner)
             
             kernel_code_lines.extend([
                 "        weight=weight,",
                 "        total_weight=total_weight,",
-                "        is_first=is_first,",
-                "        is_last=is_last,",
+                "        num_macro_steps=num_macro_steps,",
+                "        is_inner_first=is_inner_first,",
+                "        is_inner_last=is_inner_last,",
+                "        is_middle=is_middle,",
+                "        is_outer_first=is_outer_first,",
+                "        is_outer_last=is_outer_last,",
+                "        current_step=current_step,",
                 "        n_saved_points=save_idx_len,",
             ])
             
@@ -875,20 +1571,52 @@ class StatisticsAggregator:
                 ops_list = list(ops)
             self._variable_ops[var] = [str(o).lower() for o in ops_list]
         self._storage.clear()
+        self._output_keys = []
         self._metadata.clear()
-        # Reset mean fast-path holders
-        self._mean_variables = {k for k, v in self._variable_ops.items() if 'mean' in v}
-        self._mean_storage.clear()
-        self._mean_metadata.clear()
+        self._output_is_outer: Dict[str, bool] = {}
+        
         self._aggregator_function = None
         self._aggregator_generated = False
         self._kernel_states = None
+        self._current_macro_step_count = 0.0
 
         # Clean up old temporary files
         self._cleanup_temp_files()
 
         # Validate and setup each variable
         for var_name, ops in self._variable_ops.items():
+            # Handle compound op dependencies
+            extra_ops = []
+            import re
+            for op in ops:
+                if '_' in op:
+                    parts = op.split('_')
+                    outer_op = parts[0]
+                    # Check for maxk/mink pattern
+                    match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer_op)
+                    if match_k:
+                        base = match_k.group(1)
+                        k = int(match_k.group(2))
+                        if base in ['argmax', 'argmin']:
+                            # argmaxK needs maxK
+                            req_base = 'max' if base == 'argmax' else 'min'
+                            req = f"{req_base}{k}_{parts[1]}"
+                            if req not in ops and req not in extra_ops:
+                                extra_ops.append(req)
+                    
+                    elif parts[0] == 'argmax':
+                        req = f"max_{parts[1]}"
+                        if req not in ops and req not in extra_ops:
+                            extra_ops.append(req)
+                    elif parts[0] == 'argmin':
+                        req = f"min_{parts[1]}"
+                        if req not in ops and req not in extra_ops:
+                            extra_ops.append(req)
+            ops.extend(extra_ops)
+            
+            # Sort ops to ensure deps are processed if needed, though dict order usually fine
+            ops.sort()
+            
             if var_name not in self._tensor_registry:
                 raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
 
@@ -916,53 +1644,148 @@ class StatisticsAggregator:
             if actual_ndim > max_ndim:
                 raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only up to {max_ndim}D variables are supported.")
 
+            is_2d = (self.num_trials > 1 and actual_ndim == 3) or (self.num_trials == 1 and actual_ndim == 2)
+            if is_2d and any(op in ops for op in ['argmax', 'argmin', 'max', 'min']):
+                raise ValueError(f"argmax/argmin/max/min operations are not supported for 2D variable '{var_name}' (with levels).")
+
             # Track
             self._variables.add(var_name)
 
             for op in ops:
                 out_name = f"{var_name}_{op}"
+                
+                # Parse op parts
+                op_parts = op.split('_')
+                outer_op = op_parts[0]
+                
+                # Check for K
+                k_val = 1
+                match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer_op)
+                if match_k:
+                    outer_base = match_k.group(1)
+                    k_val = int(match_k.group(2))
+                    outer_op = outer_base # normalize for allocation logic below (mostly)
+                
                 # Allocate storage by op
-                if op == 'max':
-                    init_tensor = torch.full(actual_shape, -torch.inf, dtype=tensor.dtype, device=self.device)
-                elif op == 'min':
-                    init_tensor = torch.full(actual_shape, torch.inf, dtype=tensor.dtype, device=self.device)
+                if k_val > 1:
+                    alloc_shape = actual_shape + (k_val,)
                 else:
-                    init_tensor = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                    alloc_shape = actual_shape
+
+                if outer_op.startswith('max'):
+                    # max or maxK
+                    init_tensor = torch.full(alloc_shape, -torch.inf, dtype=tensor.dtype, device=self.device)
+                elif outer_op.startswith('min'):
+                    init_tensor = torch.full(alloc_shape, torch.inf, dtype=tensor.dtype, device=self.device)
+                elif outer_op.startswith('argmax') or outer_op.startswith('argmin'):
+                    init_tensor = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
+                elif outer_op == 'first':
+                    # Similar to 'last', we just need storage. Zero initialization is fine as it will be overwritten on is_first.
+                    init_tensor = torch.zeros(alloc_shape, dtype=tensor.dtype, device=self.device)
+                else:
+                    init_tensor = torch.zeros(alloc_shape, dtype=tensor.dtype, device=self.device)
                 self._storage[out_name] = init_tensor
+                self._output_keys.append(out_name)
+
+                # For compound ops, allocate inner state
+                if len(op_parts) > 1:
+                    inner_op = op_parts[1]
+                    inner_state_name = f"{var_name}_{inner_op}_inner_state"
+                    if inner_state_name not in self._storage:
+                         # Initialize inner state
+                         if inner_op == 'mean':
+                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                         elif inner_op == 'max':
+                             init_inner = torch.full(actual_shape, -torch.inf, dtype=tensor.dtype, device=self.device)
+                         elif inner_op == 'min':
+                             init_inner = torch.full(actual_shape, torch.inf, dtype=tensor.dtype, device=self.device)
+                         elif inner_op == 'sum':
+                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                         elif inner_op in ('first', 'last', 'mid'):
+                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                         else:
+                             # Should be caught by validator, but safe fallback
+                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                         self._storage[inner_state_name] = init_inner
+                         
+                         # Allocate weight state if inner op is mean (to calculate weighted average)
+                         if inner_op in ('mean', 'max', 'min', 'first', 'last', 'mid'):
+                             weight_state_name = f"{var_name}_{inner_op}_weight_state"
+                             if weight_state_name not in self._storage:
+                                 self._storage[weight_state_name] = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
 
                 if save_coord and save_coord not in self._coord_cache:
                     coord_tensor = self._tensor_registry[save_coord]
                     self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
+                
+                out_dtype = torch_to_numpy_dtype(tensor.dtype)
+                if outer_op in ('argmax', 'argmin'):
+                    out_dtype = 'i4' # int32
 
                 meta = {
                     'original_variable': var_name,
                     'op': op,
                     'save_idx': save_idx,
                     'tensor_shape': tensor_shape,
-                    'dtype': torch_to_numpy_dtype(tensor.dtype),
+                    'dtype': out_dtype,
                     'actual_shape': actual_shape,
                     'actual_ndim': actual_ndim,
                     'save_coord': save_coord,
                     'description': f"{description} ({op})",
                     'stride_input': tensor.shape[1] if self.num_trials > 1 else 0,
+                    'k': k_val
                 }
                 self._metadata[out_name] = meta
+                
+                # Classify as outer if it is a compound op (e.g. max_mean)
+                self._output_is_outer[out_name] = len(op_parts) > 1
 
-                if op == 'mean':
-                    mean_var_name = out_name
-                    self._mean_storage[mean_var_name] = init_tensor
-                    self._mean_metadata[mean_var_name] = meta
-                    self._tensor_registry[mean_var_name] = init_tensor
 
         # Generate kernels and prepare states for all requested variables/ops
         self._generate_aggregator_function()
         self._prepare_kernel_states()
 
     
-    def update_statistics(self, weight: float, total_weight: float = 0.0, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
+    def update_statistics(self, weight: float, total_weight: float = 0.0, 
+                          is_inner_first: bool = False, is_inner_last: bool = False, 
+                          is_outer_first: bool = False, is_outer_last: bool = False,
+                          BLOCK_SIZE: int = 128, custom_step_index: Optional[int] = None,
+                          # Legacy kwargs support
+                          is_first: bool = False, is_last: bool = False, 
+                          is_middle: bool = False, is_macro_step_end: bool = False) -> None:
         if not self._aggregator_generated:
             raise RuntimeError("Statistics aggregation not initialized. Call initialize_streaming_aggregation() first.")
-        self._aggregator_function(self._kernel_states, weight, total_weight, is_first, is_last, BLOCK_SIZE)
+        
+        # Handle legacy or new parameters
+        _is_inner_first = is_inner_first or is_first
+        _is_inner_last = is_inner_last or is_last
+        
+        if _is_inner_first:
+            self._step_count = 0
+            
+        if _is_inner_last:
+             for out_name, is_outer in self._output_is_outer.items():
+                 if not is_outer:
+                     self._dirty_outputs.add(out_name)
+        
+        if is_outer_last:
+             for out_name, is_outer in self._output_is_outer.items():
+                 if is_outer:
+                     self._dirty_outputs.add(out_name)
+
+        if is_macro_step_end: # Legacy support or counter
+            self._current_macro_step_count += 1.0
+
+        step_val = custom_step_index if custom_step_index is not None else self._step_count
+        macro_count_val = (float(custom_step_index) + 1.0) if custom_step_index is not None else self._current_macro_step_count
+            
+        self._aggregator_function(self._kernel_states, weight, total_weight, macro_count_val, 
+                                  _is_inner_first, _is_inner_last, is_middle, 
+                                  is_outer_first, is_outer_last,
+                                  step_val, BLOCK_SIZE)
+        
+        self._step_count += 1
+
     
     def finalize_time_step(self, dt: Union[datetime, cftime.datetime]) -> None:
         """
@@ -991,8 +1814,18 @@ class StatisticsAggregator:
             if not self._files_created:
                 self._create_netcdf_files()
         
-        # Write all outputs
-        for out_name, tensor in (self._storage if self._storage else self._mean_storage).items():
+        # Write all outputs that are marked dirty
+        # Use explicit list of output keys to maintain order/determinism
+        keys_to_write = [k for k in self._output_keys if k in self._dirty_outputs]
+        
+        # Clear dirty set for next step
+        self._dirty_outputs.clear()
+        
+        for out_name in keys_to_write:
+            tensor = self._storage[out_name]
+
+            if out_name not in self._netcdf_files:
+                continue
             output_path = self._netcdf_files[out_name]
             time_step_data = tensor.detach().cpu().numpy()
             
@@ -1005,9 +1838,12 @@ class StatisticsAggregator:
             args = (out_name, time_step_data, output_path, dt)
             future = executor.submit(_write_time_step_netcdf_process, args)
             self._write_futures.append(future)
+            
+        # Reset counters
+        self._current_macro_step_count = 0.0
         
         # Manage backlog: Wait if too many steps are pending
-        batch_n = len(self._storage) if self._storage else len(self._mean_storage)
+        batch_n = len(self._storage)
         max_futures = self.max_pending_steps * batch_n
         
         while len(self._write_futures) > max_futures:

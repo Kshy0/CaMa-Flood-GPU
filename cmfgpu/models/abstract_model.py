@@ -15,6 +15,7 @@ from typing import (Any, ClassVar, Dict, Iterator, List, Literal, Optional,
                     Self, Tuple, Type, Union)
 
 import cftime
+import re
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -83,7 +84,7 @@ class AbstractModel(BaseModel, ABC):
     # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
     # one variable can appear under multiple ops.
     variables_to_save: Optional[Dict[str, Union[str, List[str]]]] = Field(
-        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last."
+        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, argmax, argmin."
     )
     precision: Literal["float32", "float64"] = Field(default="float32", description="Precision of the model")
     world_size: int = Field(default=1, description="Total number of distributed processes")
@@ -777,12 +778,28 @@ class AbstractModel(BaseModel, ABC):
         registered_vars = set()
 
         # Normalize variables_to_save (op -> vars) into var -> set[ops]
-        allowed_ops = {"mean", "max", "min", "last"}
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum"}
+        import re
+        topk_pattern = re.compile(r'^(max|min|argmax|argmin)(\d+)$')
+
         var_to_ops: Dict[str, List[str]] = {}
         for op, vars_val in self.variables_to_save.items():
             op_l = str(op).lower()
-            if op_l not in allowed_ops:
-                raise ValueError(f"Invalid op '{op}'. Allowed: {sorted(allowed_ops)}")
+            op_parts = op_l.split('_')
+            
+            # Validate op parts
+            for p in op_parts:
+                if p not in allowed_ops and not topk_pattern.match(p):
+                     raise ValueError(f"Invalid op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
+
+            if len(op_parts) > 1:
+                outer, inner = op_parts[0], op_parts[1]
+                # Check for inner restriction
+                if inner in ('argmax', 'argmin') or topk_pattern.match(inner):
+                    raise ValueError(f"Invalid composite op '{op}': '{inner}' (arg or top-k) cannot be used as an inner operation.")
+                if len(op_parts) > 2:
+                    raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")
+
             if isinstance(vars_val, str):
                 names = [vars_val]
             elif isinstance(vars_val, list):
@@ -812,9 +829,20 @@ class AbstractModel(BaseModel, ABC):
 
                 # Check category
                 category = field_info.json_schema_extra.get("category", "param")
-                if category not in ("state", "shared_state", "init_state"):
+                if category not in ("state", "shared_state", "init_state", "param"):
                      print(f"[rank {self.rank}] Warning: Variable '{var_name}' is category '{category}', skipping output (only state/shared_state/init_state allowed).")
                      continue
+
+                # Check dimensionality and restrictions
+                ops = var_to_ops[var_name]
+                # 1D is usually (N,), 2D is (N, Level).
+                # We can assume N is consistent.
+                is_2d = tensor.ndim > 1
+                if is_2d:
+                    for op in ops:
+                        op_base = op.split('_')[0]
+                        if topk_pattern.match(op_base) or op_base in ('max', 'min', 'argmax', 'argmin'):
+                            raise ValueError(f"Operation '{op}' is not allowed for 2D variable '{var_name}' (ndim={tensor.ndim}). Only 'mean', 'sum', 'last', 'first', 'mid' are supported for 2D variables.")
 
                 # Register the main tensor if not already done
                 if var_name not in registered_vars:
@@ -865,16 +893,18 @@ class AbstractModel(BaseModel, ABC):
             variable_ops=var_to_ops
         )
 
-    def update_statistics(self, weight: float, total_weight: float = 0.0, is_first: bool = False, is_last: bool = False, BLOCK_SIZE: int = 128) -> None:
+    def update_statistics(self, weight: float, total_weight: float = 0.0, is_first: bool = False, is_last: bool = False, is_middle: bool = False, is_macro_step_end: bool = False, is_inner_first: bool = False, is_inner_last: bool = False, is_outer_first: bool = False, is_outer_last: bool = False, BLOCK_SIZE: int = 128, custom_step_index: Optional[int] = None) -> None:
         """
         Update streaming statistics with a time weight.
         Args:
             weight: dt in seconds for this sub-step (time-weighted accumulation)
             is_first: whether this sub-step is the first of a stats window
             is_last: whether this sub-step is the last of a stats window
+            is_middle: whether this sub-step is the middle of a stats window
+            is_macro_step_end: whether this sub-step is the end of a macro-step
         """
         if self._statistics_aggregator is not None:
-            self._statistics_aggregator.update_statistics(weight, total_weight, is_first, is_last, BLOCK_SIZE)
+            self._statistics_aggregator.update_statistics(weight, total_weight, is_inner_first=is_inner_first, is_inner_last=is_inner_last, is_outer_first=is_outer_first, is_outer_last=is_outer_last, BLOCK_SIZE=BLOCK_SIZE, custom_step_index=custom_step_index, is_first=is_first, is_last=is_last, is_middle=is_middle, is_macro_step_end=is_macro_step_end)
 
     def finalize_time_step(self, current_time: Union[datetime, cftime.datetime]) -> None:
         """
@@ -1204,7 +1234,9 @@ class AbstractModel(BaseModel, ABC):
         if self.variables_to_save is None:
             return self
         # Validate shape: dict[op -> vars]
-        allowed_ops = {"mean", "max", "min", "last"}
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum"}
+        topk_pattern = re.compile(r'^(max|min|argmax|argmin)(\d+)$')
+
         if not isinstance(self.variables_to_save, dict):
             # Optional convenience: list[str] => mean
             names = list(self.variables_to_save) if isinstance(self.variables_to_save, list) else []
@@ -1213,8 +1245,21 @@ class AbstractModel(BaseModel, ABC):
             pairs = []
             for op, vs in self.variables_to_save.items():
                 op_l = str(op).lower()
-                if op_l not in allowed_ops:
-                    raise ValueError(f"Invalid statistics op '{op}'. Allowed: {sorted(allowed_ops)}")
+                op_parts = op_l.split('_')
+                
+                for p in op_parts:
+                    if p not in allowed_ops and not topk_pattern.match(p):
+                        raise ValueError(f"Invalid statistics op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
+                
+                if len(op_parts) > 1:
+                    outer, inner = op_parts[0], op_parts[1]
+                    # Disallow argmax/argmin as inner ops (prohibit argmax_argmax, mean_argmax)
+                    if inner in ('argmax', 'argmin') or topk_pattern.match(inner):
+                        raise ValueError(f"Invalid composite op '{op}': '{inner}' cannot be used as an inner operation.")
+                    # Disallow more than 2 levels for now
+                    if len(op_parts) > 2:
+                        raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")
+
                 if isinstance(vs, str):
                     vars_list = [vs]
                 elif isinstance(vs, list):
