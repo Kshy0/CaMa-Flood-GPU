@@ -30,7 +30,6 @@ def compute_flood_stage_kernel(
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
-    flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
@@ -162,7 +161,6 @@ def compute_flood_stage_kernel(
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
     tl.store(protected_depth_ptr  + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)
-    tl.store(flood_area_ptr       + offs, flood_area, mask=mask)
     
 
 @triton.jit
@@ -184,7 +182,6 @@ def compute_flood_stage_log_kernel(
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
-    flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
@@ -343,7 +340,6 @@ def compute_flood_stage_log_kernel(
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
     tl.store(protected_depth_ptr  + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)
-    tl.store(flood_area_ptr       + offs, flood_area, mask=mask)
 
 
 @triton.jit
@@ -365,7 +361,6 @@ def compute_flood_stage_batched_kernel(
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
-    flood_area_ptr,              # *f32: Flood area (in/out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
@@ -519,4 +514,3 @@ def compute_flood_stage_batched_kernel(
     tl.store(flood_depth_ptr      + idx, flood_depth, mask=mask)
     tl.store(protected_depth_ptr  + idx, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + idx, flood_fraction, mask=mask)
-    tl.store(flood_area_ptr       + idx, flood_area, mask=mask)

@@ -53,7 +53,8 @@ def computed_levee_field(
     save_idx: Optional[str] = "levee_save_idx",
     save_coord: Optional[str] = "levee_save_id",
     dim_coords: Optional[str] = "base.levee_catchment_id",
-    category: Literal["topology", "derived_param", "state"] = "derived_param",
+    category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
+    expr: Optional[str] = None,
     **kwargs,
 ):
     return computed_tensor_field(
@@ -64,6 +65,7 @@ def computed_levee_field(
         save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
+        expr=expr,
         **kwargs,
     )
 

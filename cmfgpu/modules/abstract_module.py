@@ -74,7 +74,8 @@ def computed_tensor_field(
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
-    category: Literal["topology", "derived_param", "state", "shared_state"] = "derived_param",
+    category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
+    expr: Optional[str] = None,
     **kwargs
 ):
     """
@@ -92,8 +93,13 @@ def computed_tensor_field(
                   - 'derived_param': Computed parameter (can be batched)
                   - 'state': Computed state variable (ALWAYS batched if num_trials > 1)
                   - 'shared_state': Computed state variable (NEVER batched)
+                  - 'virtual': Computed on-demand during analysis/output (not stored in memory)
+        expr: Expression string for virtual variables
         **kwargs: Additional computed_field parameters
     """
+    if expr is not None and category != "virtual":
+        raise ValueError("expr can only be provided when category is 'virtual'")
+
     if dtype != "float":
         save_idx = None
 
@@ -109,6 +115,7 @@ def computed_tensor_field(
             "save_coord": save_coord,
             "dim_coords": dim_coords,
             "category": category,
+            "expr": expr
         },
         **kwargs
     )
@@ -374,7 +381,16 @@ class AbstractModule(BaseModel, ABC):
         Validate computed tensors to ensure they are correctly defined.
         """
         auto_fix_log = {}
-        for field_name in self.get_model_computed_fields():
+        for field_name, field_info in self.get_model_computed_fields().items():
+            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
+            if json_schema_extra is None:
+                continue
+
+            # Need to skip virtual fields
+            category = json_schema_extra.get('category', 'derived_param')
+            if category == 'virtual':
+                continue
+
             tensor = getattr(self, field_name)
             if not isinstance(tensor, torch.Tensor):
                 continue

@@ -305,22 +305,38 @@ class AbstractModel(BaseModel, ABC):
     def _resolve_id_tensor(self, module: Any, id_attr: Optional[str]) -> Optional[torch.Tensor]:
         """
         Helper to resolve the ID tensor from a module given an attribute path.
+        If not found locally, attempts to find it globally via variable_map.
         """
         if not id_attr:
             return None
             
+        # 1. Try local resolution (supports nested attributes)
         if "." in id_attr:
             # Try to resolve nested attribute
             parts = id_attr.split(".")
             curr = module
+            found = True
             for part in parts:
                 if hasattr(curr, part):
                     curr = getattr(curr, part)
                 else:
-                    return None
-            return curr if isinstance(curr, torch.Tensor) else None
+                    found = False
+                    break
+            if found and isinstance(curr, torch.Tensor):
+                return curr
         elif hasattr(module, id_attr):
-            return getattr(module, id_attr)
+            val = getattr(module, id_attr)
+            if isinstance(val, torch.Tensor):
+                return val
+
+        # 2. Try global resolution
+        if id_attr in self.variable_map:
+            mod_inst, field, _ = self.variable_map[id_attr]
+            if hasattr(mod_inst, field):
+                val = getattr(mod_inst, field)
+                if isinstance(val, torch.Tensor):
+                    return val
+
         return None
 
     def _resolve_plan_item(self, item: PlanItem):
@@ -812,78 +828,122 @@ class AbstractModel(BaseModel, ABC):
                     var_to_ops[name].append(op_l)
 
         registered_vars_by_shape: Dict[str, List[str]] = {}
+        
+        # 1. Expand variables to include dependencies of virtual variables
+        vars_to_process = list(var_to_ops.keys())
+        vars_seen = set(vars_to_process)
+        idx = 0
+        while idx < len(vars_to_process):
+            curr_var = vars_to_process[idx]
+            idx += 1
+            
+            if curr_var not in self.variable_map:
+                continue
 
-        for var_name in var_to_ops.keys():
-            for module_name in self.opened_modules:
-                module_instance = self.get_module(module_name)
-                if not hasattr(module_instance, var_name):
+            module_instance, attr_name, _ = self.variable_map[curr_var]
+            
+            # Check normal fields
+            field_info = module_instance.get_model_fields().get(attr_name)
+            if field_info is None:
+                # Check computed fields
+                field_info = module_instance.get_model_computed_fields().get(attr_name)
+            
+            if field_info:
+                cat = field_info.json_schema_extra.get("category", "param")
+                if cat == 'virtual':
+                    expr = field_info.json_schema_extra.get("expr", "")
+                    # Simple regex for potential tokens
+                    deps = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                    for d in deps:
+                        if d not in vars_seen:
+                            vars_seen.add(d)
+                            vars_to_process.append(d)
+
+        # 2. Register all variables (original + dependencies)
+        registered_vars = set()
+        for var_name in vars_to_process:
+            if var_name not in self.variable_map:
+                if self.rank == 0:
+                    print(f"Warning: Variable '{var_name}' not found in variable_map. Skipping.")
+                continue
+
+            module_instance, attr_name, _ = self.variable_map[var_name]
+
+            if not hasattr(module_instance, attr_name):
+                continue
+
+            tensor = getattr(module_instance, attr_name)
+            field_info = module_instance.get_model_fields().get(attr_name)
+            if field_info is None:
+                field_info = module_instance.get_model_computed_fields().get(attr_name)
+            
+            if field_info is None:
+                continue
+
+            # Check category
+            category = field_info.json_schema_extra.get("category", "param")
+            allowed_cats = ("state", "shared_state", "init_state", "param", "virtual")
+            if category not in allowed_cats:
+                    # Only warn if it's an explicitly requested output
+                    if var_name in var_to_ops:
+                        print(f"[rank {self.rank}] Warning: Variable '{var_name}' is category '{category}', skipping output (allowed: {allowed_cats}).")
                     continue
 
-                tensor = getattr(module_instance, var_name)
-                field_info = module_instance.get_model_fields().get(var_name)
-                if field_info is None:
-                    field_info = module_instance.get_model_computed_fields().get(var_name)
-                
-                if field_info is None:
-                    continue
-
-                # Check category
-                category = field_info.json_schema_extra.get("category", "param")
-                if category not in ("state", "shared_state", "init_state", "param"):
-                     print(f"[rank {self.rank}] Warning: Variable '{var_name}' is category '{category}', skipping output (only state/shared_state/init_state allowed).")
-                     continue
-
-                # Check dimensionality and restrictions
+            # Check dimensionality and restrictions (only for requested outputs)
+            if var_name in var_to_ops:
                 ops = var_to_ops[var_name]
-                # 1D is usually (N,), 2D is (N, Level).
-                # We can assume N is consistent.
-                is_2d = tensor.ndim > 1
-                if is_2d:
-                    for op in ops:
-                        op_base = op.split('_')[0]
-                        if topk_pattern.match(op_base) or op_base in ('max', 'min', 'argmax', 'argmin'):
-                            raise ValueError(f"Operation '{op}' is not allowed for 2D variable '{var_name}' (ndim={tensor.ndim}). Only 'mean', 'sum', 'last', 'first', 'mid' are supported for 2D variables.")
+                if category != 'virtual':
+                    # 1D is usually (N,), 2D is (N, Level).
+                    # We can assume N is consistent.
+                    is_2d = tensor.ndim > 1
+                    if is_2d:
+                        for op in ops:
+                            op_base = op.split('_')[0]
+                            if topk_pattern.match(op_base) or op_base in ('max', 'min', 'argmax', 'argmin'):
+                                raise ValueError(f"Operation '{op}' is not allowed for 2D variable '{var_name}' (ndim={tensor.ndim}). Only 'mean', 'sum', 'last', 'first', 'mid' are supported for 2D variables.")
 
-                # Register the main tensor if not already done
-                if var_name not in registered_vars:
+            # Register the main tensor if not already done
+            if var_name not in registered_vars:
+                if category == 'virtual':
+                    self._statistics_aggregator.register_virtual_tensor(var_name, field_info)
+                else:
                     self._statistics_aggregator.register_tensor(var_name, tensor, field_info)
-                    registered_vars.add(var_name)
                     shape_str = str(tuple(tensor.shape))
                     if shape_str not in registered_vars_by_shape:
                         registered_vars_by_shape[shape_str] = []
                     registered_vars_by_shape[shape_str].append(var_name)
+                
+                registered_vars.add(var_name)
 
-                # Check for save_idx
-                save_idx = field_info.json_schema_extra.get("save_idx")
-                if save_idx and save_idx not in registered_vars:
-                    if hasattr(module_instance, save_idx):
-                        save_tensor = getattr(module_instance, save_idx)
-                        self._statistics_aggregator.register_tensor(save_idx, save_tensor, {})
-                        registered_vars.add(save_idx)
-                        shape_str = str(tuple(save_tensor.shape))
-                        if shape_str not in registered_vars_by_shape:
-                            registered_vars_by_shape[shape_str] = []
-                        registered_vars_by_shape[shape_str].append(save_idx)
-                    else:
-                        raise ValueError(
-                            f"save_idx '{save_idx}' not found in module '{module_name}' for variable '{var_name}'"
-                        )
+            # Check for save_idx
+            save_idx = field_info.json_schema_extra.get("save_idx")
+            if save_idx and save_idx not in registered_vars:
+                if hasattr(module_instance, save_idx):
+                    save_tensor = getattr(module_instance, save_idx)
+                    self._statistics_aggregator.register_tensor(save_idx, save_tensor, {})
+                    registered_vars.add(save_idx)
+                    shape_str = str(tuple(save_tensor.shape))
+                    if shape_str not in registered_vars_by_shape:
+                        registered_vars_by_shape[shape_str] = []
+                    registered_vars_by_shape[shape_str].append(save_idx)
+                else:
+                    raise ValueError(
+                        f"save_idx '{save_idx}' not found in module '{type(module_instance).__name__}' for variable '{var_name}'"
+                    )
 
-                # Check for save_coord
-                save_coord = field_info.json_schema_extra.get("save_coord")
-                if save_coord and save_coord not in registered_vars:
-                    if hasattr(module_instance, save_coord):
-                        coord_tensor = getattr(module_instance, save_coord)
-                        self._statistics_aggregator.register_tensor(save_coord, coord_tensor, {})
-                        registered_vars.add(save_coord)
-                        shape_str = str(tuple(coord_tensor.shape))
-                        if shape_str not in registered_vars_by_shape:
-                            registered_vars_by_shape[shape_str] = []
-                        registered_vars_by_shape[shape_str].append(save_coord)
-                    else:
-                        print(f"Warning: save_coord '{save_coord}' not found in module '{module_name}' for variable '{var_name}'")
-
-                break  # break once var_name is found in a module
+            # Check for save_coord
+            save_coord = field_info.json_schema_extra.get("save_coord")
+            if save_coord and save_coord not in registered_vars:
+                if hasattr(module_instance, save_coord):
+                    coord_tensor = getattr(module_instance, save_coord)
+                    self._statistics_aggregator.register_tensor(save_coord, coord_tensor, {})
+                    registered_vars.add(save_coord)
+                    shape_str = str(tuple(coord_tensor.shape))
+                    if shape_str not in registered_vars_by_shape:
+                        registered_vars_by_shape[shape_str] = []
+                    registered_vars_by_shape[shape_str].append(save_coord)
+                else:
+                    print(f"Warning: save_coord '{save_coord}' not found in module '{type(module_instance).__name__}' for variable '{var_name}'")
         
         if registered_vars_by_shape:
             for shape_str, vars_list in registered_vars_by_shape.items():

@@ -28,7 +28,6 @@ def compute_levee_stage_kernel(
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
-    flood_area_ptr,
     num_levees: tl.constexpr,
     num_flood_levels: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -236,7 +235,6 @@ def compute_levee_stage_kernel(
     tl.store(flood_depth_ptr + levee_catchment_idx, f_dph, mask=mask)
     tl.store(protected_depth_ptr + levee_catchment_idx, p_dph, mask=mask)
     tl.store(flood_fraction_ptr + levee_catchment_idx, f_frc, mask=mask)
-    tl.store(flood_area_ptr + levee_catchment_idx, f_frc * catchment_area, mask=mask)
 
 
 @triton.jit
@@ -257,7 +255,6 @@ def compute_levee_stage_log_kernel(
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
-    flood_area_ptr,
     total_storage_stage_sum_ptr,
     river_storage_sum_ptr,
     flood_storage_sum_ptr,
@@ -479,7 +476,6 @@ def compute_levee_stage_log_kernel(
     tl.store(flood_depth_ptr + levee_catchment_idx, f_dph, mask=mask)
     tl.store(protected_depth_ptr + levee_catchment_idx, p_dph, mask=mask)
     tl.store(flood_fraction_ptr + levee_catchment_idx, f_frc, mask=mask)
-    tl.store(flood_area_ptr + levee_catchment_idx, f_frc * catchment_area, mask=mask)
 
 
 @triton.jit
@@ -614,7 +610,6 @@ def compute_levee_stage_batched_kernel(
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
-    flood_area_ptr,
     num_levees: tl.constexpr,
     num_flood_levels: tl.constexpr,
     num_trials: tl.constexpr,
@@ -849,7 +844,6 @@ def compute_levee_stage_batched_kernel(
     tl.store(flood_depth_ptr + trial_offset_catchments + levee_catchment_idx, f_dph, mask=mask)
     tl.store(protected_depth_ptr + trial_offset_catchments + levee_catchment_idx, p_dph, mask=mask)
     tl.store(flood_fraction_ptr + trial_offset_catchments + levee_catchment_idx, f_frc, mask=mask)
-    tl.store(flood_area_ptr + trial_offset_catchments + levee_catchment_idx, f_frc * catchment_area, mask=mask)
 
 
 @triton.jit

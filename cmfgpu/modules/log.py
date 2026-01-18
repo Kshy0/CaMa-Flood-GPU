@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar, List, Literal, Tuple, Union
+from typing import ClassVar, List, Literal, Optional, Tuple, Union
 
 import cftime
 import numpy as np
@@ -29,12 +29,16 @@ def computed_log_field(
     description: str,
     shape: Tuple[str, ...] = ("log_buffer_size",),
     dtype: Literal["float", "int", "bool"] = "float",
+    category: Literal["topology", "derived_param", "state", "virtual"] = "state",
+    expr: Optional[str] = None,
     **kwargs
 ):
     return computed_tensor_field(
         description=description,
         shape=shape,
         dtype=dtype,
+        category=category,
+        expr=expr,
         **kwargs
     )
 

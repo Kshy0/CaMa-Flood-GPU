@@ -225,7 +225,6 @@ def compute_inflow_kernel(
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
-    total_outflow_ptr,             # *f32: Total outflow (output)
     total_storage_ptr,             # *f32: Total storage
     outgoing_storage_ptr,          # *f32: Outgoing storage
     river_inflow_ptr,              # *f32: River inflow (output, atomic add)
@@ -260,7 +259,6 @@ def compute_inflow_kernel(
     # Write back limited values
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
-    tl.store(total_outflow_ptr + offs, updated_river_outflow + updated_flood_outflow, mask=mask)
     tl.store(limit_rate_ptr + offs, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
@@ -501,7 +499,6 @@ def compute_inflow_batched_kernel(
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
-    total_outflow_ptr,             # *f32: Total outflow (output)
     total_storage_ptr,             # *f32: Total storage
     outgoing_storage_ptr,          # *f32: Outgoing storage
     river_inflow_ptr,              # *f32: River inflow (output, atomic add)
@@ -545,7 +542,6 @@ def compute_inflow_batched_kernel(
     # Write back limited values
     tl.store(river_outflow_ptr + idx, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + idx, updated_flood_outflow, mask=mask)
-    tl.store(total_outflow_ptr + idx, updated_river_outflow + updated_flood_outflow, mask=mask)
     tl.store(limit_rate_ptr + idx, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------

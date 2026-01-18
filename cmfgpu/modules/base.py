@@ -52,7 +52,8 @@ def computed_base_field(
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
     dim_coords: Optional[str] = "catchment_id",
-    category: Literal["topology", "derived_param", "state"] = "derived_param",
+    category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
+    expr: Optional[str] = None,
     **kwargs
 ):
 
@@ -64,6 +65,7 @@ def computed_base_field(
         save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
+        expr=expr,
         **kwargs
     )
 
@@ -423,11 +425,12 @@ class BaseModule(AbstractModule):
 
     @computed_base_field(
         description="Total flooded area (m²)",
-        category="state",
+        category="virtual",
+        expr="flood_fraction * catchment_area"
     )
     @cached_property
     def flood_area(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
+        return None
 
     @computed_base_field(
         description="Fraction of catchment area that is flooded (-)",
@@ -447,11 +450,12 @@ class BaseModule(AbstractModule):
 
     @computed_base_field(
         description="Total outflow from catchment (river + flood) (m³ s⁻¹)",
-        category="state",
+        category="virtual",
+        expr="river_outflow + flood_outflow",
     )
     @cached_property
     def total_outflow(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
+        return None
 
     # ------------------------------------------------------------------ #
     # Post-init validation

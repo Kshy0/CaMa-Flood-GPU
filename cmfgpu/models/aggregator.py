@@ -318,6 +318,18 @@ class StatisticsAggregator:
         
         # Invalidate pre-computed states when new tensors are registered
         self._kernel_states = None
+
+    def register_virtual_tensor(self, name: str, field_info: FieldInfo) -> None:
+        """
+        Register a virtual tensor (no data, just metadata).
+        
+        Args:
+            name: Variable name
+            field_info: Pydantic field information (must contain expr)
+        """
+        self._field_registry[name] = field_info
+        # Do NOT add to _tensor_registry since it has no storage
+        self._kernel_states = None
         
     def initialize_streaming_aggregation(self, variable_ops: Optional[Dict[str, List[str]]] = None, variable_names: Optional[List[str]] = None) -> None:
         """
@@ -399,10 +411,39 @@ class StatisticsAggregator:
     def _prepare_kernel_states(self) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
         required_tensors: Dict[str, torch.Tensor] = {}
+        import re
+
+        def get_dependencies(expr: str) -> Set[str]:
+            tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+            deps = set()
+            for token in tokens:
+                if token in self._tensor_registry:
+                    deps.add(token)
+                elif token in self._field_registry:
+                    f_info = self._field_registry[token]
+                    cat = getattr(f_info, 'json_schema_extra', {}).get('category')
+                    if cat == 'virtual':
+                        sub = getattr(f_info, 'json_schema_extra', {}).get('expr')
+                        if sub:
+                            deps.update(get_dependencies(sub))
+            return deps
 
         # Add original variables and their output buffers
         for var_name, ops in self._variable_ops.items():
-            required_tensors[var_name] = self._tensor_registry[var_name]
+            field_info = self._field_registry.get(var_name)
+            json_extra = getattr(field_info, 'json_schema_extra', {})
+            category = json_extra.get('category', 'param')
+            
+            if category == 'virtual':
+                expr = json_extra.get('expr')
+                if expr:
+                    deps = get_dependencies(expr)
+                    for dep in deps:
+                        if dep in self._tensor_registry:
+                            required_tensors[dep] = self._tensor_registry[dep]
+            elif var_name in self._tensor_registry:
+                required_tensors[var_name] = self._tensor_registry[var_name]
+
             for op in ops:
                 out_name = f"{var_name}_{op}"
                 required_tensors[out_name] = self._storage[out_name]
@@ -527,6 +568,37 @@ class StatisticsAggregator:
         self._kernel_module = module
         self._aggregator_function = getattr(module, 'internal_update_statistics')
         self._aggregator_generated = True
+
+    def _emit_variable_load(self, var_name: str, code_lines: List[str], emitted: Set[str], is_2d: bool = False):
+        """Helper to emit load instructions or expression evaluation recursively."""
+        if var_name in emitted:
+            return
+        
+        info = self._field_registry.get(var_name)
+        json_extra = getattr(info, 'json_schema_extra', {})
+        cat = json_extra.get('category', 'param')
+        
+        import re
+        if cat == 'virtual':
+             expr = json_extra.get('expr')
+             # Find dependencies
+             tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+             for token in tokens:
+                  # Only recurse if it's a known variable (field or registered tensor)
+                  if token in self._field_registry or token in self._tensor_registry:
+                       self._emit_variable_load(token, code_lines, emitted, is_2d)
+             
+             indent = "        " if is_2d else "    "
+             code_lines.append(f"{indent}{var_name} = {expr}")
+        else:
+             # Real tensor load
+             indent = "        " if is_2d else "    "
+             if is_2d:
+                  code_lines.append(f"{indent}{var_name} = tl.load({var_name}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+             else:
+                  code_lines.append(f"{indent}{var_name} = tl.load({var_name}_ptr + idx, mask=mask, other=0.0)")
+        
+        emitted.add(var_name)
     
     def _generate_1d_processing(self, kernel_code_lines: List[str], dims_1d: List[str]) -> None:
         """Generate code for 1D variable processing - FIXED LOGIC."""
@@ -535,9 +607,10 @@ class StatisticsAggregator:
             "    # Use idx to access original data, offs for mean storage",
         ])
         
-        # Load current values using idx (original grid indices)
+        # Load current values (or compute virtuals)
+        emitted_vars = set()
         for var in dims_1d:
-            kernel_code_lines.append(f"    {var} = tl.load({var}_ptr + idx, mask=mask, other=0.0)")
+            self._emit_variable_load(var, kernel_code_lines, emitted_vars, is_2d=False)
         
         # Load old means using offs (sequential storage)
         kernel_code_lines.append("    if is_first:")
@@ -568,9 +641,10 @@ class StatisticsAggregator:
             "    for level in tl.static_range(n_levels):",
         ])
         
-        # Load current values using idx (original grid indices)
+        # Load current values (or compute virtuals)
+        emitted_vars = set()
         for var in dims_2d:
-            kernel_code_lines.append(f"        {var} = tl.load({var}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+            self._emit_variable_load(var, kernel_code_lines, emitted_vars, is_2d=True)
         
         # Load old means using offs (sequential storage)
         kernel_code_lines.append("        if is_first:")
@@ -615,9 +689,30 @@ class StatisticsAggregator:
             f"    {save_idx}_ptr,",
         ])
 
-        # Pointers
+        # Gather input pointers (resolving virtuals)
+        input_ptrs = set()
+        def _gather_inputs(name):
+             info = self._field_registry.get(name)
+             if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
+                  expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                  import re
+                  toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                  for t in toks:
+                       if t in self._field_registry or t in self._tensor_registry:
+                            _gather_inputs(t)
+             else:
+                  input_ptrs.add(name)
+        
         for var in var_list:
+             _gather_inputs(var)
+
+        # Pointers
+        # Inputs
+        sorted_inputs = sorted(list(input_ptrs))
+        for var in sorted_inputs:
             kernel_code_lines.append(f"    {var}_ptr,")
+
+        for var in var_list:
             for op in self._variable_ops[var]:
                 kernel_code_lines.append(f"    {var}_{op}_ptr,")
             
@@ -672,21 +767,49 @@ class StatisticsAggregator:
             kernel_code_lines.extend([
                 f"{indent}# 1D variables",
             ])
+            # Helper to emit values
+            emitted_vars = set()
+            def emit_val(v_name):
+                if v_name in emitted_vars: return f"{v_name}_val"
+                
+                info = self._field_registry.get(v_name)
+                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
+                
+                if cat == 'virtual':
+                     expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                     # Resolve deps
+                     import re
+                     toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                     for t in toks:
+                          if t in self._field_registry or t in self._tensor_registry:
+                               emit_val(t)
+                     
+                     expr_code = expr
+                     for t in toks:
+                          if t in self._field_registry or t in self._tensor_registry:
+                               expr_code = re.sub(r'\b' + t + r'\b', f"{t}_val", expr_code)
+                     kernel_code_lines.append(f"{indent}{v_name}_val = {expr_code}")
+                else:
+                     in_ptr_loc = f"{v_name}_ptr + t * stride_input + idx"
+                     kernel_code_lines.append(f"{indent}{v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                
+                emitted_vars.add(v_name)
+                return f"{v_name}_val"
+
             for var in dims_1d:
                 ops = self._variable_ops[var]
-                # Adjust pointers
-                in_ptr = f"{var}_ptr + t * stride_input + idx"
                 out_offset = f"t * n_saved_points + offs"
 
                 if len(ops) == 1 and ops[0] == 'last':
-                    # last-only: load only when needed
+                    # Optimized last-only path
+                    val_name = emit_val(var)
                     kernel_code_lines.extend([
                         f"{indent}if is_inner_last:",
-                        f"{indent2}val = tl.load({in_ptr}, mask=mask, other=0.0)",
-                        f"{indent2}tl.store({var}_last_ptr + {out_offset}, val, mask=mask)",
+                        f"{indent2}tl.store({var}_last_ptr + {out_offset}, {val_name}, mask=mask)",
                     ])
                 else:
-                    kernel_code_lines.append(f"{indent}val = tl.load({in_ptr}, mask=mask, other=0.0)")
+                    val_name = emit_val(var)
+                    kernel_code_lines.append(f"{indent}val = {val_name}")
 
                     # Inner states update
                     inner_ops = set(op.split('_')[1] for op in ops if '_' in op)
@@ -1458,9 +1581,30 @@ class StatisticsAggregator:
                 f"        {save_idx}_ptr=states['{save_idx}'],",
             ])
             
-            # Add variable pointers
+            # Gather input pointers (resolving virtuals)
+            input_args = set()
+            def _gather_inputs(name):
+                 info = self._field_registry.get(name)
+                 if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
+                      expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                      import re
+                      toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                      for t in toks:
+                           if t in self._field_registry or t in self._tensor_registry:
+                                _gather_inputs(t)
+                 else:
+                      input_args.add(name)
+            
             for var in var_list:
-                kernel_code_lines.append(f"        {var}_ptr=states['{var}'],")
+                 _gather_inputs(var)
+
+            # Add Input pointers
+            sorted_inputs = sorted(list(input_args))
+            for var in sorted_inputs:
+                 kernel_code_lines.append(f"        {var}_ptr=states['{var}'],")
+            
+            # Add variable output pointers
+            for var in var_list:
                 for op in self._variable_ops[var]:
                     kernel_code_lines.append(f"        {var}_{op}_ptr=states['{var}_{op}'],")
                 
@@ -1521,17 +1665,36 @@ class StatisticsAggregator:
         
         for var_name in self._variables:
             field_info = self._field_registry[var_name]
-            tensor = self._tensor_registry[var_name]
+            tensor = self._tensor_registry.get(var_name)
+            
+            # Virtual fallback for meta info construction
+            if tensor is None:
+                 # Check if meta info was constructed during init
+                 first_op = self._variable_ops[var_name][0]
+                 out_name = f"{var_name}_{first_op}"
+                 meta = self._metadata[out_name]
+                 
+                 tensor_info[var_name] = {
+                    'tensor': None,
+                    'tensor_shape': meta['tensor_shape'],
+                    'actual_shape': meta['actual_shape'],
+                    'actual_ndim': meta['actual_ndim']
+                }
+            else:
+                json_schema_extra = getattr(field_info, 'json_schema_extra', {})
+                save_idx = json_schema_extra.get('save_idx')
+                tensor_shape = json_schema_extra.get('tensor_shape', ())
+                
+                tensor_info[var_name] = {
+                    'tensor': tensor,
+                    'tensor_shape': tensor_shape,  # Logical grid shape
+                    'actual_shape': tensor.shape,  # Sampled data shape
+                    'actual_ndim': tensor.ndim     # Based on actual data
+                }
+                
+            # Need save_idx to group
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
             save_idx = json_schema_extra.get('save_idx')
-            tensor_shape = json_schema_extra.get('tensor_shape', ())
-            
-            tensor_info[var_name] = {
-                'tensor': tensor,
-                'tensor_shape': tensor_shape,  # Logical grid shape
-                'actual_shape': tensor.shape,  # Sampled data shape
-                'actual_ndim': tensor.ndim     # Based on actual data
-            }
             
             if save_idx not in grouped_by_save_idx:
                 grouped_by_save_idx[save_idx] = []
@@ -1617,13 +1780,21 @@ class StatisticsAggregator:
             # Sort ops to ensure deps are processed if needed, though dict order usually fine
             ops.sort()
             
-            if var_name not in self._tensor_registry:
-                raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
-
-            tensor = self._tensor_registry[var_name]
+            tensor = None
             field_info = self._field_registry[var_name]
-
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
+            category = json_schema_extra.get('category', 'param')
+            is_virtual = category == 'virtual'
+
+            if var_name in self._tensor_registry:
+                tensor = self._tensor_registry[var_name]
+            elif is_virtual:
+                tensor = None
+            else:
+                raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
+            
+            target_dtype = tensor.dtype if tensor is not None else torch.float32
+
             tensor_shape = json_schema_extra.get('tensor_shape', ())
             save_idx = json_schema_extra.get('save_idx')
             description = getattr(field_info, 'description', f"Variable {var_name}")
@@ -1633,13 +1804,67 @@ class StatisticsAggregator:
                 raise ValueError(f"Variable '{var_name}' must have save_idx in json_schema_extra")
 
             if save_idx in self._tensor_registry:
-                if self.num_trials > 1:
-                    actual_shape = (self.num_trials, len(self._tensor_registry[save_idx])) + tensor.shape[2:]
+                ref_save_idx = self._tensor_registry[save_idx]
+                if tensor is not None:
+                     # Real tensor shape/dim logic
+                     tensor_ndim = tensor.ndim
+                     tensor_base_shape = tensor.shape
                 else:
-                    actual_shape = (len(self._tensor_registry[save_idx]),) + tensor.shape[1:]
+                     # Virtual tensor logic
+                     # Infer ndim/shape from tensor_shape or dependencies
+                     tensor_ndim = 1 + (1 if self.num_trials > 1 else 0) # Base guess
+                     if len(tensor_shape) > 1: # Has extra dims
+                          tensor_ndim += (len(tensor_shape) - 1)
+                     
+                     # Construct hypothetical shape for allocation size
+                     tensor_base_shape = (len(ref_save_idx),) # minimum
+                     if len(tensor_shape) > 1:
+                           # Try to resolve dimensions from dependencies or registry
+                           expr = json_schema_extra.get('expr')
+                           toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                           found_dep = False
+                           for t in toks:
+                                if t in self._tensor_registry:
+                                     dep = self._tensor_registry[t]
+                                     tensor_ndim = dep.ndim
+                                     tensor_base_shape = dep.shape
+                                     target_dtype = dep.dtype
+                                     found_dep = True
+                                     break
+                           if not found_dep:
+                                # Try to resolve dimensions from registry
+                                try:
+                                    extra_dims = []
+                                    # tensor_shape[0] is the grid dimension, skip it
+                                    # tensor_shape[1:] are the extra dimensions (e.g. levels)
+                                    for dim_name in tensor_shape[1:]:
+                                         if dim_name in self._tensor_registry:
+                                              d_val = self._tensor_registry[dim_name]
+                                              if d_val.numel() == 1:
+                                                   extra_dims.append(int(d_val.item()))
+                                              else:
+                                                   raise ValueError
+                                         else:
+                                              raise ValueError
+                                    
+                                    # Construct a fake base shape that satisfies the slicing logic below
+                                    # The logic below uses [2:] (if trials) or [1:] (if no trials)
+                                    # to get the EXTRA dims.
+                                    prefix_len = 2 if self.num_trials > 1 else 1
+                                    tensor_base_shape = (1,) * prefix_len + tuple(extra_dims)
+                                    target_dtype = torch.float32
+
+                                except ValueError:
+                                     raise ValueError(f"Virtual variable '{var_name}' has multi-dimensional shape {tensor_shape}. Dependencies not found in registry, and dimensions could not be resolved directly.")
+
+                if self.num_trials > 1:
+                    actual_shape = (self.num_trials, len(ref_save_idx)) + tensor_base_shape[2:] if tensor_ndim > 1 else (self.num_trials, len(ref_save_idx))
+                else:
+                    actual_shape = (len(ref_save_idx),) + tensor_base_shape[1:]
             else:
                 raise ValueError(f"Save index '{save_idx}' not registered in tensor registry")
-            actual_ndim = tensor.ndim
+            
+            actual_ndim = tensor_ndim
             max_ndim = 3 if self.num_trials > 1 else 2
             if actual_ndim > max_ndim:
                 raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only up to {max_ndim}D variables are supported.")
@@ -1674,16 +1899,16 @@ class StatisticsAggregator:
 
                 if outer_op.startswith('max'):
                     # max or maxK
-                    init_tensor = torch.full(alloc_shape, -torch.inf, dtype=tensor.dtype, device=self.device)
+                    init_tensor = torch.full(alloc_shape, -torch.inf, dtype=target_dtype, device=self.device)
                 elif outer_op.startswith('min'):
-                    init_tensor = torch.full(alloc_shape, torch.inf, dtype=tensor.dtype, device=self.device)
+                    init_tensor = torch.full(alloc_shape, torch.inf, dtype=target_dtype, device=self.device)
                 elif outer_op.startswith('argmax') or outer_op.startswith('argmin'):
                     init_tensor = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
                 elif outer_op == 'first':
                     # Similar to 'last', we just need storage. Zero initialization is fine as it will be overwritten on is_first.
-                    init_tensor = torch.zeros(alloc_shape, dtype=tensor.dtype, device=self.device)
+                    init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
                 else:
-                    init_tensor = torch.zeros(alloc_shape, dtype=tensor.dtype, device=self.device)
+                    init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
                 self._storage[out_name] = init_tensor
                 self._output_keys.append(out_name)
 
@@ -1694,31 +1919,31 @@ class StatisticsAggregator:
                     if inner_state_name not in self._storage:
                          # Initialize inner state
                          if inner_op == 'mean':
-                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                             init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          elif inner_op == 'max':
-                             init_inner = torch.full(actual_shape, -torch.inf, dtype=tensor.dtype, device=self.device)
+                             init_inner = torch.full(actual_shape, -torch.inf, dtype=target_dtype, device=self.device)
                          elif inner_op == 'min':
-                             init_inner = torch.full(actual_shape, torch.inf, dtype=tensor.dtype, device=self.device)
+                             init_inner = torch.full(actual_shape, torch.inf, dtype=target_dtype, device=self.device)
                          elif inner_op == 'sum':
-                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                             init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          elif inner_op in ('first', 'last', 'mid'):
-                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                             init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          else:
                              # Should be caught by validator, but safe fallback
-                             init_inner = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                             init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          self._storage[inner_state_name] = init_inner
                          
                          # Allocate weight state if inner op is mean (to calculate weighted average)
                          if inner_op in ('mean', 'max', 'min', 'first', 'last', 'mid'):
                              weight_state_name = f"{var_name}_{inner_op}_weight_state"
                              if weight_state_name not in self._storage:
-                                 self._storage[weight_state_name] = torch.zeros(actual_shape, dtype=tensor.dtype, device=self.device)
+                                 self._storage[weight_state_name] = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
 
                 if save_coord and save_coord not in self._coord_cache:
                     coord_tensor = self._tensor_registry[save_coord]
                     self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
                 
-                out_dtype = torch_to_numpy_dtype(tensor.dtype)
+                out_dtype = torch_to_numpy_dtype(target_dtype)
                 if outer_op in ('argmax', 'argmin'):
                     out_dtype = 'i4' # int32
 
@@ -1732,7 +1957,7 @@ class StatisticsAggregator:
                     'actual_ndim': actual_ndim,
                     'save_coord': save_coord,
                     'description': f"{description} ({op})",
-                    'stride_input': tensor.shape[1] if self.num_trials > 1 else 0,
+                    'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
                     'k': k_val
                 }
                 self._metadata[out_name] = meta

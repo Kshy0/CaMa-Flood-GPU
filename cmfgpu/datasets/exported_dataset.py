@@ -154,17 +154,6 @@ class ExportedDataset(NetCDFDataset):
     # -------------------------
     # Public API tweaks
     # -------------------------
-    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
-        """Read contiguous block starting at current_time -> (T, C)."""
-        try:
-            start_abs = self._global_times.index(current_time)
-        except ValueError as e:
-            raise ValueError(f"Start time {current_time} not found in global timeline") from e
-        end_abs = min(start_abs + int(chunk_len), len(self._global_times))
-        times = self._global_times[start_abs:end_abs]
-        ops = self._ops_from_times(times)
-        data = self._read_ops(ops)
-        return data / self.unit_factor
 
     # Override mapping/broadcast to a no-op flatten
     def shard_forcing(
