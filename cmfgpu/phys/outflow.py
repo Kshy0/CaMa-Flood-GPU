@@ -6,6 +6,7 @@
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -151,9 +152,9 @@ def compute_outflow_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use exp(log()) for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * tl.exp((-7.0/3.0) * tl.log(river_semi_implicit_flow_depth))
+                      * libdevice.pow(river_semi_implicit_flow_depth, -7.0/3.0)
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -165,9 +166,9 @@ def compute_outflow_kernel(
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     
-    # Use exp(log()) for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * tl.exp((-4.0/3.0) * tl.log(flood_semi_implicit_flow_depth)) / flood_implicit_area
+                      * libdevice.pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
@@ -426,9 +427,9 @@ def compute_outflow_batched_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use exp(log()) for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * tl.exp((-7.0/3.0) * tl.log(river_semi_implicit_flow_depth))
+                      * libdevice.pow(river_semi_implicit_flow_depth, -7.0/3.0)
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -440,9 +441,9 @@ def compute_outflow_batched_kernel(
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     
-    # Use exp(log()) for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * tl.exp((-4.0/3.0) * tl.log(flood_semi_implicit_flow_depth)) / flood_implicit_area
+                      * libdevice.pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)

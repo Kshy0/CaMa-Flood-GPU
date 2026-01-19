@@ -8,6 +8,7 @@
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -570,7 +571,7 @@ def compute_levee_bifurcation_outflow_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * tl.exp((-7.0/3.0) * tl.log(bifurcation_semi_implicit_flow_depth))
+                    * libdevice.pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
@@ -959,7 +960,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * tl.exp((-7.0/3.0) * tl.log(bifurcation_semi_implicit_flow_depth))
+                    * libdevice.pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)

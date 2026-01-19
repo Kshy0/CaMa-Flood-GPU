@@ -22,6 +22,7 @@ import cftime
 import netCDF4 as nc
 import numpy as np
 import torch
+import ast
 from pydantic.fields import FieldInfo
 
 from cmfgpu.models.utils import torch_to_numpy_dtype
@@ -38,12 +39,49 @@ def _is_wsl() -> bool:
     except Exception:
         return False
 
+def sanitize_symbol(name: str) -> str:
+    """Sanitize a string to be a valid python identifier/filename."""
+    # Replace common operators with text
+    name = name.replace('**', '_pow_')
+    name = name.replace('^', '_pow_')
+    name = name.replace('+', '_plus_')
+    name = name.replace('-', '_minus_')
+    name = name.replace('*', '_mul_')
+    name = name.replace('/', '_div_')
+    name = name.replace('.', '_dot_')
+    # Replace any other non-alphanumeric with _
+    name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    # Remove leading numbers
+    if name and name[0].isdigit():
+        name = '_' + name
+    # Collapse underscores
+    name = re.sub(r'_+', '_', name)
+    return name.strip('_')
 
 def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
     (mean_var_name, time_step_data, output_path, time_datetime) = args
     
     with nc.Dataset(output_path, 'a') as ncfile:
-        nc_var = ncfile.variables[mean_var_name]
+        # Robustly locate the target variable even if name was sanitized
+        target_var = None
+        if mean_var_name in ncfile.variables:
+            target_var = mean_var_name
+        else:
+            safe = sanitize_symbol(mean_var_name)
+            if safe in ncfile.variables:
+                target_var = safe
+            else:
+                 # Last resort: find first variable that is not dimension/coord related
+                 for v in ncfile.variables:
+                     if v not in ('time', 'trial', 'saved_points', 'levels', 'rank', 'catchment_id'):
+                         target_var = v
+                         break
+        
+        if target_var is None:
+             # Should not happen if file created correctly
+             raise KeyError(f"Could not find variable for '{mean_var_name}' (safe: '{sanitize_symbol(mean_var_name)}') in {output_path}")
+
+        nc_var = ncfile.variables[target_var]
         time_var = ncfile.variables['time']
         
         current_len = len(nc_var)
@@ -91,16 +129,20 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
     """
     (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials) = args
 
+    safe_name = sanitize_symbol(mean_var_name)
+
     if year is not None:
-        filename = f"{mean_var_name}_rank{rank}_{year}.nc"
+        filename = f"{safe_name}_rank{rank}_{year}.nc"
     else:
-        filename = f"{mean_var_name}_rank{rank}.nc"
+        filename = f"{safe_name}_rank{rank}.nc"
     output_path = output_dir / filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     with nc.Dataset(output_path, 'w', format='NETCDF4') as ncfile:
         # Write global attributes
         ncfile.setncattr('title', f'Time series for rank {rank}: {mean_var_name}')
+        ncfile.setncattr('original_variable_name', mean_var_name)
+
         actual_shape = metadata.get('actual_shape', ())  # Spatial shape
         tensor_shape = metadata.get('tensor_shape', ())  # Logical grid shape
         coord_name = metadata.get('save_coord', None)
@@ -157,7 +199,7 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
         time_var.setncattr('calendar', calendar)
         # Create main data variable (empty, will be filled during streaming)
         nc_var = ncfile.createVariable(
-            mean_var_name,
+            safe_name,
             dtype,
             dim_names,
             zlib=True,
@@ -165,6 +207,7 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
         nc_var.setncattr('description', metadata.get("description", ""))
         nc_var.setncattr('actual_shape', str(actual_shape))
         nc_var.setncattr('tensor_shape', str(tensor_shape))
+        nc_var.setncattr('long_name', mean_var_name)
     
     return output_path
 
@@ -224,9 +267,13 @@ class StatisticsAggregator:
         
         self._tensor_registry: Dict[str, torch.Tensor] = {}
         self._field_registry: Dict[str, FieldInfo] = {}
+        
+        # Cache for sanitized names
+        self._safe_name_cache: Dict[str, str] = {}
 
         # Streaming mode support
         self._netcdf_files: Dict[str, Path] = {}  # out_name -> NetCDF file path
+        
         self._all_created_files: Set[Path] = set()
         self._files_created: bool = False
 
@@ -249,6 +296,12 @@ class StatisticsAggregator:
         if self.save_kernels:
             print(f"Generated kernels will be saved to: {self.kernels_dir}")
     
+    def _get_safe_name(self, name: str) -> str:
+        """Get or create a sanitized name for a variable/expression."""
+        if name not in self._safe_name_cache:
+            self._safe_name_cache[name] = sanitize_symbol(name)
+        return self._safe_name_cache[name]
+
     def _cleanup_temp_files(self):
         """Remove temporary kernel files."""
         if self._temp_kernel_file and os.path.exists(self._temp_kernel_file):
@@ -316,6 +369,9 @@ class StatisticsAggregator:
         self._tensor_registry[name] = tensor
         self._field_registry[name] = field_info
         
+        # Pre-cache safe name
+        self._get_safe_name(name)
+        
         # Invalidate pre-computed states when new tensors are registered
         self._kernel_states = None
 
@@ -328,6 +384,7 @@ class StatisticsAggregator:
             field_info: Pydantic field information (must contain expr)
         """
         self._field_registry[name] = field_info
+        self._get_safe_name(name)
         # Do NOT add to _tensor_registry since it has no storage
         self._kernel_states = None
         
@@ -411,7 +468,6 @@ class StatisticsAggregator:
     def _prepare_kernel_states(self) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
         required_tensors: Dict[str, torch.Tensor] = {}
-        import re
 
         def get_dependencies(expr: str) -> Set[str]:
             tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
@@ -448,6 +504,12 @@ class StatisticsAggregator:
                 out_name = f"{var_name}_{op}"
                 required_tensors[out_name] = self._storage[out_name]
                 
+                if op.startswith('median') or (op.startswith('q') and op[1:].isdigit()):
+                    q_name = f"{var_name}_median_q_state"
+                    n_name = f"{var_name}_median_n_state"
+                    required_tensors[q_name] = self._storage[q_name]
+                    required_tensors[n_name] = self._storage[n_name]
+
                 # Add inner states for compound ops
                 if '_' in op:
                     parts = op.split('_')
@@ -456,10 +518,17 @@ class StatisticsAggregator:
                     if inner_name in self._storage:
                         required_tensors[inner_name] = self._storage[inner_name]
                         # Also add weight state if needed
-                        if inner == 'mean':
+                        if inner in ('mean', 'first', 'last', 'mid'):
                             w_name = f"{var_name}_{inner}_weight_state"
                             if w_name in self._storage:
                                 required_tensors[w_name] = self._storage[w_name]
+                        elif inner == 'median':
+                            qi_name = f"{var_name}_median_inner_q_state"
+                            ni_name = f"{var_name}_median_inner_n_state"
+                            if qi_name in self._storage:
+                                required_tensors[qi_name] = self._storage[qi_name]
+                            if ni_name in self._storage:
+                                required_tensors[ni_name] = self._storage[ni_name]
 
         # Collect required dimensions and save indices
         required_dims: Set[str] = set()
@@ -518,6 +587,7 @@ class StatisticsAggregator:
             "",
             "import triton",
             "import triton.language as tl",
+            "from triton.language.extra import libdevice",
             "",
             '# ============================================================================',
             f"# Generated Triton kernels for statistics aggregation - Rank {self.rank}",
@@ -569,102 +639,83 @@ class StatisticsAggregator:
         self._aggregator_function = getattr(module, 'internal_update_statistics')
         self._aggregator_generated = True
 
+    def _transform_pow_expr(self, expr: str) -> str:
+        """
+        Transform power operations in an expression string to Triton-compatible tl.exp(log()).
+        Power operator ** or ^ is transformed.
+        """
+        if '**' not in expr and '^' not in expr:
+            return expr
+            
+        safe_expr = expr.replace('^', '**')
+        
+        def _visit_and_transform_pow(node):
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    new_list = []
+                    for item in value:
+                        if isinstance(item, ast.AST):
+                            new_list.append(_visit_and_transform_pow(item))
+                        else:
+                            new_list.append(item)
+                    setattr(node, field, new_list)
+                elif isinstance(value, ast.AST):
+                    setattr(node, field, _visit_and_transform_pow(value))
+            
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+                return ast.Call(
+                    func=ast.Attribute(value=ast.Name(id='libdevice', ctx=ast.Load()), attr='pow', ctx=ast.Load()),
+                    args=[node.left, node.right],
+                    keywords=[]
+                )
+            return node
+
+        try:
+            expr_tree = ast.parse(safe_expr, mode='eval')
+            expr_tree = _visit_and_transform_pow(expr_tree)
+            return ast.unparse(expr_tree)
+        except Exception as e:
+            print(f"Warning: Failed to transform power expression '{safe_expr}': {e}")
+            return safe_expr
+
     def _emit_variable_load(self, var_name: str, code_lines: List[str], emitted: Set[str], is_2d: bool = False):
         """Helper to emit load instructions or expression evaluation recursively."""
         if var_name in emitted:
             return
         
+        # Get safe name for this variable
+        safe_var_name = self._get_safe_name(var_name)
+        
         info = self._field_registry.get(var_name)
         json_extra = getattr(info, 'json_schema_extra', {})
         cat = json_extra.get('category', 'param')
         
-        import re
         if cat == 'virtual':
              expr = json_extra.get('expr')
              # Find dependencies
              tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+             safe_expr = expr
              for token in tokens:
                   # Only recurse if it's a known variable (field or registered tensor)
                   if token in self._field_registry or token in self._tensor_registry:
                        self._emit_variable_load(token, code_lines, emitted, is_2d)
+                       # Replace token in expression with safe token
+                       safe_token = self._get_safe_name(token)
+                       safe_expr = re.sub(r'\b' + token + r'\b', safe_token, safe_expr)
+             
+             safe_expr = self._transform_pow_expr(safe_expr)
              
              indent = "        " if is_2d else "    "
-             code_lines.append(f"{indent}{var_name} = {expr}")
+             code_lines.append(f"{indent}{safe_var_name} = {safe_expr}")
         else:
              # Real tensor load
              indent = "        " if is_2d else "    "
              if is_2d:
-                  code_lines.append(f"{indent}{var_name} = tl.load({var_name}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+                  code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
              else:
-                  code_lines.append(f"{indent}{var_name} = tl.load({var_name}_ptr + idx, mask=mask, other=0.0)")
+                  code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx, mask=mask, other=0.0)")
         
         emitted.add(var_name)
-    
-    def _generate_1d_processing(self, kernel_code_lines: List[str], dims_1d: List[str]) -> None:
-        """Generate code for 1D variable processing - FIXED LOGIC."""
-        kernel_code_lines.extend([
-            "    # -------- 1-D variables --------",
-            "    # Use idx to access original data, offs for mean storage",
-        ])
-        
-        # Load current values (or compute virtuals)
-        emitted_vars = set()
-        for var in dims_1d:
-            self._emit_variable_load(var, kernel_code_lines, emitted_vars, is_2d=False)
-        
-        # Load old means using offs (sequential storage)
-        kernel_code_lines.append("    if is_first:")
-        for var in dims_1d:
-            kernel_code_lines.append(f"        {var}_old_mean = tl.zeros_like({var})")
-        kernel_code_lines.append("    else:")
-        for var in dims_1d:
-            kernel_code_lines.append(f"        {var}_old_mean = tl.load({var}_mean_ptr + offs, mask=mask, other=0.0)")
-        
-        # Update means (time-weighted)
-        for var in dims_1d:
-            kernel_code_lines.append(f"    {var}_new_mean = {var}_old_mean + {var} * weight")
-        # Finalize mean on last by dividing by total_weight
-        kernel_code_lines.append("    if is_last:")
-        for var in dims_1d:
-            kernel_code_lines.append(f"        {var}_new_mean = {var}_new_mean / total_weight")
-        
-        # Store new means using offs (sequential storage)
-        for var in dims_1d:
-            kernel_code_lines.append(f"    tl.store({var}_mean_ptr + offs, {var}_new_mean, mask=mask)")
-        kernel_code_lines.append("")
-    
-    def _generate_2d_processing(self, kernel_code_lines: List[str], dims_2d: List[str]) -> None:
-        """Generate code for 2D variable processing - FIXED LOGIC."""
-        kernel_code_lines.extend([
-            "    # -------- 2-D variables --------",
-            "    # Use idx for original data access, offs for mean storage",
-            "    for level in tl.static_range(n_levels):",
-        ])
-        
-        # Load current values (or compute virtuals)
-        emitted_vars = set()
-        for var in dims_2d:
-            self._emit_variable_load(var, kernel_code_lines, emitted_vars, is_2d=True)
-        
-        # Load old means using offs (sequential storage)
-        kernel_code_lines.append("        if is_first:")
-        for var in dims_2d:
-            kernel_code_lines.append(f"            {var}_old_mean = tl.zeros_like({var})")
-        kernel_code_lines.append("        else:")
-        for var in dims_2d:
-            kernel_code_lines.append(f"            {var}_old_mean = tl.load({var}_mean_ptr + offs * n_levels + level, mask=mask, other=0.0)")
-        
-        # Update means (time-weighted)
-        for var in dims_2d:
-            kernel_code_lines.append(f"        {var}_new_mean = {var}_old_mean + {var} * weight")
-        kernel_code_lines.append("        if is_last:")
-        for var in dims_2d:
-            kernel_code_lines.append(f"            {var}_new_mean = {var}_new_mean / total_weight")
-        
-        # Store new means using offs (sequential storage)
-        for var in dims_2d:
-            kernel_code_lines.append(f"        tl.store({var}_mean_ptr + offs * n_levels + level, {var}_new_mean, mask=mask)")
-        kernel_code_lines.append("")
     
     def _generate_kernel_for_group(self, kernel_code_lines: List[str], kernel_name: str,
                                    save_idx: str, var_list: List[str],
@@ -695,7 +746,6 @@ class StatisticsAggregator:
              info = self._field_registry.get(name)
              if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                   expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                  import re
                   toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
                   for t in toks:
                        if t in self._field_registry or t in self._tensor_registry:
@@ -710,11 +760,23 @@ class StatisticsAggregator:
         # Inputs
         sorted_inputs = sorted(list(input_ptrs))
         for var in sorted_inputs:
-            kernel_code_lines.append(f"    {var}_ptr,")
+            safe_var = self._get_safe_name(var)
+            # Avoid duplicate argument if save_idx matches input var
+            if safe_var == save_idx:
+                continue
+            kernel_code_lines.append(f"    {safe_var}_ptr,")
 
         for var in var_list:
+            safe_var = self._get_safe_name(var)
+            # Track which extra state pointers have been added to avoid duplicates
+            added_median_state = False
+            
             for op in self._variable_ops[var]:
-                kernel_code_lines.append(f"    {var}_{op}_ptr,")
+                kernel_code_lines.append(f"    {safe_var}_{op}_ptr,")
+                if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
+                     kernel_code_lines.append(f"    {safe_var}_median_q_state_ptr,")
+                     kernel_code_lines.append(f"    {safe_var}_median_n_state_ptr,")
+                     added_median_state = True
             
             # Inner state pointers
             added_inner = set()
@@ -722,9 +784,12 @@ class StatisticsAggregator:
                 if '_' in op:
                     inner = op.split('_')[1]
                     if inner not in added_inner:
-                        kernel_code_lines.append(f"    {var}_{inner}_inner_state_ptr,")
-                        if inner == 'mean':
-                            kernel_code_lines.append(f"    {var}_{inner}_weight_state_ptr,")
+                        kernel_code_lines.append(f"    {safe_var}_{inner}_inner_state_ptr,")
+                        if inner in ('mean', 'first', 'last', 'mid'):
+                            kernel_code_lines.append(f"    {safe_var}_{inner}_weight_state_ptr,")
+                        if inner == 'median':
+                            kernel_code_lines.append(f"    {safe_var}_median_inner_q_state_ptr,")
+                            kernel_code_lines.append(f"    {safe_var}_median_inner_n_state_ptr,")
                         added_inner.add(inner)
 
         kernel_code_lines.extend([
@@ -737,6 +802,7 @@ class StatisticsAggregator:
             "    is_outer_first,",
             "    is_outer_last,",
             "    current_step,",
+            "    step_count_val,",
             "    n_saved_points: tl.constexpr,",
         ])
         if dims_2d:
@@ -770,7 +836,10 @@ class StatisticsAggregator:
             # Helper to emit values
             emitted_vars = set()
             def emit_val(v_name):
-                if v_name in emitted_vars: return f"{v_name}_val"
+                # Using safe names inside kernel
+                safe_v_name = self._get_safe_name(v_name)
+                
+                if safe_v_name in emitted_vars: return f"{safe_v_name}_val"
                 
                 info = self._field_registry.get(v_name)
                 cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
@@ -779,45 +848,164 @@ class StatisticsAggregator:
                      expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
                      # Resolve deps
                      import re
+                     safe_expr = expr
                      toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
                      for t in toks:
                           if t in self._field_registry or t in self._tensor_registry:
-                               emit_val(t)
+                               emit_val(t) # Ensure dep is emitted
+                               safe_t = self._get_safe_name(t)
+                               # Replace original dep name with safe_dep_val
+                               safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
                      
-                     expr_code = expr
-                     for t in toks:
-                          if t in self._field_registry or t in self._tensor_registry:
-                               expr_code = re.sub(r'\b' + t + r'\b', f"{t}_val", expr_code)
-                     kernel_code_lines.append(f"{indent}{v_name}_val = {expr_code}")
+                     safe_expr = self._transform_pow_expr(safe_expr)
+                     kernel_code_lines.append(f"{indent}{safe_v_name}_val = {safe_expr}")
                 else:
-                     in_ptr_loc = f"{v_name}_ptr + t * stride_input + idx"
-                     kernel_code_lines.append(f"{indent}{v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                     in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
+                     kernel_code_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
                 
-                emitted_vars.add(v_name)
-                return f"{v_name}_val"
+                emitted_vars.add(safe_v_name)
+                return f"{safe_v_name}_val"
 
             for var in dims_1d:
                 ops = self._variable_ops[var]
                 out_offset = f"t * n_saved_points + offs"
+                
+                safe_var = self._get_safe_name(var)
 
+                # Check for Median Ops (Outer)
+                median_outer_ops = [op for op in ops if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and '_' not in op]
+                
                 if len(ops) == 1 and ops[0] == 'last':
                     # Optimized last-only path
                     val_name = emit_val(var)
                     kernel_code_lines.extend([
                         f"{indent}if is_inner_last:",
-                        f"{indent2}tl.store({var}_last_ptr + {out_offset}, {val_name}, mask=mask)",
+                        f"{indent2}tl.store({safe_var}_last_ptr + {out_offset}, {val_name}, mask=mask)",
                     ])
                 else:
                     val_name = emit_val(var)
                     kernel_code_lines.append(f"{indent}val = {val_name}")
 
+                    # Pre-calculate Outer P-Square if needed
+                    # If multiple ops request quantiles, we only want to run the algo once per step.
+                    if median_outer_ops:
+                        val_var = "val" # Logic below expects val_var for generic ops, usually defined later but we need it for shared algo
+                        
+                        # Correct offset calculation for P-Square state
+                        # State shape: (5, num_trials, n_saved_points)
+                        # Offset = k * (num_trials * n_saved_points) + t * n_saved_points + offs
+                        stride_k = f"(num_trials * n_saved_points)"
+                        offset_t = f"(t * n_saved_points + offs)"
+
+                        kernel_code_lines.extend([
+                            f"{indent}# P-Square Median Update (Outer - Shared)",
+                            f"{indent}macro_step = current_step",
+                            f"{indent}if macro_step < 5:",
+                            f"{indent2}q_ptr_k = {safe_var}_median_q_state_ptr + macro_step * {stride_k} + {offset_t}",
+                            f"{indent2}tl.store(q_ptr_k, {val_var}, mask=mask)",
+                            f"{indent2}if macro_step == 4:",
+                            # Sort and Initialize
+                            f"{indent3}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent3}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent3}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent3}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent3}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, mask=mask)",
+                            
+                            # Vectorized Bubble Sort
+                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                            f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+                            f"{indent3}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
+                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                            f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                            
+                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, q0, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, q1, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, q2, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, q3, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, q4, mask=mask)",
+                            
+                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 0 * {stride_k} + {offset_t}, 0, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 1 * {stride_k} + {offset_t}, 1, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 2 * {stride_k} + {offset_t}, 2, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 3 * {stride_k} + {offset_t}, 3, mask=mask)",
+                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 4 * {stride_k} + {offset_t}, 4, mask=mask)",
+                            
+                            f"{indent}elif macro_step >= 5:",
+                            f"{indent2}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent2}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent2}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent2}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, mask=mask)",
+                            f"{indent2}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, mask=mask)",
+                            
+                            f"{indent2}n0 = tl.load({safe_var}_median_n_state_ptr + 0 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
+                            f"{indent2}n1 = tl.load({safe_var}_median_n_state_ptr + 1 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
+                            f"{indent2}n2 = tl.load({safe_var}_median_n_state_ptr + 2 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
+                            f"{indent2}n3 = tl.load({safe_var}_median_n_state_ptr + 3 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
+                            f"{indent2}n4 = tl.load({safe_var}_median_n_state_ptr + 4 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
+                            
+                            f"{indent2}q0 = tl.minimum(q0, {val_var})",
+                            f"{indent2}q4 = tl.maximum(q4, {val_var})",
+                            f"{indent2}n4 = n4 + 1.0",
+                            f"{indent2}n1 = n1 + tl.where({val_var} < q1, 1.0, 0.0)",
+                            f"{indent2}n2 = n2 + tl.where({val_var} < q2, 1.0, 0.0)",
+                            f"{indent2}n3 = n3 + tl.where({val_var} < q3, 1.0, 0.0)",
+                            
+                            f"{indent2}N_total = macro_step + 1.0",
+                            f"{indent2}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
+                            
+                            f"{indent2}d = d1 - n1",
+                            f"{indent2}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
+                            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                            f"{indent2}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
+                            f"{indent2}q_linear = q1 + dsign * (tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0)))",
+                            f"{indent2}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
+                            f"{indent2}q1 = tl.where(cond, q_cand, q1)",
+                            f"{indent2}n1 = tl.where(cond, n1 + dsign, n1)",
+
+                            f"{indent2}d = d2 - n2",
+                            f"{indent2}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
+                            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                            f"{indent2}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
+                            f"{indent2}q_linear = q2 + dsign * (tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1)))",
+                            f"{indent2}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
+                            f"{indent2}q2 = tl.where(cond, q_cand, q2)",
+                            f"{indent2}n2 = tl.where(cond, n2 + dsign, n2)",
+
+                            f"{indent2}d = d3 - n3",
+                            f"{indent2}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
+                            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                            f"{indent2}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
+                            f"{indent2}q_linear = q3 + dsign * (tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2)))",
+                            f"{indent2}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
+                            f"{indent2}q3 = tl.where(cond, q_cand, q3)",
+                            f"{indent2}n3 = tl.where(cond, n3 + dsign, n3)",
+                            
+                            # Store Back
+                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, q0, mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, q1, mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, q2, mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, q3, mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, q4, mask=mask)",
+                            
+                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 0 * {stride_k} + {offset_t}, n0.to(tl.int32), mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 1 * {stride_k} + {offset_t}, n1.to(tl.int32), mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 2 * {stride_k} + {offset_t}, n2.to(tl.int32), mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 3 * {stride_k} + {offset_t}, n3.to(tl.int32), mask=mask)",
+                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 4 * {stride_k} + {offset_t}, n4.to(tl.int32), mask=mask)",
+                        ])
+
                     # Inner states update
                     inner_ops = set(op.split('_')[1] for op in ops if '_' in op)
                     for inner in inner_ops:
                         kernel_code_lines.append(f"{indent}val_for_{inner} = tl.zeros_like(val)")
-                        inner_ptr = f"{var}_{inner}_inner_state_ptr + {out_offset}"
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + {out_offset}"
                         if inner == 'mean':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
                                  f"{indent}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
@@ -875,6 +1063,116 @@ class StatisticsAggregator:
                                  f"{indent}if is_inner_last:",
                                  f"{indent2}val_for_{inner} = tl.load({inner_ptr}, mask=mask, other=0.0)",
                              ])
+                        elif inner == 'median':
+                             # Inner P-Square Median Implementation
+                             # This logic handles P-Square update for every sub-step (inner loop)
+                             # and extracts result on is_inner_last
+                             
+                             kernel_code_lines.extend([
+                                 f"{indent}# P-Square Inner Median Update",
+                                 f"{indent}if is_inner_first and step_count_val==0:",
+                                 # Reset if needed
+                                 f"{indent2}pass",
+                                 
+                                 f"{indent}if step_count_val < 5:",
+                                 f"{indent2}q_ptr_k = {safe_var}_median_inner_q_state_ptr + step_count_val * n_saved_points + offs",
+                                 f"{indent2}tl.store(q_ptr_k, val, mask=mask)",
+                                 f"{indent2}if step_count_val == 4:",
+                                 # Sort and Initialize Inner
+                                 f"{indent3}q0 = tl.load({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
+                                 f"{indent3}q1 = tl.load({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
+                                 f"{indent3}q2 = tl.load({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
+                                 f"{indent3}q3 = tl.load({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
+                                 f"{indent3}q4 = tl.load({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
+                                 
+                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                 f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                                 f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+                                 f"{indent3}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
+                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                 f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                                 f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                 f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                 
+                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
+                                 
+                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 0 * n_saved_points + offs, 0, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 1 * n_saved_points + offs, 1, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 2 * n_saved_points + offs, 2, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 3 * n_saved_points + offs, 3, mask=mask)",
+                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 4 * n_saved_points + offs, 4, mask=mask)",
+                                 
+                                 f"{indent}elif step_count_val >= 5:",
+                                 f"{indent2}q0 = tl.load({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
+                                 f"{indent2}q1 = tl.load({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
+                                 f"{indent2}q2 = tl.load({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
+                                 f"{indent2}q3 = tl.load({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
+                                 f"{indent2}q4 = tl.load({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
+                                 
+                                 f"{indent2}n0 = tl.load({safe_var}_median_inner_n_state_ptr + 0 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                 f"{indent2}n1 = tl.load({safe_var}_median_inner_n_state_ptr + 1 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                 f"{indent2}n2 = tl.load({safe_var}_median_inner_n_state_ptr + 2 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                 f"{indent2}n3 = tl.load({safe_var}_median_inner_n_state_ptr + 3 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                 f"{indent2}n4 = tl.load({safe_var}_median_inner_n_state_ptr + 4 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                 
+                                 f"{indent2}q0 = tl.minimum(q0, val)",
+                                 f"{indent2}q4 = tl.maximum(q4, val)",
+                                 f"{indent2}n4 = n4 + 1.0",
+                                 f"{indent2}n1 = n1 + tl.where(val < q1, 1.0, 0.0)",
+                                 f"{indent2}n2 = n2 + tl.where(val < q2, 1.0, 0.0)",
+                                 f"{indent2}n3 = n3 + tl.where(val < q3, 1.0, 0.0)",
+                                 
+                                 f"{indent2}N_total = step_count_val + 1.0",
+                                 f"{indent2}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
+                                 
+                                 f"{indent2}d = d1 - n1",
+                                 f"{indent2}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
+                                 f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                                 f"{indent2}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
+                                 f"{indent2}q_linear = q1 + dsign * (tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0)))",
+                                 f"{indent2}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
+                                 f"{indent2}q1 = tl.where(cond, q_cand, q1)",
+                                 f"{indent2}n1 = tl.where(cond, n1 + dsign, n1)",
+
+                                 f"{indent2}d = d2 - n2",
+                                 f"{indent2}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
+                                 f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                                 f"{indent2}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
+                                 f"{indent2}q_linear = q2 + dsign * (tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1)))",
+                                 f"{indent2}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
+                                 f"{indent2}q2 = tl.where(cond, q_cand, q2)",
+                                 f"{indent2}n2 = tl.where(cond, n2 + dsign, n2)",
+        
+                                 f"{indent2}d = d3 - n3",
+                                 f"{indent2}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
+                                 f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                                 f"{indent2}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
+                                 f"{indent2}q_linear = q3 + dsign * (tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2)))",
+                                 f"{indent2}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
+                                 f"{indent2}q3 = tl.where(cond, q_cand, q3)",
+                                 f"{indent2}n3 = tl.where(cond, n3 + dsign, n3)",
+                                 
+                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
+                                 
+                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 0 * n_saved_points + offs, n0.to(tl.int32), mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 1 * n_saved_points + offs, n1.to(tl.int32), mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 2 * n_saved_points + offs, n2.to(tl.int32), mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 3 * n_saved_points + offs, n3.to(tl.int32), mask=mask)",
+                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 4 * n_saved_points + offs, n4.to(tl.int32), mask=mask)",
+                                 
+                                 f"{indent}if is_inner_last:",
+                                 f"{indent2}val_for_{inner} = tl.load({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
+                             ])
                         elif inner == 'last':
                              kernel_code_lines.extend([
                                  f"{indent}inner_{inner}_new = val",
@@ -883,7 +1181,7 @@ class StatisticsAggregator:
                              ])
 
                     for op in ops:
-                        out_ptr = f"{var}_{op}_ptr + {out_offset}"
+                        out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
                         op_parts = op.split('_')
                         if len(op_parts) > 1:
                             outer = op_parts[0]
@@ -915,7 +1213,7 @@ class StatisticsAggregator:
                                         f"{indent2}# Bubble Insert Max K={k_val}",
                                         f"{indent2}new_val = {val_var}",
                                         f"{indent2}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent2}base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent2}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent2}if is_outer_first and current_step==0:",
                                         f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
@@ -932,7 +1230,7 @@ class StatisticsAggregator:
 
                             elif outer == 'argmax':
                                 if k_val == 1:
-                                    comp_ptr = f"{var}_max_{inner}_ptr + {out_offset}"
+                                    comp_ptr = f"{safe_var}_max_{inner}_ptr + {out_offset}"
                                     kernel_code_lines.extend([
                                         f"{indent2}if is_outer_first and current_step==0:",
                                         f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
@@ -948,7 +1246,7 @@ class StatisticsAggregator:
                                     # Then maxK runs, reads OLD maxK values, updates values.
                                     
                                     comp_op = f"max{k_val}_{inner}"
-                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
                                     
                                     kernel_code_lines.extend([
                                         f"{indent2}# Bubble Insert Argmax K={k_val}",
@@ -958,7 +1256,7 @@ class StatisticsAggregator:
                                         # Pointer to values (read-only for comparison)
                                         f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
                                         # Pointer to indices (read-write)
-                                        f"{indent2}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent2}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent2}if is_outer_first and current_step==0:",
                                         f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
@@ -992,7 +1290,7 @@ class StatisticsAggregator:
                                         f"{indent2}# Bubble Insert Min K={k_val}",
                                         f"{indent2}new_val = {val_var}",
                                         f"{indent2}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent2}base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent2}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent2}if is_outer_first and current_step==0:",
                                         f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
@@ -1009,7 +1307,7 @@ class StatisticsAggregator:
                                     
                             elif outer == 'argmin':
                                 if k_val == 1:
-                                    comp_ptr = f"{var}_min_{inner}_ptr + {out_offset}"
+                                    comp_ptr = f"{safe_var}_min_{inner}_ptr + {out_offset}"
                                     kernel_code_lines.extend([
                                         f"{indent2}if is_outer_first and current_step==0:",
                                         f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
@@ -1022,7 +1320,7 @@ class StatisticsAggregator:
                                     # Argmin K
                                     # Assume argminK runs before minK
                                     comp_op = f"min{k_val}_{inner}"
-                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
                                     
                                     kernel_code_lines.extend([
                                         f"{indent2}# Bubble Insert Argmin K={k_val}",
@@ -1030,7 +1328,7 @@ class StatisticsAggregator:
                                         f"{indent2}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
                                         f"{indent2}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        f"{indent2}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent2}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent2}if is_outer_first and current_step==0:",
                                         f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
@@ -1067,6 +1365,111 @@ class StatisticsAggregator:
                                     f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
                                     f"{indent3}new = old + {val_var}",
                                     f"{indent3}tl.store({out_ptr}, new, mask=mask)",
+                                ])
+                            elif outer == 'median':
+                                kernel_code_lines.extend([
+                                    f"{indent2}macro_step = current_step",
+                                    f"{indent2}if macro_step < 5:",
+                                    f"{indent3}q_ptr_k = {safe_var}_median_q_state_ptr + macro_step * n_saved_points + offs",
+                                    f"{indent3}tl.store(q_ptr_k, {val_var}, mask=mask)",
+                                    f"{indent3}if macro_step == 4:",
+                                    # Sort and Initialize
+                                    f"{indent4}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
+                                    f"{indent4}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
+                                    f"{indent4}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
+                                    f"{indent4}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
+                                    f"{indent4}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
+                                    
+                                    # Vectorized Bubble Sort
+                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                    f"{indent4}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                                    f"{indent4}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+                                    f"{indent4}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
+                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                    f"{indent4}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                                    f"{indent4}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                    f"{indent4}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+                                    
+                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
+                                    
+                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 0 * n_saved_points + offs, 0, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 1 * n_saved_points + offs, 1, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 2 * n_saved_points + offs, 2, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 3 * n_saved_points + offs, 3, mask=mask)",
+                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 4 * n_saved_points + offs, 4, mask=mask)",
+                                    f"{indent4}tl.store({out_ptr}, q2, mask=mask)",
+                                    
+                                    f"{indent2}elif macro_step >= 5:",
+                                    f"{indent3}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
+                                    f"{indent3}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
+                                    f"{indent3}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
+                                    f"{indent3}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
+                                    f"{indent3}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
+                                    
+                                    f"{indent3}n0 = tl.load({safe_var}_median_n_state_ptr + 0 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                    f"{indent3}n1 = tl.load({safe_var}_median_n_state_ptr + 1 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                    f"{indent3}n2 = tl.load({safe_var}_median_n_state_ptr + 2 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                    f"{indent3}n3 = tl.load({safe_var}_median_n_state_ptr + 3 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                    f"{indent3}n4 = tl.load({safe_var}_median_n_state_ptr + 4 * n_saved_points + offs, mask=mask).to(tl.float32)",
+                                    
+                                    f"{indent3}q0 = tl.minimum(q0, {val_var})",
+                                    f"{indent3}q4 = tl.maximum(q4, {val_var})",
+                                    f"{indent3}n4 = n4 + 1.0",
+                                    f"{indent3}n1 = n1 + tl.where({val_var} < q1, 1.0, 0.0)",
+                                    f"{indent3}n2 = n2 + tl.where({val_var} < q2, 1.0, 0.0)",
+                                    f"{indent3}n3 = n3 + tl.where({val_var} < q3, 1.0, 0.0)",
+                                    
+                                    f"{indent3}N_total = macro_step + 1.0",
+                                    f"{indent3}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
+                                    
+                                    f"{indent3}d = d1 - n1",
+                                    f"{indent3}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
+                                    f"{indent3}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                                    f"{indent3}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
+                                    f"{indent3}q_linear = q1 + dsign * (tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0)))",
+                                    f"{indent3}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
+                                    f"{indent3}q1 = tl.where(cond, q_cand, q1)",
+                                    f"{indent3}n1 = tl.where(cond, n1 + dsign, n1)",
+
+                                    f"{indent3}d = d2 - n2",
+                                    f"{indent3}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
+                                    f"{indent3}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                                    f"{indent3}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
+                                    f"{indent3}q_linear = q2 + dsign * (tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1)))",
+                                    f"{indent3}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
+                                    f"{indent3}q2 = tl.where(cond, q_cand, q2)",
+                                    f"{indent3}n2 = tl.where(cond, n2 + dsign, n2)",
+
+                                    f"{indent3}d = d3 - n3",
+                                    f"{indent3}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
+                                    f"{indent3}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+                                    f"{indent3}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
+                                    f"{indent3}q_linear = q3 + dsign * (tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2)))",
+                                    f"{indent3}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
+                                    f"{indent3}q3 = tl.where(cond, q_cand, q3)",
+                                    f"{indent3}n3 = tl.where(cond, n3 + dsign, n3)",
+                                    
+                                    # Store Back
+                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
+                                    
+                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 0 * n_saved_points + offs, n0.to(tl.int32), mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 1 * n_saved_points + offs, n1.to(tl.int32), mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 2 * n_saved_points + offs, n2.to(tl.int32), mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 3 * n_saved_points + offs, n3.to(tl.int32), mask=mask)",
+                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 4 * n_saved_points + offs, n4.to(tl.int32), mask=mask)",
+                                    
+                                    # Output Median
+                                    f"{indent3}tl.store({out_ptr}, q2, mask=mask)",
                                 ])
                             continue
 
@@ -1113,18 +1516,17 @@ class StatisticsAggregator:
                                 f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'argmax':
-                            max_ptr = f"{var}_max_ptr + {out_offset}"
+                            max_ptr = f"{safe_var}_max_ptr + {out_offset}"
                             kernel_code_lines.extend([
                                 f"{indent}if is_inner_first:",
                                 f"{indent2}tl.store({out_ptr}, current_step, mask=mask)",
-                                f"{indent2}if is_inner_last:", 
                                 f"{indent}else:",
                                 f"{indent2}curr_max = tl.load({max_ptr}, mask=mask, other=val)",
                                 f"{indent2}cond_mask = val > curr_max",
                                 f"{indent2}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
                             ])
                         elif op == 'argmin':
-                            min_ptr = f"{var}_min_ptr + {out_offset}"
+                            min_ptr = f"{safe_var}_min_ptr + {out_offset}"
                             kernel_code_lines.extend([
                                 f"{indent}if is_inner_first:",
                                 f"{indent2}tl.store({out_ptr}, current_step, mask=mask)",
@@ -1148,6 +1550,21 @@ class StatisticsAggregator:
                                 f"{indent}if is_middle:",
                                 f"{indent2}tl.store({out_ptr}, val, mask=mask)",
                             ])
+                        elif (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and '_' not in op:
+                            # Use Shared P-Square State (updated above)
+                            # Map op suffix to quantile index
+                            q_idx = 2 # default median (50%)
+                            if 'max' in op or '100' in op: q_idx = 4
+                            elif 'min' in op or '00' in op: q_idx = 0
+                            elif '75' in op: q_idx = 3
+                            elif '25' in op: q_idx = 1
+                            elif '50' in op: q_idx = 2
+                            
+                            kernel_code_lines.extend([
+                                f"{indent}# Output {op} from Shared P-Square State",
+                                f"{indent}q_val = tl.load({safe_var}_median_q_state_ptr + {q_idx} * {stride_k} + {offset_t}, mask=mask)",
+                                f"{indent}tl.store({out_ptr}, q_val, mask=mask)"
+                            ])
                 kernel_code_lines.append("")
 
         # 2D processing
@@ -1160,11 +1577,39 @@ class StatisticsAggregator:
                     f"{indent}# 2D variables (mean/min/max and mixed)",
                     f"{indent}for level in tl.static_range(n_levels):",
                 ])
+                emitted_vars_2d = set()
+                def emit_val_2d(v_name):
+                    safe_v_name = self._get_safe_name(v_name)
+                    if safe_v_name in emitted_vars_2d: return f"{safe_v_name}_val"
+                    
+                    info = self._field_registry.get(v_name)
+                    cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
+                    
+                    if cat == 'virtual' and info:
+                         expr = getattr(info, 'json_schema_extra', {}).get('expr')
+                         import re
+                         safe_expr = expr
+                         toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                         for t in toks:
+                              if t in self._field_registry or t in self._tensor_registry:
+                                   emit_val_2d(t)
+                                   safe_t = self._get_safe_name(t)
+                                   safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
+                         safe_expr = self._transform_pow_expr(safe_expr)
+                         kernel_code_lines.append(f"{indent2}{safe_v_name}_val = {safe_expr}")
+                    else:
+                         in_ptr_loc = f"{safe_v_name}_ptr + (t * stride_input + idx) * n_levels + level"
+                         kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                    
+                    emitted_vars_2d.add(safe_v_name)
+                    return f"{safe_v_name}_val"
+
                 for var in non_last_only:
-                    in_ptr = f"{var}_ptr + (t * stride_input + idx) * n_levels + level"
+                    safe_var = self._get_safe_name(var)
                     out_offset = f"(t * n_saved_points + offs) * n_levels + level"
                     
-                    kernel_code_lines.append(f"{indent2}val = tl.load({in_ptr}, mask=mask, other=0.0)")
+                    val_name = emit_val_2d(var)
+                    kernel_code_lines.append(f"{indent2}val = {val_name}")
 
                     # Inner states update
                     ops = self._variable_ops[var]
@@ -1174,9 +1619,9 @@ class StatisticsAggregator:
                         # This value is used if is_update_outer is True, where it gets overwritten.
                         kernel_code_lines.append(f"{indent2}val_for_{inner} = tl.zeros_like(val)")
 
-                        inner_ptr = f"{var}_{inner}_inner_state_ptr + {out_offset}"
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + {out_offset}"
                         if inner == 'mean':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
@@ -1201,7 +1646,7 @@ class StatisticsAggregator:
                                  f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
                              ])
                         elif inner == 'max':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
@@ -1220,7 +1665,7 @@ class StatisticsAggregator:
                                  f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
                              ])
                         elif inner == 'min':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
@@ -1239,7 +1684,7 @@ class StatisticsAggregator:
                                  f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
                              ])
                         elif inner == 'first':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
@@ -1258,7 +1703,7 @@ class StatisticsAggregator:
                                  f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
                              ])
                         elif inner == 'last':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
@@ -1270,7 +1715,7 @@ class StatisticsAggregator:
                                  f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
                              ])
                         elif inner == 'mid':
-                             weight_ptr = f"{var}_{inner}_weight_state_ptr + {out_offset}"
+                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
@@ -1285,7 +1730,7 @@ class StatisticsAggregator:
                              ])
 
                     for op in self._variable_ops[var]:
-                        out_ptr = f"{var}_{op}_ptr + {out_offset}"
+                        out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
                         op_parts = op.split('_')
                         if len(op_parts) > 1:
                             outer = op_parts[0]
@@ -1317,7 +1762,7 @@ class StatisticsAggregator:
                                         f"{indent3}# Bubble Insert Max K={k_val}",
                                         f"{indent3}new_val = {val_var}",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent3}base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent3}if is_outer_first and current_step==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
@@ -1334,7 +1779,7 @@ class StatisticsAggregator:
 
                             elif outer == 'argmax':
                                 if k_val == 1:
-                                    comp_ptr = f"{var}_max_{inner}_ptr + {out_offset}"
+                                    comp_ptr = f"{safe_var}_max_{inner}_ptr + {out_offset}"
                                     kernel_code_lines.extend([
                                         f"{indent3}if is_outer_first and current_step==0:",
                                         f"{indent4}tl.store({out_ptr}, current_step, mask=mask)",
@@ -1346,14 +1791,14 @@ class StatisticsAggregator:
                                 else:
                                     # Argmax K
                                     comp_op = f"max{k_val}_{inner}"
-                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
                                     kernel_code_lines.extend([
                                         f"{indent3}# Bubble Insert Argmax K={k_val}",
                                         f"{indent3}comp_val = {val_var}",
                                         f"{indent3}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent3}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        f"{indent3}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent3}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent3}if is_outer_first and current_step==0:",
                                         f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
@@ -1384,7 +1829,7 @@ class StatisticsAggregator:
                                         f"{indent3}# Bubble Insert Min K={k_val}",
                                         f"{indent3}new_val = {val_var}",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent3}base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent3}if is_outer_first and current_step==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
@@ -1401,7 +1846,7 @@ class StatisticsAggregator:
 
                             elif outer == 'argmin':
                                 if k_val == 1:
-                                    comp_ptr = f"{var}_min_{inner}_ptr + {out_offset}"
+                                    comp_ptr = f"{safe_var}_min_{inner}_ptr + {out_offset}"
                                     kernel_code_lines.extend([
                                         f"{indent3}if is_outer_first and current_step==0:",
                                         f"{indent4}tl.store({out_ptr}, current_step, mask=mask)",
@@ -1413,14 +1858,14 @@ class StatisticsAggregator:
                                 else:
                                     # Argmin K
                                     comp_op = f"min{k_val}_{inner}"
-                                    comp_ptr_base = f"{var}_{comp_op}_ptr"
+                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
                                     kernel_code_lines.extend([
                                         f"{indent3}# Bubble Insert Argmin K={k_val}",
                                         f"{indent3}comp_val = {val_var}",
                                         f"{indent3}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent3}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        f"{indent3}idx_base_ptr = {var}_{op}_ptr + k_offset",
+                                        f"{indent3}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
                                         f"{indent3}if is_outer_first and current_step==0:",
                                         f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
@@ -1496,7 +1941,7 @@ class StatisticsAggregator:
                             ])
                         elif op == 'argmax':
                             # 2D argmax logic
-                            max_ptr = f"{var}_max_ptr + {out_offset}"
+                            max_ptr = f"{safe_var}_max_ptr + {out_offset}"
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
@@ -1506,7 +1951,7 @@ class StatisticsAggregator:
                                 f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
                             ])
                         elif op == 'argmin':
-                            min_ptr = f"{var}_min_ptr + {out_offset}"
+                            min_ptr = f"{safe_var}_min_ptr + {out_offset}"
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
@@ -1530,6 +1975,8 @@ class StatisticsAggregator:
                                 f"{indent2}if is_middle:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                             ])
+                        elif op == 'median':
+                            pass # Median P-Square is 1D only for now, not supported in 2D with levels currently
                 kernel_code_lines.append("")
 
             if last_only_vars:
@@ -1539,11 +1986,13 @@ class StatisticsAggregator:
                     f"{indent2}for level in tl.static_range(n_levels):",
                 ])
                 for var in last_only_vars:
-                    in_ptr = f"{var}_ptr + (t * stride_input + idx) * n_levels + level"
+                    safe_var = self._get_safe_name(var)
                     out_offset = f"(t * n_saved_points + offs) * n_levels + level"
+                    
+                    val_name = emit_val_2d(var)
                     kernel_code_lines.extend([
-                        f"{indent3}val = tl.load({in_ptr}, mask=mask, other=0.0)",
-                        f"{indent3}tl.store({var}_last_ptr + {out_offset}, val, mask=mask)",
+                        f"{indent3}val = {val_name}",
+                        f"{indent3}tl.store({safe_var}_last_ptr + {out_offset}, val, mask=mask)",
                     ])
         kernel_code_lines.append("")
 
@@ -1553,7 +2002,7 @@ class StatisticsAggregator:
         """Generate the main python function that calls kernels."""
         kernel_code_lines.extend([
             "# Main update function",
-            "def internal_update_statistics(states, weight, total_weight, num_macro_steps, is_inner_first, is_inner_last, is_middle, is_outer_first, is_outer_last, current_step, BLOCK_SIZE):",
+            "def internal_update_statistics(states, weight, total_weight, num_macro_steps, is_inner_first, is_inner_last, is_middle, is_outer_first, is_outer_last, current_step, step_count_val, BLOCK_SIZE):",
         ])
         
         if self.num_trials > 1:
@@ -1588,7 +2037,7 @@ class StatisticsAggregator:
                  if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                       expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
                       import re
-                      toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                      toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
                       for t in toks:
                            if t in self._field_registry or t in self._tensor_registry:
                                 _gather_inputs(t)
@@ -1601,12 +2050,22 @@ class StatisticsAggregator:
             # Add Input pointers
             sorted_inputs = sorted(list(input_args))
             for var in sorted_inputs:
-                 kernel_code_lines.append(f"        {var}_ptr=states['{var}'],")
+                 safe_var = self._get_safe_name(var)
+                 # Avoid duplicate argument if save_idx matches input var
+                 if safe_var == save_idx:
+                     continue
+                 kernel_code_lines.append(f"        {safe_var}_ptr=states['{var}'],")
             
             # Add variable output pointers
             for var in var_list:
+                safe_var = self._get_safe_name(var)
+                added_median_state = False
                 for op in self._variable_ops[var]:
-                    kernel_code_lines.append(f"        {var}_{op}_ptr=states['{var}_{op}'],")
+                    kernel_code_lines.append(f"        {safe_var}_{op}_ptr=states['{var}_{op}'],")
+                    if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
+                        kernel_code_lines.append(f"        {safe_var}_median_q_state_ptr=states['{var}_median_q_state'],")
+                        kernel_code_lines.append(f"        {safe_var}_median_n_state_ptr=states['{var}_median_n_state'],")
+                        added_median_state = True
                 
                 # Inner state pointers
                 added_inner = set()
@@ -1614,9 +2073,12 @@ class StatisticsAggregator:
                     if '_' in op:
                         inner = op.split('_')[1]
                         if inner not in added_inner:
-                             kernel_code_lines.append(f"        {var}_{inner}_inner_state_ptr=states['{var}_{inner}_inner_state'],")
-                             if inner in ('mean', 'max', 'min', 'first', 'last', 'mid'):
-                                 kernel_code_lines.append(f"        {var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
+                             kernel_code_lines.append(f"        {safe_var}_{inner}_inner_state_ptr=states['{var}_{inner}_inner_state'],")
+                             if inner in ('mean', 'first', 'last', 'mid'):
+                                 kernel_code_lines.append(f"        {safe_var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
+                             if inner == 'median':
+                                 kernel_code_lines.append(f"        {safe_var}_median_inner_q_state_ptr=states['{var}_median_inner_q_state'],")
+                                 kernel_code_lines.append(f"        {safe_var}_median_inner_n_state_ptr=states['{var}_median_inner_n_state'],")
                              added_inner.add(inner)
             
             kernel_code_lines.extend([
@@ -1629,6 +2091,7 @@ class StatisticsAggregator:
                 "        is_outer_first=is_outer_first,",
                 "        is_outer_last=is_outer_last,",
                 "        current_step=current_step,",
+                "        step_count_val=step_count_val,",
                 "        n_saved_points=save_idx_len,",
             ])
             
@@ -1752,29 +2215,40 @@ class StatisticsAggregator:
             extra_ops = []
             import re
             for op in ops:
-                if '_' in op:
-                    parts = op.split('_')
-                    outer_op = parts[0]
-                    # Check for maxk/mink pattern
-                    match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer_op)
-                    if match_k:
-                        base = match_k.group(1)
-                        k = int(match_k.group(2))
-                        if base in ['argmax', 'argmin']:
-                            # argmaxK needs maxK
-                            req_base = 'max' if base == 'argmax' else 'min'
-                            req = f"{req_base}{k}_{parts[1]}"
-                            if req not in ops and req not in extra_ops:
-                                extra_ops.append(req)
-                    
-                    elif parts[0] == 'argmax':
-                        req = f"max_{parts[1]}"
+                parts = op.split('_')
+                outer_op = parts[0]
+                inner_suffix = parts[1] if len(parts) > 1 else None
+
+                # Check for maxk/mink pattern
+                match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer_op)
+                if match_k:
+                    base = match_k.group(1)
+                    k = int(match_k.group(2))
+                    if base in ['argmax', 'argmin']:
+                        # argmaxK needs maxK
+                        req_base = 'max' if base == 'argmax' else 'min'
+                        if inner_suffix:
+                            req = f"{req_base}{k}_{inner_suffix}"
+                        else:
+                            req = f"{req_base}{k}"
+                        
                         if req not in ops and req not in extra_ops:
                             extra_ops.append(req)
-                    elif parts[0] == 'argmin':
-                        req = f"min_{parts[1]}"
-                        if req not in ops and req not in extra_ops:
-                            extra_ops.append(req)
+                
+                elif outer_op == 'argmax':
+                    if inner_suffix:
+                        req = f"max_{inner_suffix}"
+                    else:
+                        req = "max"
+                    if req not in ops and req not in extra_ops:
+                        extra_ops.append(req)
+                elif outer_op == 'argmin':
+                    if inner_suffix:
+                        req = f"min_{inner_suffix}"
+                    else:
+                        req = "min"
+                    if req not in ops and req not in extra_ops:
+                        extra_ops.append(req)
             ops.extend(extra_ops)
             
             # Sort ops to ensure deps are processed if needed, though dict order usually fine
@@ -1907,6 +2381,21 @@ class StatisticsAggregator:
                 elif outer_op == 'first':
                     # Similar to 'last', we just need storage. Zero initialization is fine as it will be overwritten on is_first.
                     init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
+                elif outer_op.startswith('median') or (outer_op.startswith('q') and outer_op[1:].isdigit()):
+                    init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
+                    # Allocate P-Square states: 5 markers (q) and 5 positions (n)
+                    q_shape = (5,) + actual_shape
+                    n_shape = (5,) + actual_shape
+                    
+                    q_state_name = f"{var_name}_median_q_state"
+                    n_state_name = f"{var_name}_median_n_state"
+                    
+                    if q_state_name not in self._storage:
+                        # q state holds marker heights
+                        self._storage[q_state_name] = torch.zeros(q_shape, dtype=target_dtype, device=self.device)
+                    if n_state_name not in self._storage:
+                        # n state holds marker positions (integer counts)
+                        self._storage[n_state_name] = torch.zeros(n_shape, dtype=torch.int32, device=self.device)
                 else:
                     init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
                 self._storage[out_name] = init_tensor
@@ -1927,6 +2416,22 @@ class StatisticsAggregator:
                          elif inner_op == 'sum':
                              init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          elif inner_op in ('first', 'last', 'mid'):
+                             init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
+                         elif inner_op == 'median':
+                             # Inner P-Square Median State
+                             # We need Q (markers) and N (positions) for inner loop
+                             # Shape: (5, *actual_shape)
+                             q_shape = (5,) + actual_shape
+                             n_shape = (5,) + actual_shape
+                             
+                             q_inner_name = f"{var_name}_median_inner_q_state"
+                             n_inner_name = f"{var_name}_median_inner_n_state"
+                             
+                             if q_inner_name not in self._storage:
+                                 self._storage[q_inner_name] = torch.zeros(q_shape, dtype=target_dtype, device=self.device)
+                             if n_inner_name not in self._storage:
+                                 self._storage[n_inner_name] = torch.zeros(n_shape, dtype=torch.int32, device=self.device)
+                             
                              init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          else:
                              # Should be caught by validator, but safe fallback
@@ -1990,11 +2495,13 @@ class StatisticsAggregator:
             
         if _is_inner_last:
              for out_name, is_outer in self._output_is_outer.items():
+                 # We only trigger dirty for non-outer (Standard) ops when inner loop ends
                  if not is_outer:
                      self._dirty_outputs.add(out_name)
         
         if is_outer_last:
              for out_name, is_outer in self._output_is_outer.items():
+                 # We trigger dirty for outer ops when outer loop ends
                  if is_outer:
                      self._dirty_outputs.add(out_name)
 
@@ -2004,10 +2511,12 @@ class StatisticsAggregator:
         step_val = custom_step_index if custom_step_index is not None else self._step_count
         macro_count_val = (float(custom_step_index) + 1.0) if custom_step_index is not None else self._current_macro_step_count
             
+        # Ensure kernel states is actually populated correctly for new keys
+            
         self._aggregator_function(self._kernel_states, weight, total_weight, macro_count_val, 
                                   _is_inner_first, _is_inner_last, is_middle, 
                                   is_outer_first, is_outer_last,
-                                  step_val, BLOCK_SIZE)
+                                  step_val, self._step_count, BLOCK_SIZE)
         
         self._step_count += 1
 

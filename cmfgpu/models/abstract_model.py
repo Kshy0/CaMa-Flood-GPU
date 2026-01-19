@@ -83,8 +83,8 @@ class AbstractModel(BaseModel, ABC):
     opened_modules: List[str] = Field(default_factory=list, description="List of active modules")
     # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
     # one variable can appear under multiple ops.
-    variables_to_save: Optional[Dict[str, Union[str, List[str]]]] = Field(
-        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, argmax, argmin."
+    variables_to_save: Optional[Dict[str, Union[str, List[Union[str, Dict[str, str]]]]]] = Field(
+        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, argmax, argmin. Variables can be strings or {alias: expr} dicts."
     )
     precision: Literal["float32", "float64"] = Field(default="float32", description="Precision of the model")
     world_size: int = Field(default=1, description="Total number of distributed processes")
@@ -794,18 +794,22 @@ class AbstractModel(BaseModel, ABC):
         registered_vars = set()
 
         # Normalize variables_to_save (op -> vars) into var -> set[ops]
-        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum"}
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum", "median"}
         import re
         topk_pattern = re.compile(r'^(max|min|argmax|argmin)(\d+)$')
+        q_pattern = re.compile(r'^q\d+$')
 
         var_to_ops: Dict[str, List[str]] = {}
+        # Stores explicit expressions provided by user: alias -> expression
+        explicit_expressions: Dict[str, str] = {}
+
         for op, vars_val in self.variables_to_save.items():
             op_l = str(op).lower()
             op_parts = op_l.split('_')
             
             # Validate op parts
             for p in op_parts:
-                if p not in allowed_ops and not topk_pattern.match(p):
+                if p not in allowed_ops and not topk_pattern.match(p) and not q_pattern.match(p):
                      raise ValueError(f"Invalid op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
 
             if len(op_parts) > 1:
@@ -816,16 +820,104 @@ class AbstractModel(BaseModel, ABC):
                 if len(op_parts) > 2:
                     raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")
 
-            if isinstance(vars_val, str):
-                names = [vars_val]
+            # Standardize vars_val to a list of items
+            if isinstance(vars_val, (str, tuple)):
+                items = [vars_val]
             elif isinstance(vars_val, list):
-                names = list(vars_val)
+                items = vars_val
             else:
-                raise ValueError(f"variables_to_save['{op}'] must be a string or list of strings")
-            for name in names:
+                raise ValueError(f"variables_to_save['{op}'] must be a string, tuple (name, expr), or list of them.")
+            
+            for item in items:
+                if isinstance(item, str):
+                    name = item
+                elif isinstance(item, (tuple, list)) and len(item) == 2:
+                    name = item[0]
+                    expr = item[1]
+                    if name in explicit_expressions and explicit_expressions[name] != expr:
+                         raise ValueError(f"Conflicting expressions for alias '{name}': '{explicit_expressions[name]}' vs '{expr}'")
+                    explicit_expressions[name] = expr
+                elif isinstance(item, dict):
+                    if len(item) != 1:
+                        raise ValueError(f"Dictionary item in variables_to_save['{op}'] must have exactly one key-value pair {{alias: expr}}. Got: {item}")
+                    name, expr = next(iter(item.items()))
+                    if name in explicit_expressions and explicit_expressions[name] != expr:
+                         raise ValueError(f"Conflicting expressions for alias '{name}': '{explicit_expressions[name]}' vs '{expr}'")
+                    explicit_expressions[name] = expr
+                else:
+                    raise ValueError(f"Invalid item in variables_to_save['{op}']: {item}. Must be string, dict {{name: expr}}, or (name, expr) tuple.")
+
                 var_to_ops.setdefault(name, [])
                 if op_l not in var_to_ops[name]:
                     var_to_ops[name].append(op_l)
+
+        # Handle ad-hoc expressions in var_to_ops
+        adhoc_virtuals: Dict[str, Any] = {}
+        
+        current_vars = list(var_to_ops.keys())
+        for var_name in current_vars:
+            if var_name in self.variable_map:
+                continue
+            
+            # If provided as tuple, usage is explicit. If string, assume string IS the expression.
+            expression = explicit_expressions.get(var_name, var_name)
+            
+            # Check if it looks like an expression (simple heuristic)
+            # and if we can resolve its tokens
+            import re
+            tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expression))
+            
+            valid_deps = []
+            for t in tokens:
+                 if t in self.variable_map:
+                      valid_deps.append(t)
+            
+            # If no dependencies found, skip (likely invalid or constant)
+            if not valid_deps:
+                 continue
+
+            # Consistency Check
+            # Ensure all dependencies share the same save_idx/save_coord/dim_coords
+            def get_field_meta(name):
+                 mod, attr, _ = self.variable_map[name]
+                 info = mod.get_model_fields().get(attr) or mod.get_model_computed_fields().get(attr)
+                 if info:
+                      extra = info.json_schema_extra or {}
+                      return (extra.get("save_idx"), extra.get("save_coord"), extra.get("dim_coords"))
+                 return (None, None, None)
+
+            ref_meta = get_field_meta(valid_deps[0])
+            # Only enforce save_idx and dim_coords roughly.
+            # save_coord might act differently but usually matches too.
+            
+            for dep in valid_deps[1:]:
+                 curr_meta = get_field_meta(dep)
+                 if curr_meta != ref_meta:
+                      raise ValueError(
+                          f"Inconsistent metadata in virtual variable '{var_name}' (expression: '{expression}'). "
+                          f"Dependency '{valid_deps[0]}' has {ref_meta}, but '{dep}' has {curr_meta}. "
+                          "All dependencies in an expression must share the same 'save_idx', 'save_coord', and 'dim_coords' to ensure correct parallel iteration."
+                      )
+
+            # Create FieldInfo
+            save_idx, save_coord, dim_coords = ref_meta
+            
+            new_info = Field(
+                description=f"Ad-hoc expression: {expression}",
+                json_schema_extra={
+                    "category": "virtual",
+                    "expr": expression,
+                    "save_idx": save_idx,
+                    "save_coord": save_coord,
+                    "dim_coords": dim_coords
+                }
+            )
+            
+            adhoc_virtuals[var_name] = new_info
+
+        # No need to sanitize names or update var_to_ops keys further, 
+        # as var_to_ops already uses the keys we intend to register.
+
 
         registered_vars_by_shape: Dict[str, List[str]] = {}
         
@@ -838,6 +930,15 @@ class AbstractModel(BaseModel, ABC):
             idx += 1
             
             if curr_var not in self.variable_map:
+                if curr_var in adhoc_virtuals:
+                    field_info = adhoc_virtuals[curr_var]
+                    # Check for deps in adhoc virtuals
+                    expr = field_info.json_schema_extra.get("expr", "")
+                    deps = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                    for d in deps:
+                        if d not in vars_seen:
+                            vars_seen.add(d)
+                            vars_to_process.append(d)
                 continue
 
             module_instance, attr_name, _ = self.variable_map[curr_var]
@@ -863,8 +964,14 @@ class AbstractModel(BaseModel, ABC):
         registered_vars = set()
         for var_name in vars_to_process:
             if var_name not in self.variable_map:
+                if var_name in adhoc_virtuals:
+                     if var_name not in registered_vars:
+                         self._statistics_aggregator.register_virtual_tensor(var_name, adhoc_virtuals[var_name])
+                         registered_vars.add(var_name)
+                     continue
+
                 if self.rank == 0:
-                    print(f"Warning: Variable '{var_name}' not found in variable_map. Skipping.")
+                    print(f"Warning: Variable '{var_name}' not found in variable_map or adhoc list. Skipping.")
                 continue
 
             module_instance, attr_name, _ = self.variable_map[var_name]
@@ -1294,8 +1401,9 @@ class AbstractModel(BaseModel, ABC):
         if self.variables_to_save is None:
             return self
         # Validate shape: dict[op -> vars]
-        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum"}
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum", "median"}
         topk_pattern = re.compile(r'^(max|min|argmax|argmin)(\d+)$')
+        q_pattern = re.compile(r'^q\d+$')
 
         if not isinstance(self.variables_to_save, dict):
             # Optional convenience: list[str] => mean
@@ -1308,7 +1416,7 @@ class AbstractModel(BaseModel, ABC):
                 op_parts = op_l.split('_')
                 
                 for p in op_parts:
-                    if p not in allowed_ops and not topk_pattern.match(p):
+                    if p not in allowed_ops and not topk_pattern.match(p) and not q_pattern.match(p):
                         raise ValueError(f"Invalid statistics op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
                 
                 if len(op_parts) > 1:
@@ -1325,12 +1433,24 @@ class AbstractModel(BaseModel, ABC):
                 elif isinstance(vs, list):
                     vars_list = vs
                 else:
-                    raise ValueError(f"variables_to_save['{op}'] must be a string or list of strings")
+                    raise ValueError(f"variables_to_save['{op}'] must be a string or list of strings/dicts")
                 for var in vars_list:
-                    pairs.append((var, op_l))
+                    if isinstance(var, dict):
+                        var_name = next(iter(var.keys()))
+                        # Explicit definition {alias: expr} -> Treat as valid virtual
+                        pairs.append((var_name, op_l, True))
+                    elif isinstance(var, (tuple, list)):
+                        var_name = var[0]
+                         # Explicit definition (alias, expr) -> Treat as valid virtual
+                        pairs.append((var_name, op_l, True))
+                    else:
+                        pairs.append((var, op_l, False))
 
         # Validate each variable exists and has save_idx
-        for var, _ in pairs:
+        for var, _, is_explicit in pairs:
+            if is_explicit:
+                continue
+
             found = False
             has_save_idx = False
             for module in self.opened_modules:
@@ -1343,6 +1463,15 @@ class AbstractModel(BaseModel, ABC):
                     if extra and extra.get("save_idx") is not None:
                         has_save_idx = True
                     break
+            
+            # If not found as direct field, check if it is a valid expression
+            if not found:
+                 # If the variable name contains characters other than alphanumeric and underscore,
+                 # we assume it is a mathematical expression.
+                 if re.search(r'[^a-zA-Z0-9_]', var):
+                     found = True
+                     has_save_idx = True  # We assume expressions are valid for now and let Aggregator handle/validate them.
+
             if not found:
                 raise ValueError(f"Variable '{var}' not found in any opened module.")
             if not has_save_idx:

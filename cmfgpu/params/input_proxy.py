@@ -96,7 +96,7 @@ class InputProxy:
             raise RuntimeError(f"Error lazy loading variable '{key}' from {self.file_path}: {e}")
 
         except Exception as e:
-            raise RuntimeError(f"Error loading data from NetCDF {file_path}: {e}")
+            raise RuntimeError(f"Error loading data from NetCDF {self.file_path}: {e}")
 
         return cls(data, attrs, dims, lazy=lazy, file_path=file_path, available_vars=available_vars)
 

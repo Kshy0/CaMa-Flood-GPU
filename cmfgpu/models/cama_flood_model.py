@@ -225,8 +225,7 @@ class CaMaFlood(AbstractModel):
                     is_outer_last=is_outer_last,
                     is_middle=is_middle,
                     is_macro_step_end=is_last, # Count every inner step for correct mean normalization
-                    BLOCK_SIZE=self.BLOCK_SIZE,
-                    custom_step_index=self._stats_macro_step
+                    BLOCK_SIZE=self.BLOCK_SIZE
                 )
 
         # Reset elapsed counter after closing a window
