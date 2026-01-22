@@ -362,7 +362,7 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def total_storage(self) -> torch.Tensor:
-        return self.river_storage + self.flood_storage
+        return self.river_storage + self.flood_storage + self.protected_storage
 
     # ---------------- Hidden / intermediate states ------------------- #
     @computed_base_field(

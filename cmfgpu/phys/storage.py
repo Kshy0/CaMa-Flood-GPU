@@ -242,7 +242,7 @@ def compute_flood_stage_log_kernel(
     tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_storage, 0)) * 1e-9)
     tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_inflow + flood_inflow) * time_step, 0)) * 1e-9)
     tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
-    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow - river_outflow - flood_outflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff - river_outflow - flood_outflow - global_bifurcation_outflow) * time_step, 0)) * 1e-9)
 
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----

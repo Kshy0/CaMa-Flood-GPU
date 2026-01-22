@@ -1380,6 +1380,10 @@ class AbstractModel(BaseModel, ABC):
                 else:
                     # For scalars, we just set the value
                     # If it's a numpy scalar, convert to python type if needed, or just set
+                    if isinstance(new_val, (np.ndarray, np.generic)):
+                        if new_val.ndim == 0:
+                            new_val = new_val.item()
+                    
                     setattr(module, field_name, new_val)
                     loaded_count += 1
 
