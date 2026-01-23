@@ -1001,9 +1001,14 @@ class AbstractModel(BaseModel, ABC):
                 ops = var_to_ops[var_name]
                 if category != 'virtual':
                     # 1D is usually (N,), 2D is (N, Level).
-                    # We can assume N is consistent.
-                    is_2d = tensor.ndim > 1
-                    if is_2d:
+                    # With trials: 1D is (T, N), 2D is (T, N, Level)
+                    limit = 1
+                    if self.num_trials and self.num_trials > 1:
+                        limit = 2
+                    
+                    is_real_2d = tensor.ndim > limit
+
+                    if is_real_2d:
                         for op in ops:
                             op_base = op.split('_')[0]
                             if topk_pattern.match(op_base) or op_base in ('max', 'min', 'argmax', 'argmin'):

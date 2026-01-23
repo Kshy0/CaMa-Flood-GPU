@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import netCDF4 as nc
 import numpy as np
 
+from matplotlib.ticker import FuncFormatter
 
 class MultiRankStatsReader:
     """
@@ -36,6 +37,25 @@ class MultiRankStatsReader:
     # ----------------------------------------------------------------------------------
     # Internal helpers
     # ----------------------------------------------------------------------------------
+    def _safe_time_str(self, t_obj, fmt="%Y-%m-%d %H:%M:%S") -> str:
+        """Helper to safely format time objects (datetime, cftime, or others)."""
+        # Try strftime first (works for datetime and modern cftime)
+        if hasattr(t_obj, "strftime"):
+             try:
+                 return t_obj.strftime(fmt)
+             except Exception:
+                 pass
+        
+        # Fallback to isoformat
+        if hasattr(t_obj, "isoformat"):
+             try:
+                 return t_obj.isoformat()
+             except Exception:
+                 pass
+                 
+        # Fallback to string
+        return str(t_obj)
+
     def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> Optional[str]:
         """Pick a ('saved_points',) variable to serve as save_coord."""
         if self.coord_name and self.coord_name in ds.variables:
@@ -166,12 +186,10 @@ class MultiRankStatsReader:
         t0 = np.concatenate(all_times)
         dt0 = nc.num2date(t0, units=self._time_units, calendar=self._time_calendar)
         
-        if self._time_calendar in ["standard", "gregorian"]:
-            self._time_datetimes = [
-                datetime(d.year, d.month, d.day, d.hour, d.minute, d.second) for d in dt0
-            ]
-        else:
-            self._time_datetimes = list(dt0)
+        # Keep original time objects (python datetime or cftime.datetime)
+        # We no longer force-convert/clamp invalid dates (e.g. Feb 30) because
+        # plotting now handles numeric time axes correctly via FuncFormatter.
+        self._time_datetimes = list(dt0)
 
         self._time_values_num = t0
         self._time_len = len(t0)
@@ -340,37 +358,76 @@ class MultiRankStatsReader:
 
         # Apply closed datetime slice with strict range checking (no clamping)
         if time_range is not None:
-            start_dt, end_dt = time_range
-            if start_dt > end_dt:
-                raise ValueError("time_range start must be <= end (closed interval).")
+            # Strategy: Convert input range to numeric values using the NetCDF unit/calendar.
+            start_in, end_in = time_range
+            
+            try:
+                # date2num handles mixing types gracefully usually (if calendar compatible)
+                t_start_val = nc.date2num(start_in, self._time_units, self._time_calendar)
+                t_end_val = nc.date2num(end_in, self._time_units, self._time_calendar)
+                
+                # Check coverage against numeric limits
+                file_min = self._time_values_num[0]
+                file_max = self._time_values_num[-1]
+                
+                if t_start_val < file_min or t_end_val > file_max:
+                    # Provide informative error
+                    # Try to format limits back to dates for message
+                    try:
+                        d_min = self._safe_time_str(self._time_datetimes[0])
+                        d_max = self._safe_time_str(self._time_datetimes[-1])
+                        d_req_start = self._safe_time_str(start_in)
+                        d_req_end = self._safe_time_str(end_in)
+                    except:
+                        d_min, d_max = str(file_min), str(file_max)
+                        d_req_start, d_req_end = str(start_in), str(end_in)
+                        
+                    raise ValueError(
+                        f"time_range outside available coverage. "
+                        f"Requested [{d_req_start} .. {d_req_end}] but coverage is [{d_min} .. {d_max}]."
+                    )
 
-            first_dt = self._time_datetimes[0]
-            last_dt = self._time_datetimes[-1]
-            # New strict behavior: raise if outside coverage
-            if start_dt < first_dt or end_dt > last_dt:
-                raise ValueError(
-                    f"time_range outside available coverage. "
-                    f"Requested [{start_dt} .. {end_dt}] but coverage is [{first_dt} .. {last_dt}]."
-                )
+                # Locate indices using vectorized numeric comparison
+                # left: first index where time >= start
+                # right: last index where time <= end
+                
+                valid_mask = (self._time_values_num >= t_start_val) & (self._time_values_num <= t_end_val)
+                indices = np.where(valid_mask)[0]
+                
+                if len(indices) == 0:
+                     raise ValueError("No time steps found in the request range.")
+                
+                left = indices[0]
+                right = indices[-1]
 
-            # Locate left boundary: exact DT >= start_dt (since start_dt within range it will exist)
-            dts = self._time_datetimes
-            left = None
-            for i, dt in enumerate(dts):
-                if dt >= start_dt:
-                    left = i
-                    break
-            if left is None:
-                raise ValueError("Failed to locate start index (unexpected).")
+            except Exception as e:
+                print(f"Warning: Numeric time comparison failed ({e}), falling back to direct object comparison.")
+                
+                start_dt, end_dt = start_in, end_in
+                if start_dt > end_dt:
+                     raise ValueError("time_range start must be <= end (closed interval).")
+                     
+                first_dt = self._time_datetimes[0]
+                last_dt = self._time_datetimes[-1]
+                
+                if start_dt < first_dt or end_dt > last_dt:
+                    raise ValueError(f"time_range outside coverage [{first_dt} .. {last_dt}]")
 
-            # Locate right boundary: last dt <= end_dt
-            right = None
-            for j in range(len(dts) - 1, -1, -1):
-                if dts[j] <= end_dt:
-                    right = j
-                    break
-            if right is None or right < left:
-                raise ValueError("Failed to locate end index (unexpected).")
+                dts = self._time_datetimes
+                left = None
+                for i, dt in enumerate(dts):
+                    if dt >= start_dt:
+                        left = i
+                        break
+                
+                right = None
+                for j in range(len(dts) - 1, -1, -1):
+                    if dts[j] <= end_dt:
+                        right = j
+                        break
+
+            if left is None or right is None:
+                raise ValueError("Failed to locate time slice indices.")
 
             self._slice_start = left
             self._slice_end = right
@@ -804,19 +861,51 @@ class MultiRankStatsReader:
         figsize: Tuple[int, int] = (8, 6),
         as_scatter_if_no_map: bool = True,
         s: float = 1.0,
+        auto_crop: bool = True,
+        crop_pad: int = 10,
     ) -> None:
         if t_index < 0 or t_index >= self._time_len:
             raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
-        t_str = self.times[t_index].isoformat() if self.times else f"t={t_index}"
+            
+        t_str = f"t={t_index}"
+        if self.times:
+             t_str = self._safe_time_str(self.times[t_index])
+        
+        # Check if we have trials to display in title
+        has_trials = False
+        if self._rank_files and self._rank_files[0]["has_trials"]:
+            has_trials = True
+        
+        title_str = f"{self.var_name} @ {t_str}"
+        if has_trials:
+            title_str += f" (Trial {trial})"
 
         fig, ax = plt.subplots(figsize=figsize)
         if self.map_shape is not None:
             grid = self.get_grid(t_index, level=level, trial=trial)
             im = ax.imshow(grid.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{self.var_name} @ {t_str}")
+            ax.set_title(title_str)
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
+            
+            if auto_crop:
+                valid_mask = np.isfinite(grid)
+                if np.any(valid_mask):
+                    xs, ys = np.where(valid_mask)
+                    if len(xs) > 0:
+                        xmin, xmax = xs.min(), xs.max()
+                        ymin, ymax = ys.min(), ys.max()
+                        
+                        # Apply padding
+                        xmin = max(0, xmin - crop_pad)
+                        xmax = min(grid.shape[0] - 1, xmax + crop_pad)
+                        ymin = max(0, ymin - crop_pad)
+                        ymax = min(grid.shape[1] - 1, ymax + crop_pad)
+                        
+                        ax.set_xlim(xmin - 0.5, xmax + 0.5)
+                        ax.set_ylim(ymax + 0.5, ymin - 0.5)
+
         elif as_scatter_if_no_map:
             xs: List[np.ndarray] = []
             ys: List[np.ndarray] = []
@@ -865,9 +954,18 @@ class MultiRankStatsReader:
             v_all = np.concatenate(vals) if vals else np.array([])
             sc = ax.scatter(x_all, y_all, c=v_all, s=s, cmap=cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{self.var_name} (scatter) @ {t_str}")
+            ax.set_title(f"{title_str} (scatter)")
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
+            
+            if auto_crop and len(x_all) > 0:
+                xmin, xmax = x_all.min(), x_all.max()
+                ymin, ymax = y_all.min(), y_all.max()
+                
+                ax.set_xlim(xmin - crop_pad, xmax + crop_pad)
+                ax.set_ylim(ymax + crop_pad, ymin - crop_pad)
+                ax.invert_yaxis()
+
         else:
             raise RuntimeError("Cannot plot without map_shape and scatter fallback disabled.")
         fig.tight_layout()
@@ -885,6 +983,8 @@ class MultiRankStatsReader:
         vmax: Optional[float] = None,
         cmap: str = "viridis",
         figsize: Tuple[int, int] = (8, 6),
+        auto_crop: bool = True,
+        crop_pad: int = 10,
     ) -> None:
         if self._map_shape is None:
             raise RuntimeError("Animation requires map_shape.")
@@ -894,10 +994,34 @@ class MultiRankStatsReader:
             raise ValueError("Invalid t_range: ensure t_start < t_end")
 
         nx_, ny_ = self._map_shape
-        xmin = 0 if x_range is None else max(0, int(x_range[0]))
-        xmax = nx_ - 1 if x_range is None else min(nx_ - 1, int(x_range[1]))
-        ymin = 0 if y_range is None else max(0, int(y_range[0]))
-        ymax = ny_ - 1 if y_range is None else min(ny_ - 1, int(y_range[1]))
+        
+        xmin = 0 
+        xmax = nx_ - 1 
+        ymin = 0 
+        ymax = ny_ - 1
+        
+        if auto_crop and (x_range is None and y_range is None):
+            # Fetch first frame
+            grid_0 = self.get_grid(t_start, level=level, trial=trial)
+            valid_mask = np.isfinite(grid_0)
+            if np.any(valid_mask):
+                xs, ys = np.where(valid_mask)
+                xmin_c, xmax_c = xs.min(), xs.max()
+                ymin_c, ymax_c = ys.min(), ys.max()
+                
+                xmin = max(0, xmin_c - crop_pad)
+                xmax = min(nx_ - 1, xmax_c + crop_pad)
+                ymin = max(0, ymin_c - crop_pad)
+                ymax = min(ny_ - 1, ymax_c + crop_pad)
+        
+        # Override with manual ranges if provided
+        if x_range is not None:
+            xmin = max(0, int(x_range[0]))
+            xmax = min(nx_ - 1, int(x_range[1]))
+        if y_range is not None:
+            ymin = max(0, int(y_range[0]))
+            ymax = min(ny_ - 1, int(y_range[1]))
+
         if xmin > xmax or ymin > ymax:
             raise ValueError("Invalid x_range or y_range")
 
@@ -909,11 +1033,19 @@ class MultiRankStatsReader:
             vmax = np.nanmax(window) if np.isfinite(window).any() else 1.0
         if not (vmax > vmin):
             vmax = vmin + 1.0
+            
+        extent = (xmin - 0.5, xmax + 0.5, ymax + 0.5, ymin - 0.5)
 
         fig, ax = plt.subplots(figsize=figsize)
-        im = ax.imshow(window.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax)
+        im = ax.imshow(window.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax, extent=extent)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ttl = ax.set_title(f"{self.var_name} @ {self.times[t_start].isoformat()}")
+        
+        # Use our robust time logic if available
+        t_label = f"t={t_start}"
+        if self.times:
+             t_label = self._safe_time_str(self.times[t_start])
+             
+        ttl = ax.set_title(f"{self.var_name} @ {t_label}")
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         fig.tight_layout()
@@ -923,7 +1055,12 @@ class MultiRankStatsReader:
             grid = self.get_grid(ti, level=level, trial=trial)
             win = grid[xmin:xmax + 1, ymin:ymax + 1]
             im.set_data(win.T)
-            ttl.set_text(f"{self.var_name} @ {self.times[ti].isoformat()}")
+            
+            t_lbl = f"t={ti}"
+            if self.times:
+                t_lbl = self._safe_time_str(self.times[ti])
+                
+            ttl.set_text(f"{self.var_name} @ {t_lbl}")
             return [im, ttl]
 
         frames = t_end - t_start
@@ -944,6 +1081,140 @@ class MultiRankStatsReader:
                 raise RuntimeError("ffmpeg writer not found. Install ffmpeg or use .gif.")
             ani.save(out_path, writer=writer)
         plt.close(fig)
+
+    def plot_series(
+        self,
+        points: Union[np.ndarray, Sequence[np.ndarray], List[int]],
+        level: Optional[int] = None,
+        trial: Union[int, List[int]] = 0,
+        figsize: Tuple[int, int] = (12, 6),
+        title: Optional[str] = None,
+        ax: Optional[plt.Axes] = None,
+        labels: Optional[List[str]] = None,
+        **kwargs
+    ) -> plt.Axes:
+        """
+        Plot time series for specified points (IDs or XY coordinates).
+        
+        Args:
+            points: One or more points. Can be a list of IDs/catchment_ids, or a list of (x,y) tuples.
+            level: Level index if variable has levels.
+            trial: Single trial index (int) or list of trial indices.
+            figsize: Figure size tuple (width, height) if creating new figure.
+            title: Title of the plot.
+            ax: Existing matplotlib axis to plot on.
+            labels: Optional list of labels for the points (length must match number of points).
+            **kwargs: Additional keyword arguments passed to ax.plot
+        
+        Returns:
+            The matplotlib Axes object.
+        """
+        if isinstance(trial, int):
+            trials = [trial]
+        else:
+            trials = trial
+            
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+            created_fig = True
+            
+        # Select Time Axis Strategy
+        # Prefer raw numeric values + FuncFormatter for perfect calendar support
+        use_numeric_time = False
+        if hasattr(self, "_time_values_num") and self._time_values_num is not None \
+           and hasattr(self, "_time_units") and getattr(self, "_time_calendar", None):
+            times_to_plot = self._time_values_num
+            use_numeric_time = True
+        elif self.times:
+            # Fallback to datetime list (cached property)
+            times_to_plot = self.times
+        else:
+            # Fallback to simple indices
+            times_to_plot = np.arange(self.time_len)
+
+        # Ensure points is in a format suitable for get_series
+        
+        for t in trials:
+            # Fetch data: shape (time_len, num_points)
+            data = self.get_series(points, level=level, trial=t)
+            num_points = data.shape[1]
+            
+            for i in range(num_points):
+                # Construct label
+                # If multiple trials, include trial info. If multiple points, include point info.
+                lbl_parts = []
+                
+                # Point Label
+                if labels and i < len(labels):
+                    lbl_parts.append(str(labels[i]))
+                else:
+                    # Try to give a sensible default label from points
+                    if isinstance(points, (list, tuple, np.ndarray)):
+                        # If points passed as [1, 2], points[i] is 1
+                        # If points passed as [[1,2], [3,4]], points[i] is [1,2]
+                        try:
+                            pt_val = points[i]
+                            lbl_parts.append(f"Pt {pt_val}")
+                        except:
+                            lbl_parts.append(f"Pt {i}")
+                    else:
+                        lbl_parts.append(f"Pt {i}")
+
+                # Trial Label (only if ambiguous or multiple trials)
+                if len(trials) > 1:
+                    lbl_parts.append(f"(Trial {t})")
+                elif not labels and num_points == 1:
+                     # Single point, single trial, explicit label is nice
+                     lbl_parts.append(f"(Trial {t})")
+
+                label_str = " ".join(lbl_parts)
+                
+                ax.plot(times_to_plot, data[:, i], label=label_str, **kwargs)
+
+        # Setup Axis Formatting
+        if use_numeric_time:
+            def time_tick_formatter(x, pos):
+                try:
+                    # Use netcdf4 num2date to convert scalar to cftime/datetime object
+                    # This works for ALL calendars (360_day, noleap, etc)
+                    d = nc.num2date(x, units=self._time_units, calendar=self._time_calendar)
+                    return d.strftime('%Y-%m-%d')
+                except Exception:
+                    return f"{x:.1f}"
+            
+            ax.xaxis.set_major_formatter(FuncFormatter(time_tick_formatter))
+            ax.set_xlabel(f"Time ({self._time_calendar})")
+        else:
+            ax.set_xlabel("Time")
+
+        ax.set_ylabel(self.var_name)
+        
+        if title:
+            ax.set_title(title)
+        elif not ax.get_title():
+            # Default title
+            t_str = ""
+            if len(times_to_plot) > 0:
+                if use_numeric_time:
+                     try:
+                        start_d = nc.num2date(times_to_plot[0], units=self._time_units, calendar=self._time_calendar)
+                        end_d = nc.num2date(times_to_plot[-1], units=self._time_units, calendar=self._time_calendar)
+                        t_str = f"{start_d.strftime('%Y-%m-%d')} - {end_d.strftime('%Y-%m-%d')}"
+                     except:
+                        pass
+                elif hasattr(times_to_plot[0], 'date'):
+                    t_str = f"{times_to_plot[0].date()} - {times_to_plot[-1].date()}"
+            ax.set_title(f"{self.var_name} Time Series {t_str}")
+            
+        ax.legend()
+        ax.grid(True, linestyle='--', alpha=0.3)
+        
+        # If we created the figure, layout tight
+        if created_fig:
+            plt.tight_layout()
+            
+        return ax
 
     # ----------------------------------------------------------------------------------
     # Export
