@@ -12,9 +12,9 @@
 
 ## Prerequisites
 
-- Python == 3.13.11  
-- PyTorch (with CUDA support) == 2.9.1+cu130
-- Triton == 3.5.1
+- Python == 3.14.2  
+- PyTorch (with CUDA support) == 2.10.0+cu130
+- Triton == 3.6.0
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4

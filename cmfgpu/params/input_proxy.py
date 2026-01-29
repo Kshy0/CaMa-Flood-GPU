@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union, Tuple
 
 import numpy as np
 import numpy.ma as ma
@@ -27,20 +27,27 @@ class InputProxy:
         attrs: Optional[Dict[str, Any]] = None,
         dims: Optional[Dict[str, int]] = None,
         lazy: bool = True,
-        file_path: Optional[Union[str, Path]] = None,
-        available_vars: Optional[Set[str]] = None,
+        file_path: Optional[Union[str, Path, List[Union[str, Path]]]] = None,
+        visible_vars: Optional[Set[str]] = None,
+        file_indices: Optional[Dict[str, np.ndarray]] = None,
     ):
         self.data = data
         self.attrs = attrs or {}
         self.dims = dims or {}
         self.lazy = lazy
         self.file_path = file_path
-        self.available_vars = available_vars or set(data.keys())
+        self.visible_vars = visible_vars or set(data.keys())
+        self.file_map: Dict[str, str] = {}
+        self.file_indices = file_indices or {}
 
     @staticmethod
-    def _read_var_from_ds(ds: Dataset, var_name: str) -> np.ndarray:
+    def _read_var_from_ds(ds: Dataset, var_name: str, indices: Any = None) -> np.ndarray:
         var = ds.variables[var_name]
-        v = var[:]
+        if indices is None:
+            v = var[:]
+        else:
+            v = var[indices]
+
         if ma.isMaskedArray(v):
             # Fill masked values conservatively
             if np.issubdtype(v.dtype, np.floating):
@@ -51,54 +58,214 @@ class InputProxy:
             return np.asarray(v)
 
     @classmethod
-    def from_nc(cls, file_path: Union[str, Path], lazy: bool = False) -> InputProxy:
+    def from_nc(
+        cls,
+        file_path: Union[str, Path, List[Union[str, Path]]],
+        lazy: bool = False,
+        visible_vars: Optional[Union[List[str], Set[str]]] = None,
+        align_on: Optional[str] = None,
+    ) -> InputProxy:
         """
-        Create an InputProxy from a NetCDF file.
-        Reads all variables, dimensions, and attributes into memory.
-        If lazy=True, variables are not read until accessed.
+        Create an InputProxy from one or multiple NetCDF files.
+        If multiple files are provided, checks for naming conflicts.
+        Reads variables, dimensions, and attributes into memory or sets up lazy loading.
+
+        Args:
+            file_path: Path(s) to NetCDF file(s).
+            lazy: If True, data is loaded on demand.
+            visible_vars: Optional list/set of variable names to include. Others are ignored.
+            align_on: Variable name to use for alignment. 
+                      The FIRST file encountered containing this variable serves as the REFERENCE.
+                      Subsequent files will be reordered to match the order of this variable in the reference file.
         """
         data = {}
         attrs = {}
         dims = {}
-        available_vars = set()
+        found_vars = set()
+        file_map = {}
+        file_indices = {}
+
+        # Normalize visible_vars
+        if visible_vars is not None:
+            visible_vars = set(visible_vars)
+
+        # Normalize to list
+        if isinstance(file_path, (str, Path)):
+            file_paths = [file_path]
+        else:
+            file_paths = file_path
+
+        reference_keys = None
+
+        for fp in file_paths:
+            path_str = str(fp)
+            try:
+                with Dataset(path_str, "r") as ds:
+                    # Alignment logic
+                    alignment_idx = None
+                    if align_on:
+                        # Only consider alignment if the key variable is "visible"
+                        is_align_key_visible = (visible_vars is None) or (align_on in visible_vars)
+                        
+                        if is_align_key_visible and align_on in ds.variables:
+                            current_keys = cls._read_var_from_ds(ds, align_on)
+                            
+                            if reference_keys is None:
+                                # First file with the key sets the reference order
+                                reference_keys = current_keys
+                            else:
+                                if len(current_keys) != len(reference_keys):
+                                     raise ValueError(f"Alignment error: Variable '{align_on}' in '{path_str}' has different length ({len(current_keys)}) than reference ({len(reference_keys)}).")
+
+                                # Subsequent files are aligned to the reference
+                                sorter = np.argsort(current_keys)
+                                sorted_keys = current_keys[sorter]
+
+                                # Match keys strictly
+                                insert_idx = np.searchsorted(sorted_keys, reference_keys)
+                                
+                                # Check range and equality
+                                if np.any(insert_idx >= len(current_keys)):
+                                     raise ValueError(f"Alignment failed: Key variable '{align_on}' in '{path_str}' mismatches reference keys (indices out of bounds).")
+                                
+                                matched = sorted_keys[insert_idx]
+                                if not np.array_equal(matched, reference_keys):
+                                     raise ValueError(f"Alignment failed: Key variable '{align_on}' in '{path_str}' does not strictly match reference keys.")
+                                
+                                # alignment_idx maps: index in Ref -> index in Current
+                                alignment_idx = sorter[insert_idx]
+                                file_indices[path_str] = alignment_idx
+
+                    # Merge attributes
+                    for attr_name in ds.ncattrs():
+                        attrs[attr_name] = ds.getncattr(attr_name)
+
+                    # Merge dimensions
+                    for dim_name, dim in ds.dimensions.items():
+                        dims[dim_name] = dim.size
+                    
+                    # Merge variables and check for conflicts
+                    for var_name in ds.variables:
+                        # Visibility check
+                        if visible_vars is not None and var_name not in visible_vars:
+                            continue
+
+                        if var_name in found_vars:
+                             prev_file = file_map.get(var_name)
+                             # Skip conflict check for align key (we use the first one encountered)
+                             if align_on and var_name == align_on:
+                                 continue
+                             
+                             if prev_file != path_str:
+                                 raise ValueError(f"Naming conflict: Variable '{var_name}' exists in both '{prev_file}' and '{path_str}'")
+                        
+                        found_vars.add(var_name)
+                        file_map[var_name] = path_str
+
+                        if not lazy:
+                            val = cls._read_var_from_ds(ds, var_name)
+                            # Apply alignment if eager loading
+                            if alignment_idx is not None and val.ndim > 0 and val.shape[0] == len(alignment_idx):
+                                val = val[alignment_idx]
+                            data[var_name] = val
+
+            except Exception as e:
+                # Re-raise if it's our error
+                if "Naming conflict" in str(e) or "Alignment failed" in str(e):
+                    raise
+                raise RuntimeError(f"Error loading data from NetCDF {path_str}: {e}")
+
+        instance = cls(
+            data, attrs, dims, lazy=lazy, file_path=file_path, visible_vars=found_vars, file_indices=file_indices
+        )
+        instance.file_map = file_map
+        return instance
+
+    def _resolve_target_path(self, key: str) -> str:
+        target_path = None
+        
+        # Priority 1: Check internal file map (populated if from_nc with multiple files)
+        if self.file_map and key in self.file_map:
+            target_path = self.file_map[key]
+        
+        # Priority 2: If single file path is stored, use it
+        elif self.file_path and isinstance(self.file_path, (str, Path)):
+             target_path = self.file_path
+             
+        # Priority 3: If file_path is a list and map failed
+        elif self.file_path and isinstance(self.file_path, list):
+             raise RuntimeError(f"Variable '{key}' not found in file map, and multiple files provided. Cannot disambiguate source.")
+
+        if not target_path:
+             # Last resort check: if we only have one file in list?
+             if isinstance(self.file_path, list) and len(self.file_path) == 1:
+                 target_path = self.file_path[0]
+             else:
+                raise RuntimeError(f"Cannot lazy load variable '{key}': file source not mapped and file_path is ambiguous.")
+        
+        return str(target_path)
+
+    def _load_var(self, key: str, indices: Any = None) -> np.ndarray:
+        target_path = self._resolve_target_path(key)
+        alignment_idx = self.file_indices.get(target_path)
 
         try:
-            with Dataset(file_path, "r") as ds:
-                # Read global attributes
-                for attr_name in ds.ncattrs():
-                    attrs[attr_name] = ds.getncattr(attr_name)
-
-                # Read dimensions
-                for dim_name, dim in ds.dimensions.items():
-                    dims[dim_name] = dim.size
-                
-                available_vars = set(ds.variables.keys())
-
-                if not lazy:
-                    # Read variables
-                    for var_name in available_vars:
-                        data[var_name] = cls._read_var_from_ds(ds, var_name)
-
-        except Exception as e:
-            raise RuntimeError(f"Error loading data from NetCDF {file_path}: {e}")
-
-        return cls(data, attrs, dims, lazy=lazy, file_path=file_path, available_vars=available_vars)
-
-    def _load_var(self, key: str) -> np.ndarray:
-        if not self.file_path:
-            raise RuntimeError("Cannot lazy load variable: file_path is not set.")
-        try:
-            with Dataset(self.file_path, "r") as ds:
+            with Dataset(target_path, "r") as ds:
                 if key not in ds.variables:
-                     raise KeyError(f"Variable '{key}' not found in {self.file_path}")
-                return self._read_var_from_ds(ds, key)
-        except Exception as e:
-            raise RuntimeError(f"Error lazy loading variable '{key}' from {self.file_path}: {e}")
+                     raise KeyError(f"Variable '{key}' not found in {target_path}")
 
-        except Exception as e:
-            raise RuntimeError(f"Error loading data from NetCDF {self.file_path}: {e}")
+                final_indices = indices
+                if alignment_idx is not None:
+                     v_shape = ds.variables[key].shape
+                     if len(v_shape) > 0 and v_shape[0] == len(alignment_idx):
+                         if indices is None:
+                             final_indices = alignment_idx
+                         elif isinstance(indices, tuple):
+                             remapped = alignment_idx[indices[0]]
+                             final_indices = (remapped, *indices[1:])
+                         else:
+                             final_indices = alignment_idx[indices]
 
-        return cls(data, attrs, dims, lazy=lazy, file_path=file_path, available_vars=available_vars)
+                return self._read_var_from_ds(ds, key, indices=final_indices)
+        except Exception as e:
+            raise RuntimeError(f"Error lazy loading variable '{key}' from {target_path}: {e}")
+
+    def get_subset(self, key: str, indices: Any) -> Any:
+        """
+        Get a subset of a variable.
+        If the variable is in memory, slices it.
+        If lazy, reads only the requested indices from the file.
+        """
+        if key in self.data:
+            return self.data[key][indices]
+        
+        if self.lazy and key in self.visible_vars:
+            return self._load_var(key, indices=indices)
+            
+        raise KeyError(f"Variable '{key}' not found in InputProxy.")
+
+    def get_var_shape(self, key: str) -> Tuple[int, ...]:
+        """
+        Get the shape of a variable without loading it fully if possible.
+        """
+        # If in memory, return shape
+        if key in self.data:
+            val = self.data[key]
+            # Handle list/scalar or other types if necessary, though data usually is ndarray/tensor
+            if hasattr(val, "shape"):
+                return tuple(val.shape)
+            return ()
+
+        # If lazy, peek at file
+        if self.lazy and key in self.visible_vars:
+            target_path = self._resolve_target_path(key)
+            with Dataset(target_path, "r") as ds:
+                if key not in ds.variables:
+                     raise KeyError(f"Variable '{key}' not found in {target_path}")
+                return tuple(ds.variables[key].shape)
+        
+        raise KeyError(f"Variable '{key}' not found in InputProxy.")
+
 
     def to_nc(self, file_path: Union[str, Path], output_complevel: int = 4) -> None:
         """
@@ -247,7 +414,7 @@ class InputProxy:
         """
         if indices is not None:
             # If lazy and not in memory yet, try to load it first so we can update it
-            if name not in self.data and self.lazy and name in self.available_vars:
+            if name not in self.data and self.lazy and name in self.visible_vars:
                 self.data[name] = self._load_var(name)
 
             if name not in self.data:
@@ -273,7 +440,7 @@ class InputProxy:
         if key in self.data:
             return self.data[key]
         
-        if self.lazy and key in self.available_vars:
+        if self.lazy and key in self.visible_vars:
             return self._load_var(key)
             
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
@@ -282,7 +449,7 @@ class InputProxy:
         self.data[key] = value
 
     def __contains__(self, key: str) -> bool:
-        return key in self.data or (self.lazy and key in self.available_vars)
+        return key in self.data or (self.lazy and key in self.visible_vars)
 
     def keys(self) -> Set[str]:
-        return self.available_vars.union(self.data.keys())
+        return self.visible_vars.union(self.data.keys())

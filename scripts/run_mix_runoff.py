@@ -24,7 +24,6 @@ def main():
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "log", "bifurcation"]
     variables_to_save = {"mean": ["river_outflow"], "last": ["river_depth"]}
-    precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360
     runoff_chunk_len = 48
@@ -65,7 +64,6 @@ def main():
         start_date=start_date,
         end_date=end_date,
         unit_factor=unit_factor,
-        out_dtype=precision,
         var_name=var_name0,
         chunk_len=runoff_chunk_len,
         time_interval=runoff_time_interval,
@@ -80,7 +78,6 @@ def main():
         start_date=start_date,
         end_date=end_date,
         unit_factor=unit_factor,
-        out_dtype=precision,
         var_name=var_name1,
         chunk_len=runoff_chunk_len,
         time_interval=runoff_time_interval,
@@ -100,7 +97,6 @@ def main():
         output_dir=output_dir,
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
-        precision=precision,
         output_workers=output_workers,
         output_complevel=4,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -112,7 +108,6 @@ def main():
     local_runoff_matrix, local_runoff_indices = dataset0.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
-        precision=precision,
         device=device,
     )
     loader0 = DataLoader(

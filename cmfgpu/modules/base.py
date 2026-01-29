@@ -30,6 +30,7 @@ def BaseField(
     save_coord: Optional[str] = "catchment_save_id",
     dim_coords: Optional[str] = "catchment_id",
     category: Literal["topology", "param", "init_state"] = "param",
+    mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
 ):
 
@@ -42,6 +43,7 @@ def BaseField(
         save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
+        mode=mode,
         **kwargs
     )
 
@@ -98,6 +100,7 @@ class BaseModule(AbstractModule):
         ),
         dtype="int",
         category="topology",
+        mode="cpu",
     )
 
 
@@ -105,6 +108,7 @@ class BaseModule(AbstractModule):
         description="ID of immediate downstream catchment (points to self at river mouth)",
         dtype="int",
         category="topology",
+        mode="discard",
     )
 
     # --------------------------------------------------------------------- #
@@ -146,13 +150,6 @@ class BaseModule(AbstractModule):
         category="param",
     )
 
-    # Catchment-type flags
-    is_river_mouth: torch.Tensor = BaseField(
-        description="Boolean mask for river-mouth catchments",
-        dtype="bool",
-        category="topology",
-    )
-
     levee_catchment_id: Optional[torch.Tensor] = BaseField(
         description="Catchment ID for each levee",
         dtype="int",
@@ -161,6 +158,7 @@ class BaseModule(AbstractModule):
         shape=("num_levees",),
         default=None,
         category="topology",
+        mode="cpu",
     )
 
     # Output-control mask
@@ -492,14 +490,6 @@ class BaseModule(AbstractModule):
             if self.levee_catchment_id.numel() > 0:
                 if torch.any(self.levee_catchment_id < 0):
                     raise ValueError("levee_catchment_id contains negative values")
-        return self
-
-    @model_validator(mode="after")
-    def validate_is_river_mouth(self) -> Self:
-        if not torch.all(
-            self.catchment_id[self.is_river_mouth] == self.downstream_id[self.is_river_mouth]
-        ):
-            raise ValueError("is_river_mouth must point to self in downstream_id")
         return self
 
     @model_validator(mode="after")

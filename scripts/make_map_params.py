@@ -8,7 +8,7 @@ from cmfgpu.params.merit_map import MERITMap
 print("=== Generating Map Parameters ===")
 
 # --- Configuration Start ---
-map_resolution = "glb_15min"
+map_resolution = "glb_06min"
 map_dir = f"/home/eat/cmf_v420_pkg/map/{map_resolution}"
 out_dir = f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"
 
@@ -19,7 +19,8 @@ gauge_file = f"{map_dir}/GRDC_alloc.txt"
 # Settings
 target_gpus = 1
 visualized = True
-levee_flag = False
+levee_flag = True
+basin_use_file = False
 # --- Configuration End ---
 
 merit_map = MERITMap(
@@ -30,7 +31,7 @@ merit_map = MERITMap(
     levee_flag=levee_flag,
     visualized=visualized,
     bif_levels_to_keep=5,
-    basin_use_file=False,
+    basin_use_file=basin_use_file,
     target_gpus=target_gpus,
     out_file="parameters.nc",
 )

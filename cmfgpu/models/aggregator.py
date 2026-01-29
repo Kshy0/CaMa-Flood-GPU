@@ -336,7 +336,10 @@ class StatisticsAggregator:
                 except:
                     pass
             for executor in self._write_executors:
-                executor.shutdown(wait=True)
+                try:
+                    executor.shutdown(wait=True)
+                except Exception:
+                    pass
             self._write_executors = []
             self._write_futures = []
     

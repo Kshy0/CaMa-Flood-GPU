@@ -9,12 +9,12 @@ Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v
 """
 from datetime import datetime
 from functools import cached_property
-from typing import Callable, ClassVar, Dict, Optional, Type, Union
+from typing import Callable, ClassVar, Dict, Optional, Self, Type, Union
 
 import cftime
 import torch
 import triton
-from pydantic import PrivateAttr, computed_field
+from pydantic import PrivateAttr, computed_field, model_validator
 from torch import distributed as dist
 
 from cmfgpu.models.abstract_model import AbstractModel
@@ -90,6 +90,12 @@ class CaMaFlood(AbstractModel):
     @cached_property
     def levee_flag(self) -> bool:
         return self.levee is not None
+    
+    @model_validator(mode="after")
+    def validate_log_compatibility(self) -> Self:
+        if self.num_trials is not None and self.num_trials > 1 and "log" in self.opened_modules:
+            raise ValueError("The 'log' module cannot be used when num_trials > 1.")
+        return self
 
     @cached_property
     def base_grid(self) -> Callable:
@@ -249,7 +255,6 @@ class CaMaFlood(AbstractModel):
         # Outflow computation
         if self.num_trials is not None:
             compute_outflow_batched_kernel[self.base_grid](
-                is_river_mouth_ptr=self.base.is_river_mouth,
                 downstream_idx_ptr=self.base.downstream_idx,
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
@@ -290,7 +295,6 @@ class CaMaFlood(AbstractModel):
             )
         else:
             compute_outflow_kernel[self.base_grid](
-                is_river_mouth_ptr=self.base.is_river_mouth,
                 downstream_idx_ptr=self.base.downstream_idx,
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
@@ -422,7 +426,6 @@ class CaMaFlood(AbstractModel):
         # Inflow computation
         if self.num_trials is not None:
             compute_inflow_batched_kernel[self.base_grid](
-                is_river_mouth_ptr=self.base.is_river_mouth,
                 downstream_idx_ptr=self.base.downstream_idx,
                 river_outflow_ptr=self.base.river_outflow,
                 flood_outflow_ptr=self.base.flood_outflow,
@@ -437,7 +440,6 @@ class CaMaFlood(AbstractModel):
             )
         else:
             compute_inflow_kernel[self.base_grid](
-                is_river_mouth_ptr=self.base.is_river_mouth,
                 downstream_idx_ptr=self.base.downstream_idx,
                 river_outflow_ptr=self.base.river_outflow,
                 flood_outflow_ptr=self.base.flood_outflow,

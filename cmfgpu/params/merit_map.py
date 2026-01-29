@@ -153,7 +153,6 @@ class MERITMap(BaseModel):
         "downstream_distance",
         "river_storage",
         "river_mouth_id",
-        "is_river_mouth",
     ]
 
     output_optional: ClassVar[List[str]] = [

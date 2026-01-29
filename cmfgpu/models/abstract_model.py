@@ -86,7 +86,7 @@ class AbstractModel(BaseModel, ABC):
     variables_to_save: Optional[Dict[str, Union[str, List[Union[str, Dict[str, str]]]]]] = Field(
         None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, argmax, argmin. Variables can be strings or {alias: expr} dicts."
     )
-    precision: Literal["float32", "float64"] = Field(default="float32", description="Precision of the model")
+    precision: Literal["float32"] = Field(default="float32", description="Precision of the model")
     world_size: int = Field(default=1, description="Total number of distributed processes")
     rank: int = Field(default=0, description="Current process rank in distributed setup")
     device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
@@ -682,6 +682,12 @@ class AbstractModel(BaseModel, ABC):
             self._modules[module_name] = module_instance
 
         self.initialize_statistics_aggregator()
+
+        for module_name in self.opened_modules:
+            mod = self.get_module(module_name)
+            if mod:
+                mod.handle_tensor_mode()
+
         self.print_memory_summary()
         print("All modules initialized successfully.")
 
@@ -1156,41 +1162,37 @@ class AbstractModel(BaseModel, ABC):
                     missing_fields.append(field_name)
                     continue
 
-                full_np = self.input_proxy[field_name]
-
                 group_var = self.variable_group_mapping.get(field_name, None)
                 if group_var is not None:
                     idx = group_indices_cache[group_var]
+
+                    # Use get_var_shape to check dimensions without loading full data
+                    full_shape = self.input_proxy.get_var_shape(field_name)
+
+                    # Handle batched parameters (num_trials, num_catchments, ...)
+                    if len(full_shape) > 1 and self.num_trials is not None and full_shape[0] == self.num_trials:
+                         # Batched parameter: (T, N, ...) -> slice dim 1
+                         slicer = (slice(None), idx)
+                    else:
+                         # Standard parameter: (N, ...) -> slice dim 0
+                         slicer = idx
+
+                    # Read only the subset
+                    local_np = self.input_proxy.get_subset(field_name, slicer)
+                    module_data[field_name] = to_torch(local_np)
+
                     if idx.size == 0:
-                        # Construct empty with correct trailing shape
-                        base_shape = full_np.shape[1:] if isinstance(full_np, np.ndarray) else ()
-                        empty_np = np.empty((0, *base_shape), dtype=getattr(full_np, "dtype", np.float32))
-                        module_data[field_name] = to_torch(empty_np)
-                        
                         if group_var not in no_local_fields:
                             no_local_fields[group_var] = []
                         no_local_fields[group_var].append(field_name)
                     else:
-                        # Handle batched parameters (num_trials, num_catchments, ...)
-                        # If the first dimension is num_trials, we need to index the second dimension
-                        if full_np.ndim > 1 and self.num_trials is not None and full_np.shape[0] == self.num_trials:
-                            # Batched parameter: (T, N, ...)
-                            # We want to select indices from the second dimension (N)
-                            # Result should be (T, L, ...) where L is len(idx)
-                            local_np = full_np[:, idx]
-                        else:
-                            # Standard parameter: (N, ...)
-                            local_np = full_np[idx]
-                            
-                        module_data[field_name] = to_torch(local_np)
-                        
                         shape = local_np.shape
                         key = (shape, group_var)
                         if key not in distributed_fields:
                             distributed_fields[key] = []
                         distributed_fields[key].append(field_name)
                 else:
-                    module_data[field_name] = to_torch(full_np)
+                    module_data[field_name] = to_torch(self.input_proxy[field_name])
                     full_fields.append(field_name)
             
             # Flush logs

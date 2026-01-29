@@ -11,7 +11,6 @@ from triton.language.extra import libdevice
 
 @triton.jit
 def compute_outflow_kernel(
-    is_river_mouth_ptr,                     # *bool mask: 1 means river mouth 
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
@@ -58,8 +57,8 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     # (1) Load previous time step input variables
     #----------------------------------------------------------------------
-    is_river_mouth = tl.load(is_river_mouth_ptr + offs, mask=mask, other=0)
     downstream_idx = tl.load(downstream_idx_ptr + offs, mask=mask, other=0)
+    is_river_mouth = downstream_idx == offs
 
     # river variables
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
@@ -222,7 +221,6 @@ def compute_outflow_kernel(
 
 @triton.jit
 def compute_inflow_kernel(
-    is_river_mouth_ptr,            # *i32: River mouth mask
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
@@ -263,14 +261,13 @@ def compute_inflow_kernel(
     tl.store(limit_rate_ptr + offs, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
-    is_river_mouth = tl.load(is_river_mouth_ptr + offs, mask=mask, other=0)
+    is_river_mouth = downstream_idx == offs
     tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=mask&(~is_river_mouth))
     tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=mask&(~is_river_mouth))
 
 
 @triton.jit
 def compute_outflow_batched_kernel(
-    is_river_mouth_ptr,                     # *bool mask: 1 means river mouth 
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
@@ -329,8 +326,8 @@ def compute_outflow_batched_kernel(
     # (1) Load previous time step input variables
     #----------------------------------------------------------------------
     # Topology is never batched
-    is_river_mouth = tl.load(is_river_mouth_ptr + catchment_idx, mask=mask, other=0)
     downstream_idx = tl.load(downstream_idx_ptr + catchment_idx, mask=mask, other=0)
+    is_river_mouth = downstream_idx == catchment_idx
 
     # river variables
     river_outflow = tl.load(river_outflow_ptr + idx, mask=mask, other=0.0)
@@ -496,7 +493,6 @@ def compute_outflow_batched_kernel(
 
 @triton.jit
 def compute_inflow_batched_kernel(
-    is_river_mouth_ptr,            # *i32: River mouth mask
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
@@ -546,6 +542,6 @@ def compute_inflow_batched_kernel(
     tl.store(limit_rate_ptr + idx, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
-    is_river_mouth = tl.load(is_river_mouth_ptr + catchment_idx, mask=mask, other=0)
+    is_river_mouth = downstream_idx == catchment_idx
     tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=mask&(~is_river_mouth))
     tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=mask&(~is_river_mouth))

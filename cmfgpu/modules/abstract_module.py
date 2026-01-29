@@ -28,6 +28,7 @@ def TensorField(
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
     category: Literal["topology", "param", "init_state"] = "param",
+    mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
 ):
     """
@@ -45,6 +46,10 @@ def TensorField(
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
                   - 'init_state': Initializable state variable (ALWAYS batched if num_trials > 1)
+        mode: Handling of variables after initialization:
+                  - 'device': Keep on current device (default)
+                  - 'cpu': Move to CPU memory to save GPU memory
+                  - 'discard': Set to None after initialization to maximize memory saving
         **kwargs: Additional Field parameters
     """
     if dtype != "float":
@@ -64,6 +69,7 @@ def TensorField(
             "save_coord": save_coord,
             "dim_coords": dim_coords,
             "category": category,
+            "mode": mode,
         }
     )
 
@@ -461,6 +467,7 @@ class AbstractModule(BaseModel, ABC):
         """
         Calculate the memory usage of the module in bytes.
         Excludes intermediate tensors.
+        Only counts tensors currently on the active computing device.
         """
         total_bytes = 0
         
@@ -477,7 +484,9 @@ class AbstractModule(BaseModel, ABC):
             
             # Check if it's a tensor
             if isinstance(value, torch.Tensor):
-                total_bytes += value.element_size() * value.nelement()
+                # Only count if on the main computing device
+                if value.device == self.device:
+                    total_bytes += value.element_size() * value.nelement()
                 
         return total_bytes
 
@@ -540,3 +549,34 @@ class AbstractModule(BaseModel, ABC):
             check_field(name, field)
                 
         return res
+
+    def handle_tensor_mode(self) -> None:
+        """
+        Process variables based on their mode setting:
+        - 'device': Keep on current device (default)
+        - 'cpu': Move to CPU memory
+        - 'discard': Remove from memory (set to None) to save space
+        """
+        for name, field_info in self.get_model_fields().items():
+            json_schema_extra = getattr(field_info, 'json_schema_extra', {})
+            if json_schema_extra is None:
+                continue
+
+            mode = json_schema_extra.get('mode', 'device')
+            
+            if mode == 'device':
+                continue
+                
+            if not hasattr(self, name):
+                continue
+                
+            val = getattr(self, name)
+            if not isinstance(val, torch.Tensor):
+                # Could be None already
+                continue
+                
+            if mode == 'cpu':
+                if val.device.type != 'cpu':
+                    setattr(self, name, val.cpu())
+            elif mode == 'discard':
+                setattr(self, name, None)

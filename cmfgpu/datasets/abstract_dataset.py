@@ -336,8 +336,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def build_local_runoff_matrix(self, 
                                   runoff_mapping_file: str, 
                                   desired_catchment_ids: np.ndarray, 
-                                  precision: Literal["float32", "float64"], 
-                                  device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+                                  device: torch.device,
+                                  precision: Literal["float32", "float64"]="float32") -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Build PyTorch CSR matrix for mapping runoff data to specified catchments.
         Loads scipy compressed sparse matrix data and converts to PyTorch.

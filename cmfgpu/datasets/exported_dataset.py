@@ -49,10 +49,12 @@ class ExportedDataset(NetCDFDataset):
         prefix: Optional[str] = "runoff_",
         suffix: str = "rank0.nc",
         time_to_key: Optional[Callable[[datetime], str]] = exported_time_to_key,
+        coord_name: str = "save_coord",  # Default to standard name
         *args,
         **kwargs,
     ):
 
+        self.coord_name = coord_name
         super().__init__(
             base_dir=base_dir,
             start_date=start_date,
@@ -80,9 +82,10 @@ class ExportedDataset(NetCDFDataset):
         key = self.time_to_key(self.start_date)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         with Dataset(path, "r") as ds:
-            if "save_coord" not in ds.variables:
-                raise ValueError(f"'save_coord' not found in {path.name}")
-            arr = ds.variables["save_coord"][:]
+            if self.coord_name not in ds.variables:
+                raise ValueError(f"Coordinate variable '{self.coord_name}' not found in {path.name}. Available: {list(ds.variables.keys())}")
+            
+            arr = ds.variables[self.coord_name][:]
             sc = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray) else np.asarray(arr)).astype(np.int64)
             return sc, np.arange(sc.shape[0], dtype=np.int64)
 
@@ -195,9 +198,9 @@ class ExportedDataset(NetCDFDataset):
         key = self.time_to_key(self.start_date)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         with Dataset(path, "r") as ds:
-            if "save_coord" not in ds.variables:
-                raise ValueError(f"'save_coord' not found in {path}")
-            arr = ds.variables["save_coord"][:]
+            if self.coord_name not in ds.variables:
+                raise ValueError(f"Coordinate variable '{self.coord_name}' not found in {path}")
+            arr = ds.variables[self.coord_name][:]
             sc = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray) else np.asarray(arr)).astype(np.int64)
 
         # Find positions for desired catchments

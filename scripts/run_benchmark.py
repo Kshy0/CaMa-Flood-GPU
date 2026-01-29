@@ -26,7 +26,6 @@ def benchmark_block_sizes():
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
     variables_to_save = {}
-    precision = "float32"
     time_step = 86400.0
     default_num_sub_steps = 360
     loader_workers = 3
@@ -59,7 +58,6 @@ def benchmark_block_sizes():
         output_dir=output_dir,
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
-        precision=precision,
         output_workers=0,
         output_complevel=0,
         BLOCK_SIZE=BLOCK_SIZE_LIST[0], 
@@ -73,7 +71,6 @@ def benchmark_block_sizes():
         end_date=end_date,
         unit_factor=unit_factor,
         bin_dtype=bin_dtype,
-        out_dtype=precision,
         prefix=prefix,
         suffix=suffix,
     )
@@ -81,7 +78,6 @@ def benchmark_block_sizes():
     local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
-        precision=precision,
         device=device,
     )
 

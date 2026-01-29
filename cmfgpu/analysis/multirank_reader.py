@@ -187,8 +187,6 @@ class MultiRankStatsReader:
         dt0 = nc.num2date(t0, units=self._time_units, calendar=self._time_calendar)
         
         # Keep original time objects (python datetime or cftime.datetime)
-        # We no longer force-convert/clamp invalid dates (e.g. Feb 30) because
-        # plotting now handles numeric time axes correctly via FuncFormatter.
         self._time_datetimes = list(dt0)
 
         self._time_values_num = t0

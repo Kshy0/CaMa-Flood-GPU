@@ -31,6 +31,7 @@ def LeveeField(
     save_coord: Optional[str] = "levee_save_id",
     dim_coords: Optional[str] = "base.levee_catchment_id",
     category: Literal["topology", "param", "init_state"] = "param",
+    mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs,
 ):
     return TensorField(
@@ -42,6 +43,7 @@ def LeveeField(
         save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
+        mode=mode,
         **kwargs,
     )
 
@@ -95,6 +97,7 @@ class LeveeModule(AbstractModule):
         description="Unique ID for each levee",
         dtype="int",
         category="topology",
+        mode="cpu",
     )
 
     # ------------------------------------------------------------------ #

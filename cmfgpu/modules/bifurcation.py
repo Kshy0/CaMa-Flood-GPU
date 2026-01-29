@@ -31,6 +31,7 @@ def BifurcationField(
     save_coord: Optional[str] = "bifurcation_path_save_id",
     dim_coords: Optional[str] = "bifurcation_path_id",
     category: Literal["topology", "param", "init_state"] = "param",
+    mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
 ):
     return TensorField(
@@ -42,6 +43,7 @@ def BifurcationField(
         save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
+        mode=mode,
         **kwargs
     )
 
@@ -85,12 +87,14 @@ class BifurcationModule(AbstractModule):
         description="Unique ID for each bifurcation path (used to distinguish paths for identification in saved results)",
         dtype="int",
         category="topology",
+        mode="cpu",
     )
 
     bifurcation_basin_id: torch.Tensor = BifurcationField(
         description="Basin ID for each bifurcation path (used to group paths by basin)",
         dtype="int",
         category="topology",
+        mode="discard",
     )
 
     # ------------------------------------------------------------------ #
@@ -107,12 +111,14 @@ class BifurcationModule(AbstractModule):
         description="Upstream catchment IDs for each bifurcation path",
         dtype="int",
         category="topology",
+        mode="discard",
     )
 
     bifurcation_downstream_id: torch.Tensor = BifurcationField(
         description="Downstream catchment IDs for each bifurcation path",
         dtype="int",
         category="topology",
+        mode="discard",
     )
 
     # ------------------------------------------------------------------ #
