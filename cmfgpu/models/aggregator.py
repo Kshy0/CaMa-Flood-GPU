@@ -1203,7 +1203,7 @@ class StatisticsAggregator:
                             if outer == 'max':
                                 if k_val == 1:
                                     kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
                                         f"{indent2}else:",
                                         f"{indent3}old = tl.load({out_ptr}, mask=mask, other={val_var})",
@@ -1218,7 +1218,7 @@ class StatisticsAggregator:
                                         f"{indent2}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent2}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
                                         f"{indent3}for k in range(1, {k_val}):",
                                         f"{indent4}tl.store(base_ptr + k, -float('inf'), mask=mask)",
@@ -1235,7 +1235,7 @@ class StatisticsAggregator:
                                 if k_val == 1:
                                     comp_ptr = f"{safe_var}_max_{inner}_ptr + {out_offset}"
                                     kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
                                         f"{indent2}else:",
                                         f"{indent3}curr_max = tl.load({comp_ptr}, mask=mask, other={val_var})",
@@ -1261,7 +1261,7 @@ class StatisticsAggregator:
                                         # Pointer to indices (read-write)
                                         f"{indent2}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
                                         # others initialized to 0 (default)
                                         f"{indent2}else:",
@@ -1280,7 +1280,7 @@ class StatisticsAggregator:
                             elif outer == 'min':
                                 if k_val == 1:
                                     kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
                                         f"{indent2}else:",
                                         f"{indent3}old = tl.load({out_ptr}, mask=mask, other={val_var})",
@@ -1295,7 +1295,7 @@ class StatisticsAggregator:
                                         f"{indent2}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent2}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
                                         f"{indent3}for k in range(1, {k_val}):",
                                         f"{indent3}    tl.store(base_ptr + k, float('inf'), mask=mask)",
@@ -1312,7 +1312,7 @@ class StatisticsAggregator:
                                 if k_val == 1:
                                     comp_ptr = f"{safe_var}_min_{inner}_ptr + {out_offset}"
                                     kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
                                         f"{indent2}else:",
                                         f"{indent3}curr_min = tl.load({comp_ptr}, mask=mask, other={val_var})",
@@ -1333,7 +1333,7 @@ class StatisticsAggregator:
                                         f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
                                         f"{indent2}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         
-                                        f"{indent2}if is_outer_first and current_step==0:",
+                                        f"{indent2}if is_outer_first:",
                                         f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
                                         f"{indent2}else:",
                                         f"{indent3}for k in range({k_val}):",
@@ -1349,7 +1349,7 @@ class StatisticsAggregator:
                             elif outer == 'mean':
                                 # Outer mean implementation
                                 kernel_code_lines.extend([
-                                    f"{indent2}if is_outer_first and current_step==0:",
+                                    f"{indent2}if is_outer_first:",
                                     f"{indent3}new = {val_var}",
                                     f"{indent2}else:",
                                     f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
@@ -1362,7 +1362,7 @@ class StatisticsAggregator:
                                 ])
                             elif outer == 'sum':
                                 kernel_code_lines.extend([
-                                    f"{indent2}if is_outer_first and current_step==0:",
+                                    f"{indent2}if is_outer_first:",
                                     f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
                                     f"{indent2}else:",
                                     f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",

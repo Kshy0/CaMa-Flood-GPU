@@ -432,7 +432,7 @@ class MultiRankStatsReader:
             self._t_indices = np.arange(left, right + 1, dtype=np.int64)
 
             self._time_values_num = self._time_values_num[self._t_indices]
-            self._time_datetimes = [dts[i] for i in self._t_indices]
+            self._time_datetimes = [self._time_datetimes[i] for i in self._t_indices]
             self._time_len = len(self._t_indices)
         else:
             self._slice_start = 0

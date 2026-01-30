@@ -26,10 +26,10 @@ def compute_flood_stage_kernel(
     river_storage_ptr,           # *f32: River storage (in/out)
     flood_storage_ptr,           # *f32: Flood storage (in/out)
     protected_storage_ptr,       # *f32: Protected storage (in/out)
-    river_depth_ptr,             # *f32: River depth (in/out)
-    flood_depth_ptr,             # *f32: Flood depth (in/out)
-    protected_depth_ptr,         # *f32: Protected depth (in/out)
-    flood_fraction_ptr,          # *f32: Flood fraction (in/out)
+    river_depth_ptr,             # *f32: River depth (out)
+    flood_depth_ptr,             # *f32: Flood depth (out)
+    protected_depth_ptr,         # *f32: Protected depth (out)
+    flood_fraction_ptr,          # *f32: Flood fraction (out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
@@ -147,7 +147,6 @@ def compute_flood_stage_kernel(
         tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
     )
 
-    flood_area    = flood_fraction * catchment_area
     flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
 
     # Return to zero
@@ -500,7 +499,6 @@ def compute_flood_stage_batched_kernel(
         tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
     )
 
-    flood_area    = flood_fraction * catchment_area
     flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
 
     # Return to zero
