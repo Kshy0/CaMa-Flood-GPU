@@ -780,17 +780,21 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         - chunk_len: positive integer upper bound of steps to read
 
         Returns:
-        - 2D numpy array with shape (T, N), where:
-          * N equals the full grid size (lon * lat)
-          * T ∈ [1, chunk_len]. The final block near the end of the time range
-            may have T < chunk_len.
+        - If _local_runoff_indices is None (before build_local_runoff_matrix):
+            3D numpy array with shape (T, Y, X) where Y=lat, X=lon
+        - If _local_runoff_indices is set (after build_local_runoff_matrix):
+            2D numpy array with shape (T, N) where N = number of active grids
+        - T ∈ [1, chunk_len]. The final block near the end may have T < chunk_len.
+
+        Spatial convention:
+        - Dimension order: (lat, lon) i.e. (Y, X)
+        - When flattening: C-order (row-major), lon varies fastest
+        - Coordinate arrays from get_coordinates(): (lon, lat)
 
         Implementation notes:
         - Do not read beyond the available time range; truncate instead.
-        - Do not pad to chunk_len here; AbstractDataset.__getitem__ will pad with zeros
-          to (chunk_len, N).
+        - Do not pad to chunk_len here; AbstractDataset.__getitem__ will pad.
         - Preserve chronological order for the returned timesteps.
-        - Always return full grid data; column extraction is handled by __getitem__.
         """
         raise NotImplementedError
 
@@ -947,41 +951,66 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         lon, lat = self.get_coordinates()
         return len(lon) * len(lat)
 
+    @property
+    def grid_shape(self) -> Tuple[int, int]:
+        """
+        Returns (ny, nx) = (lat_size, lon_size) grid dimensions.
+        
+        Spatial convention: (Y, X) = (lat, lon)
+        """
+        lon, lat = self.get_coordinates()
+        return (len(lat), len(lon))
 
     def __getitem__(self, idx: int) -> np.ndarray:
         """
-        Fetch one chunk (T <= chunk_len) starting at chunk index `idx` and pad to (chunk_len, N).
+        Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
         
-        Requires build_local_runoff_matrix to be called first.
-        Data is already compressed (only active columns) from read_chunk.
+        Returns:
+        - If build_local_runoff_matrix has been called: (chunk_len, N) compressed data
+        - Otherwise: (chunk_len, Y, X) full grid data
+        
+        Pads with zeros if the actual data is shorter than chunk_len.
         """
-        if self._local_runoff_indices is None:
-            raise RuntimeError(
-                "build_local_runoff_matrix must be called before using __getitem__. "
-                "Use get_data() or read_chunk() for raw data access."
-            )
-        
         # Compute absolute start index for this chunk
         if idx < 0:
             idx += len(self)
         
-        N = self.data_size
+        compressed = self._local_runoff_indices is not None
+        
         # Non-rank-0: return zeros to keep shapes consistent across ranks
         if not is_rank_zero():
-            data = np.empty((self.chunk_len, N), dtype=self.out_dtype)
-            return data
+            if compressed:
+                return np.empty((self.chunk_len, self.data_size), dtype=self.out_dtype)
+            else:
+                ny, nx = self.grid_shape
+                return np.empty((self.chunk_len, ny, nx), dtype=self.out_dtype)
 
-        # Rank-0: fetch data (already compressed by read_chunk)
+        # Rank-0: fetch data
         data = self.read_chunk(idx)
         
-        if data.ndim != 2 or data.shape[1] != N:
-            raise ValueError(
-                f"read_chunk returned shape {tuple(data.shape)}, expected (T, {N})"
-            )
-        T = data.shape[0]
-        if T < self.chunk_len:
-            pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
-            data = np.vstack([data, pad]) if data.size else pad
+        if compressed:
+            # Expect (T, N)
+            N = self.data_size
+            if data.ndim != 2 or data.shape[1] != N:
+                raise ValueError(
+                    f"read_chunk returned shape {tuple(data.shape)}, expected (T, {N})"
+                )
+            T = data.shape[0]
+            if T < self.chunk_len:
+                pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
+                data = np.vstack([data, pad]) if data.size else pad
+        else:
+            # Expect (T, Y, X)
+            ny, nx = self.grid_shape
+            if data.ndim != 3 or data.shape[1] != ny or data.shape[2] != nx:
+                raise ValueError(
+                    f"read_chunk returned shape {tuple(data.shape)}, expected (T, {ny}, {nx})"
+                )
+            T = data.shape[0]
+            if T < self.chunk_len:
+                pad = np.zeros((self.chunk_len - T, ny, nx), dtype=self.out_dtype)
+                data = np.vstack([data, pad]) if data.size else pad
+        
         return data
 
     def __len__(self) -> int:

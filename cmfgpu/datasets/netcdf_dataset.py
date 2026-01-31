@@ -317,21 +317,20 @@ class NetCDFDataset(AbstractDataset):
         Each op is (file_key, abs_indices). We'll fetch exactly these time steps
         from the file in a single fancy-indexing operation along the time axis.
         
-        If _local_runoff_indices is set (after build_local_runoff_matrix),
-        extracts only active columns for memory efficiency.
-        Otherwise returns full grid data (T, Y*X).
+        Returns:
+        - If _local_runoff_indices is set: (T, N) compressed array
+        - If _local_runoff_indices is None: (T, Y, X) full grid array
+        
+        Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
         """
         ny, nx = self._grid_shape
-        full_size = ny * nx
-        
-        # Determine output column count
-        if self._local_runoff_indices is not None:
-            out_cols = len(self._local_runoff_indices)
-        else:
-            out_cols = full_size
+        compressed = self._local_runoff_indices is not None
         
         if not ops:
-            return np.empty((0, out_cols), dtype=self.out_dtype)
+            if compressed:
+                return np.empty((0, len(self._local_runoff_indices)), dtype=self.out_dtype)
+            else:
+                return np.empty((0, ny, nx), dtype=self.out_dtype)
         
         chunks: List[np.ndarray] = []
         
@@ -363,16 +362,15 @@ class NetCDFDataset(AbstractDataset):
                 
                 # Normalize to (T, Y, X)
                 arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
-                T, Y, X = arr.shape
                 
-                # Collapse spatial to (T, Y*X)
-                flat = arr.reshape(T, Y * X)
-                
-                # Extract active columns if set (for memory efficiency)
-                if self._local_runoff_indices is not None:
+                if compressed:
+                    # Flatten and extract active columns: (T, Y, X) -> (T, N)
+                    T, Y, X = arr.shape
+                    flat = arr.reshape(T, Y * X)
                     out = flat[:, self._local_runoff_indices]
                 else:
-                    out = flat
+                    # Keep as (T, Y, X)
+                    out = arr
                 
                 out = out.astype(self.out_dtype, copy=False)
                 chunks.append(out)
@@ -397,7 +395,9 @@ class NetCDFDataset(AbstractDataset):
     def get_data(self, current_time: Union[datetime, cftime.datetime], chunk_len: int) -> np.ndarray:
         """Read a contiguous block starting at current_time with minimal NetCDF I/O.
 
-        Returns: (T, N) where T <= length and N is the number of valid points.
+        Returns:
+        - If _local_runoff_indices is set: (T, N) compressed array
+        - If _local_runoff_indices is None: (T, Y, X) full grid array
         """
         try:
             start_abs = self.get_index_by_time(current_time)

@@ -97,6 +97,13 @@ class ExportedDataset(NetCDFDataset):
         sc, _ = self.get_coordinates()
         return len(sc)
 
+    @property
+    def grid_shape(self) -> Tuple[int, int]:
+        """ExportedDataset has no grid; data is already at catchment level."""
+        raise NotImplementedError(
+            "ExportedDataset has no grid shape. Data is already catchment-aggregated."
+        )
+
     # -------------------------
     # Reading helpers (T, C)
     # -------------------------
@@ -234,12 +241,11 @@ class ExportedDataset(NetCDFDataset):
     # Override __getitem__ - no rank gating for exported data
     # -------------------------
     def __getitem__(self, idx: int) -> np.ndarray:
-        """Fetch chunk - each rank reads independently for exported data."""
-        if self._local_runoff_indices is None:
-            raise RuntimeError(
-                "build_local_runoff_matrix must be called before using __getitem__."
-            )
+        """Fetch chunk - each rank reads independently for exported data.
         
+        If build_local_runoff_matrix has been called, returns data reordered to
+        match desired catchment order. Otherwise, returns data in file order.
+        """
         if idx < 0:
             idx += len(self)
         

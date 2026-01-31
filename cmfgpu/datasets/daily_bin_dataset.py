@@ -52,16 +52,28 @@ class DailyBinDataset(AbstractDataset):
         self._validate_files_exist()
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
-        lat = np.arange(89.5, -89.5 - 1, -1)
-        lon = np.arange(-179.5, 179.5 + 1, 1)
+        """Return (lon, lat) coordinate arrays.
+        
+        Note: shape is (ny, nx) = (lat, lon), so shape[0] is lat size, shape[1] is lon size.
+        Coordinates are cell centers, computed from shape assuming global coverage.
+        """
+        ny, nx = self.shape
+        # Resolution in degrees
+        res_lat = 180.0 / ny
+        res_lon = 360.0 / nx
+        # Cell centers: start at (90 - res/2) for lat, (-180 + res/2) for lon
+        lat = np.linspace(90 - res_lat / 2, -90 + res_lat / 2, ny)
+        lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
         return lon, lat
 
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
         """Read one day's data from binary file.
         
-        If _local_runoff_indices is set (after build_local_runoff_matrix),
-        extracts only active columns for memory efficiency.
-        Otherwise returns full grid data (1, Y*X).
+        Returns:
+        - If _local_runoff_indices is set: (1, N) compressed array
+        - If _local_runoff_indices is None: (1, Y, X) full grid array
+        
+        Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
         """
         if chunk_len != 1:
             raise ValueError("DailyBinDataset only supports chunk_len=1 (one day per file)")
@@ -69,12 +81,15 @@ class DailyBinDataset(AbstractDataset):
         file_path = Path(self.base_dir) / filename
         data = np.fromfile(file_path, dtype=self.bin_dtype)
         data[~(data >= 0)] = 0.0
+        data = data.astype(self.out_dtype) / self.unit_factor
         
-        # Extract active columns if set
         if self._local_runoff_indices is not None:
-            data = data[self._local_runoff_indices]
-        
-        return (data.astype(self.out_dtype) / self.unit_factor)[None, :]
+            # Return compressed (1, N)
+            return data[self._local_runoff_indices][None, :]
+        else:
+            # Return full grid (1, Y, X)
+            ny, nx = self.shape
+            return data.reshape(1, ny, nx)
     
     def close(self):
         pass
