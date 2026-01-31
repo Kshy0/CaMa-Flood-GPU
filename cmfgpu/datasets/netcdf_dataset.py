@@ -212,7 +212,6 @@ class NetCDFDataset(AbstractDataset):
         prefix: str = "e2o_ecmwf_wrr2_glob15_day_Runoff_",
         suffix: str = ".nc",
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
-        mask: Optional[np.ndarray] = None,
         *args,
         **kwargs,
     ):
@@ -222,7 +221,6 @@ class NetCDFDataset(AbstractDataset):
         self.prefix = prefix
         self.suffix = suffix
         self.time_to_key = time_to_key
-        self._user_mask = mask
 
         # Runtime metadata
         self._file_times = {}
@@ -299,63 +297,44 @@ class NetCDFDataset(AbstractDataset):
         return data
 
     @cached_property
-    def _mask_2d(self) -> np.ndarray:
-        """Compute a boolean (Y, X) mask of valid spatial points from the first timestep."""
-        if self._user_mask is not None:
-            return self._user_mask
-
+    def _grid_shape(self) -> Tuple[int, int]:
+        """Get (ny, nx) grid dimensions from the first file."""
         key = self.time_to_key(self.start_date)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         with Dataset(path, "r") as ds:
             var = ds.variables[self.var_name]
             dims = var.dimensions
-            t_idx = self._pick_dim(dims, "time", "valid_time")
             y_idx = self._pick_dim(dims, "lat", "latitude", "y")
             x_idx = self._pick_dim(dims, "lon", "longitude", "long", "x")
             if y_idx is None or x_idx is None:
                 raise ValueError(f"Unable to recognize lat/lon dims in {dims}")
-
-            # Build slice selecting the first time step
-            sl = [slice(None)] * var.ndim
-            if t_idx is not None:
-                sl[t_idx] = 0
-            snap = var[tuple(sl)]
-            snap = snap.filled(np.nan) if isinstance(snap, np.ma.MaskedArray) else np.array(snap)
-
-            # Move to (Y, X)
-            if t_idx is not None:
-                y_adj = y_idx - (1 if y_idx > t_idx else 0)
-                x_adj = x_idx - (1 if x_idx > t_idx else 0)
-            else:
-                y_adj, x_adj = y_idx, x_idx
-
-            if snap.ndim != 2:
-                axes = list(range(snap.ndim))
-                axes.remove(y_adj)
-                axes.remove(x_adj if x_adj < len(axes) + 1 else x_adj)
-                snap = np.transpose(snap, axes + [y_adj, x_adj])
-                snap = snap.reshape(snap.shape[-2], snap.shape[-1])
-            else:
-                if not (y_adj == 0 and x_adj == 1):
-                    snap = np.transpose(snap, axes=[y_adj, x_adj])
-
-            return ~np.isnan(snap)
-
-    @cached_property
-    def _mask_linear(self) -> np.ndarray:
-        """Linear indices (C-order) of valid spatial points."""
-        m = self._mask_2d
-        return np.flatnonzero(m.ravel(order="C")).astype(np.int64)
+            shape = var.shape
+            return (shape[y_idx], shape[x_idx])
 
     def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
         """Execute per-file reads using absolute time indices.
 
         Each op is (file_key, abs_indices). We'll fetch exactly these time steps
         from the file in a single fancy-indexing operation along the time axis.
+        
+        If _local_runoff_indices is set (after build_local_runoff_matrix),
+        extracts only active columns for memory efficiency.
+        Otherwise returns full grid data (T, Y*X).
         """
+        ny, nx = self._grid_shape
+        full_size = ny * nx
+        
+        # Determine output column count
+        if self._local_runoff_indices is not None:
+            out_cols = len(self._local_runoff_indices)
+        else:
+            out_cols = full_size
+        
         if not ops:
-            return np.empty((0, int(self.data_size)), dtype=self.out_dtype)
+            return np.empty((0, out_cols), dtype=self.out_dtype)
+        
         chunks: List[np.ndarray] = []
+        
         for key, abs_indices in ops:
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as ds:
@@ -366,29 +345,38 @@ class NetCDFDataset(AbstractDataset):
                 x_idx = self._pick_dim(dims, "lon", "longitude", "long", "x")
                 if t_idx is None or y_idx is None or x_idx is None:
                     raise ValueError(f"Expect at least time/lat/lon dims, got: {dims}")
-                # Build absolute time indices and read them directly in one go
+                
                 if not abs_indices:
-                    # No indices requested from this file; skip
                     continue
+                    
                 abs_idx = np.asarray(abs_indices, dtype=np.int32)
                 sel = [slice(None)] * var.ndim
-                # Use fancy indexing along the time dimension to fetch only required steps
                 sel[t_idx] = abs_idx
                 arr = var[tuple(sel)]
+                
                 # Fill masks / NaNs
                 if isinstance(arr, np.ma.MaskedArray):
                     arr = arr.filled(0.0)
                 else:
                     arr = np.nan_to_num(np.asarray(arr), nan=0.0)
                 arr = np.asarray(arr)
+                
                 # Normalize to (T, Y, X)
                 arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
                 T, Y, X = arr.shape
-                # Collapse spatial to (T, Y*X) and select valid indices
+                
+                # Collapse spatial to (T, Y*X)
                 flat = arr.reshape(T, Y * X)
-                out = flat[:, self._mask_linear]
+                
+                # Extract active columns if set (for memory efficiency)
+                if self._local_runoff_indices is not None:
+                    out = flat[:, self._local_runoff_indices]
+                else:
+                    out = flat
+                
                 out = out.astype(self.out_dtype, copy=False)
                 chunks.append(out)
+                
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
     def read_chunk(self, idx: int) -> np.ndarray:
@@ -446,11 +434,6 @@ class NetCDFDataset(AbstractDataset):
             if lat is None or lon is None:
                 raise ValueError("Unable to find lat/lon variables in the dataset.")
             return np.array(lon[:]), np.array(lat[:])
-
-    @cached_property
-    def data_mask(self) -> np.ndarray:
-        """Expose spatial mask as (Y, X) for mapping utilities."""
-        return self._mask_2d
 
 
 

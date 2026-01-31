@@ -87,7 +87,7 @@ def main():
         output_split_by_year=output_split_by_year
     )
 
-    local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(
+    local_runoff_matrix = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         device=device,
@@ -107,7 +107,7 @@ def main():
     last_valid_time = start_date
     for batch_runoff in loader:
         with torch.cuda.stream(stream):
-            batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
+            batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, world_size)
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:

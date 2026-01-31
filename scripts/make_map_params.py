@@ -19,7 +19,6 @@ gauge_file = f"{map_dir}/GRDC_alloc.txt"
 # Settings
 target_gpus = 1
 visualized = True
-levee_flag = True
 basin_use_file = False
 # --- Configuration End ---
 
@@ -28,7 +27,6 @@ merit_map = MERITMap(
     out_dir=out_dir,
     bifori_file=bifori_file, # Set to None if not available
     gauge_file=gauge_file,   # Set to None if not available
-    levee_flag=levee_flag,
     visualized=visualized,
     bif_levels_to_keep=5,
     basin_use_file=basin_use_file,

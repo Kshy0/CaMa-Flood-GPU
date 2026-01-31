@@ -113,14 +113,14 @@ class MERITMap(BaseModel):
     # Allow selecting a minimal subset of basins via points of interest (POI)
     # Structure example:
     # {
-    #   "gauges": "all" | ["1234", "5678"],  # gauge IDs as strings; "all" keeps basins with any loaded gauge
+    #   "gauges": "all" | ["1234", "5678", "123*"],  # gauge IDs as strings; "all" keeps basins with any loaded gauge
     #   "coords": [(x, y), ...],               # 0-based grid indices; will be validated and mapped to catchment IDs
     #   "catchments": [int, int, ...]          # explicit catchment_id list
     # }
     points_of_interest: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Optional POI selector to reduce simulated area: gauges ('all' or string IDs), "
+            "Optional POI selector to reduce simulated area: gauges ('all', string IDs, or wildcard patterns), "
             "coords as (x,y) pairs, and explicit catchment IDs."
         ),
     )
@@ -176,6 +176,7 @@ class MERITMap(BaseModel):
         "levee_fraction",
         "levee_crown_height",
         "levee_basin_id",
+        "gauge_catchment_id",
         "longitude",
         "latitude",
     ]
@@ -295,6 +296,7 @@ class MERITMap(BaseModel):
 
         self.gauge_id = np.array(sorted(gauge_id_set), dtype=np.int64)
         self.num_gauges = len(self.gauge_id)
+        self.gauge_catchment_id = self.gauge_id
 
         print(f"Loaded {len(self.gauge_info)} gauges covering {self.num_gauges} catchments")
 
@@ -654,6 +656,12 @@ class MERITMap(BaseModel):
             self.removed_bifurcation_downstream_y = self.removed_bifurcation_downstream_y[keep_rem]
             self.bifurcation_basin_id = pos[idx_in_sorted_bif].astype(np.int64)
 
+        if self.num_gauges > 0 and hasattr(self, 'gauge_catchment_id'):
+            gauge_mask = np.isin(self.gauge_catchment_id, self.catchment_id)
+            self.gauge_catchment_id = self.gauge_catchment_id[gauge_mask]
+            self.gauge_id = self.gauge_catchment_id
+            self.num_gauges = len(self.gauge_id)
+
     def load_parameters(self) -> None:
 
         def _read_2d_map(filename: str) -> np.ndarray:
@@ -738,6 +746,9 @@ class MERITMap(BaseModel):
             if self.levee_flag:
                 ds.createDimension("levee", self.num_levees)
 
+            if self.num_gauges > 0:
+                ds.createDimension("gauge", self.num_gauges)
+
             # Helper to map data shapes to dims
             def infer_dims(arr: np.ndarray):
                 shape = arr.shape
@@ -752,6 +763,8 @@ class MERITMap(BaseModel):
                         return ("bifurcation_path",)
                     if self.levee_flag and shape[0] == self.num_levees:
                         return ("levee",)
+                    if self.num_gauges > 0 and shape[0] == self.num_gauges:
+                        return ("gauge",)
                     if shape[0] == self.flood_depth_table.shape[1]:
                         return ("flood_level",)
                 elif len(shape) == 2:
@@ -908,7 +921,10 @@ class MERITMap(BaseModel):
             latitude=self.latitude if hasattr(self, 'latitude') else None,
             title="MERIT Global Basins with Bifurcation Paths",
             interactive=interactive_basin_picker,
-            basin_extra_text=basin_extra_text
+            basin_extra_text=basin_extra_text,
+            upstream_area=self.upstream_area if hasattr(self, 'upstream_area') else None,
+            catchment_id=self.catchment_id if interactive_basin_picker else None,
+            downstream_id=self.downstream_id if interactive_basin_picker else None
         )
         
         if not interactive_basin_picker:

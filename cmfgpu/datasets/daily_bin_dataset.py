@@ -5,7 +5,6 @@
 #
 
 from datetime import datetime, timedelta
-from functools import cached_property
 from pathlib import Path
 from typing import List, Tuple
 
@@ -58,17 +57,24 @@ class DailyBinDataset(AbstractDataset):
         return lon, lat
 
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+        """Read one day's data from binary file.
+        
+        If _local_runoff_indices is set (after build_local_runoff_matrix),
+        extracts only active columns for memory efficiency.
+        Otherwise returns full grid data (1, Y*X).
+        """
         if chunk_len != 1:
             raise ValueError("DailyBinDataset only supports chunk_len=1 (one day per file)")
         filename = f"{self.prefix}{current_time:%Y%m%d}{self.suffix}"
         file_path = Path(self.base_dir) / filename
         data = np.fromfile(file_path, dtype=self.bin_dtype)
         data[~(data >= 0)] = 0.0
+        
+        # Extract active columns if set
+        if self._local_runoff_indices is not None:
+            data = data[self._local_runoff_indices]
+        
         return (data.astype(self.out_dtype) / self.unit_factor)[None, :]
-
-    @cached_property
-    def data_mask(self):
-        return np.ones(np.prod(self.shape), dtype=bool)
     
     def close(self):
         pass

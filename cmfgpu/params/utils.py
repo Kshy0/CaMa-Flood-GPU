@@ -7,6 +7,7 @@
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
+import fnmatch
 
 from netCDF4 import Dataset
 from cmfgpu.utils import find_indices_in
@@ -233,12 +234,23 @@ def resolve_target_cids_from_poi(
                 for info in gauge_info.values():
                     target_cids.extend(info.get("upstream_id", []))
             elif isinstance(gauges_val, (list, tuple)):
-                # Specific gauges
-                for g_id_str in gauges_val:
-                    if str(g_id_str) in gauge_info:
-                        target_cids.extend(gauge_info[str(g_id_str)].get("upstream_id", []))
+                # Specific gauges or wildcards
+                for g_id_pattern in gauges_val:
+                    pattern = str(g_id_pattern)
+                    # Check if it contains wildcard characters
+                    if '*' in pattern or '?' in pattern or '[' in pattern:
+                         matched = False
+                         for g_key, info in gauge_info.items():
+                              if fnmatch.fnmatch(g_key, pattern):
+                                   target_cids.extend(info.get("upstream_id", []))
+                                   matched = True
+                         if not matched:
+                              print(f"Warning: No gauges matched pattern '{pattern}'.")
                     else:
-                        print(f"Warning: Gauge {g_id_str} not found in loaded gauge info.")
+                        if pattern in gauge_info:
+                            target_cids.extend(gauge_info[pattern].get("upstream_id", []))
+                        else:
+                            print(f"Warning: Gauge {pattern} not found in loaded gauge info.")
         else:
              # Fallback or warning if gauge_info not provided (e.g. from NC without gauge vars)
              print("Warning: 'gauges' POI requested but gauge_info not provided or available.")
@@ -314,7 +326,11 @@ def plot_basins_common(
     latitude: Optional[np.ndarray] = None,
     title: str = "Basin Visualization",
     interactive: bool = False,
-    basin_extra_text: Optional[Dict[int, str]] = None
+    basin_extra_text: Optional[Dict[int, str]] = None,
+    upstream_area: Optional[np.ndarray] = None,
+    catchment_id: Optional[np.ndarray] = None,
+    downstream_id: Optional[np.ndarray] = None,
+    color_by_upstream_area: bool = False
 ) -> None:
     """
     Shared plotting logic for basins.
@@ -322,7 +338,7 @@ def plot_basins_common(
     try:
         import matplotlib.pyplot as plt
         from matplotlib.collections import LineCollection
-        from matplotlib.colors import ListedColormap
+        from matplotlib.colors import ListedColormap, LogNorm
     except ImportError:
         print("matplotlib not available")
         return
@@ -358,9 +374,14 @@ def plot_basins_common(
 
     # Basin Map
     basin_map = np.full(map_shape, fill_value=np.nan, dtype=float)
+    uparea_map = None
     if len(catchment_x) > 0:
         basin_map[catchment_x, catchment_y] = catchment_basin_id
         num_basins = int(catchment_basin_id.max()) + 1
+        
+        if upstream_area is not None:
+            uparea_map = np.full(map_shape, fill_value=np.nan, dtype=float)
+            uparea_map[catchment_x, catchment_y] = upstream_area
     else:
         num_basins = 0
 
@@ -381,13 +402,27 @@ def plot_basins_common(
     if levees_xy: special_colors.append((0.5, 0, 0.5))
 
     basin_colors = generate_random_colors(num_basins, special_colors)
-    cmap = ListedColormap(basin_colors)
-    cmap.set_bad(alpha=0.0)
+    default_cmap = ListedColormap(basin_colors)
+    default_cmap.set_bad(alpha=0.0)
 
     # Plot
     plt.figure(figsize=(12, 10))
-    plt.imshow(np.ma.masked_invalid(basin_map).T, origin='upper', cmap=cmap, interpolation='nearest',
-               vmin=-0.5, vmax=num_basins - 0.5, extent=extent)
+    
+    if color_by_upstream_area and uparea_map is not None:
+         # Use LogNorm for better visualization of large ranges in upstream area
+         valid_uparea = uparea_map[uparea_map > 0]
+         vmin = np.nanmin(valid_uparea) if valid_uparea.size > 0 else 1.0
+         vmax = np.nanmax(uparea_map) if np.nanmax(uparea_map) > vmin else vmin + 1.0
+         
+         norm = LogNorm(vmin=vmin, vmax=vmax)
+         img_data = np.ma.masked_invalid(uparea_map).T
+         
+         plt.imshow(img_data, origin='upper', cmap='plasma', interpolation='nearest',
+                   norm=norm, extent=extent)
+         plt.colorbar(label='Upstream Area ($m^2$)')
+    else:
+        plt.imshow(np.ma.masked_invalid(basin_map).T, origin='upper', cmap=default_cmap, interpolation='nearest',
+                vmin=-0.5, vmax=num_basins - 0.5, extent=extent)
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
@@ -474,6 +509,27 @@ def plot_basins_common(
             bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.9),
             fontsize=8, visible=False, zorder=10
         )
+
+        highlight_im = None
+        cid_map = None
+        upstream_adj = None
+        cid_to_idx = None
+        upstream_cache = {}
+
+        if catchment_id is not None and downstream_id is not None:
+             highlight_data = np.zeros((*map_shape, 4), dtype=float)
+             highlight_im = ax.imshow(highlight_data.transpose((1, 0, 2)), origin='upper', extent=extent, zorder=20, interpolation='nearest')
+
+             cid_map = np.full(map_shape, fill_value=-1, dtype=np.int64)
+             cid_map[catchment_x, catchment_y] = catchment_id
+             
+             upstream_adj = defaultdict(list)
+             for u, d in zip(catchment_id, downstream_id):
+                 if d >= 0 and d != u:
+                     upstream_adj[d].append(u)
+             
+             cid_to_idx = {cid: i for i, cid in enumerate(catchment_id)}
+
         def on_click(event):
             if event.inaxes is not ax: return
              # Calc indices
@@ -488,7 +544,12 @@ def plot_basins_common(
 
             val = basin_map[xi, yi]
             if np.isnan(val):
-                ann.set_visible(False); plt.draw(); return
+                ann.set_visible(False)
+                if highlight_im:
+                     highlight_data[:] = 0.0
+                     highlight_im.set_data(highlight_data.transpose((1, 0, 2)))
+                plt.draw()
+                return
             
             basin_id = int(val)
             text = f"Basin: {basin_id}\nIdx: ({xi},{yi})"
@@ -497,6 +558,62 @@ def plot_basins_common(
                 text += f"\n{basin_extra_text[basin_id]}"
 
             if use_lonlat: text += f"\nLoc: {event.xdata:.3f},{event.ydata:.3f}"
+            
+            if uparea_map is not None:
+                val_uparea = uparea_map[xi, yi]
+                if not np.isnan(val_uparea):
+                    text += f"\nUpArea: {val_uparea/1e6:.2f} km²"
+
+            if highlight_im and cid_map is not None:
+                 clicked_cid = cid_map[xi, yi]
+                 if clicked_cid != -1:
+                      # Highlight logic
+                      highlight_data[:] = 0.0
+                      
+                      # Get background color of clicked point to calculate contrast color
+                      if 0 <= basin_id < len(basin_colors):
+                          bg_color = basin_colors[basin_id]
+                          # Calculate luminance 
+                          L = 0.2126 * bg_color[0] + 0.7152 * bg_color[1] + 0.0722 * bg_color[2]
+                          if L > 0.5:
+                              contrast_color = [0.0, 0.0, 0.0, 0.8] # Black for light background
+                          else:
+                              contrast_color = [1.0, 1.0, 1.0, 0.8] # White for dark background
+                      else:
+                          contrast_color = [1.0, 0.0, 1.0, 0.7] # Fallback Magenta
+
+                      if clicked_cid in upstream_cache:
+                          current_set = upstream_cache[clicked_cid]
+                      else:
+                          current_set = set()
+                          q = [clicked_cid]
+                          visited = {clicked_cid}
+                          
+                          while q:
+                              curr = q.pop(0)
+
+                              # Optimization: If we hit a node that is already cached, reuse result
+                              if curr in upstream_cache:
+                                  current_set.update(upstream_cache[curr])
+                                  continue 
+
+                              if curr in cid_to_idx:
+                                   idx = cid_to_idx[curr]
+                                   cx, cy = catchment_x[idx], catchment_y[idx]
+                                   current_set.add((cx, cy))
+                              
+                              for neighbor in upstream_adj[curr]:
+                                   if neighbor not in visited:
+                                       visited.add(neighbor)
+                                       q.append(neighbor)
+                          
+                          upstream_cache[clicked_cid] = current_set
+
+                      for cx, cy in current_set:
+                           highlight_data[cx, cy] = contrast_color
+                      
+                      highlight_im.set_data(highlight_data.transpose((1, 0, 2)))
+
             print(f"Selected: {text.replace(chr(10), ', ')}")
             ann.set_text(text)
             ann.xy = (event.xdata, event.ydata)
@@ -522,7 +639,8 @@ def visualize_nc_basins(
     visualize_bifurcations: bool = True,
     visualize_levees: bool = True,
     interactive: bool = False,
-    pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    color_by_upstream_area: bool = False
 ) -> None:
     """
     Visualize basins from a generated NetCDF parameter file using shared plotting logic.
@@ -550,6 +668,14 @@ def visualize_nc_basins(
         
         # Gather Optional Data
         gauges_xy = None
+        if visualize_gauges and 'gauge_catchment_id' in ds.variables and 'catchment_id' in ds.variables:
+            g_cids = ds['gauge_catchment_id'][:]
+            c_ids = ds['catchment_id'][:]
+            idx = find_indices_in(g_cids, c_ids)
+            idx = idx[idx >= 0]
+            if idx.size > 0:
+                gauges_xy = (catchment_x[idx], catchment_y[idx])
+
         bifurcations = None
         if visualize_bifurcations and 'bifurcation_catchment_x' in ds.variables:
             bifurcations = {
@@ -562,6 +688,18 @@ def visualize_nc_basins(
         levees_xy = None
         if visualize_levees and 'levee_catchment_x' in ds.variables:
             levees_xy = (ds['levee_catchment_x'][:], ds['levee_catchment_y'][:])
+
+        upstream_area = None
+        if 'upstream_area' in ds.variables:
+            upstream_area = ds['upstream_area'][:]
+
+        catchment_id = None
+        downstream_id = None
+        if interactive:
+            if 'catchment_id' in ds.variables:
+                catchment_id = ds['catchment_id'][:]
+            if 'downstream_id' in ds.variables:
+                downstream_id = ds['downstream_id'][:]
 
         plot_basins_common(
             map_shape=map_shape,
@@ -576,7 +714,11 @@ def visualize_nc_basins(
             latitude=latitude,
             title=f"Basins (from {Path(nc_path).name})",
             interactive=interactive,
-            pois_xy=pois_xy
+            pois_xy=pois_xy,
+            upstream_area=upstream_area,
+            catchment_id=catchment_id,
+            downstream_id=downstream_id,
+            color_by_upstream_area=color_by_upstream_area
         )
 
 def crop_parameters_nc(
@@ -584,7 +726,9 @@ def crop_parameters_nc(
     output_nc: Union[str, Path],
     points_of_interest: Dict[str, Any],
     visualize: bool = False,
-    only_save_pois: bool = False
+    only_save_pois: bool = False,
+    interactive_basin_picker: bool = False,
+    color_by_upstream_area: bool = False
 ) -> None:
     """
     Crops an existing parameter NetCDF to a subset of basins covering specific points of interest.
@@ -701,6 +845,7 @@ def crop_parameters_nc(
                     dst.createDimension(name, num_merged_basins)
                 elif name == 'bifurcation_path': pass
                 elif name == 'levee': pass
+                elif name == 'gauge': pass
                 else:
                     dst.createDimension(name, len(dim) if not dim.isunlimited() else None)
             
@@ -717,6 +862,13 @@ def crop_parameters_nc(
                  lev_mask = np.isin(lev_basin_id, kept_basin_ids)
                  if 'levee' not in dst.dimensions:
                       dst.createDimension('levee', np.sum(lev_mask))
+
+            gauge_mask = None
+            if 'gauge_catchment_id' in src.variables:
+                gauge_cids = src['gauge_catchment_id'][:]
+                gauge_mask = np.isin(gauge_cids, kept_catchment_ids)
+                if 'gauge' not in dst.dimensions:
+                    dst.createDimension('gauge', np.sum(gauge_mask))
 
             for name, var in src.variables.items():
                 dims = var.dimensions
@@ -766,6 +918,12 @@ def crop_parameters_nc(
                           new_data = map_idx_to_new[idx_in_kept].astype(new_data.dtype)
                      dst.createVariable(name, var.dtype, dims, zlib=True)
                      dst[name][:] = new_data
+                
+                elif primary_dim == 'gauge' and gauge_mask is not None:
+                    new_data = data[gauge_mask]
+                    dst.createVariable(name, var.dtype, dims, zlib=True)
+                    dst[name][:] = new_data
+
                 else:
                      dst.createVariable(name, var.dtype, dims, zlib=True)
                      dst[name][:] = data
@@ -784,4 +942,4 @@ def crop_parameters_nc(
                    pois_xy = (catchment_x[poi_idx], catchment_y[poi_idx])
 
          img_path = output_nc.parent / (output_nc.stem + ".png")
-         visualize_nc_basins(output_nc, save_path=img_path, pois_xy=pois_xy)
+         visualize_nc_basins(output_nc, save_path=img_path, pois_xy=pois_xy, interactive=interactive_basin_picker, color_by_upstream_area=color_by_upstream_area)

@@ -75,7 +75,7 @@ def benchmark_block_sizes():
         suffix=suffix,
     )
 
-    local_runoff_matrix, local_runoff_indices = dataset.build_local_runoff_matrix(
+    local_runoff_matrix = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         device=device,
@@ -106,7 +106,7 @@ def benchmark_block_sizes():
 
         for batch_runoff in loader:
             with torch.cuda.stream(stream):
-                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, local_runoff_indices, world_size)
+                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, world_size)
                 for runoff in batch_runoff:
                     if current_time > end_date:
                         continue

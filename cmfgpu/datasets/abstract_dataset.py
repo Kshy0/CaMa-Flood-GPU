@@ -126,6 +126,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.time_interval = time_interval
         self.calendar = calendar
         
+        # Local runoff indices for spatial compression (set by build_local_runoff_matrix)
+        self._local_runoff_indices: Optional[np.ndarray] = None
+        
         # Convert dates to the specified calendar immediately
         self.start_date = self._convert_to_calendar(start_date)
         self.end_date = self._convert_to_calendar(end_date)
@@ -296,7 +299,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self,
         batch_runoff: torch.Tensor,
         local_runoff_matrix: torch.Tensor,
-        local_runoff_indices: torch.Tensor,
         world_size: int,
     ) -> torch.Tensor:
         """
@@ -306,7 +308,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
           - (B, T, N) for single trial
           - (B, T, K, N) for K trials
         
-        We'll flatten the non-spatial dimensions into a single dimension before mapping.
+        N should match data_size (compressed runoff grids after build_local_runoff_matrix).
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
         if batch_runoff.dim() == 3:
@@ -321,7 +323,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if world_size > 1:
             dist.broadcast(flat, src=0)
 
-        out = (flat[:, local_runoff_indices] @ local_runoff_matrix).contiguous()
+        out = (flat @ local_runoff_matrix).contiguous()
         
         # If input was 4D (B, T, K, N), reshape output to (B*T, K, C)
         # This makes it ready for step-by-step slicing in the main loop
@@ -337,14 +339,22 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                                   runoff_mapping_file: str, 
                                   desired_catchment_ids: np.ndarray, 
                                   device: torch.device,
-                                  precision: Literal["float32", "float64"]="float32") -> Tuple[torch.Tensor, torch.Tensor]:
+                                  precision: Literal["float32", "float64"]="float32") -> torch.Tensor:
         """
-        Build PyTorch CSR matrix for mapping runoff data to specified catchments.
-        Loads scipy compressed sparse matrix data and converts to PyTorch.
-        The output catchment order will match the order of desired_catchment_ids.
+        Build PyTorch sparse matrix for mapping runoff data to specified catchments.
+        
+        This method:
+        1. Loads the sparse mapping matrix from npz file
+        2. Extracts submatrix for desired catchments
+        3. Identifies non-zero columns (active runoff grids)
+        4. Sets self._local_runoff_indices for use in __getitem__
+        5. Returns the compressed mapping matrix
+        
+        After calling this method, data_size will return the compressed size,
+        and __getitem__ will automatically extract only the needed columns.
         """
         runoff_mapping_file = Path(runoff_mapping_file)
-        precision = torch.float32 if precision == "float32" else torch.float64
+        torch_precision = torch.float32 if precision == "float32" else torch.float64
         if runoff_mapping_file is None or not os.path.exists(runoff_mapping_file):
             raise ValueError("Runoff mapping file not found. Cannot build local matrix.")
         
@@ -355,12 +365,21 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         sparse_data = mapping_data['sparse_data']
         sparse_indices = mapping_data['sparse_indices'] 
         sparse_indptr = mapping_data['sparse_indptr']
-        matrix_shape = mapping_data['matrix_shape']
+        matrix_shape = tuple(mapping_data['matrix_shape'])
         
         full_sparse_matrix = csr_matrix(
             (sparse_data, sparse_indices, sparse_indptr),
-            shape=tuple(matrix_shape)
+            shape=matrix_shape
         )
+        
+        # Verify mapping matrix columns match full grid size
+        lon, lat = self.get_coordinates()
+        full_grid_size = len(lon) * len(lat)
+        if matrix_shape[1] != full_grid_size:
+            raise ValueError(
+                f"Mapping matrix columns ({matrix_shape[1]}) != full grid size ({full_grid_size}). "
+                "Please regenerate the mapping file."
+            )
         
         # Use find_indices_in to get row indices for desired catchments
         desired_row_indices = find_indices_in(desired_catchment_ids, all_catchment_ids)
@@ -368,7 +387,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         # Check which catchments were found
         valid_idx = desired_row_indices != -1
         
-        if np.any(valid_idx == -1):
+        if np.any(~valid_idx):
             raise ValueError(
                 f"Some desired catchments ({np.sum(~valid_idx)}) were not found in the mapping file. "
                 "Please check your input data or mapping file."
@@ -379,36 +398,38 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         
         # Remove columns that are all zeros to optimize memory
         col_sums = np.array(submatrix.sum(axis=0)).flatten()
-        non_zero_cols = np.where(col_sums != 0)[0]
+        non_zero_cols = np.where(col_sums != 0)[0].astype(np.int64)
         
         if len(non_zero_cols) == 0:
             raise ValueError("No non-zero runoff data found for the desired catchments.")
         
-        # Extract final submatrix with only non-zero columns
-        final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
+        # Store the local runoff indices for use in __getitem__
+        self._local_runoff_indices = non_zero_cols
         
-        # Store the information needed for data extraction
-        local_runoff_indices = torch.tensor(non_zero_cols, dtype=torch.int64,device=device)
+        # Extract final submatrix with only non-zero columns and transpose
+        # Shape: (num_runoff_grids, num_catchments)
+        final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
 
-        # Convert to PyTorch tensors
+        # Convert to PyTorch sparse COO tensor
         row_tensor = torch.from_numpy(final_submatrix.row.astype(np.int64)).to(device)
         col_tensor = torch.from_numpy(final_submatrix.col.astype(np.int64)).to(device)
-        data_tensor = torch.from_numpy(final_submatrix.data.astype(np.float32)).to(device).to(precision)
+        data_tensor = torch.from_numpy(final_submatrix.data.astype(np.float32)).to(device).to(torch_precision)
 
-        # Create PyTorch sparse CSR tensor
         indices = torch.stack([row_tensor, col_tensor])
         local_runoff_matrix = torch.sparse_coo_tensor(
             indices, data_tensor, 
             size=(len(non_zero_cols), len(desired_catchment_ids)),
-            dtype=precision,
+            dtype=torch_precision,
             device=device
         ).coalesce()
         
-        print(f"Built local runoff matrix for {len(desired_catchment_ids)} catchments "
-            f"and {len(non_zero_cols)} runoff grids on device {device}")
-        print(f"Original matrix shape: {matrix_shape}, Local matrix shape: {local_runoff_matrix.shape}")
-        print(f"Found {np.sum(valid_idx)} out of {len(desired_catchment_ids)} requested catchments")
-        return local_runoff_matrix, local_runoff_indices
+        if is_rank_zero():
+            compression = 100 * (1 - len(non_zero_cols) / full_grid_size)
+            print(f"[Dataset] Built local runoff matrix: {len(non_zero_cols)} active grids "
+                  f"out of {full_grid_size} total")
+            print(f"[Dataset] Mapping {len(non_zero_cols)} runoff grids -> {len(desired_catchment_ids)} catchments")
+        
+        return local_runoff_matrix
 
     def export_catchment_runoff(
         self,
@@ -506,7 +527,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             time_var.setncattr("units", "seconds since 1900-01-01 00:00:00")
             time_var.setncattr("calendar", "standard")
 
-            save_coord = ds.createVariable("save_coord", "i8", ("saved_points",))
+            save_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
             save_coord[:] = catchment_ids
 
             out_var = ds.createVariable(
@@ -663,21 +684,13 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             )
         runoff_idx = compute_runoff_id(ro_lon, ro_lat, valid_lon, valid_lat)
 
-        # Handle mask if available
-        col_mask = self.data_mask
-        if col_mask is not None:
-            col_mask = np.ravel(col_mask, order="C")
-        else:
-            col_mask = np.ones((len(ro_lat) * len(ro_lon)), dtype=bool)
+        # Full grid - no masking needed
+        full_grid_size = len(ro_lat) * len(ro_lon)
 
-        col_mapping = -np.ones_like(col_mask, dtype=np.int64)
-        col_mapping[np.flatnonzero(col_mask)] = np.arange(col_mask.sum())
-        mapped_runoff_idx = col_mapping[runoff_idx]
-
-        # Filter valid mappings
-        valid_mask = (catchment_idx != -1) & (mapped_runoff_idx != -1)
+        # Filter valid mappings (only check catchment validity)
+        valid_mask = catchment_idx != -1
         row_idx = catchment_idx[valid_mask]
-        col_idx = mapped_runoff_idx[valid_mask]
+        col_idx = runoff_idx[valid_mask]
         data_values = valid_areas[valid_mask]
 
         # Optionally align/subset catchments to parameter_nc order/region
@@ -710,14 +723,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 data_values = data_values[keep_rows]
                 # Update outputs
                 save_catchment_ids = desired_ids[keep_mask_nc]
-                matrix_shape = (save_catchment_ids.size, col_mask.sum())
+                matrix_shape = (save_catchment_ids.size, full_grid_size)
             except Exception as e:
                 raise ValueError(
                     f"Failed to read or process parameter_nc: {path_nc}. "
                     "Ensure it contains 'catchment_id' variable."
                 ) from e
         else:
-            matrix_shape = (len(catchment_id), col_mask.sum())
+            matrix_shape = (len(catchment_id), full_grid_size)
 
         # Report missing mapping rows (relative to selected set)
         unique_row_count = len(np.unique(row_idx))
@@ -768,7 +781,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         Returns:
         - 2D numpy array with shape (T, N), where:
-          * N equals the number of valid spatial points (sum of data_mask)
+          * N equals the full grid size (lon * lat)
           * T ∈ [1, chunk_len]. The final block near the end of the time range
             may have T < chunk_len.
 
@@ -777,16 +790,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         - Do not pad to chunk_len here; AbstractDataset.__getitem__ will pad with zeros
           to (chunk_len, N).
         - Preserve chronological order for the returned timesteps.
+        - Always return full grid data; column extraction is handled by __getitem__.
         """
         raise NotImplementedError
-    
-    @property
-    @abstractmethod
-    def data_mask(self) -> np.ndarray:
-        """
-        Returns the mask of the dataset.
-        """
-        pass
 
     @abstractmethod
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -926,16 +932,35 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         Closes any open resources or files.
         """
         pass
-    
-    @cached_property
+
+    @property
     def data_size(self) -> int:
-        return int(self.data_mask.sum())
+        """
+        Returns the number of runoff grid points to be loaded per timestep.
+        
+        Before build_local_runoff_matrix is called: returns full grid size.
+        After build_local_runoff_matrix is called: returns compressed size (active grids only).
+        """
+        if self._local_runoff_indices is not None:
+            return len(self._local_runoff_indices)
+        # Full grid size from coordinates
+        lon, lat = self.get_coordinates()
+        return len(lon) * len(lat)
 
 
     def __getitem__(self, idx: int) -> np.ndarray:
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx` and pad to (chunk_len, N).
+        
+        Requires build_local_runoff_matrix to be called first.
+        Data is already compressed (only active columns) from read_chunk.
         """
+        if self._local_runoff_indices is None:
+            raise RuntimeError(
+                "build_local_runoff_matrix must be called before using __getitem__. "
+                "Use get_data() or read_chunk() for raw data access."
+            )
+        
         # Compute absolute start index for this chunk
         if idx < 0:
             idx += len(self)
@@ -946,12 +971,12 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             data = np.empty((self.chunk_len, N), dtype=self.out_dtype)
             return data
 
-        # Rank-0: fetch data and pad if needed
+        # Rank-0: fetch data (already compressed by read_chunk)
         data = self.read_chunk(idx)
         
         if data.ndim != 2 or data.shape[1] != N:
             raise ValueError(
-                f"read_chunk must return (T, N) with N={N}, got {tuple(data.shape)}"
+                f"read_chunk returned shape {tuple(data.shape)}, expected (T, {N})"
             )
         T = data.shape[0]
         if T < self.chunk_len:
@@ -1040,6 +1065,7 @@ class MixedDataset(AbstractDataset):
                     raise ValueError(f"Operand {i} has different data_size")
 
         # Initialize AbstractDataset using the base dataset's attributes
+        # Inherit runoff_mapping_file from base dataset
         super().__init__(
             start_date=base.start_date,
             end_date=base.end_date,
@@ -1049,7 +1075,8 @@ class MixedDataset(AbstractDataset):
             spin_up_cycles=base.spin_up_cycles,
             spin_up_start_date=base.spin_up_start_date,
             spin_up_end_date=base.spin_up_end_date,
-            calendar=base.calendar
+            calendar=base.calendar,
+            runoff_mapping_file=base._runoff_mapping_file,
         )
         self.operation = operation
 
@@ -1101,13 +1128,11 @@ class StaticParameterDataset:
         var_name: str,
         lat_name: str = "lat",
         lon_name: str = "lon",
-        mask: Optional[np.ndarray] = None,
     ):
         self.nc_path = Path(nc_path)
         self.var_name = var_name
         self.lat_name = lat_name
         self.lon_name = lon_name
-        self._user_mask = mask
 
         if not self.nc_path.exists():
             raise FileNotFoundError(f"File not found: {self.nc_path}")
@@ -1134,8 +1159,9 @@ class StaticParameterDataset:
                 raise ValueError(f"Unsupported dimensions for variable {self.var_name}: {self.shape}")
 
     @property
-    def data_mask(self) -> Optional[np.ndarray]:
-        return self._user_mask
+    def data_mask(self) -> np.ndarray:
+        """Returns a full mask (all True) for mapping table generation."""
+        return np.ones((len(self.lat), len(self.lon)), dtype=bool)
 
     @property
     def data_size(self) -> int:
@@ -1151,7 +1177,7 @@ class StaticParameterDataset:
         """
         Reads data. For static data (ndim=2), idx is ignored (returns the single map).
         For climatology (ndim=3), returns the data at time index idx.
-        Returns shape (1, lat*lon) or (1, N).
+        Returns shape (1, lat*lon).
         """
         with nc.Dataset(self.nc_path, "r") as ds:
             var = ds.variables[self.var_name]
@@ -1164,23 +1190,8 @@ class StaticParameterDataset:
             if isinstance(data, np.ma.MaskedArray):
                 data = data.filled(np.nan)
             
-            # Flatten to (N,)
-            data = data.flatten()
-            
-            # Apply mask if exists (to match AbstractDataset behavior, though here we usually just return flattened data)
-            # AbstractDataset.read_chunk returns (T, N_valid)
-            # Here we return (1, N_valid)
-            
-            if self._user_mask is not None:
-                # _user_mask should be boolean array of shape (lat, lon) or flattened
-                if self._user_mask.shape != data.shape:
-                     flat_mask = self._user_mask.flatten()
-                else:
-                     flat_mask = self._user_mask
-                
-                data = data[flat_mask]
-            
-            return data.reshape(1, -1)
+            # Flatten to (N,) and return as (1, N)
+            return data.flatten().reshape(1, -1)
 
     def generate_runoff_mapping_table(
         self,
@@ -1419,7 +1430,7 @@ class StaticParameterDataset:
                 time_var = ds.createVariable("time", "f8", ("time",))
                 time_var.setncattr("units", "months" if self.ndim==3 else "unknown") # Simplified
             
-            save_coord = ds.createVariable("save_coord", "i8", ("saved_points",))
+            save_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
             save_coord[:] = catchment_ids
 
             dims = ("time", "saved_points") if self.has_time else ("saved_points",)

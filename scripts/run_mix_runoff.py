@@ -105,7 +105,7 @@ def main():
         calendar=dataset0.calendar,
     )
     # assume both datasets have the same formatting and mapping
-    local_runoff_matrix, local_runoff_indices = dataset0.build_local_runoff_matrix(
+    local_runoff_matrix = dataset0.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         device=device,
@@ -132,7 +132,7 @@ def main():
     last_valid_time = start_date
     for batch_runoff0, batch_runoff1 in zip(loader0, loader1):
         with torch.cuda.stream(stream):
-            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_runoff_matrix, local_runoff_indices, world_size)
+            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_runoff_matrix, world_size)
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:
