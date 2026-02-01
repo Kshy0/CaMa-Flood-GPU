@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,7 +16,6 @@ from typing import (Any, ClassVar, Dict, Iterator, List, Literal, Optional,
                     Self, Tuple, Type, Union)
 
 import cftime
-import re
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -84,7 +84,7 @@ class AbstractModel(BaseModel, ABC):
     # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
     # one variable can appear under multiple ops.
     variables_to_save: Optional[Dict[str, Union[str, List[Union[str, Dict[str, str]]]]]] = Field(
-        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, argmax, argmin. Variables can be strings or {alias: expr} dicts."
+        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, sum, median. For max/min, argmax/argmin are automatically computed. Variables can be strings or {alias: expr} dicts."
     )
     precision: Literal["float32"] = Field(default="float32", description="Precision of the model")
     world_size: int = Field(default=1, description="Total number of distributed processes")
@@ -96,11 +96,19 @@ class AbstractModel(BaseModel, ABC):
     output_split_by_year: bool = Field(default=False, description="Whether to split output files by year")
     num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
     save_kernels: bool = Field(default=False, description="Whether to save generated Triton kernels")
-    max_pending_steps: int = Field(default=10, description="Maximum number of pending time steps for output buffering")
+    max_pending_steps: int = Field(default=20, description="Maximum number of pending time steps for output buffering")
     output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(default=None, description="Time to start saving output")
     calendar: str = Field(default="standard", description="Calendar type for time handling (e.g., standard, noleap)")
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
+
+    _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
+    
+    # Parameter Change Plan State
+    _plans: List[PlanItem] = PrivateAttr(default_factory=list)
+    _active_plans: List[ActivePlan] = PrivateAttr(default_factory=list)
+    _next_plan_idx: int = PrivateAttr(default=0)
+    _cached_grouped_plans: Optional[Dict[Tuple[int, str], List[ActivePlan]]] = PrivateAttr(default=None)
 
     @model_validator(mode='after')
     def align_output_start_time(self) -> Self:
@@ -131,14 +139,6 @@ class AbstractModel(BaseModel, ABC):
                 # If conversion fails, we leave it as is and hope for the best or fail later
                 pass
         return self
-
-    _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
-    
-    # Parameter Change Plan State
-    _plans: List[PlanItem] = PrivateAttr(default_factory=list)
-    _active_plans: List[ActivePlan] = PrivateAttr(default_factory=list)
-    _next_plan_idx: int = PrivateAttr(default=0)
-    _cached_grouped_plans: Optional[Dict[Tuple[int, str], List[ActivePlan]]] = PrivateAttr(default=None)
 
     @field_validator('num_trials')
     @classmethod
@@ -264,20 +264,14 @@ class AbstractModel(BaseModel, ABC):
             return
 
         # 2. Filter finished plans and check if grouping update is needed
-        valid_active_plans = []
-        for active in self._active_plans:
-            item = active.item
-            is_finished = False
-            
-            if active.steps_executed >= item.active_steps:
-                is_finished = True
-            
-            if not is_finished:
-                valid_active_plans.append(active)
-            else:
-                plans_changed = True
-        
-        self._active_plans = valid_active_plans
+        # Use list comprehension for better performance
+        initial_count = len(self._active_plans)
+        self._active_plans = [
+            active for active in self._active_plans
+            if active.steps_executed < active.item.active_steps
+        ]
+        if len(self._active_plans) != initial_count:
+            plans_changed = True
 
         if not self._active_plans:
             self._cached_grouped_plans = None
@@ -290,9 +284,8 @@ class AbstractModel(BaseModel, ABC):
                 if active.item._is_ready:
                     # Use id(module) as key because Pydantic models are not hashable
                     key = (id(active.item._module), active.item._attr_name)
-                    if key not in grouped_plans:
-                        grouped_plans[key] = []
-                    grouped_plans[key].append(active)
+                    # Use setdefault for cleaner and slightly more efficient code
+                    grouped_plans.setdefault(key, []).append(active)
             self._cached_grouped_plans = grouped_plans
 
         # 4. Execute grouped plans
@@ -509,9 +502,8 @@ class AbstractModel(BaseModel, ABC):
         for plan in sorted_plans:
             if plan.is_set_value:
                 key = (plan.variable_name, plan.start_time)
-                if key not in set_plans_map:
-                    set_plans_map[key] = []
-                set_plans_map[key].append(plan)
+                # Use setdefault for cleaner and more efficient code
+                set_plans_map.setdefault(key, []).append(plan)
 
         conflicts = []
         
@@ -795,14 +787,16 @@ class AbstractModel(BaseModel, ABC):
             num_trials=self.num_trials or 1,
             save_kernels=self.save_kernels,
             max_pending_steps=self.max_pending_steps,
+            calendar=self.calendar,
         )
 
         registered_vars = set()
 
         # Normalize variables_to_save (op -> vars) into var -> set[ops]
-        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum", "median"}
+        # Note: argmax/argmin are automatically created when max/min is requested
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "median"}
         import re
-        topk_pattern = re.compile(r'^(max|min|argmax|argmin)(\d+)$')
+        topk_pattern = re.compile(r'^(max|min)(\d+)$')
         q_pattern = re.compile(r'^q\d+$')
 
         var_to_ops: Dict[str, List[str]] = {}
@@ -815,14 +809,16 @@ class AbstractModel(BaseModel, ABC):
             
             # Validate op parts
             for p in op_parts:
+                if p.startswith('argmax') or p.startswith('argmin'):
+                    raise ValueError(f"Invalid op '{op}': argmax/argmin cannot be specified directly. They are auto-generated with max/min.")
                 if p not in allowed_ops and not topk_pattern.match(p) and not q_pattern.match(p):
                      raise ValueError(f"Invalid op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
 
             if len(op_parts) > 1:
                 outer, inner = op_parts[0], op_parts[1]
-                # Check for inner restriction
-                if inner in ('argmax', 'argmin') or topk_pattern.match(inner):
-                    raise ValueError(f"Invalid composite op '{op}': '{inner}' (arg or top-k) cannot be used as an inner operation.")
+                # Check for inner restriction: top-k cannot be inner op
+                if topk_pattern.match(inner):
+                    raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k) cannot be used as an inner operation.")
                 if len(op_parts) > 2:
                     raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")
 
@@ -1017,7 +1013,7 @@ class AbstractModel(BaseModel, ABC):
                     if is_real_2d:
                         for op in ops:
                             op_base = op.split('_')[0]
-                            if topk_pattern.match(op_base) or op_base in ('max', 'min', 'argmax', 'argmin'):
+                            if topk_pattern.match(op_base) or op_base in ('max', 'min'):
                                 raise ValueError(f"Operation '{op}' is not allowed for 2D variable '{var_name}' (ndim={tensor.ndim}). Only 'mean', 'sum', 'last', 'first', 'mid' are supported for 2D variables.")
 
             # Register the main tensor if not already done
@@ -1412,8 +1408,9 @@ class AbstractModel(BaseModel, ABC):
         if self.variables_to_save is None:
             return self
         # Validate shape: dict[op -> vars]
-        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "argmax", "argmin", "sum", "median"}
-        topk_pattern = re.compile(r'^(max|min|argmax|argmin)(\d+)$')
+        # Note: argmax/argmin are automatically created when max/min is requested
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "median"}
+        topk_pattern = re.compile(r'^(max|min)(\d+)$')
         q_pattern = re.compile(r'^q\d+$')
 
         if not isinstance(self.variables_to_save, dict):
@@ -1432,9 +1429,9 @@ class AbstractModel(BaseModel, ABC):
                 
                 if len(op_parts) > 1:
                     outer, inner = op_parts[0], op_parts[1]
-                    # Disallow argmax/argmin as inner ops (prohibit argmax_argmax, mean_argmax)
-                    if inner in ('argmax', 'argmin') or topk_pattern.match(inner):
-                        raise ValueError(f"Invalid composite op '{op}': '{inner}' cannot be used as an inner operation.")
+                    # Disallow top-k as inner ops
+                    if topk_pattern.match(inner):
+                        raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k) cannot be used as an inner operation.")
                     # Disallow more than 2 levels for now
                     if len(op_parts) > 2:
                         raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")

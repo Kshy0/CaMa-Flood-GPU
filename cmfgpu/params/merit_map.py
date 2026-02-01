@@ -17,10 +17,11 @@ from netCDF4 import Dataset
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
 
-from cmfgpu.params.utils import (compute_init_river_depth, read_bifori,
-                                 reorder_by_basin_size, topological_sort,
-                                 trace_outlets_dict, resolve_target_cids_from_poi,
-                                 get_kept_basin_ids, plot_basins_common)
+from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
+                                 plot_basins_common, read_bifori,
+                                 reorder_by_basin_size,
+                                 resolve_target_cids_from_poi,
+                                 topological_sort, trace_outlets_dict)
 from cmfgpu.utils import binread, find_indices_in, read_map
 
 
@@ -654,7 +655,6 @@ class MERITMap(BaseModel):
             self.removed_bifurcation_catchment_y = self.removed_bifurcation_catchment_y[keep_rem]
             self.removed_bifurcation_downstream_x = self.removed_bifurcation_downstream_x[keep_rem]
             self.removed_bifurcation_downstream_y = self.removed_bifurcation_downstream_y[keep_rem]
-            self.bifurcation_basin_id = pos[idx_in_sorted_bif].astype(np.int64)
 
         if self.num_gauges > 0 and hasattr(self, 'gauge_catchment_id'):
             gauge_mask = np.isin(self.gauge_catchment_id, self.catchment_id)

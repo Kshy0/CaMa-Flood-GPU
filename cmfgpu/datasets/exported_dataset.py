@@ -238,6 +238,15 @@ class ExportedDataset(NetCDFDataset):
             raise ValueError(f"Expected 3D or 4D tensor, got {batch_runoff.dim()}D")
 
     # -------------------------
+    # Disable grid-based methods
+    # -------------------------
+    def generate_runoff_mapping_table(self, *args, **kwargs):
+        raise NotImplementedError("ExportedDataset does not require mapping tables.")
+
+    def export_catchment_runoff(self, *args, **kwargs):
+        raise NotImplementedError("ExportedDataset is already at catchment level.")
+
+    # -------------------------
     # Override __getitem__ - no rank gating for exported data
     # -------------------------
     def __getitem__(self, idx: int) -> np.ndarray:
@@ -260,12 +269,3 @@ class ExportedDataset(NetCDFDataset):
             pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
             data = np.vstack([data, pad]) if data.size else pad
         return data
-
-    # -------------------------
-    # Disable grid-based methods
-    # -------------------------
-    def generate_runoff_mapping_table(self, *args, **kwargs):
-        raise NotImplementedError("ExportedDataset does not require mapping tables.")
-
-    def export_catchment_runoff(self, *args, **kwargs):
-        raise NotImplementedError("ExportedDataset is already at catchment level.")

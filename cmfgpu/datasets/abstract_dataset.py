@@ -112,6 +112,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None,
         spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
         calendar: str = "standard",
+        clip_negative: bool = True,
         *args,
         **kwargs,
     ):
@@ -125,6 +126,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.spin_up_end_date = spin_up_end_date
         self.time_interval = time_interval
         self.calendar = calendar
+        self.clip_negative = clip_negative
         
         # Local runoff indices for spatial compression (set by build_local_runoff_matrix)
         self._local_runoff_indices: Optional[np.ndarray] = None
@@ -380,6 +382,30 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 f"Mapping matrix columns ({matrix_shape[1]}) != full grid size ({full_grid_size}). "
                 "Please regenerate the mapping file."
             )
+        
+        # Validate coordinate metadata if present in npz
+        if 'coord_lon' in mapping_data and 'coord_lat' in mapping_data:
+            saved_lon = mapping_data['coord_lon']
+            saved_lat = mapping_data['coord_lat']
+            
+            lon_match = (len(lon) == len(saved_lon) and 
+                        np.allclose(lon, saved_lon, rtol=1e-5, atol=1e-8))
+            lat_match = (len(lat) == len(saved_lat) and 
+                        np.allclose(lat, saved_lat, rtol=1e-5, atol=1e-8))
+            
+            if not lon_match or not lat_match:
+                raise ValueError(
+                    f"Coordinate mismatch between dataset and mapping file.\n"
+                    f"Dataset: lon[{len(lon)}] range [{lon[0]:.4f}, {lon[-1]:.4f}], "
+                    f"lat[{len(lat)}] range [{lat[0]:.4f}, {lat[-1]:.4f}]\n"
+                    f"Mapping: lon[{len(saved_lon)}] range [{saved_lon[0]:.4f}, {saved_lon[-1]:.4f}], "
+                    f"lat[{len(saved_lat)}] range [{saved_lat[0]:.4f}, {saved_lat[-1]:.4f}]\n"
+                    "Please regenerate the mapping file with matching coordinates."
+                )
+        else:
+            if is_rank_zero():
+                print("[Dataset] Warning: Mapping file has no coordinate metadata. "
+                      "Consider regenerating for better validation.")
         
         # Use find_indices_in to get row indices for desired catchments
         desired_row_indices = find_indices_in(desired_catchment_ids, all_catchment_ids)
@@ -753,12 +779,16 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         sparse_matrix.eliminate_zeros()
         
         # Prepare mapping data for saving with compressed sparse matrix
+        # Include coordinate metadata for validation during loading
         mapping_data = {
             'catchment_ids': save_catchment_ids.astype(np.int64),
             'sparse_data': sparse_matrix.data.astype(np.float32),
             'sparse_indices': sparse_matrix.indices.astype(np.int64),
             'sparse_indptr': sparse_matrix.indptr.astype(np.int64),
-            'matrix_shape': np.array(matrix_shape, dtype=np.int64)
+            'matrix_shape': np.array(matrix_shape, dtype=np.int64),
+            # Coordinate metadata for validation
+            'coord_lon': ro_lon.astype(np.float64),
+            'coord_lat': ro_lat.astype(np.float64),
         }
 
         output_path = Path(out_dir) / npz_file
@@ -769,6 +799,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         print(f"Mapping contains {matrix_shape[0]} catchments "
             f"and {len(sparse_matrix.data)} non-zero runoff grid mappings")
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
+        print(f"Coordinate metadata: lon[{len(ro_lon)}] x lat[{len(ro_lat)}]")
 
     @abstractmethod
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
@@ -961,6 +992,16 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         lon, lat = self.get_coordinates()
         return (len(lat), len(lon))
 
+    def _combine(self, other, operation, reverse=False):
+        is_dataset = isinstance(other, AbstractDataset)
+        is_scalar = isinstance(other, (int, float, np.number))
+        
+        if not (is_dataset or is_scalar):
+            return NotImplemented
+
+        operands = [self, other] if not reverse else [other, self]
+        return MixedDataset(operands, operation=operation)
+
     def __getitem__(self, idx: int) -> np.ndarray:
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
@@ -1011,21 +1052,15 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 pad = np.zeros((self.chunk_len - T, ny, nx), dtype=self.out_dtype)
                 data = np.vstack([data, pad]) if data.size else pad
         
+        # Clip negative values to zero if enabled
+        if self.clip_negative:
+            np.maximum(data, 0, out=data)
+        
         return data
 
     def __len__(self) -> int:
         real_len = self._real_len()
         return real_len + self.num_spin_up_chunks
-
-    def _combine(self, other, operation, reverse=False):
-        is_dataset = isinstance(other, AbstractDataset)
-        is_scalar = isinstance(other, (int, float, np.number))
-        
-        if not (is_dataset or is_scalar):
-            return NotImplemented
-
-        operands = [self, other] if not reverse else [other, self]
-        return MixedDataset(operands, operation=operation)
 
     def __add__(self, other):
         return self._combine(other, "add")
@@ -1094,7 +1129,6 @@ class MixedDataset(AbstractDataset):
                     raise ValueError(f"Operand {i} has different data_size")
 
         # Initialize AbstractDataset using the base dataset's attributes
-        # Inherit runoff_mapping_file from base dataset
         super().__init__(
             start_date=base.start_date,
             end_date=base.end_date,
@@ -1105,7 +1139,7 @@ class MixedDataset(AbstractDataset):
             spin_up_start_date=base.spin_up_start_date,
             spin_up_end_date=base.spin_up_end_date,
             calendar=base.calendar,
-            runoff_mapping_file=base._runoff_mapping_file,
+            clip_negative=base.clip_negative,
         )
         self.operation = operation
 
@@ -1198,9 +1232,6 @@ class StaticParameterDataset:
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.lon, self.lat
-
-    def __len__(self) -> int:
-        return self._len
 
     def read_chunk(self, idx: int) -> np.ndarray:
         """
@@ -1501,3 +1532,6 @@ class StaticParameterDataset:
                     out_var[:] = agg_block_np[0, :]
 
         return nc_path
+
+    def __len__(self) -> int:
+        return self._len

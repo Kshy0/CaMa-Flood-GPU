@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import os
@@ -22,7 +23,6 @@ import cftime
 import netCDF4 as nc
 import numpy as np
 import torch
-import ast
 from pydantic.fields import FieldInfo
 
 from cmfgpu.models.utils import torch_to_numpy_dtype
@@ -62,42 +62,55 @@ def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
     (mean_var_name, time_step_data, output_path, time_datetime) = args
     
     with nc.Dataset(output_path, 'a') as ncfile:
-        # Robustly locate the target variable even if name was sanitized
-        target_var = None
-        if mean_var_name in ncfile.variables:
-            target_var = mean_var_name
-        else:
-            safe = sanitize_symbol(mean_var_name)
-            if safe in ncfile.variables:
-                target_var = safe
-            else:
-                 # Last resort: find first variable that is not dimension/coord related
-                 for v in ncfile.variables:
-                     if v not in ('time', 'trial', 'saved_points', 'levels', 'rank', 'catchment_id'):
-                         target_var = v
-                         break
-        
-        if target_var is None:
-             # Should not happen if file created correctly
-             raise KeyError(f"Could not find variable for '{mean_var_name}' (safe: '{sanitize_symbol(mean_var_name)}') in {output_path}")
-
-        nc_var = ncfile.variables[target_var]
+        safe = sanitize_symbol(mean_var_name)
         time_var = ncfile.variables['time']
         
-        current_len = len(nc_var)
+        # Check if this is a multi-rank variable (k > 1)
+        # by looking for variables named safe_0, safe_1, etc.
+        if f"{safe}_0" in ncfile.variables:
+            # Multi-rank case: write to separate variables
+            k_val = time_step_data.shape[-1]  # Last dimension is k
+            current_len = len(ncfile.variables[f"{safe}_0"])
+            
+            for k_idx in range(k_val):
+                var_name_k = f"{safe}_{k_idx}"
+                nc_var = ncfile.variables[var_name_k]
+                # Extract the k-th slice (remove last dimension)
+                if time_step_data.ndim == 2:
+                    # (saved_points, k) -> (saved_points,)
+                    nc_var[current_len, :] = time_step_data[:, k_idx]
+                elif time_step_data.ndim == 3:
+                    # (saved_points, levels, k) -> (saved_points, levels)
+                    nc_var[current_len, :, :] = time_step_data[:, :, k_idx]
+        else:
+            # Single variable case
+            target_var = None
+            if mean_var_name in ncfile.variables:
+                target_var = mean_var_name
+            elif safe in ncfile.variables:
+                target_var = safe
+            else:
+                # Last resort: find first variable that is not dimension/coord related
+                for v in ncfile.variables:
+                    if v not in ('time', 'trial', 'saved_points', 'levels', 'catchment_id'):
+                        target_var = v
+                        break
+            
+            if target_var is None:
+                raise KeyError(f"Could not find variable for '{mean_var_name}' (safe: '{safe}') in {output_path}")
+
+            nc_var = ncfile.variables[target_var]
+            current_len = len(nc_var)
+            
+            # Append data
+            if time_step_data.ndim == 1:
+                nc_var[current_len, :] = time_step_data
+            elif time_step_data.ndim == 2:
+                nc_var[current_len, :, :] = time_step_data
+            elif time_step_data.ndim == 3:
+                nc_var[current_len, :, :, :] = time_step_data
         
-        # Append data
-        if time_step_data.ndim == 1:
-            nc_var[current_len, :] = time_step_data
-        elif time_step_data.ndim == 2:
-            nc_var[current_len, :, :] = time_step_data
-        elif time_step_data.ndim == 3:
-            # e.g. (saved_points, levels, k) or (saved_points, k) ??
-            # time_step_data is (saved_points, k) or (saved_points, levels)
-            # If K is present, shape is (saved_points, k) -> 1D var with K
-            nc_var[current_len, :, :, :] = time_step_data
-        
-        # Append datetime
+        # Append datetime (only once, same for all k)
         time_unit = time_var.getncattr("units")
         calendar = time_var.getncattr("calendar")
         time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
@@ -175,16 +188,8 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
                 ncfile.createDimension('saved_points', actual_shape[0])
                 ncfile.createDimension('levels', actual_shape[1])
         
-        # Add Rank/K dimension if needed
+        # Handle K dimension by creating multiple variables instead of a rank dimension
         k_val = metadata.get('k', 1)
-        if k_val > 1:
-            dim_names.append('rank')
-            if 'rank' not in ncfile.dimensions:
-                ncfile.createDimension('rank', k_val) 
-            elif len(ncfile.dimensions['rank']) != k_val:
-                # Fallback if different K used in same file (unlikely for now)
-                # But to be safe, maybe use rank_{k}
-                pass 
                 
         if coord_name and coord_values is not None:
             coord_var = ncfile.createVariable(
@@ -197,17 +202,34 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
         time_var = ncfile.createVariable('time', 'f8', ('time',))
         time_var.setncattr('units', time_unit)
         time_var.setncattr('calendar', calendar)
-        # Create main data variable (empty, will be filled during streaming)
-        nc_var = ncfile.createVariable(
-            safe_name,
-            dtype,
-            dim_names,
-            zlib=True,
-            complevel=complevel)
-        nc_var.setncattr('description', metadata.get("description", ""))
-        nc_var.setncattr('actual_shape', str(actual_shape))
-        nc_var.setncattr('tensor_shape', str(tensor_shape))
-        nc_var.setncattr('long_name', mean_var_name)
+        
+        # Create data variables - if k > 1, create k separate variables
+        if k_val > 1:
+            for k_idx in range(k_val):
+                var_name_k = f"{safe_name}_{k_idx}"
+                nc_var = ncfile.createVariable(
+                    var_name_k,
+                    dtype,
+                    dim_names,
+                    zlib=True,
+                    complevel=complevel)
+                nc_var.setncattr('description', f"{metadata.get('description', '')} [rank {k_idx}]")
+                nc_var.setncattr('actual_shape', str(actual_shape))
+                nc_var.setncattr('tensor_shape', str(tensor_shape))
+                nc_var.setncattr('long_name', f"{mean_var_name}_{k_idx}")
+                nc_var.setncattr('rank_index', k_idx)
+        else:
+            # Single variable (k=1)
+            nc_var = ncfile.createVariable(
+                safe_name,
+                dtype,
+                dim_names,
+                zlib=True,
+                complevel=complevel)
+            nc_var.setncattr('description', metadata.get("description", ""))
+            nc_var.setncattr('actual_shape', str(actual_shape))
+            nc_var.setncattr('tensor_shape', str(tensor_shape))
+            nc_var.setncattr('long_name', mean_var_name)
     
     return output_path
 
@@ -220,7 +242,8 @@ class StatisticsAggregator:
     def __init__(self, device: torch.device, output_dir: Path, rank: int, 
                  num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
                  output_split_by_year: bool = False, num_trials: int = 1,
-                 max_pending_steps: int = 10):
+                 max_pending_steps: int = 10, calendar: str = "standard",
+                 time_unit: str = "days since 1900-01-01 00:00:00"):
         """
         Initialize the statistics aggregator.
         
@@ -235,6 +258,8 @@ class StatisticsAggregator:
             num_trials: Number of parallel simulations
             max_pending_steps: Maximum number of time steps to buffer in memory before blocking.
                                Increase this to allow GPU to run ahead of disk I/O.
+            calendar: CF calendar type (e.g., 'standard', 'noleap', '360_day')
+            time_unit: CF time unit string (e.g., 'days since 1900-01-01 00:00:00')
         """
         self.device = device
         self.output_dir = output_dir
@@ -245,11 +270,16 @@ class StatisticsAggregator:
         self.output_split_by_year = output_split_by_year
         self.num_trials = num_trials
         self.max_pending_steps = max(1, max_pending_steps)
-        self.calendar = None
-        self.time_unit = None
+        self.calendar = calendar
+        self.time_unit = time_unit
         self._current_year = None
         
         self._step_count = 0
+        self._macro_step_index = 0  # Current macro step index (outer loop counter)
+        
+        # Time index tracking for argmax/argmin conversion
+        # Maps macro step index -> datetime, populated during finalize_time_step
+        self._macro_step_times: List[Union[datetime, cftime.datetime]] = []
 
         # Create kernels directory if saving is enabled
         if self.save_kernels:
@@ -295,12 +325,6 @@ class StatisticsAggregator:
         print(f"Initialized StreamingStatisticsAggregator for rank {self.rank} with {self.num_workers} workers")
         if self.save_kernels:
             print(f"Generated kernels will be saved to: {self.kernels_dir}")
-    
-    def _get_safe_name(self, name: str) -> str:
-        """Get or create a sanitized name for a variable/expression."""
-        if name not in self._safe_name_cache:
-            self._safe_name_cache[name] = sanitize_symbol(name)
-        return self._safe_name_cache[name]
 
     def _cleanup_temp_files(self):
         """Remove temporary kernel files."""
@@ -348,6 +372,12 @@ class StatisticsAggregator:
         self._cleanup_temp_files()
         self._cleanup_executor()
         self._cleanup_lock_files()
+    
+    def _get_safe_name(self, name: str) -> str:
+        """Get or create a sanitized name for a variable/expression."""
+        if name not in self._safe_name_cache:
+            self._safe_name_cache[name] = sanitize_symbol(name)
+        return self._safe_name_cache[name]
     
     def _generate_unique_name(self) -> str:
         """Generate a unique name for kernel files using timestamp + rank + hash."""
@@ -507,6 +537,24 @@ class StatisticsAggregator:
                 out_name = f"{var_name}_{op}"
                 required_tensors[out_name] = self._storage[out_name]
                 
+                # For max/min operations, also add their argmax/argmin storage
+                op_parts = op.split('_')
+                outer_op = op_parts[0]
+                match_k = re.match(r'(max|min)(\d+)$', outer_op)
+                if match_k:
+                    base_op = match_k.group(1)
+                    arg_name = f"{var_name}_arg{op}"
+                    if arg_name in self._storage:
+                        required_tensors[arg_name] = self._storage[arg_name]
+                elif outer_op == 'max':
+                    arg_name = f"{var_name}_arg{op}"
+                    if arg_name in self._storage:
+                        required_tensors[arg_name] = self._storage[arg_name]
+                elif outer_op == 'min':
+                    arg_name = f"{var_name}_arg{op}"
+                    if arg_name in self._storage:
+                        required_tensors[arg_name] = self._storage[arg_name]
+                
                 if op.startswith('median') or (op.startswith('q') and op[1:].isdigit()):
                     q_name = f"{var_name}_median_q_state"
                     n_name = f"{var_name}_median_n_state"
@@ -583,8 +631,8 @@ class StatisticsAggregator:
             '- Load save_idx values to get original grid indices',
             '- Use idx to access original data: data[idx]',
             '- Store outputs using sequential indexing: out[offs]',
-            '- For argmax: stores current_step when a new max is found',
-            '- For argmin: stores current_step when a new min is found',
+            '- max/min ops automatically update corresponding argmax/argmin (step index)',
+            '- argmax/argmin indices are converted to datetime on NC file write',
             '- For mid: stores val when is_middle is True',
             '"""',
             "",
@@ -720,6 +768,605 @@ class StatisticsAggregator:
         
         emitted.add(var_name)
     
+    def _generate_psquare_code(self, lines: List[str], var: str, q_ptr: str, n_ptr: str,
+                               val_var: str, step_var: str, out_ptr: str, stride_expr: str,
+                               offset_expr: str, indent: str, indent2: str, indent3: str) -> None:
+        """
+        Generate P-Square algorithm code for median/quantile computation.
+        This is a reusable helper for both outer and inner median operations.
+        
+        Args:
+            lines: List to append code lines to
+            var: Variable name (safe)
+            q_ptr: Base pointer for q state
+            n_ptr: Base pointer for n state
+            val_var: Variable containing the value to insert
+            step_var: Variable containing the step index
+            out_ptr: Output pointer for result (if None, only state update)
+            stride_expr: Expression for stride between q/n values
+            offset_expr: Expression for base offset
+            indent, indent2, indent3: Indentation strings
+        """
+        lines.extend([
+            f"{indent}# P-Square Median Update",
+            f"{indent}if {step_var} < 5:",
+            f"{indent2}q_ptr_k = {q_ptr} + {step_var} * {stride_expr} + {offset_expr}",
+            f"{indent2}tl.store(q_ptr_k, {val_var}, mask=mask)",
+            f"{indent2}if {step_var} == 4:",
+            # Load 5 values
+            f"{indent3}q0 = tl.load({q_ptr} + 0 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent3}q1 = tl.load({q_ptr} + 1 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent3}q2 = tl.load({q_ptr} + 2 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent3}q3 = tl.load({q_ptr} + 3 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent3}q4 = tl.load({q_ptr} + 4 * {stride_expr} + {offset_expr}, mask=mask)",
+            # Bubble sort (10 comparisons for 5 elements)
+            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+            f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+            f"{indent3}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
+            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+            f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
+            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
+            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
+            # Store sorted values
+            f"{indent3}tl.store({q_ptr} + 0 * {stride_expr} + {offset_expr}, q0, mask=mask)",
+            f"{indent3}tl.store({q_ptr} + 1 * {stride_expr} + {offset_expr}, q1, mask=mask)",
+            f"{indent3}tl.store({q_ptr} + 2 * {stride_expr} + {offset_expr}, q2, mask=mask)",
+            f"{indent3}tl.store({q_ptr} + 3 * {stride_expr} + {offset_expr}, q3, mask=mask)",
+            f"{indent3}tl.store({q_ptr} + 4 * {stride_expr} + {offset_expr}, q4, mask=mask)",
+            # Initialize n positions
+            f"{indent3}tl.store({n_ptr} + 0 * {stride_expr} + {offset_expr}, 0, mask=mask)",
+            f"{indent3}tl.store({n_ptr} + 1 * {stride_expr} + {offset_expr}, 1, mask=mask)",
+            f"{indent3}tl.store({n_ptr} + 2 * {stride_expr} + {offset_expr}, 2, mask=mask)",
+            f"{indent3}tl.store({n_ptr} + 3 * {stride_expr} + {offset_expr}, 3, mask=mask)",
+            f"{indent3}tl.store({n_ptr} + 4 * {stride_expr} + {offset_expr}, 4, mask=mask)",
+        ])
+        if out_ptr:
+            lines.append(f"{indent3}tl.store({out_ptr}, q2, mask=mask)")
+        
+        lines.extend([
+            f"{indent}elif {step_var} >= 5:",
+            # Load state
+            f"{indent2}q0 = tl.load({q_ptr} + 0 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent2}q1 = tl.load({q_ptr} + 1 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent2}q2 = tl.load({q_ptr} + 2 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent2}q3 = tl.load({q_ptr} + 3 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent2}q4 = tl.load({q_ptr} + 4 * {stride_expr} + {offset_expr}, mask=mask)",
+            f"{indent2}n0 = tl.load({n_ptr} + 0 * {stride_expr} + {offset_expr}, mask=mask).to(tl.float32)",
+            f"{indent2}n1 = tl.load({n_ptr} + 1 * {stride_expr} + {offset_expr}, mask=mask).to(tl.float32)",
+            f"{indent2}n2 = tl.load({n_ptr} + 2 * {stride_expr} + {offset_expr}, mask=mask).to(tl.float32)",
+            f"{indent2}n3 = tl.load({n_ptr} + 3 * {stride_expr} + {offset_expr}, mask=mask).to(tl.float32)",
+            f"{indent2}n4 = tl.load({n_ptr} + 4 * {stride_expr} + {offset_expr}, mask=mask).to(tl.float32)",
+            # Update bounds and counts
+            f"{indent2}q0 = tl.minimum(q0, {val_var})",
+            f"{indent2}q4 = tl.maximum(q4, {val_var})",
+            f"{indent2}n4 = n4 + 1.0",
+            f"{indent2}n1 = n1 + tl.where({val_var} < q1, 1.0, 0.0)",
+            f"{indent2}n2 = n2 + tl.where({val_var} < q2, 1.0, 0.0)",
+            f"{indent2}n3 = n3 + tl.where({val_var} < q3, 1.0, 0.0)",
+            # Desired positions
+            f"{indent2}N_total = {step_var} + 1.0",
+            f"{indent2}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
+            # Adjust marker 1
+            f"{indent2}d = d1 - n1",
+            f"{indent2}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
+            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+            f"{indent2}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
+            f"{indent2}q_linear = q1 + dsign * tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0))",
+            f"{indent2}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
+            f"{indent2}q1 = tl.where(cond, q_cand, q1); n1 = tl.where(cond, n1 + dsign, n1)",
+            # Adjust marker 2
+            f"{indent2}d = d2 - n2",
+            f"{indent2}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
+            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+            f"{indent2}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
+            f"{indent2}q_linear = q2 + dsign * tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1))",
+            f"{indent2}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
+            f"{indent2}q2 = tl.where(cond, q_cand, q2); n2 = tl.where(cond, n2 + dsign, n2)",
+            # Adjust marker 3
+            f"{indent2}d = d3 - n3",
+            f"{indent2}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
+            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
+            f"{indent2}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
+            f"{indent2}q_linear = q3 + dsign * tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2))",
+            f"{indent2}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
+            f"{indent2}q3 = tl.where(cond, q_cand, q3); n3 = tl.where(cond, n3 + dsign, n3)",
+            # Store state
+            f"{indent2}tl.store({q_ptr} + 0 * {stride_expr} + {offset_expr}, q0, mask=mask)",
+            f"{indent2}tl.store({q_ptr} + 1 * {stride_expr} + {offset_expr}, q1, mask=mask)",
+            f"{indent2}tl.store({q_ptr} + 2 * {stride_expr} + {offset_expr}, q2, mask=mask)",
+            f"{indent2}tl.store({q_ptr} + 3 * {stride_expr} + {offset_expr}, q3, mask=mask)",
+            f"{indent2}tl.store({q_ptr} + 4 * {stride_expr} + {offset_expr}, q4, mask=mask)",
+            f"{indent2}tl.store({n_ptr} + 0 * {stride_expr} + {offset_expr}, n0.to(tl.int32), mask=mask)",
+            f"{indent2}tl.store({n_ptr} + 1 * {stride_expr} + {offset_expr}, n1.to(tl.int32), mask=mask)",
+            f"{indent2}tl.store({n_ptr} + 2 * {stride_expr} + {offset_expr}, n2.to(tl.int32), mask=mask)",
+            f"{indent2}tl.store({n_ptr} + 3 * {stride_expr} + {offset_expr}, n3.to(tl.int32), mask=mask)",
+            f"{indent2}tl.store({n_ptr} + 4 * {stride_expr} + {offset_expr}, n4.to(tl.int32), mask=mask)",
+        ])
+        if out_ptr:
+            lines.append(f"{indent2}tl.store({out_ptr}, q2, mask=mask)")
+
+    def _generate_1d_vars_grouped(self, kernel_code_lines: List[str], dims_1d: List[str],
+                                    indent: str, indent2: str, indent3: str, indent4: str, indent5: str) -> None:
+        """
+        Generate 1D variable processing code with conditions grouped for efficiency.
+        All operations under the same condition are emitted in a single if block.
+        Supports all ops including maxK/minK bubble insert and median P-Square.
+        """
+        from collections import defaultdict
+        
+        if not dims_1d:
+            return
+            
+        kernel_code_lines.append(f"{indent}# 1D variables")
+        
+        # Phase 1: Emit variable loads (always needed vars)
+        # Collect which vars need unconditional load vs conditional load
+        vars_need_val = set()  # vars that need val loaded unconditionally
+        vars_conditional_only = set()  # vars only used in first/last/mid
+        
+        for var in dims_1d:
+            ops = self._variable_ops[var]
+            conditional_only_ops = {'first', 'last', 'mid'}
+            if all(op in conditional_only_ops for op in ops):
+                vars_conditional_only.add(var)
+            else:
+                vars_need_val.add(var)
+        
+        # Helper to emit variable value load
+        emitted_vars = set()
+        def emit_val(v_name, to_lines):
+            safe_v_name = self._get_safe_name(v_name)
+            if safe_v_name in emitted_vars:
+                return f"{safe_v_name}_val"
+            
+            info = self._field_registry.get(v_name)
+            cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
+            
+            if cat == 'virtual':
+                expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                safe_expr = expr
+                toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                for t in toks:
+                    if t in self._field_registry or t in self._tensor_registry:
+                        emit_val(t, to_lines)
+                        safe_t = self._get_safe_name(t)
+                        safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
+                safe_expr = self._transform_pow_expr(safe_expr)
+                to_lines.append(f"{indent}{safe_v_name}_val = {safe_expr}")
+            else:
+                in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
+                to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+            
+            emitted_vars.add(safe_v_name)
+            return f"{safe_v_name}_val"
+        
+        # Phase 2: Collect all operations grouped by condition
+        # Condition groups with order preserved:
+        # - 'unconditional': always executed (state updates, accumulations)
+        # - 'is_inner_first': init operations
+        # - 'not_is_inner_first': comparison operations  
+        # - 'is_inner_last': finalization and output
+        # - 'is_inner_last.is_outer_first': compound init
+        # - 'is_inner_last.not_is_outer_first': compound compare
+        # - 'is_inner_last.is_outer_last': final mean division
+        # - 'is_inner_last.not_is_outer_last': store accumulation
+        # - 'is_middle': mid operations
+        
+        ops_unconditional = []
+        ops_is_inner_first = []
+        ops_not_is_inner_first = []
+        ops_is_inner_last = []
+        ops_is_inner_last_is_outer_first = []
+        
+        # Special storage for maxK/minK operations (need for loop)
+        self._maxk_ops = []
+        ops_is_inner_last_not_is_outer_first = []
+        ops_is_inner_last_is_outer_last = []
+        ops_is_inner_last_not_is_outer_last = []
+        ops_is_middle = []
+        
+        # Track which inner aggregations are needed
+        inner_aggregations_needed = defaultdict(set)  # inner_type -> set of vars
+        
+        for var in dims_1d:
+            safe_var = self._get_safe_name(var)
+            ops = self._variable_ops[var]
+            out_offset = "t * n_saved_points + offs"
+            
+            # Check for compound ops that need inner aggregation
+            for op in ops:
+                if '_' in op:
+                    inner = op.split('_')[1]
+                    inner_aggregations_needed[inner].add(var)
+                
+            # Process each operation
+            for op in ops:
+                out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
+                op_parts = op.split('_')
+                
+                # ===== Compound operations (e.g., max_mean, min_mean) =====
+                if len(op_parts) > 1:
+                    outer = op_parts[0]
+                    inner = op_parts[1]
+                    
+                    # Parse maxK/minK pattern
+                    k_val = 1
+                    match_k = re.match(r'(max|min)(\d+)$', outer)
+                    if match_k:
+                        outer = match_k.group(1)
+                        k_val = int(match_k.group(2))
+                    
+                    val_var = f"val_for_{inner}"
+                    
+                    if outer == 'max':
+                        arg_op = f"arg{op}"
+                        if k_val == 1:
+                            arg_ptr = f"{safe_var}_{arg_op}_ptr + {out_offset}"
+                            ops_is_inner_last_is_outer_first.append(
+                                f"tl.store({out_ptr}, {val_var}, mask=mask)")
+                            ops_is_inner_last_is_outer_first.append(
+                                f"tl.store({arg_ptr}, macro_step_index, mask=mask)")
+                            ops_is_inner_last_not_is_outer_first.extend([
+                                f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                f"{safe_var}_{op}_cond = {val_var} > {safe_var}_{op}_old",
+                                f"tl.store({out_ptr}, tl.maximum({safe_var}_{op}_old, {val_var}), mask=mask)",
+                                f"tl.store({arg_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
+                            ])
+                        else:
+                            # maxK bubble insert - store as special op with metadata
+                            # Will be emitted as a for loop in the is_inner_last block
+                            if not hasattr(self, '_maxk_ops'):
+                                self._maxk_ops = []
+                            self._maxk_ops.append({
+                                'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
+                                'out_offset': out_offset, 'arg_op': arg_op, 'type': 'max'
+                            })
+                            
+                    elif outer == 'min':
+                        arg_op = f"arg{op}"
+                        if k_val == 1:
+                            arg_ptr = f"{safe_var}_{arg_op}_ptr + {out_offset}"
+                            ops_is_inner_last_is_outer_first.append(
+                                f"tl.store({out_ptr}, {val_var}, mask=mask)")
+                            ops_is_inner_last_is_outer_first.append(
+                                f"tl.store({arg_ptr}, macro_step_index, mask=mask)")
+                            ops_is_inner_last_not_is_outer_first.extend([
+                                f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                f"{safe_var}_{op}_cond = {val_var} < {safe_var}_{op}_old",
+                                f"tl.store({out_ptr}, tl.minimum({safe_var}_{op}_old, {val_var}), mask=mask)",
+                                f"tl.store({arg_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
+                            ])
+                        else:
+                            # minK bubble insert
+                            if not hasattr(self, '_maxk_ops'):
+                                self._maxk_ops = []
+                            self._maxk_ops.append({
+                                'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
+                                'out_offset': out_offset, 'arg_op': arg_op, 'type': 'min'
+                            })
+                            
+                    elif outer == 'mean':
+                        ops_is_inner_last_is_outer_first.append(
+                            f"{safe_var}_{op}_accum = {val_var}")
+                        ops_is_inner_last_not_is_outer_first.append(
+                            f"{safe_var}_{op}_accum = tl.load({out_ptr}, mask=mask, other=0.0) + {val_var}")
+                        ops_is_inner_last_is_outer_last.append(
+                            f"tl.store({out_ptr}, {safe_var}_{op}_accum / num_macro_steps, mask=mask)")
+                        ops_is_inner_last_not_is_outer_last.append(
+                            f"tl.store({out_ptr}, {safe_var}_{op}_accum, mask=mask)")
+                            
+                    elif outer == 'sum':
+                        ops_is_inner_last_is_outer_first.append(
+                            f"tl.store({out_ptr}, {val_var}, mask=mask)")
+                        ops_is_inner_last_not_is_outer_first.extend([
+                            f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                            f"tl.store({out_ptr}, {safe_var}_{op}_old + {val_var}, mask=mask)",
+                        ])
+                    continue
+                
+                # ===== Simple operations =====
+                if op == 'mean':
+                    inner_ops = set(o.split('_')[1] for o in ops if '_' in o)
+                    if 'mean' in inner_ops:
+                        # Reuse val_for_mean from inner aggregation
+                        ops_is_inner_last.append(f"tl.store({out_ptr}, val_for_mean, mask=mask)")
+                    else:
+                        # Standalone mean - needs state
+                        ops_unconditional.extend([
+                            f"# Standalone mean for {safe_var}",
+                            f"{safe_var}_mean_old = tl.where(is_inner_first, tl.zeros_like(val), tl.load({out_ptr}, mask=mask, other=0.0))",
+                            f"{safe_var}_mean_new = {safe_var}_mean_old + val * weight",
+                            f"{safe_var}_mean_out = tl.where(is_inner_last, {safe_var}_mean_new / total_weight, {safe_var}_mean_new)",
+                        ])
+                        ops_unconditional.append(f"tl.store({out_ptr}, {safe_var}_mean_out, mask=mask)")
+                        
+                elif op == 'sum':
+                    ops_unconditional.extend([
+                        f"{safe_var}_sum_old = tl.where(is_inner_first, tl.zeros_like(val), tl.load({out_ptr}, mask=mask, other=0.0))",
+                        f"tl.store({out_ptr}, {safe_var}_sum_old + val * weight, mask=mask)",
+                    ])
+                    
+                elif op == 'max':
+                    argmax_ptr = f"{safe_var}_argmax_ptr + {out_offset}"
+                    ops_is_inner_first.extend([
+                        f"tl.store({out_ptr}, val, mask=mask)",
+                        f"tl.store({argmax_ptr}, macro_step_index, mask=mask)",
+                    ])
+                    ops_not_is_inner_first.extend([
+                        f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other=val)",
+                        f"{safe_var}_max_cond = val > {safe_var}_max_old",
+                        f"tl.store({out_ptr}, tl.where({safe_var}_max_cond, val, {safe_var}_max_old), mask=mask)",
+                        f"tl.store({argmax_ptr}, macro_step_index, mask=mask & {safe_var}_max_cond)",
+                    ])
+                    
+                elif op == 'min':
+                    argmin_ptr = f"{safe_var}_argmin_ptr + {out_offset}"
+                    ops_is_inner_first.extend([
+                        f"tl.store({out_ptr}, val, mask=mask)",
+                        f"tl.store({argmin_ptr}, macro_step_index, mask=mask)",
+                    ])
+                    ops_not_is_inner_first.extend([
+                        f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other=val)",
+                        f"{safe_var}_min_cond = val < {safe_var}_min_old",
+                        f"tl.store({out_ptr}, tl.where({safe_var}_min_cond, val, {safe_var}_min_old), mask=mask)",
+                        f"tl.store({argmin_ptr}, macro_step_index, mask=mask & {safe_var}_min_cond)",
+                    ])
+                    
+                elif op == 'last':
+                    if var in vars_conditional_only:
+                        # Load inline
+                        in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
+                        ops_is_inner_last.extend([
+                            f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
+                        ])
+                    else:
+                        ops_is_inner_last.append(f"tl.store({out_ptr}, val, mask=mask)")
+                        
+                elif op == 'first':
+                    if var in vars_conditional_only:
+                        in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
+                        ops_is_inner_first.extend([
+                            f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
+                        ])
+                    else:
+                        ops_is_inner_first.append(f"tl.store({out_ptr}, val, mask=mask)")
+                        
+                elif op == 'mid':
+                    if var in vars_conditional_only:
+                        in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
+                        ops_is_middle.extend([
+                            f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
+                        ])
+                    else:
+                        ops_is_middle.append(f"tl.store({out_ptr}, val, mask=mask)")
+                
+                # ===== Median/Quantile operations =====
+                elif op.startswith('median') or (op.startswith('q') and len(op) > 1 and op[1:].isdigit()):
+                    # Outer median/quantile - P-Square algorithm applied to macro_step_index
+                    # Track for deferred generation (all median ops for a var share state)
+                    if not hasattr(self, '_median_outer_ops'):
+                        self._median_outer_ops = {}
+                    if safe_var not in self._median_outer_ops:
+                        self._median_outer_ops[safe_var] = []
+                    self._median_outer_ops[safe_var].append((op, out_ptr))
+        
+        # Phase 3: Emit loads for vars that need unconditional val
+        for var in vars_need_val:
+            emit_val(var, kernel_code_lines)
+        
+        # Assign val for the first var that needs it (for shared ops)
+        if vars_need_val:
+            first_var = next(iter(vars_need_val))
+            safe_first = self._get_safe_name(first_var)
+            kernel_code_lines.append(f"{indent}val = {safe_first}_val")
+        
+        # Phase 4: Emit inner aggregation state updates
+        for inner_type, inner_vars in inner_aggregations_needed.items():
+            # Get representative var for state pointers
+            for var in inner_vars:
+                safe_var = self._get_safe_name(var)
+                out_offset = "t * n_saved_points + offs"
+                inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                
+                kernel_code_lines.append(f"{indent}val_for_{inner_type} = tl.zeros_like(val)")
+                
+                if inner_type == 'mean':
+                    weight_ptr = f"{safe_var}_{inner_type}_weight_state_ptr + {out_offset}"
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                        f"{indent}weight_{inner_type}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                        f"{indent}inner_{inner_type}_new = inner_{inner_type}_old + val * weight",
+                        f"{indent}weight_{inner_type}_new = weight_{inner_type}_old + weight",
+                    ])
+                    # Store based on condition - use tl.where for efficiency
+                    kernel_code_lines.extend([
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, inner_{inner_type}_new), mask=mask)",
+                        f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, weight_{inner_type}_new), mask=mask)",
+                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new / weight_{inner_type}_new, val_for_{inner_type})",
+                    ])
+                elif inner_type == 'sum':
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                        f"{indent}inner_{inner_type}_new = inner_{inner_type}_old + val * weight",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, inner_{inner_type}_new), mask=mask)",
+                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new, val_for_{inner_type})",
+                    ])
+                elif inner_type == 'max':
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=val)",
+                        f"{indent}inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), val, tl.maximum(inner_{inner_type}_old, val))",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, -float('inf'), inner_{inner_type}_new), mask=mask)",
+                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new, val_for_{inner_type})",
+                    ])
+                elif inner_type == 'min':
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=val)",
+                        f"{indent}inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), val, tl.minimum(inner_{inner_type}_old, val))",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, float('inf'), inner_{inner_type}_new), mask=mask)",
+                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new, val_for_{inner_type})",
+                    ])
+                elif inner_type == 'mid':
+                    kernel_code_lines.extend([
+                        f"{indent}tl.store({inner_ptr}, val, mask=mask & is_middle)",
+                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), val_for_{inner_type})",
+                    ])
+                elif inner_type == 'last':
+                    kernel_code_lines.append(f"{indent}val_for_{inner_type} = tl.where(is_inner_last, val, val_for_{inner_type})")
+                elif inner_type == 'median':
+                    # Inner P-Square median - use step_count_val as step index
+                    # Track for deferred generation (all inner median ops share state)
+                    if not hasattr(self, '_median_inner_ops'):
+                        self._median_inner_ops = {}
+                    self._median_inner_ops[safe_var] = out_offset
+                break  # Only emit once per inner_type
+        
+        # Phase 5: Emit unconditional ops
+        for line in ops_unconditional:
+            kernel_code_lines.append(f"{indent}{line}")
+        
+        # Phase 6: Emit grouped conditional blocks
+        if ops_is_inner_first:
+            kernel_code_lines.append(f"{indent}if is_inner_first:")
+            for line in ops_is_inner_first:
+                kernel_code_lines.append(f"{indent2}{line}")
+                
+        if ops_not_is_inner_first:
+            if ops_is_inner_first:
+                kernel_code_lines.append(f"{indent}else:")
+            else:
+                kernel_code_lines.append(f"{indent}if not is_inner_first:")
+            for line in ops_not_is_inner_first:
+                kernel_code_lines.append(f"{indent2}{line}")
+        
+        if ops_is_middle:
+            kernel_code_lines.append(f"{indent}if is_middle:")
+            for line in ops_is_middle:
+                kernel_code_lines.append(f"{indent2}{line}")
+        
+        # Nested conditions for is_inner_last with outer conditions
+        has_inner_last_ops = (ops_is_inner_last or ops_is_inner_last_is_outer_first or 
+                             ops_is_inner_last_not_is_outer_first or ops_is_inner_last_is_outer_last or
+                             ops_is_inner_last_not_is_outer_last or self._maxk_ops)
+        
+        if has_inner_last_ops:
+            kernel_code_lines.append(f"{indent}if is_inner_last:")
+            
+            # is_outer_first / not is_outer_first
+            if ops_is_inner_last_is_outer_first or ops_is_inner_last_not_is_outer_first:
+                kernel_code_lines.append(f"{indent2}if is_outer_first:")
+                for line in ops_is_inner_last_is_outer_first:
+                    kernel_code_lines.append(f"{indent3}{line}")
+                if ops_is_inner_last_not_is_outer_first:
+                    kernel_code_lines.append(f"{indent2}else:")
+                    for line in ops_is_inner_last_not_is_outer_first:
+                        kernel_code_lines.append(f"{indent3}{line}")
+            
+            # is_outer_last / not is_outer_last (for mean finalization)
+            if ops_is_inner_last_is_outer_last or ops_is_inner_last_not_is_outer_last:
+                kernel_code_lines.append(f"{indent2}if is_outer_last:")
+                for line in ops_is_inner_last_is_outer_last:
+                    kernel_code_lines.append(f"{indent3}{line}")
+                if ops_is_inner_last_not_is_outer_last:
+                    kernel_code_lines.append(f"{indent2}else:")
+                    for line in ops_is_inner_last_not_is_outer_last:
+                        kernel_code_lines.append(f"{indent3}{line}")
+            
+            # Simple is_inner_last ops
+            for line in ops_is_inner_last:
+                kernel_code_lines.append(f"{indent2}{line}")
+            
+            # MaxK/MinK bubble insert operations
+            for maxk_op in self._maxk_ops:
+                safe_var = maxk_op['var']
+                op = maxk_op['op']
+                k_val = maxk_op['k']
+                val_var = maxk_op['val_var']
+                out_offset = maxk_op['out_offset']
+                arg_op = maxk_op['arg_op']
+                op_type = maxk_op['type']  # 'max' or 'min'
+                
+                inf_val = "-float('inf')" if op_type == 'max' else "float('inf')"
+                cmp_op = '>' if op_type == 'max' else '<'
+                
+                # Wrap out_offset in parentheses for correct multiplication
+                out_offset_k = f"({out_offset}) * {k_val}"
+                
+                kernel_code_lines.extend([
+                    f"{indent2}# Bubble Insert {op_type.upper()} K={k_val} for {safe_var}_{op}",
+                    f"{indent2}new_val_{safe_var} = {val_var}",
+                    f"{indent2}new_idx_{safe_var} = tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)",
+                    f"{indent2}if is_outer_first:",
+                    f"{indent3}tl.store({safe_var}_{op}_ptr + {out_offset_k}, new_val_{safe_var}, mask=mask)",
+                    f"{indent3}tl.store({safe_var}_{arg_op}_ptr + {out_offset_k}, new_idx_{safe_var}, mask=mask)",
+                ])
+                for k in range(1, k_val):
+                    kernel_code_lines.extend([
+                        f"{indent3}tl.store({safe_var}_{op}_ptr + {out_offset_k} + {k}, {inf_val}, mask=mask)",
+                        f"{indent3}tl.store({safe_var}_{arg_op}_ptr + {out_offset_k} + {k}, 0, mask=mask)",
+                    ])
+                kernel_code_lines.extend([
+                    f"{indent2}else:",
+                    f"{indent3}for k in range({k_val}):",
+                    f"{indent4}old_k = tl.load({safe_var}_{op}_ptr + {out_offset_k} + k, mask=mask, other={inf_val})",
+                    f"{indent4}old_idx_k = tl.load({safe_var}_{arg_op}_ptr + {out_offset_k} + k, mask=mask, other=0)",
+                    f"{indent4}swap_mask = new_val_{safe_var} {cmp_op} old_k",
+                    f"{indent4}val_to_store = tl.where(swap_mask, new_val_{safe_var}, old_k)",
+                    f"{indent4}idx_to_store = tl.where(swap_mask, new_idx_{safe_var}, old_idx_k)",
+                    f"{indent4}new_val_{safe_var} = tl.where(swap_mask, old_k, new_val_{safe_var})",
+                    f"{indent4}new_idx_{safe_var} = tl.where(swap_mask, old_idx_k, new_idx_{safe_var})",
+                    f"{indent4}tl.store({safe_var}_{op}_ptr + {out_offset_k} + k, val_to_store, mask=mask)",
+                    f"{indent4}tl.store({safe_var}_{arg_op}_ptr + {out_offset_k} + k, idx_to_store, mask=mask)",
+                ])
+        
+        # Phase 7: Emit inner median P-Square operations
+        if hasattr(self, '_median_inner_ops') and self._median_inner_ops:
+            kernel_code_lines.append(f"{indent}# Inner Median P-Square Algorithm")
+            kernel_code_lines.append(f"{indent}inner_step = step_count_val.to(tl.int32)")
+            for safe_var, out_offset in self._median_inner_ops.items():
+                kernel_code_lines.append(f"{indent}val_for_median = tl.zeros_like(val)")
+                q_ptr = f"{safe_var}_median_inner_q_state_ptr"
+                n_ptr = f"{safe_var}_median_inner_n_state_ptr"
+                stride_k = "n_saved_points"
+                offset_expr = "offs"
+                
+                self._generate_psquare_code(
+                    kernel_code_lines, safe_var, q_ptr, n_ptr,
+                    "val", "inner_step", None, stride_k, offset_expr,
+                    indent, indent2, indent3
+                )
+                # Extract median on is_inner_last
+                kernel_code_lines.extend([
+                    f"{indent}if is_inner_last:",
+                    f"{indent2}val_for_median = tl.load({q_ptr} + 2 * {stride_k} + {offset_expr}, mask=mask, other=0.0)",
+                ])
+            self._median_inner_ops = {}  # Reset
+        
+        # Phase 8: Emit outer median P-Square operations
+        if hasattr(self, '_median_outer_ops') and self._median_outer_ops:
+            kernel_code_lines.append(f"{indent}# Outer Median P-Square Algorithm")
+            for safe_var, ops_list in self._median_outer_ops.items():
+                q_ptr = f"{safe_var}_median_q_state_ptr"
+                n_ptr = f"{safe_var}_median_n_state_ptr"
+                stride_k = "(num_trials * n_saved_points)"
+                offset_expr = "(t * n_saved_points + offs)"
+                
+                # Generate P-Square with first output pointer
+                out_ptr = ops_list[0][1] if ops_list else None
+                self._generate_psquare_code(
+                    kernel_code_lines, safe_var, q_ptr, n_ptr,
+                    "val", "macro_step_index", out_ptr, stride_k, offset_expr,
+                    indent, indent2, indent3
+                )
+            self._median_outer_ops = {}  # Reset
+        
+        kernel_code_lines.append("")
+
     def _generate_kernel_for_group(self, kernel_code_lines: List[str], kernel_name: str,
                                    save_idx: str, var_list: List[str],
                                    tensor_info: Dict[str, Dict[str, Any]]) -> None:
@@ -773,9 +1420,33 @@ class StatisticsAggregator:
             safe_var = self._get_safe_name(var)
             # Track which extra state pointers have been added to avoid duplicates
             added_median_state = False
+            added_arg_ops = set()  # Track argmax/argmin ops already added
             
             for op in self._variable_ops[var]:
                 kernel_code_lines.append(f"    {safe_var}_{op}_ptr,")
+                
+                # For max/min operations, also add corresponding argmax/argmin pointer
+                op_parts = op.split('_')
+                outer_op = op_parts[0]
+                # Check for maxK/minK pattern
+                match_k = re.match(r'(max|min)(\d+)$', outer_op)
+                if match_k:
+                    base_op = match_k.group(1)
+                    arg_op_name = f"arg{op}"
+                    if arg_op_name not in added_arg_ops:
+                        kernel_code_lines.append(f"    {safe_var}_{arg_op_name}_ptr,")
+                        added_arg_ops.add(arg_op_name)
+                elif outer_op == 'max':
+                    arg_op_name = f"arg{op}"
+                    if arg_op_name not in added_arg_ops:
+                        kernel_code_lines.append(f"    {safe_var}_{arg_op_name}_ptr,")
+                        added_arg_ops.add(arg_op_name)
+                elif outer_op == 'min':
+                    arg_op_name = f"arg{op}"
+                    if arg_op_name not in added_arg_ops:
+                        kernel_code_lines.append(f"    {safe_var}_{arg_op_name}_ptr,")
+                        added_arg_ops.add(arg_op_name)
+                        
                 if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
                      kernel_code_lines.append(f"    {safe_var}_median_q_state_ptr,")
                      kernel_code_lines.append(f"    {safe_var}_median_n_state_ptr,")
@@ -804,7 +1475,7 @@ class StatisticsAggregator:
             "    is_middle,",
             "    is_outer_first,",
             "    is_outer_last,",
-            "    current_step,",
+            "    macro_step_index,",
             "    step_count_val,",
             "    n_saved_points: tl.constexpr,",
         ])
@@ -831,744 +1502,10 @@ class StatisticsAggregator:
         indent4 = indent3 + "    "
         indent5 = indent4 + "    "
 
-        # 1D processing
+        # 1D processing - use grouped generation for all vars (including median)
         if dims_1d:
-            kernel_code_lines.extend([
-                f"{indent}# 1D variables",
-            ])
-            # Helper to emit values
-            emitted_vars = set()
-            def emit_val(v_name):
-                # Using safe names inside kernel
-                safe_v_name = self._get_safe_name(v_name)
-                
-                if safe_v_name in emitted_vars: return f"{safe_v_name}_val"
-                
-                info = self._field_registry.get(v_name)
-                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
-                
-                if cat == 'virtual':
-                     expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                     # Resolve deps
-                     import re
-                     safe_expr = expr
-                     toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                     for t in toks:
-                          if t in self._field_registry or t in self._tensor_registry:
-                               emit_val(t) # Ensure dep is emitted
-                               safe_t = self._get_safe_name(t)
-                               # Replace original dep name with safe_dep_val
-                               safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
-                     
-                     safe_expr = self._transform_pow_expr(safe_expr)
-                     kernel_code_lines.append(f"{indent}{safe_v_name}_val = {safe_expr}")
-                else:
-                     in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
-                     kernel_code_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
-                
-                emitted_vars.add(safe_v_name)
-                return f"{safe_v_name}_val"
-
-            for var in dims_1d:
-                ops = self._variable_ops[var]
-                out_offset = f"t * n_saved_points + offs"
-                
-                safe_var = self._get_safe_name(var)
-
-                # Check for Median Ops (Outer)
-                median_outer_ops = [op for op in ops if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and '_' not in op]
-                
-                if len(ops) == 1 and ops[0] == 'last':
-                    # Optimized last-only path
-                    val_name = emit_val(var)
-                    kernel_code_lines.extend([
-                        f"{indent}if is_inner_last:",
-                        f"{indent2}tl.store({safe_var}_last_ptr + {out_offset}, {val_name}, mask=mask)",
-                    ])
-                else:
-                    val_name = emit_val(var)
-                    kernel_code_lines.append(f"{indent}val = {val_name}")
-
-                    # Pre-calculate Outer P-Square if needed
-                    # If multiple ops request quantiles, we only want to run the algo once per step.
-                    if median_outer_ops:
-                        val_var = "val" # Logic below expects val_var for generic ops, usually defined later but we need it for shared algo
-                        
-                        # Correct offset calculation for P-Square state
-                        # State shape: (5, num_trials, n_saved_points)
-                        # Offset = k * (num_trials * n_saved_points) + t * n_saved_points + offs
-                        stride_k = f"(num_trials * n_saved_points)"
-                        offset_t = f"(t * n_saved_points + offs)"
-
-                        kernel_code_lines.extend([
-                            f"{indent}# P-Square Median Update (Outer - Shared)",
-                            f"{indent}macro_step = current_step",
-                            f"{indent}if macro_step < 5:",
-                            f"{indent2}q_ptr_k = {safe_var}_median_q_state_ptr + macro_step * {stride_k} + {offset_t}",
-                            f"{indent2}tl.store(q_ptr_k, {val_var}, mask=mask)",
-                            f"{indent2}if macro_step == 4:",
-                            # Sort and Initialize
-                            f"{indent3}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent3}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent3}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent3}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent3}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, mask=mask)",
-                            
-                            # Vectorized Bubble Sort
-                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                            f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
-                            f"{indent3}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
-                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                            f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
-                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                            f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                            f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                            
-                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, q0, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, q1, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, q2, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, q3, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, q4, mask=mask)",
-                            
-                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 0 * {stride_k} + {offset_t}, 0, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 1 * {stride_k} + {offset_t}, 1, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 2 * {stride_k} + {offset_t}, 2, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 3 * {stride_k} + {offset_t}, 3, mask=mask)",
-                            f"{indent3}tl.store({safe_var}_median_n_state_ptr + 4 * {stride_k} + {offset_t}, 4, mask=mask)",
-                            
-                            f"{indent}elif macro_step >= 5:",
-                            f"{indent2}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent2}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent2}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent2}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, mask=mask)",
-                            f"{indent2}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, mask=mask)",
-                            
-                            f"{indent2}n0 = tl.load({safe_var}_median_n_state_ptr + 0 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
-                            f"{indent2}n1 = tl.load({safe_var}_median_n_state_ptr + 1 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
-                            f"{indent2}n2 = tl.load({safe_var}_median_n_state_ptr + 2 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
-                            f"{indent2}n3 = tl.load({safe_var}_median_n_state_ptr + 3 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
-                            f"{indent2}n4 = tl.load({safe_var}_median_n_state_ptr + 4 * {stride_k} + {offset_t}, mask=mask).to(tl.float32)",
-                            
-                            f"{indent2}q0 = tl.minimum(q0, {val_var})",
-                            f"{indent2}q4 = tl.maximum(q4, {val_var})",
-                            f"{indent2}n4 = n4 + 1.0",
-                            f"{indent2}n1 = n1 + tl.where({val_var} < q1, 1.0, 0.0)",
-                            f"{indent2}n2 = n2 + tl.where({val_var} < q2, 1.0, 0.0)",
-                            f"{indent2}n3 = n3 + tl.where({val_var} < q3, 1.0, 0.0)",
-                            
-                            f"{indent2}N_total = macro_step + 1.0",
-                            f"{indent2}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
-                            
-                            f"{indent2}d = d1 - n1",
-                            f"{indent2}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
-                            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                            f"{indent2}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
-                            f"{indent2}q_linear = q1 + dsign * (tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0)))",
-                            f"{indent2}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
-                            f"{indent2}q1 = tl.where(cond, q_cand, q1)",
-                            f"{indent2}n1 = tl.where(cond, n1 + dsign, n1)",
-
-                            f"{indent2}d = d2 - n2",
-                            f"{indent2}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
-                            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                            f"{indent2}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
-                            f"{indent2}q_linear = q2 + dsign * (tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1)))",
-                            f"{indent2}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
-                            f"{indent2}q2 = tl.where(cond, q_cand, q2)",
-                            f"{indent2}n2 = tl.where(cond, n2 + dsign, n2)",
-
-                            f"{indent2}d = d3 - n3",
-                            f"{indent2}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
-                            f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                            f"{indent2}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
-                            f"{indent2}q_linear = q3 + dsign * (tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2)))",
-                            f"{indent2}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
-                            f"{indent2}q3 = tl.where(cond, q_cand, q3)",
-                            f"{indent2}n3 = tl.where(cond, n3 + dsign, n3)",
-                            
-                            # Store Back
-                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 0 * {stride_k} + {offset_t}, q0, mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 1 * {stride_k} + {offset_t}, q1, mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 2 * {stride_k} + {offset_t}, q2, mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 3 * {stride_k} + {offset_t}, q3, mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_q_state_ptr + 4 * {stride_k} + {offset_t}, q4, mask=mask)",
-                            
-                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 0 * {stride_k} + {offset_t}, n0.to(tl.int32), mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 1 * {stride_k} + {offset_t}, n1.to(tl.int32), mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 2 * {stride_k} + {offset_t}, n2.to(tl.int32), mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 3 * {stride_k} + {offset_t}, n3.to(tl.int32), mask=mask)",
-                            f"{indent2}tl.store({safe_var}_median_n_state_ptr + 4 * {stride_k} + {offset_t}, n4.to(tl.int32), mask=mask)",
-                        ])
-
-                    # Inner states update
-                    inner_ops = set(op.split('_')[1] for op in ops if '_' in op)
-                    for inner in inner_ops:
-                        kernel_code_lines.append(f"{indent}val_for_{inner} = tl.zeros_like(val)")
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + {out_offset}"
-                        if inner == 'mean':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                                 f"{indent}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent}inner_{inner}_new = inner_{inner}_old + val * weight",
-                                 f"{indent}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}tl.store({inner_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 # Avoid DBZ
-                                 f"{indent2}val_for_{inner} = inner_{inner}_new / (weight_{inner}_new)",
-                                 f"{indent}else:",
-                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                                 f"{indent2}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'sum':
-                             kernel_code_lines.extend([
-                                 f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                                 f"{indent}inner_{inner}_new = inner_{inner}_old + val * weight",
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}tl.store({inner_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent}else:",
-                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'max':
-                             kernel_code_lines.extend([
-                                 f"{indent}if is_inner_first and current_step==0:",
-                                 f"{indent2}inner_{inner}_new = val",
-                                 f"{indent}else:",
-                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                                 f"{indent2}inner_{inner}_new = tl.maximum(inner_{inner}_old, val)",
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}tl.store({inner_ptr}, -float('inf'), mask=mask)",
-                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent}else:",
-                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'min':
-                             kernel_code_lines.extend([
-                                 f"{indent}if is_inner_first and current_step==0:",
-                                 f"{indent2}inner_{inner}_new = val",
-                                 f"{indent}else:",
-                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                                 f"{indent2}inner_{inner}_new = tl.minimum(inner_{inner}_old, val)",
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}tl.store({inner_ptr}, float('inf'), mask=mask)",
-                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent}else:",
-                                 f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'mid':
-                             kernel_code_lines.extend([
-                                 f"{indent}if is_middle:",
-                                 f"{indent2}tl.store({inner_ptr}, val, mask=mask)",
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}val_for_{inner} = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                             ])
-                        elif inner == 'median':
-                             # Inner P-Square Median Implementation
-                             # This logic handles P-Square update for every sub-step (inner loop)
-                             # and extracts result on is_inner_last
-                             
-                             kernel_code_lines.extend([
-                                 f"{indent}# P-Square Inner Median Update",
-                                 f"{indent}if is_inner_first and step_count_val==0:",
-                                 # Reset if needed
-                                 f"{indent2}pass",
-                                 
-                                 f"{indent}if step_count_val < 5:",
-                                 f"{indent2}q_ptr_k = {safe_var}_median_inner_q_state_ptr + step_count_val * n_saved_points + offs",
-                                 f"{indent2}tl.store(q_ptr_k, val, mask=mask)",
-                                 f"{indent2}if step_count_val == 4:",
-                                 # Sort and Initialize Inner
-                                 f"{indent3}q0 = tl.load({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
-                                 f"{indent3}q1 = tl.load({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
-                                 f"{indent3}q2 = tl.load({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
-                                 f"{indent3}q3 = tl.load({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
-                                 f"{indent3}q4 = tl.load({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
-                                 
-                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                 f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                                 f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
-                                 f"{indent3}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
-                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                 f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                                 f"{indent3}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
-                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                 f"{indent3}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                                 f"{indent3}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                 
-                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
-                                 
-                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 0 * n_saved_points + offs, 0, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 1 * n_saved_points + offs, 1, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 2 * n_saved_points + offs, 2, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 3 * n_saved_points + offs, 3, mask=mask)",
-                                 f"{indent3}tl.store({safe_var}_median_inner_n_state_ptr + 4 * n_saved_points + offs, 4, mask=mask)",
-                                 
-                                 f"{indent}elif step_count_val >= 5:",
-                                 f"{indent2}q0 = tl.load({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
-                                 f"{indent2}q1 = tl.load({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
-                                 f"{indent2}q2 = tl.load({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
-                                 f"{indent2}q3 = tl.load({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
-                                 f"{indent2}q4 = tl.load({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
-                                 
-                                 f"{indent2}n0 = tl.load({safe_var}_median_inner_n_state_ptr + 0 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                 f"{indent2}n1 = tl.load({safe_var}_median_inner_n_state_ptr + 1 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                 f"{indent2}n2 = tl.load({safe_var}_median_inner_n_state_ptr + 2 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                 f"{indent2}n3 = tl.load({safe_var}_median_inner_n_state_ptr + 3 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                 f"{indent2}n4 = tl.load({safe_var}_median_inner_n_state_ptr + 4 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                 
-                                 f"{indent2}q0 = tl.minimum(q0, val)",
-                                 f"{indent2}q4 = tl.maximum(q4, val)",
-                                 f"{indent2}n4 = n4 + 1.0",
-                                 f"{indent2}n1 = n1 + tl.where(val < q1, 1.0, 0.0)",
-                                 f"{indent2}n2 = n2 + tl.where(val < q2, 1.0, 0.0)",
-                                 f"{indent2}n3 = n3 + tl.where(val < q3, 1.0, 0.0)",
-                                 
-                                 f"{indent2}N_total = step_count_val + 1.0",
-                                 f"{indent2}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
-                                 
-                                 f"{indent2}d = d1 - n1",
-                                 f"{indent2}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
-                                 f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                                 f"{indent2}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
-                                 f"{indent2}q_linear = q1 + dsign * (tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0)))",
-                                 f"{indent2}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
-                                 f"{indent2}q1 = tl.where(cond, q_cand, q1)",
-                                 f"{indent2}n1 = tl.where(cond, n1 + dsign, n1)",
-
-                                 f"{indent2}d = d2 - n2",
-                                 f"{indent2}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
-                                 f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                                 f"{indent2}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
-                                 f"{indent2}q_linear = q2 + dsign * (tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1)))",
-                                 f"{indent2}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
-                                 f"{indent2}q2 = tl.where(cond, q_cand, q2)",
-                                 f"{indent2}n2 = tl.where(cond, n2 + dsign, n2)",
-        
-                                 f"{indent2}d = d3 - n3",
-                                 f"{indent2}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
-                                 f"{indent2}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                                 f"{indent2}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
-                                 f"{indent2}q_linear = q3 + dsign * (tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2)))",
-                                 f"{indent2}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
-                                 f"{indent2}q3 = tl.where(cond, q_cand, q3)",
-                                 f"{indent2}n3 = tl.where(cond, n3 + dsign, n3)",
-                                 
-                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
-                                 
-                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 0 * n_saved_points + offs, n0.to(tl.int32), mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 1 * n_saved_points + offs, n1.to(tl.int32), mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 2 * n_saved_points + offs, n2.to(tl.int32), mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 3 * n_saved_points + offs, n3.to(tl.int32), mask=mask)",
-                                 f"{indent2}tl.store({safe_var}_median_inner_n_state_ptr + 4 * n_saved_points + offs, n4.to(tl.int32), mask=mask)",
-                                 
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}val_for_{inner} = tl.load({safe_var}_median_inner_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
-                             ])
-                        elif inner == 'last':
-                             kernel_code_lines.extend([
-                                 f"{indent}inner_{inner}_new = val",
-                                 f"{indent}if is_inner_last:",
-                                 f"{indent2}val_for_{inner} = inner_{inner}_new",
-                             ])
-
-                    for op in ops:
-                        out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
-                        op_parts = op.split('_')
-                        if len(op_parts) > 1:
-                            outer = op_parts[0]
-                            
-                            # Parse K
-                            k_val = 1
-                            match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer)
-                            if match_k:
-                                outer = match_k.group(1) # normalize
-                                k_val = int(match_k.group(2))
-                            
-                            inner = op_parts[1]
-                            val_var = f"val_for_{inner}"
-                            kernel_code_lines.append(f"{indent}if is_inner_last:")
-                            
-                            if outer == 'max':
-                                if k_val == 1:
-                                    kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                        f"{indent3}new = tl.maximum(old, {val_var})",
-                                        f"{indent3}tl.store({out_ptr}, new, mask=mask)",
-                                    ])
-                                else:
-                                    # Bubble Insert for maxK
-                                    kernel_code_lines.extend([
-                                        f"{indent2}# Bubble Insert Max K={k_val}",
-                                        f"{indent2}new_val = {val_var}",
-                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent2}base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
-                                        f"{indent3}for k in range(1, {k_val}):",
-                                        f"{indent4}tl.store(base_ptr + k, -float('inf'), mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}for k in range({k_val}):",
-                                        f"{indent4}old_k = tl.load(base_ptr + k, mask=mask, other=-float('inf'))",
-                                        f"{indent4}swap_mask = new_val > old_k",
-                                        f"{indent4}val_to_store = tl.where(swap_mask, new_val, old_k)",
-                                        f"{indent4}new_val = tl.where(swap_mask, old_k, new_val)",
-                                        f"{indent4}tl.store(base_ptr + k, val_to_store, mask=mask)",
-                                    ])
-
-                            elif outer == 'argmax':
-                                if k_val == 1:
-                                    comp_ptr = f"{safe_var}_max_{inner}_ptr + {out_offset}"
-                                    kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}curr_max = tl.load({comp_ptr}, mask=mask, other={val_var})",
-                                        f"{indent3}cond_mask = {val_var} > curr_max",
-                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
-                                    ])
-                                else:
-                                    # Argmax K
-                                    # We duplicate the bubble logic here, reading maxK values. 
-                                    # argmaxK reads OLD maxK values (before update), decides swaps, updates indices.
-                                    # Then maxK runs, reads OLD maxK values, updates values.
-                                    
-                                    comp_op = f"max{k_val}_{inner}"
-                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
-                                    
-                                    kernel_code_lines.extend([
-                                        f"{indent2}# Bubble Insert Argmax K={k_val}",
-                                        f"{indent2}comp_val = {val_var}",
-                                        f"{indent2}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
-                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
-                                        # Pointer to values (read-only for comparison)
-                                        f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        # Pointer to indices (read-write)
-                                        f"{indent2}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        # others initialized to 0 (default)
-                                        f"{indent2}else:",
-                                        f"{indent3}for k in range({k_val}):",
-                                        f"{indent4}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=-float('inf'))",
-                                        f"{indent4}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)", # 0 or -1?
-                                        f"{indent4}swap_mask = comp_val > old_val_k",
-                                        # Swap indices based on value comparison
-                                        f"{indent4}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
-                                        f"{indent4}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
-                                        # Must also start swapping value component for next iterations comparison
-                                        f"{indent4}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
-                                        f"{indent4}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
-                                    ])
-
-                            elif outer == 'min':
-                                if k_val == 1:
-                                    kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                        f"{indent3}new = tl.minimum(old, {val_var})",
-                                        f"{indent3}tl.store({out_ptr}, new, mask=mask)",
-                                    ])
-                                else:
-                                    # Min K
-                                    kernel_code_lines.extend([
-                                        f"{indent2}# Bubble Insert Min K={k_val}",
-                                        f"{indent2}new_val = {val_var}",
-                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent2}base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store(base_ptr, new_val, mask=mask)",
-                                        f"{indent3}for k in range(1, {k_val}):",
-                                        f"{indent3}    tl.store(base_ptr + k, float('inf'), mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}for k in range({k_val}):",
-                                        f"{indent4}old_k = tl.load(base_ptr + k, mask=mask, other=float('inf'))",
-                                        f"{indent4}swap_mask = new_val < old_k",
-                                        f"{indent4}val_to_store = tl.where(swap_mask, new_val, old_k)",
-                                        f"{indent4}new_val = tl.where(swap_mask, old_k, new_val)",
-                                        f"{indent4}tl.store(base_ptr + k, val_to_store, mask=mask)",
-                                    ])
-                                    
-                            elif outer == 'argmin':
-                                if k_val == 1:
-                                    comp_ptr = f"{safe_var}_min_{inner}_ptr + {out_offset}"
-                                    kernel_code_lines.extend([
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}curr_min = tl.load({comp_ptr}, mask=mask, other={val_var})",
-                                        f"{indent3}cond_mask = {val_var} < curr_min",
-                                        f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
-                                    ])
-                                else:
-                                    # Argmin K
-                                    # Assume argminK runs before minK
-                                    comp_op = f"min{k_val}_{inner}"
-                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
-                                    
-                                    kernel_code_lines.extend([
-                                        f"{indent2}# Bubble Insert Argmin K={k_val}",
-                                        f"{indent2}comp_val = {val_var}",
-                                        f"{indent2}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
-                                        f"{indent2}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent2}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        f"{indent2}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        
-                                        f"{indent2}if is_outer_first:",
-                                        f"{indent3}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent2}else:",
-                                        f"{indent3}for k in range({k_val}):",
-                                        f"{indent4}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=float('inf'))",
-                                        f"{indent4}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
-                                        f"{indent4}swap_mask = comp_val < old_val_k",
-                                        f"{indent4}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
-                                        f"{indent4}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
-                                        f"{indent4}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
-                                        f"{indent4}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
-                                    ])
-                                    
-                            elif outer == 'mean':
-                                # Outer mean implementation
-                                kernel_code_lines.extend([
-                                    f"{indent2}if is_outer_first:",
-                                    f"{indent3}new = {val_var}",
-                                    f"{indent2}else:",
-                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                    f"{indent3}new = old + {val_var}",
-                                    f"{indent2}if is_outer_last:",
-                                    f"{indent3}new = new / (num_macro_steps)",
-                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
-                                    f"{indent2}else:",
-                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
-                                ])
-                            elif outer == 'sum':
-                                kernel_code_lines.extend([
-                                    f"{indent2}if is_outer_first:",
-                                    f"{indent3}tl.store({out_ptr}, {val_var}, mask=mask)",
-                                    f"{indent2}else:",
-                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                    f"{indent3}new = old + {val_var}",
-                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
-                                ])
-                            elif outer == 'median':
-                                kernel_code_lines.extend([
-                                    f"{indent2}macro_step = current_step",
-                                    f"{indent2}if macro_step < 5:",
-                                    f"{indent3}q_ptr_k = {safe_var}_median_q_state_ptr + macro_step * n_saved_points + offs",
-                                    f"{indent3}tl.store(q_ptr_k, {val_var}, mask=mask)",
-                                    f"{indent3}if macro_step == 4:",
-                                    # Sort and Initialize
-                                    f"{indent4}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
-                                    f"{indent4}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
-                                    f"{indent4}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
-                                    f"{indent4}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
-                                    f"{indent4}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
-                                    
-                                    # Vectorized Bubble Sort
-                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                    f"{indent4}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                                    f"{indent4}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
-                                    f"{indent4}tmp=q3; q3=tl.minimum(tmp,q4); q4=tl.maximum(tmp,q4)",
-                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                    f"{indent4}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                                    f"{indent4}tmp=q2; q2=tl.minimum(tmp,q3); q3=tl.maximum(tmp,q3)",
-                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                    f"{indent4}tmp=q1; q1=tl.minimum(tmp,q2); q2=tl.maximum(tmp,q2)",
-                                    f"{indent4}tmp=q0; q0=tl.minimum(tmp,q1); q1=tl.maximum(tmp,q1)",
-                                    
-                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
-                                    
-                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 0 * n_saved_points + offs, 0, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 1 * n_saved_points + offs, 1, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 2 * n_saved_points + offs, 2, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 3 * n_saved_points + offs, 3, mask=mask)",
-                                    f"{indent4}tl.store({safe_var}_median_n_state_ptr + 4 * n_saved_points + offs, 4, mask=mask)",
-                                    f"{indent4}tl.store({out_ptr}, q2, mask=mask)",
-                                    
-                                    f"{indent2}elif macro_step >= 5:",
-                                    f"{indent3}q0 = tl.load({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, mask=mask)",
-                                    f"{indent3}q1 = tl.load({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, mask=mask)",
-                                    f"{indent3}q2 = tl.load({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, mask=mask)",
-                                    f"{indent3}q3 = tl.load({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, mask=mask)",
-                                    f"{indent3}q4 = tl.load({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, mask=mask)",
-                                    
-                                    f"{indent3}n0 = tl.load({safe_var}_median_n_state_ptr + 0 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                    f"{indent3}n1 = tl.load({safe_var}_median_n_state_ptr + 1 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                    f"{indent3}n2 = tl.load({safe_var}_median_n_state_ptr + 2 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                    f"{indent3}n3 = tl.load({safe_var}_median_n_state_ptr + 3 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                    f"{indent3}n4 = tl.load({safe_var}_median_n_state_ptr + 4 * n_saved_points + offs, mask=mask).to(tl.float32)",
-                                    
-                                    f"{indent3}q0 = tl.minimum(q0, {val_var})",
-                                    f"{indent3}q4 = tl.maximum(q4, {val_var})",
-                                    f"{indent3}n4 = n4 + 1.0",
-                                    f"{indent3}n1 = n1 + tl.where({val_var} < q1, 1.0, 0.0)",
-                                    f"{indent3}n2 = n2 + tl.where({val_var} < q2, 1.0, 0.0)",
-                                    f"{indent3}n3 = n3 + tl.where({val_var} < q3, 1.0, 0.0)",
-                                    
-                                    f"{indent3}N_total = macro_step + 1.0",
-                                    f"{indent3}d1 = (N_total - 1) * 0.25; d2 = (N_total - 1) * 0.50; d3 = (N_total - 1) * 0.75",
-                                    
-                                    f"{indent3}d = d1 - n1",
-                                    f"{indent3}cond = ((d >= 1.0) & ((n2 - n1) > 1.0)) | ((d <= -1.0) & ((n1 - n0) > 1.0))",
-                                    f"{indent3}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                                    f"{indent3}q_next = q1 + (dsign / (n2 - n0)) * ((n1 - n0 + dsign) * (q2 - q1) / (n2 - n1) + (n2 - n1 - dsign) * (q1 - q0) / (n1 - n0))",
-                                    f"{indent3}q_linear = q1 + dsign * (tl.where(dsign > 0.0, (q2 - q1) / (n2 - n1), (q1 - q0) / (n1 - n0)))",
-                                    f"{indent3}q_cand = tl.where((q0 < q_next) & (q_next < q2), q_next, q_linear)",
-                                    f"{indent3}q1 = tl.where(cond, q_cand, q1)",
-                                    f"{indent3}n1 = tl.where(cond, n1 + dsign, n1)",
-
-                                    f"{indent3}d = d2 - n2",
-                                    f"{indent3}cond = ((d >= 1.0) & ((n3 - n2) > 1.0)) | ((d <= -1.0) & ((n2 - n1) > 1.0))",
-                                    f"{indent3}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                                    f"{indent3}q_next = q2 + (dsign / (n3 - n1)) * ((n2 - n1 + dsign) * (q3 - q2) / (n3 - n2) + (n3 - n2 - dsign) * (q2 - q1) / (n2 - n1))",
-                                    f"{indent3}q_linear = q2 + dsign * (tl.where(dsign > 0.0, (q3 - q2) / (n3 - n2), (q2 - q1) / (n2 - n1)))",
-                                    f"{indent3}q_cand = tl.where((q1 < q_next) & (q_next < q3), q_next, q_linear)",
-                                    f"{indent3}q2 = tl.where(cond, q_cand, q2)",
-                                    f"{indent3}n2 = tl.where(cond, n2 + dsign, n2)",
-
-                                    f"{indent3}d = d3 - n3",
-                                    f"{indent3}cond = ((d >= 1.0) & ((n4 - n3) > 1.0)) | ((d <= -1.0) & ((n3 - n2) > 1.0))",
-                                    f"{indent3}dsign = tl.where(d >= 0.0, 1.0, -1.0)",
-                                    f"{indent3}q_next = q3 + (dsign / (n4 - n2)) * ((n3 - n2 + dsign) * (q4 - q3) / (n4 - n3) + (n4 - n3 - dsign) * (q3 - q2) / (n3 - n2))",
-                                    f"{indent3}q_linear = q3 + dsign * (tl.where(dsign > 0.0, (q4 - q3) / (n4 - n3), (q3 - q2) / (n3 - n2)))",
-                                    f"{indent3}q_cand = tl.where((q2 < q_next) & (q_next < q4), q_next, q_linear)",
-                                    f"{indent3}q3 = tl.where(cond, q_cand, q3)",
-                                    f"{indent3}n3 = tl.where(cond, n3 + dsign, n3)",
-                                    
-                                    # Store Back
-                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 0 * n_saved_points + offs, q0, mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 1 * n_saved_points + offs, q1, mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 2 * n_saved_points + offs, q2, mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 3 * n_saved_points + offs, q3, mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_q_state_ptr + 4 * n_saved_points + offs, q4, mask=mask)",
-                                    
-                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 0 * n_saved_points + offs, n0.to(tl.int32), mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 1 * n_saved_points + offs, n1.to(tl.int32), mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 2 * n_saved_points + offs, n2.to(tl.int32), mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 3 * n_saved_points + offs, n3.to(tl.int32), mask=mask)",
-                                    f"{indent3}tl.store({safe_var}_median_n_state_ptr + 4 * n_saved_points + offs, n4.to(tl.int32), mask=mask)",
-                                    
-                                    # Output Median
-                                    f"{indent3}tl.store({out_ptr}, q2, mask=mask)",
-                                ])
-                            continue
-
-                        if op == 'mean':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}old = tl.zeros_like(val)",
-                                f"{indent}else:",
-                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                f"{indent}new = old + val * weight",
-                                f"{indent}if is_inner_last:",
-                                f"{indent2}new = new / total_weight",
-                                f"{indent}tl.store({out_ptr}, new, mask=mask)",
-                            ])
-                        elif op == 'sum':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}old = tl.zeros_like(val)",
-                                f"{indent}else:",
-                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                # Simple sum accumulation (integral if input is scaled)
-                                # Assuming val is already scaled if needed, or if it's simple accumulation.
-                                # Consistent with mean: mean is sum(val*weight)/sum(weight).
-                                # So sum should be sum(val*weight).
-                                f"{indent}new = old + val * weight",
-                                f"{indent}tl.store({out_ptr}, new, mask=mask)",
-                            ])
-                        elif op == 'max':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
-                                f"{indent}else:",
-                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=val)",
-                                f"{indent2}new = tl.maximum(old, val)",
-                                f"{indent2}tl.store({out_ptr}, new, mask=mask)",
-                            ])
-                        elif op == 'min':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
-                                f"{indent}else:",
-                                f"{indent2}old = tl.load({out_ptr}, mask=mask, other=val)",
-                                f"{indent2}new = tl.minimum(old, val)",
-                                f"{indent2}tl.store({out_ptr}, new, mask=mask)",
-                            ])
-                        elif op == 'argmax':
-                            max_ptr = f"{safe_var}_max_ptr + {out_offset}"
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask)",
-                                f"{indent}else:",
-                                f"{indent2}curr_max = tl.load({max_ptr}, mask=mask, other=val)",
-                                f"{indent2}cond_mask = val > curr_max",
-                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
-                            ])
-                        elif op == 'argmin':
-                            min_ptr = f"{safe_var}_min_ptr + {out_offset}"
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask)",
-                                f"{indent}else:",
-                                f"{indent2}curr_min = tl.load({min_ptr}, mask=mask, other=val)",
-                                f"{indent2}cond_mask = val < curr_min",
-                                f"{indent2}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
-                            ])
-                        elif op == 'last':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_last:",
-                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
-                            ])
-                        elif op == 'first':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_inner_first:",
-                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
-                            ])
-                        elif op == 'mid':
-                            kernel_code_lines.extend([
-                                f"{indent}if is_middle:",
-                                f"{indent2}tl.store({out_ptr}, val, mask=mask)",
-                            ])
-                        elif (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and '_' not in op:
-                            # Use Shared P-Square State (updated above)
-                            # Map op suffix to quantile index
-                            q_idx = 2 # default median (50%)
-                            if 'max' in op or '100' in op: q_idx = 4
-                            elif 'min' in op or '00' in op: q_idx = 0
-                            elif '75' in op: q_idx = 3
-                            elif '25' in op: q_idx = 1
-                            elif '50' in op: q_idx = 2
-                            
-                            kernel_code_lines.extend([
-                                f"{indent}# Output {op} from Shared P-Square State",
-                                f"{indent}q_val = tl.load({safe_var}_median_q_state_ptr + {q_idx} * {stride_k} + {offset_t}, mask=mask)",
-                                f"{indent}tl.store({out_ptr}, q_val, mask=mask)"
-                            ])
-                kernel_code_lines.append("")
+            self._generate_1d_vars_grouped(kernel_code_lines, dims_1d, 
+                                           indent, indent2, indent3, indent4, indent5)
 
         # 2D processing
         if dims_2d:
@@ -1653,7 +1590,7 @@ class StatisticsAggregator:
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_first and current_step==0:", 
+                                 f"{indent2}if is_first and macro_step_index==0:", 
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
@@ -1672,7 +1609,7 @@ class StatisticsAggregator:
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_first and current_step==0:",
+                                 f"{indent2}if is_first and macro_step_index==0:",
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
@@ -1741,7 +1678,7 @@ class StatisticsAggregator:
                             
                             # Parse K
                             k_val = 1
-                            match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer)
+                            match_k = re.match(r'(max|min)(\d+)$', outer)
                             if match_k:
                                 outer = match_k.group(1) # normalize
                                 k_val = int(match_k.group(2))
@@ -1750,141 +1687,97 @@ class StatisticsAggregator:
                             kernel_code_lines.append(f"{indent2}if is_macro_step_end:")
                             
                             if outer == 'max':
+                                # argmax pointer (automatically created alongside max)
+                                argmax_ptr = f"{safe_var}_arg{op}_ptr + {out_offset}"
                                 if k_val == 1:
                                     kernel_code_lines.extend([
-                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                        f"{indent4}tl.store({argmax_ptr}, macro_step_index, mask=mask)",
                                         f"{indent3}else:",
                                         f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                        f"{indent4}cond_mask = {val_var} > old",
                                         f"{indent4}new = tl.maximum(old, {val_var})",
                                         f"{indent4}tl.store({out_ptr}, new, mask=mask)",
+                                        f"{indent4}tl.store({argmax_ptr}, macro_step_index, mask=mask & cond_mask)",
                                     ])
                                 else:
-                                    # Bubble Insert Max K
+                                    # Bubble Insert Max K with ArgMax
+                                    argmax_op = f"arg{op}"
                                     kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Max K={k_val}",
+                                        f"{indent3}# Bubble Insert Max K={k_val} with ArgMax",
                                         f"{indent3}new_val = {val_var}",
+                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], macro_step_index, tl.int32)",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
+                                        f"{indent3}idx_base_ptr = {safe_var}_{argmax_op}_ptr + k_offset",
                                         
-                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
+                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
                                         f"{indent4}for k in range(1, {k_val}):",
-                                        f"{indent4}    tl.store(base_ptr + k, -float('inf'), mask=mask)",
+                                        f"{indent5}tl.store(base_ptr + k, -float('inf'), mask=mask)",
+                                        f"{indent5}tl.store(idx_base_ptr + k, 0, mask=mask)",
                                         f"{indent3}else:",
                                         f"{indent4}for k in range({k_val}):",
                                         f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=-float('inf'))",
+                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
                                         f"{indent5}swap_mask = new_val > old_k",
                                         f"{indent5}val_to_store = tl.where(swap_mask, new_val, old_k)",
-                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
-                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
-                                    ])
-
-                            elif outer == 'argmax':
-                                if k_val == 1:
-                                    comp_ptr = f"{safe_var}_max_{inner}_ptr + {out_offset}"
-                                    kernel_code_lines.extend([
-                                        f"{indent3}if is_outer_first and current_step==0:",
-                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}curr_max = tl.load({comp_ptr}, mask=mask, other={val_var})",
-                                        f"{indent4}cond_mask = {val_var} > curr_max",
-                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
-                                    ])
-                                else:
-                                    # Argmax K
-                                    comp_op = f"max{k_val}_{inner}"
-                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
-                                    kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Argmax K={k_val}",
-                                        f"{indent3}comp_val = {val_var}",
-                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
-                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent3}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        f"{indent3}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        
-                                        f"{indent3}if is_outer_first and current_step==0:",
-                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}for k in range({k_val}):",
-                                        f"{indent5}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=-float('inf'))",
-                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
-                                        f"{indent5}swap_mask = comp_val > old_val_k",
                                         f"{indent5}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
+                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
                                         f"{indent5}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
-                                        f"{indent5}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
+                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
                                         f"{indent5}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
                                     ])
 
                             elif outer == 'min':
+                                # argmin pointer (automatically created alongside min)
+                                argmin_ptr = f"{safe_var}_arg{op}_ptr + {out_offset}"
                                 if k_val == 1:
                                     kernel_code_lines.extend([
-                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
+                                        f"{indent4}tl.store({argmin_ptr}, macro_step_index, mask=mask)",
                                         f"{indent3}else:",
                                         f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
+                                        f"{indent4}cond_mask = {val_var} < old",
                                         f"{indent4}new = tl.minimum(old, {val_var})",
                                         f"{indent4}tl.store({out_ptr}, new, mask=mask)",
+                                        f"{indent4}tl.store({argmin_ptr}, macro_step_index, mask=mask & cond_mask)",
                                     ])
                                 else:
-                                    # Min K
+                                    # Min K with ArgMin
+                                    argmin_op = f"arg{op}"
                                     kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Min K={k_val}",
+                                        f"{indent3}# Bubble Insert Min K={k_val} with ArgMin",
                                         f"{indent3}new_val = {val_var}",
+                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], macro_step_index, tl.int32)",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
+                                        f"{indent3}idx_base_ptr = {safe_var}_{argmin_op}_ptr + k_offset",
                                         
-                                        f"{indent3}if is_outer_first and current_step==0:",
+                                        f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
+                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
                                         f"{indent4}for k in range(1, {k_val}):",
-                                        f"{indent4}    tl.store(base_ptr + k, float('inf'), mask=mask)",
+                                        f"{indent5}tl.store(base_ptr + k, float('inf'), mask=mask)",
+                                        f"{indent5}tl.store(idx_base_ptr + k, 0, mask=mask)",
                                         f"{indent3}else:",
                                         f"{indent4}for k in range({k_val}):",
                                         f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=float('inf'))",
+                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
                                         f"{indent5}swap_mask = new_val < old_k",
                                         f"{indent5}val_to_store = tl.where(swap_mask, new_val, old_k)",
-                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
-                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
-                                    ])
-
-                            elif outer == 'argmin':
-                                if k_val == 1:
-                                    comp_ptr = f"{safe_var}_min_{inner}_ptr + {out_offset}"
-                                    kernel_code_lines.extend([
-                                        f"{indent3}if is_outer_first and current_step==0:",
-                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}curr_min = tl.load({comp_ptr}, mask=mask, other={val_var})",
-                                        f"{indent4}cond_mask = {val_var} < curr_min",
-                                        f"{indent4}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
-                                    ])
-                                else:
-                                    # Argmin K
-                                    comp_op = f"min{k_val}_{inner}"
-                                    comp_ptr_base = f"{safe_var}_{comp_op}_ptr"
-                                    kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Argmin K={k_val}",
-                                        f"{indent3}comp_val = {val_var}",
-                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], current_step, tl.int32)",
-                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent3}val_base_ptr = {comp_ptr_base} + k_offset",
-                                        f"{indent3}idx_base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        
-                                        f"{indent3}if is_outer_first and current_step==0:",
-                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}for k in range({k_val}):",
-                                        f"{indent5}old_val_k = tl.load(val_base_ptr + k, mask=mask, other=float('inf'))",
-                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
-                                        f"{indent5}swap_mask = comp_val < old_val_k",
                                         f"{indent5}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
+                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
                                         f"{indent5}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
-                                        f"{indent5}comp_val = tl.where(swap_mask, old_val_k, comp_val)",
+                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
                                         f"{indent5}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
                                     ])
                             elif outer == 'sum':
                                 kernel_code_lines.extend([
-                                    f"{indent3}if is_outer_first and current_step==0:",
+                                    f"{indent3}if is_outer_first and macro_step_index==0:",
                                     f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
                                     f"{indent3}else:",
                                     f"{indent4}old = tl.load({out_ptr}, mask=mask, other=0.0)",
@@ -1893,7 +1786,7 @@ class StatisticsAggregator:
                             elif outer == 'mean':
                                 term = f"{val_var}"
                                 kernel_code_lines.extend([
-                                    f"{indent3}if is_outer_first and current_step==0:",
+                                    f"{indent3}if is_outer_first and macro_step_index==0:",
                                     f"{indent4}tl.store({out_ptr}, {term}, mask=mask)",
                                     f"{indent3}else:",
                                     f"{indent4}old = tl.load({out_ptr}, mask=mask, other=0.0)",
@@ -1947,21 +1840,21 @@ class StatisticsAggregator:
                             max_ptr = f"{safe_var}_max_ptr + {out_offset}"
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
-                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
+                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask)",
                                 f"{indent2}else:",
                                 f"{indent3}curr_max = tl.load({max_ptr}, mask=mask, other=val)",
                                 f"{indent3}cond_mask = val > curr_max",
-                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask & cond_mask)",
                             ])
                         elif op == 'argmin':
                             min_ptr = f"{safe_var}_min_ptr + {out_offset}"
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
-                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask)",
+                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask)",
                                 f"{indent2}else:",
                                 f"{indent3}curr_min = tl.load({min_ptr}, mask=mask, other=val)",
                                 f"{indent3}cond_mask = val < curr_min",
-                                f"{indent3}tl.store({out_ptr}, current_step, mask=mask & cond_mask)",
+                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask & cond_mask)",
                             ])
                         elif op == 'last':
                             kernel_code_lines.extend([
@@ -2005,7 +1898,7 @@ class StatisticsAggregator:
         """Generate the main python function that calls kernels."""
         kernel_code_lines.extend([
             "# Main update function",
-            "def internal_update_statistics(states, weight, total_weight, num_macro_steps, is_inner_first, is_inner_last, is_middle, is_outer_first, is_outer_last, current_step, step_count_val, BLOCK_SIZE):",
+            "def internal_update_statistics(states, weight, total_weight, num_macro_steps, is_inner_first, is_inner_last, is_middle, is_outer_first, is_outer_last, macro_step_index, step_count_val, BLOCK_SIZE):",
         ])
         
         if self.num_trials > 1:
@@ -2063,8 +1956,31 @@ class StatisticsAggregator:
             for var in var_list:
                 safe_var = self._get_safe_name(var)
                 added_median_state = False
+                added_arg_ops = set()  # Track argmax/argmin ops already added
                 for op in self._variable_ops[var]:
                     kernel_code_lines.append(f"        {safe_var}_{op}_ptr=states['{var}_{op}'],")
+                    
+                    # For max/min operations, also add corresponding argmax/argmin pointer
+                    op_parts = op.split('_')
+                    outer_op = op_parts[0]
+                    # Check for maxK/minK pattern
+                    match_k = re.match(r'(max|min)(\d+)$', outer_op)
+                    if match_k:
+                        arg_op_name = f"arg{op}"
+                        if arg_op_name not in added_arg_ops:
+                            kernel_code_lines.append(f"        {safe_var}_{arg_op_name}_ptr=states['{var}_{arg_op_name}'],")
+                            added_arg_ops.add(arg_op_name)
+                    elif outer_op == 'max':
+                        arg_op_name = f"arg{op}"
+                        if arg_op_name not in added_arg_ops:
+                            kernel_code_lines.append(f"        {safe_var}_{arg_op_name}_ptr=states['{var}_{arg_op_name}'],")
+                            added_arg_ops.add(arg_op_name)
+                    elif outer_op == 'min':
+                        arg_op_name = f"arg{op}"
+                        if arg_op_name not in added_arg_ops:
+                            kernel_code_lines.append(f"        {safe_var}_{arg_op_name}_ptr=states['{var}_{arg_op_name}'],")
+                            added_arg_ops.add(arg_op_name)
+                    
                     if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
                         kernel_code_lines.append(f"        {safe_var}_median_q_state_ptr=states['{var}_median_q_state'],")
                         kernel_code_lines.append(f"        {safe_var}_median_n_state_ptr=states['{var}_median_n_state'],")
@@ -2093,7 +2009,7 @@ class StatisticsAggregator:
                 "        is_middle=is_middle,",
                 "        is_outer_first=is_outer_first,",
                 "        is_outer_last=is_outer_last,",
-                "        current_step=current_step,",
+                "        macro_step_index=macro_step_index,",
                 "        step_count_val=step_count_val,",
                 "        n_saved_points=save_idx_len,",
             ])
@@ -2214,47 +2130,15 @@ class StatisticsAggregator:
 
         # Validate and setup each variable
         for var_name, ops in self._variable_ops.items():
-            # Handle compound op dependencies
-            extra_ops = []
+            # Note: argmax/argmin cannot be user-specified operations.
+            # They are automatically created as auxiliary storage when max/min is requested.
+            # The argmax/argmin values are stored as integer indices (macro_step_index),
+            # which are converted to NC time values (days since epoch) when written to the
+            # output files. This creates a time-series-like output where each extreme value
+            # record also has its corresponding occurrence time.
             import re
-            for op in ops:
-                parts = op.split('_')
-                outer_op = parts[0]
-                inner_suffix = parts[1] if len(parts) > 1 else None
 
-                # Check for maxk/mink pattern
-                match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer_op)
-                if match_k:
-                    base = match_k.group(1)
-                    k = int(match_k.group(2))
-                    if base in ['argmax', 'argmin']:
-                        # argmaxK needs maxK
-                        req_base = 'max' if base == 'argmax' else 'min'
-                        if inner_suffix:
-                            req = f"{req_base}{k}_{inner_suffix}"
-                        else:
-                            req = f"{req_base}{k}"
-                        
-                        if req not in ops and req not in extra_ops:
-                            extra_ops.append(req)
-                
-                elif outer_op == 'argmax':
-                    if inner_suffix:
-                        req = f"max_{inner_suffix}"
-                    else:
-                        req = "max"
-                    if req not in ops and req not in extra_ops:
-                        extra_ops.append(req)
-                elif outer_op == 'argmin':
-                    if inner_suffix:
-                        req = f"min_{inner_suffix}"
-                    else:
-                        req = "min"
-                    if req not in ops and req not in extra_ops:
-                        extra_ops.append(req)
-            ops.extend(extra_ops)
-            
-            # Sort ops to ensure deps are processed if needed, though dict order usually fine
+            # Sort ops to ensure consistent processing order
             ops.sort()
             
             tensor = None
@@ -2347,8 +2231,8 @@ class StatisticsAggregator:
                 raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only up to {max_ndim}D variables are supported.")
 
             is_2d = (self.num_trials > 1 and actual_ndim == 3) or (self.num_trials == 1 and actual_ndim == 2)
-            if is_2d and any(op in ops for op in ['argmax', 'argmin', 'max', 'min']):
-                raise ValueError(f"argmax/argmin/max/min operations are not supported for 2D variable '{var_name}' (with levels).")
+            if is_2d and any(op.split('_')[0] in ['max', 'min'] or re.match(r'(max|min)\d+$', op.split('_')[0]) for op in ops):
+                raise ValueError(f"max/min operations are not supported for 2D variable '{var_name}' (with levels).")
 
             # Track
             self._variables.add(var_name)
@@ -2362,7 +2246,7 @@ class StatisticsAggregator:
                 
                 # Check for K
                 k_val = 1
-                match_k = re.match(r'(max|min|argmax|argmin)(\d+)$', outer_op)
+                match_k = re.match(r'(max|min)(\d+)$', outer_op)
                 if match_k:
                     outer_base = match_k.group(1)
                     k_val = int(match_k.group(2))
@@ -2374,13 +2258,20 @@ class StatisticsAggregator:
                 else:
                     alloc_shape = actual_shape
 
-                if outer_op.startswith('max'):
-                    # max or maxK
+                if outer_op == 'max':
+                    # max or maxK - also create argmax storage automatically
                     init_tensor = torch.full(alloc_shape, -torch.inf, dtype=target_dtype, device=self.device)
-                elif outer_op.startswith('min'):
+                    # Create corresponding argmax storage (int32 to store macro step index)
+                    argmax_name = f"{var_name}_arg{op}"  # e.g., var_argmax, var_argmax_mean, var_argmax3_mean
+                    self._storage[argmax_name] = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
+                    self._output_keys.append(argmax_name)
+                elif outer_op == 'min':
+                    # min or minK - also create argmin storage automatically  
                     init_tensor = torch.full(alloc_shape, torch.inf, dtype=target_dtype, device=self.device)
-                elif outer_op.startswith('argmax') or outer_op.startswith('argmin'):
-                    init_tensor = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
+                    # Create corresponding argmin storage
+                    argmin_name = f"{var_name}_arg{op}"
+                    self._storage[argmin_name] = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
+                    self._output_keys.append(argmin_name)
                 elif outer_op == 'first':
                     # Similar to 'last', we just need storage. Zero initialization is fine as it will be overwritten on is_first.
                     init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
@@ -2452,8 +2343,6 @@ class StatisticsAggregator:
                     self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
                 
                 out_dtype = torch_to_numpy_dtype(target_dtype)
-                if outer_op in ('argmax', 'argmin'):
-                    out_dtype = 'i4' # int32
 
                 meta = {
                     'original_variable': var_name,
@@ -2466,9 +2355,48 @@ class StatisticsAggregator:
                     'save_coord': save_coord,
                     'description': f"{description} ({op})",
                     'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
-                    'k': k_val
+                    'k': k_val,
+                    'is_time_index': False,  # This is a regular value output
                 }
                 self._metadata[out_name] = meta
+                
+                # For max/min ops, also create metadata for their argmax/argmin counterparts
+                if outer_op == 'max':
+                    argmax_name = f"{var_name}_arg{op}"
+                    argmax_meta = {
+                        'original_variable': var_name,
+                        'op': f"arg{op}",
+                        'save_idx': save_idx,
+                        'tensor_shape': tensor_shape,
+                        'dtype': 'f8',  # float64 for time values (converted from step indices)
+                        'actual_shape': actual_shape,
+                        'actual_ndim': actual_ndim,
+                        'save_coord': save_coord,
+                        'description': f"{description} (time of argmax for {op})",
+                        'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
+                        'k': k_val,
+                        'is_time_index': True,  # This stores macro step indices, converted to time on write
+                    }
+                    self._metadata[argmax_name] = argmax_meta
+                    self._output_is_outer[argmax_name] = len(op_parts) > 1
+                elif outer_op == 'min':
+                    argmin_name = f"{var_name}_arg{op}"
+                    argmin_meta = {
+                        'original_variable': var_name,
+                        'op': f"arg{op}",
+                        'save_idx': save_idx,
+                        'tensor_shape': tensor_shape,
+                        'dtype': 'f8',  # float64 for time values
+                        'actual_shape': actual_shape,
+                        'actual_ndim': actual_ndim,
+                        'save_coord': save_coord,
+                        'description': f"{description} (time of argmin for {op})",
+                        'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
+                        'k': k_val,
+                        'is_time_index': True,
+                    }
+                    self._metadata[argmin_name] = argmin_meta
+                    self._output_is_outer[argmin_name] = len(op_parts) > 1
                 
                 # Classify as outer if it is a compound op (e.g. max_mean)
                 self._output_is_outer[out_name] = len(op_parts) > 1
@@ -2511,15 +2439,14 @@ class StatisticsAggregator:
         if is_macro_step_end: # Legacy support or counter
             self._current_macro_step_count += 1.0
 
-        step_val = custom_step_index if custom_step_index is not None else self._step_count
-        macro_count_val = (float(custom_step_index) + 1.0) if custom_step_index is not None else self._current_macro_step_count
+        macro_count_val = self._current_macro_step_count
             
         # Ensure kernel states is actually populated correctly for new keys
             
         self._aggregator_function(self._kernel_states, weight, total_weight, macro_count_val, 
                                   _is_inner_first, _is_inner_last, is_middle, 
                                   is_outer_first, is_outer_last,
-                                  step_val, self._step_count, BLOCK_SIZE)
+                                  self._macro_step_index, self._step_count, BLOCK_SIZE)
         
         self._step_count += 1
 
@@ -2530,17 +2457,14 @@ class StatisticsAggregator:
         and resetting mean storage for the next time step.
         
         Args:
-            dt: Time step to finalize
+            dt: Time step to finalize (datetime or cftime.datetime)
         """
-        # Infer calendar and time_unit if not set
-        if self.calendar is None:
-            if hasattr(dt, 'calendar'):
-                self.calendar = dt.calendar
-            else:
-                self.calendar = 'standard'
+        # Record this time step for argmax/argmin index-to-time conversion
+        # This is called at the end of each outer loop iteration
+        self._macro_step_times.append(dt)
         
-        if self.time_unit is None:
-            self.time_unit = "days since 1900-01-01 00:00:00"
+        # Increment macro step index for next iteration
+        self._macro_step_index += 1
 
         if self.output_split_by_year:
             if self._current_year != dt.year:
@@ -2564,7 +2488,31 @@ class StatisticsAggregator:
             if out_name not in self._netcdf_files:
                 continue
             output_path = self._netcdf_files[out_name]
-            time_step_data = tensor.detach().cpu().numpy()
+            
+            # Check if this is a time index variable (argmax/argmin)
+            metadata = self._metadata.get(out_name, {})
+            is_time_index = metadata.get('is_time_index', False)
+            
+            if is_time_index:
+                # Convert integer indices to time values
+                # The indices are macro step numbers; convert to NC time values
+                idx_data = tensor.detach().cpu().numpy().astype(np.int32)
+                # Create time values array
+                time_data = np.zeros_like(idx_data, dtype=np.float64)
+                
+                # Convert each index to corresponding time
+                for idx_val in np.unique(idx_data):
+                    if 0 <= idx_val < len(self._macro_step_times):
+                        step_dt = self._macro_step_times[idx_val]
+                        time_val = nc.date2num(step_dt, units=self.time_unit, calendar=self.calendar)
+                        time_data[idx_data == idx_val] = time_val
+                    else:
+                        # For indices out of range (shouldn't happen), use NaN or the current time
+                        time_data[idx_data == idx_val] = nc.date2num(dt, units=self.time_unit, calendar=self.calendar)
+                
+                time_step_data = time_data
+            else:
+                time_step_data = tensor.detach().cpu().numpy()
             
             # Select executor based on variable name hash to ensure serialization
             # This avoids the need for file locks, as all writes for a specific variable

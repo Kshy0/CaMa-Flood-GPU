@@ -16,8 +16,8 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import netCDF4 as nc
 import numpy as np
-
 from matplotlib.ticker import FuncFormatter
+
 
 class MultiRankStatsReader:
     """

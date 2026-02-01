@@ -4,16 +4,16 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
+import fnmatch
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Tuple
-import fnmatch
-
-from netCDF4 import Dataset
-from cmfgpu.utils import find_indices_in
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from netCDF4 import Dataset
 from numba import njit
+
+from cmfgpu.utils import find_indices_in
 
 
 @njit

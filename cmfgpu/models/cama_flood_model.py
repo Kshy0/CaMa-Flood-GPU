@@ -212,8 +212,10 @@ class CaMaFlood(AbstractModel):
             is_last = stat_is_last and (sub_step == num_sub_steps - 1)
             is_middle = (sub_step == num_sub_steps // 2)
             
-            is_outer_first = stat_is_outer_first
-            is_outer_last = stat_is_outer_last
+            # Outer flags should only be True when inner_last is also True
+            # (i.e., only at the end of each day's sub-step loop)
+            is_outer_first = stat_is_outer_first and is_last
+            is_outer_last = stat_is_outer_last and is_last
 
             self.do_one_sub_step(time_sub_step, runoff, sub_step, output_enabled)
             # Accumulate elapsed time in seconds for the current window

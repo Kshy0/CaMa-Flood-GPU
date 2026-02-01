@@ -95,9 +95,13 @@ class LogModule(AbstractModule):
             self._current_time + timedelta(seconds=time_step * i) for i in range(num_steps)
         ]
         if num_steps > self.log_buffer_size:
+            old_size = self.log_buffer_size
             self.log_buffer_size = num_steps + 20
             for field in self.log_vars:
-                getattr(self, field).resize_(self.log_buffer_size)
+                tensor = getattr(self, field)
+                tensor.resize_(self.log_buffer_size)
+                # Zero-fill the newly allocated portion to avoid garbage data
+                tensor[old_size:].zero_()
     
     def gather_results(self) -> None:
         """

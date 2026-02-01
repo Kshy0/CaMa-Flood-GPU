@@ -25,14 +25,6 @@ class TopologyReader:
     - Print ASCII topology tree.
     """
 
-    def __init__(self, params_path: Union[str, Path]):
-        self.params_path = Path(params_path)
-        if not self.params_path.exists():
-            raise FileNotFoundError(f"Parameters file not found: {self.params_path}")
-            
-        self.ds = None
-        self._load_data()
-
     def _load_data(self):
         """Load necessary variables into memory and build indices."""
         print(f"Loading topology from {self.params_path}...")
@@ -79,6 +71,14 @@ class TopologyReader:
                     self.rev_adj[did].append(self.c_ids[i])
                 
         print(f"Loaded {len(self.c_ids)} catchments.")
+
+    def __init__(self, params_path: Union[str, Path]):
+        self.params_path = Path(params_path)
+        if not self.params_path.exists():
+            raise FileNotFoundError(f"Parameters file not found: {self.params_path}")
+            
+        self.ds = None
+        self._load_data()
 
     def get_id_from_xy(self, x: int, y: int) -> Optional[int]:
         """Find catchment ID from (x, y) coordinates."""
@@ -449,4 +449,3 @@ class TopologyReader:
             
             if i > 0:
                 prefix += "    "
-

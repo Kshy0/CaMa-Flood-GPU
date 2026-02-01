@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.ma as ma
@@ -436,12 +436,18 @@ class InputProxy:
         except KeyError:
             return default
 
+    def keys(self) -> Set[str]:
+        return self.visible_vars.union(self.data.keys())
+
     def __getitem__(self, key: str) -> Any:
         if key in self.data:
             return self.data[key]
         
         if self.lazy and key in self.visible_vars:
-            return self._load_var(key)
+            # Cache the loaded data to avoid repeated I/O
+            loaded_data = self._load_var(key)
+            self.data[key] = loaded_data
+            return loaded_data
             
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
@@ -450,6 +456,3 @@ class InputProxy:
 
     def __contains__(self, key: str) -> bool:
         return key in self.data or (self.lazy and key in self.visible_vars)
-
-    def keys(self) -> Set[str]:
-        return self.visible_vars.union(self.data.keys())

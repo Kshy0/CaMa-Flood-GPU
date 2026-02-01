@@ -2,6 +2,7 @@
 Script to generate runoff mapping tables for input datasets.
 """
 from datetime import datetime
+
 from cmfgpu.datasets.daily_bin_dataset import DailyBinDataset
 
 print("\n=== Generating Runoff Mapping Table ===")
