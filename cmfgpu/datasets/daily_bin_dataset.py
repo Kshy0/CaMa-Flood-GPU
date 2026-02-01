@@ -40,6 +40,7 @@ class DailyBinDataset(AbstractDataset):
                  suffix: str = ".one",
                  out_dtype: str = "float32",
                  calendar: str = "standard",
+                 lat_south_to_north: bool = False,  # If True, latitude goes from south to north
                  *args, **kwargs):
 
         self.base_dir = base_dir
@@ -48,6 +49,7 @@ class DailyBinDataset(AbstractDataset):
         self.bin_dtype = bin_dtype
         self.prefix = prefix
         self.suffix = suffix
+        self.lat_south_to_north = lat_south_to_north
         super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, calendar=calendar, *args, **kwargs)
         self._validate_files_exist()
 
@@ -56,13 +58,21 @@ class DailyBinDataset(AbstractDataset):
         
         Note: shape is (ny, nx) = (lat, lon), so shape[0] is lat size, shape[1] is lon size.
         Coordinates are cell centers, computed from shape assuming global coverage.
+        
+        If lat_south_to_north is True, latitude goes from -90 to 90 (south to north).
+        Otherwise, latitude goes from 90 to -90 (north to south, default).
         """
         ny, nx = self.shape
         # Resolution in degrees
         res_lat = 180.0 / ny
         res_lon = 360.0 / nx
-        # Cell centers: start at (90 - res/2) for lat, (-180 + res/2) for lon
-        lat = np.linspace(90 - res_lat / 2, -90 + res_lat / 2, ny)
+        # Cell centers
+        if self.lat_south_to_north:
+            # South to north: start at (-90 + res/2), end at (90 - res/2)
+            lat = np.linspace(-90 + res_lat / 2, 90 - res_lat / 2, ny)
+        else:
+            # North to south: start at (90 - res/2), end at (-90 + res/2)
+            lat = np.linspace(90 - res_lat / 2, -90 + res_lat / 2, ny)
         lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
         return lon, lat
 
