@@ -7,7 +7,6 @@
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from functools import cached_property
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple, Union
 
@@ -339,28 +338,41 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
     def build_local_runoff_matrix(self, 
                                   runoff_mapping_file: str, 
-                                  desired_catchment_ids: np.ndarray, 
-                                  device: torch.device,
+                                  desired_catchment_ids: Optional[np.ndarray] = None, 
+                                  device: torch.device = None,
                                   precision: Literal["float32", "float64"]="float32") -> torch.Tensor:
         """
         Build PyTorch sparse matrix for mapping runoff data to specified catchments.
         
         This method:
         1. Loads the sparse mapping matrix from npz file
-        2. Extracts submatrix for desired catchments
+        2. Extracts submatrix for desired catchments (or all if desired_catchment_ids is None)
         3. Identifies non-zero columns (active runoff grids)
         4. Sets self._local_runoff_indices for use in __getitem__
         5. Returns the compressed mapping matrix
         
         After calling this method, data_size will return the compressed size,
         and __getitem__ will automatically extract only the needed columns.
+        
+        Args:
+            runoff_mapping_file: Path to the npz file containing the mapping matrix
+            desired_catchment_ids: Array of catchment IDs to include. If None, uses all 
+                                   catchments from the mapping file in their original order.
+            device: PyTorch device for the output tensor
+            precision: Data precision ("float32" or "float64")
+            
+        Returns:
+            local_runoff_matrix: Stensor of shape (n_active_grids, n_catchments)
         """
         runoff_mapping_file = Path(runoff_mapping_file)
         torch_precision = torch.float32 if precision == "float32" else torch.float64
         if runoff_mapping_file is None or not os.path.exists(runoff_mapping_file):
             raise ValueError("Runoff mapping file not found. Cannot build local matrix.")
         
-        # Load the scipy compressed sparse matrix data
+        # Store the mapping file path for later use
+        self._runoff_mapping_file = runoff_mapping_file
+        
+        # Load the scipy compressed sparsparse e matrix data
         mapping_data = np.load(runoff_mapping_file)
         
         all_catchment_ids = mapping_data['catchment_ids']
@@ -373,6 +385,23 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             (sparse_data, sparse_indices, sparse_indptr),
             shape=matrix_shape
         )
+        
+        # If desired_catchment_ids is None, use all catchments from the mapping file
+        if desired_catchment_ids is None:
+            desired_catchment_ids = all_catchment_ids
+            desired_row_indices = np.arange(len(all_catchment_ids))
+        else:
+            # Use find_indices_in to get row indices for desired catchments
+            desired_row_indices = find_indices_in(desired_catchment_ids, all_catchment_ids)
+            
+            # Check which catchments were found
+            valid_idx = desired_row_indices != -1
+            
+            if np.any(~valid_idx):
+                raise ValueError(
+                    f"Some desired catchments ({np.sum(~valid_idx)}) were not found in the mapping file. "
+                    "Please check your input data or mapping file."
+                )
         
         # Verify mapping matrix columns match full grid size
         lon, lat = self.get_coordinates()
@@ -407,18 +436,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 print("[Dataset] Warning: Mapping file has no coordinate metadata. "
                       "Consider regenerating for better validation.")
         
-        # Use find_indices_in to get row indices for desired catchments
-        desired_row_indices = find_indices_in(desired_catchment_ids, all_catchment_ids)
-        
-        # Check which catchments were found
-        valid_idx = desired_row_indices != -1
-        
-        if np.any(~valid_idx):
-            raise ValueError(
-                f"Some desired catchments ({np.sum(~valid_idx)}) were not found in the mapping file. "
-                "Please check your input data or mapping file."
-            )
-        
         # Extract submatrix for desired catchments only
         submatrix = full_sparse_matrix[desired_row_indices, :]
         
@@ -450,7 +467,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         ).coalesce()
         
         if is_rank_zero():
-            compression = 100 * (1 - len(non_zero_cols) / full_grid_size)
             print(f"[Dataset] Built local runoff matrix: {len(non_zero_cols)} active grids "
                   f"out of {full_grid_size} total")
             print(f"[Dataset] Mapping {len(non_zero_cols)} runoff grids -> {len(desired_catchment_ids)} catchments")
@@ -460,8 +476,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def export_catchment_runoff(
         self,
         out_dir: str | Path,
-        mapping_npz: str | Path,
-        var_name: str = "runoff",
+        local_runoff_matrix: torch.Tensor,
+        catchment_ids: Optional[np.ndarray] = None,
+        var_name: str = "var",
         dtype: Literal["float32", "float64"] = "float32",
         complevel: int = 4,
         normalized: bool = False,
@@ -469,47 +486,56 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         split_by_year: bool = False,
         units: str = "mm",
         description: Optional[str] = None,
+        filename: Optional[str] = None,
     ) -> Union[Path, List[Path]]:
         """
         Export catchment-aggregated runoff to a NetCDF file readable by MultiRankStatsReader.
+        
+        Uses the local_runoff_matrix returned by build_local_runoff_matrix().
 
-        - Output filename: {var_name}_rank0.nc (or {var_name}_rank0_{year}.nc if split_by_year)
+        - Output filename: {filename}_rank0.nc or {var_name}_rank0.nc if filename not specified
+          (or with _{year} suffix if split_by_year)
         - Dimensions: time (unlimited), saved_points
         - Variables:
             * time: numeric with units and calendar
             * save_coord: (saved_points,) linear catchment IDs (compatible with nx, ny)
             * {var_name}: (time, saved_points) aggregated runoff (area-weighted mean in mm)
-        - Inputs: sparse mapping NPZ (CSR matrix + catchment_ids) and a parameter NetCDF (to copy nx/ny attrs).
 
         Time range: uses the dataset's inherent length (e.g., defined by its __len__), no extra arguments.
 
         GPU acceleration:
         - Set `device="cuda:0"` (or any CUDA device) to enable GPU-accelerated sparse matmul.
         - Falls back to CPU if CUDA is not available.
+        
+        Args:
+            out_dir: Output directory for NetCDF files
+            local_runoff_matrix: Sparse tensor from build_local_runoff_matrix(), shape (n_grids, n_catchments)
+            catchment_ids: Array of catchment IDs. If None, reads from the mapping file used in build_local_runoff_matrix()
+            var_name: Variable name in output NetCDF
+            dtype: Output data type
+            complevel: Compression level (0-9)
+            normalized: If True, normalize mapping weights to sum to 1 per catchment
+            device: Device for computation ("cpu" or "cuda:X")
+            split_by_year: If True, create separate files per year
+            units: Units string for the output variable
+            description: Optional description for the output variable
+            filename: Optional custom filename prefix (default: var_name)
         """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        mapping_npz = Path(mapping_npz)
-
-        if not mapping_npz.exists():
-            raise FileNotFoundError(f"Mapping file not found: {mapping_npz}")
-
-        # Load mapping (SciPy CSR)
-        m = np.load(mapping_npz)
-        catchment_ids = m["catchment_ids"].astype(np.int64)
-        sparse_data = m["sparse_data"].astype(np.float32 if dtype == "float32" else np.float64)
-        sparse_indices = m["sparse_indices"].astype(np.int64)
-        sparse_indptr = m["sparse_indptr"].astype(np.int64)
-        mat_shape = tuple(np.array(m["matrix_shape"]).tolist())
-        mapping = csr_matrix((sparse_data, sparse_indices, sparse_indptr), shape=mat_shape)
-
-
-        n_catch = int(catchment_ids.shape[0])
-        n_cols = int(mat_shape[1])
-        if n_cols != self.data_size:
-            raise ValueError(
-                f"Mapping columns ({n_cols}) != dataset data_size ({self.data_size})."
-            )
+        
+        # Auto-load catchment_ids from mapping file if not provided
+        if catchment_ids is None:
+            if not hasattr(self, '_runoff_mapping_file') or self._runoff_mapping_file is None:
+                raise ValueError(
+                    "catchment_ids not provided and no mapping file available. "
+                    "Please call build_local_runoff_matrix() first or provide catchment_ids explicitly."
+                )
+            mapping_data = np.load(self._runoff_mapping_file)
+            catchment_ids = mapping_data['catchment_ids']
+        
+        n_catch = len(catchment_ids)
+        n_cols = self.data_size  # This is the compressed size after build_local_runoff_matrix
 
         # Prepare device and torch types
         torch_dtype = torch.float32 if dtype == "float32" else torch.float64
@@ -518,30 +544,36 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             print("CUDA not available; falling back to CPU for export_catchment_runoff.")
             dev = torch.device("cpu")
 
-        # Build torch sparse CSR once on the target device
-        # mapping: (n_catch, n_cols)
-        crow = torch.from_numpy(mapping.indptr.astype(np.int64))
-        ccol = torch.from_numpy(mapping.indices.astype(np.int64))
-        cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64))
+        # Use the provided local runoff matrix
+        # Shape: (n_cols, n_catch) - maps compressed runoff grids to catchments
+        t_mapping = local_runoff_matrix.to(dev).to(torch_dtype)
+        
         if normalized:
-            row_lengths = crow[1:] - crow[:-1]               # (num_catchment,)
-            row_ids = torch.repeat_interleave(
-                torch.arange(n_catch, device=dev),
-                row_lengths
-            )                                                # (nnz,)
-            row_sums = torch.zeros(n_catch, dtype=torch_dtype, device=dev)
-            row_sums.scatter_add_(0, row_ids, cval)
-            denom = row_sums[row_ids]
-            nz_mask = denom > 0
-            cval_new = torch.zeros_like(cval)
-            cval_new[nz_mask] = cval[nz_mask] / denom[nz_mask]
-            cval = cval_new
-
-        t_mapping = torch.sparse_csr_tensor(
-            crow, ccol, cval, size=(n_catch, n_cols), dtype=torch_dtype, device=dev
-        )
+            # Normalize by row sums (each catchment's total area)
+            # t_mapping shape: (n_cols, n_catch)
+            # We need to normalize columns (each catchment)
+            col_sums = torch.sparse.sum(t_mapping, dim=0).to_dense()  # (n_catch,)
+            # Create a diagonal scaling matrix or normalize in-place
+            # For COO tensor, we need to work with the values
+            t_mapping = t_mapping.coalesce()
+            indices = t_mapping.indices()  # (2, nnz)
+            values = t_mapping.values()    # (nnz,)
+            col_indices = indices[1]       # column index for each value
+            col_sums_expanded = col_sums[col_indices]
+            nz_mask = col_sums_expanded > 0
+            new_values = torch.zeros_like(values)
+            new_values[nz_mask] = values[nz_mask] / col_sums_expanded[nz_mask]
+            t_mapping = torch.sparse_coo_tensor(
+                indices, new_values, t_mapping.size(), dtype=torch_dtype, device=dev
+            ).coalesce()
+        
+        # Pre-compute transposed mapping matrix for efficient batch multiplication
+        # t_mapping shape: (n_cols, n_catch)
+        # t_mapping_T shape: (n_catch, n_cols) for sparse.mm(sparse, dense)
+        t_mapping_T = t_mapping.t().coalesce()
         
         dtype_nc = "f4" if dtype == "float32" else "f8"
+        file_prefix = filename if filename else var_name
         
         def _init_nc(path):
             ds = nc.Dataset(path, "w", format="NETCDF4")
@@ -574,10 +606,12 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         out_var = None
         current_year = None
         write_idx = 0
+        total_steps = self.num_main_steps + self.num_spin_up_steps
+        processed_steps = 0
 
         try:
             if not split_by_year:
-                nc_path = out_dir / f"{var_name}_rank0.nc"
+                nc_path = out_dir / f"{file_prefix}_rank0.nc"
                 ds, time_var, out_var = _init_nc(nc_path)
                 created_files.append(nc_path)
 
@@ -587,16 +621,22 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 block = self.read_chunk(ci)
                 if block.ndim != 2 or block.shape[1] != n_cols:
                     raise ValueError(
-                        f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols} at chunk {ci}."
+                        f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols} at chunk {ci}. "
+                        "Please call build_local_runoff_matrix() before export_catchment_runoff()."
                     )
                 T = int(block.shape[0])
 
                 # Move current block to device and compute in batch:
-                # mapping (n_catch x n_cols) @ block.T (n_cols x T) -> (n_catch x T)
-                block_t = torch.as_tensor(
+                # t_mapping_T shape: (n_catch, n_cols) - sparse COO tensor (pre-computed)
+                # block shape: (T, n_cols)
+                # We want: block @ t_mapping -> (T, n_catch)
+                # Since torch.sparse.mm expects (sparse, dense), we compute:
+                # t_mapping_T @ block.T = (n_catch, n_cols) @ (n_cols, T) = (n_catch, T)
+                # Then transpose to get (T, n_catch)
+                block_tensor = torch.as_tensor(
                     block, dtype=torch_dtype, device=dev
-                ).T  # shape: (n_cols, T)
-                agg_block = torch.sparse.mm(t_mapping, block_t)  # (n_catch, T)
+                )  # shape: (T, n_cols)
+                agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)  # (n_catch, T)
                 agg_block_np = agg_block.T.contiguous().to("cpu").numpy()  # (T, n_catch)
 
                 # Write each timestep in the block
@@ -609,7 +649,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                             if ds:
                                 ds.close()
                             current_year = year
-                            nc_path = out_dir / f"{var_name}_rank0_{year}.nc"
+                            nc_path = out_dir / f"{file_prefix}_rank0_{year}.nc"
                             ds, time_var, out_var = _init_nc(nc_path)
                             created_files.append(nc_path)
                             write_idx = 0
@@ -618,6 +658,13 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                     time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
                     time_var[write_idx] = time_val
                     write_idx += 1
+                    processed_steps += 1
+                
+                # Print progress
+                progress = processed_steps / total_steps * 100
+                print(f"\rExporting: {processed_steps}/{total_steps} steps ({progress:.1f}%)", end="", flush=True)
+            
+            print()  # New line after progress completes
         finally:
             if ds:
                 ds.close()
