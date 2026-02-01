@@ -217,13 +217,19 @@ class StatisticsAggregator:
     """
     Handles statistics aggregation with streaming NetCDF output to minimize memory usage.
     Each time step is immediately written to disk after accumulation.
+    
+    Supports two modes:
+    1. Streaming mode (default): Write each time step to NetCDF files incrementally.
+    2. In-memory mode: Store all time steps in memory (CPU by default) for small-scale analysis.
+       Results are dynamically appended, no need to pre-specify total time steps.
     """
     
     def __init__(self, device: torch.device, output_dir: Path, rank: int, 
                  num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
                  output_split_by_year: bool = False, num_trials: int = 1,
                  max_pending_steps: int = 10, calendar: str = "standard",
-                 time_unit: str = "days since 1900-01-01 00:00:00"):
+                 time_unit: str = "days since 1900-01-01 00:00:00",
+                 in_memory_mode: bool = False, result_device: Optional[torch.device] = None):
         """
         Initialize the statistics aggregator.
         
@@ -240,6 +246,10 @@ class StatisticsAggregator:
                                Increase this to allow GPU to run ahead of disk I/O.
             calendar: CF calendar type (e.g., 'standard', 'noleap', '360_day')
             time_unit: CF time unit string (e.g., 'days since 1900-01-01 00:00:00')
+            in_memory_mode: If True, store results in memory instead of writing to NC files.
+                           Results are dynamically appended as time steps are finalized.
+            result_device: Device for storing in-memory results. Defaults to CPU.
+                          Only used when in_memory_mode=True.
         """
         self.device = device
         self.output_dir = output_dir
@@ -253,6 +263,10 @@ class StatisticsAggregator:
         self.calendar = calendar
         self.time_unit = time_unit
         self._current_year = None
+        
+        # In-memory mode settings
+        self.in_memory_mode = in_memory_mode
+        self.result_device = result_device if result_device is not None else torch.device("cpu")
         
         self._step_count = 0
         self._macro_step_index = 0  # Current macro step index (outer loop counter)
@@ -302,9 +316,69 @@ class StatisticsAggregator:
         self._saved_kernel_file = None
         self._dirty_outputs: Set[str] = set()
         
+        # In-memory result tensors: out_name -> list of tensors (one per time step)
+        # Only used when in_memory_mode=True
+        self._result_tensors: Dict[str, List[torch.Tensor]] = {}
+        self._current_time_index: int = 0  # Current time index for in-memory writing
+        
         print(f"Initialized StreamingStatisticsAggregator for rank {self.rank} with {self.num_workers} workers")
+        if in_memory_mode:
+            print(f"  In-memory mode enabled, results will be stored on {self.result_device}")
         if self.save_kernels:
             print(f"Generated kernels will be saved to: {self.kernels_dir}")
+
+    def get_memory_usage(self) -> int:
+        """
+        Calculate GPU/CPU memory usage by this aggregator's core buffers.
+        
+        This returns only the memory used by accumulation buffers and kernel states,
+        NOT including in-memory result tensors (use get_result_memory_usage for that).
+        
+        Returns:
+            Total memory usage in bytes.
+        """
+        total_bytes = 0
+        
+        # Storage tensors (accumulation buffers)
+        for name, tensor in self._storage.items():
+            if isinstance(tensor, torch.Tensor):
+                total_bytes += tensor.element_size() * tensor.numel()
+        
+        # Kernel states (cached tensors for kernel execution)
+        if self._kernel_states is not None:
+            for name, tensor in self._kernel_states.items():
+                if isinstance(tensor, torch.Tensor):
+                    total_bytes += tensor.element_size() * tensor.numel()
+        
+        # Note: In-memory result tensors are NOT included here.
+        # Use get_result_memory_usage() to get the memory used by results.
+        
+        # Tensor registry (registered source tensors - these are references, not owned)
+        # We don't count these as they are owned by modules
+        
+        return total_bytes
+    
+    def get_result_memory_usage(self) -> int:
+        """
+        Calculate memory usage by in-memory result tensors.
+        
+        Only applicable when in_memory_mode=True.
+        
+        Returns:
+            Total memory usage in bytes for result tensors.
+        """
+        if not self.in_memory_mode:
+            return 0
+        
+        total_bytes = 0
+        for name, tensor_list in self._result_tensors.items():
+            for tensor in tensor_list:
+                if isinstance(tensor, torch.Tensor):
+                    total_bytes += tensor.element_size() * tensor.numel()
+        
+        return total_bytes
+        
+
 
     def _cleanup_temp_files(self):
         """Remove temporary kernel files."""
@@ -435,14 +509,129 @@ class StatisticsAggregator:
         # Initialize single time step aggregation (generic)
         self.initialize_statistics(variable_ops)
         
-        # Start the write executors (one per worker to guarantee serialization per variable)
-        self._write_executors = [ProcessPoolExecutor(max_workers=1) for _ in range(self.num_workers)]
-        self._write_futures = []
+        # If in-memory mode, initialize result storage lists instead of starting file writers
+        if self.in_memory_mode:
+            self._init_result_storage()
+            print(f"In-memory aggregation initialized with {len(self._result_tensors)} output variables")
+        else:
+            # Start the write executors (one per worker to guarantee serialization per variable)
+            self._write_executors = [ProcessPoolExecutor(max_workers=1) for _ in range(self.num_workers)]
+            self._write_futures = []
+            print(f"Streaming aggregation system initialized successfully ({len(self._write_executors)} partitioned executors)")
+    
+    def initialize_in_memory_aggregation(self, variable_ops: Optional[Dict[str, List[str]]] = None, 
+                                          variable_names: Optional[List[str]] = None) -> None:
+        """
+        Initialize in-memory aggregation for specified variables.
+        Results are stored in memory (CPU by default) instead of being written to files.
         
-        print(f"Streaming aggregation system initialized successfully ({len(self._write_executors)} partitioned executors)")
+        This is a convenience method that ensures in_memory_mode is enabled.
+        
+        Args:
+            variable_ops: Dict of variable -> op (mean|max|min|last)
+            variable_names: Backward-compatible list of variable names (defaults to mean)
+            
+        Raises:
+            ValueError: If in_memory_mode was not enabled during initialization.
+        """
+        if not self.in_memory_mode:
+            raise ValueError("in_memory_mode must be True to use initialize_in_memory_aggregation. "
+                           "Set in_memory_mode=True when creating the aggregator.")
+        
+        self.initialize_streaming_aggregation(variable_ops=variable_ops, variable_names=variable_names)
+    
+    def _init_result_storage(self) -> None:
+        """Initialize empty lists for in-memory result storage."""
+        if not self.in_memory_mode:
+            return
+            
+        self._result_tensors.clear()
+        self._current_time_index = 0
+        
+        # Initialize empty lists for each output
+        for out_name in self._output_keys:
+            self._result_tensors[out_name] = []
+    
+    def get_results(self, as_stacked: bool = True) -> Dict[str, torch.Tensor]:
+        """
+        Get the in-memory result tensors.
+        
+        Args:
+            as_stacked: If True (default), stack all time steps into a single tensor.
+                       If False, return list of per-time-step tensors.
+                            
+        Returns:
+            Dictionary mapping output names to result tensors.
+            Shape (when stacked): (time_steps, *actual_shape)
+            
+        Raises:
+            RuntimeError: If not in in-memory mode.
+        """
+        if not self.in_memory_mode:
+            raise RuntimeError("get_results() is only available in in_memory_mode")
+        
+        if as_stacked:
+            result = {}
+            for name, tensor_list in self._result_tensors.items():
+                if tensor_list:
+                    result[name] = torch.stack(tensor_list, dim=0)
+                else:
+                    result[name] = torch.tensor([], device=self.result_device)
+            return result
+        else:
+            return {name: list(tensor_list) for name, tensor_list in self._result_tensors.items()}
+    
+    def get_result(self, variable_name: str, op: str = "mean", as_stacked: bool = True) -> torch.Tensor:
+        """
+        Get a specific result tensor by variable name and operation.
+        
+        Args:
+            variable_name: Name of the variable
+            op: Operation type (mean, max, min, last, etc.)
+            as_stacked: If True (default), stack all time steps into a single tensor.
+            
+        Returns:
+            Result tensor for the specified variable and operation.
+            
+        Raises:
+            RuntimeError: If not in in-memory mode.
+            KeyError: If the specified variable/op combination doesn't exist.
+        """
+        if not self.in_memory_mode:
+            raise RuntimeError("get_result() is only available in in_memory_mode")
+        
+        out_name = f"{variable_name}_{op}"
+        if out_name not in self._result_tensors:
+            raise KeyError(f"No result found for {out_name}. Available: {list(self._result_tensors.keys())}")
+        
+        tensor_list = self._result_tensors[out_name]
+        if as_stacked and tensor_list:
+            return torch.stack(tensor_list, dim=0)
+        elif as_stacked:
+            return torch.tensor([], device=self.result_device)
+        else:
+            return list(tensor_list)
+    
+    def get_time_index(self) -> int:
+        """Get the current time index (number of finalized time steps)."""
+        return self._current_time_index
+    
+    def reset_time_index(self) -> None:
+        """Reset the time index to 0 for a new simulation run (in-memory mode only)."""
+        if not self.in_memory_mode:
+            raise RuntimeError("reset_time_index() is only available in in_memory_mode")
+        self._current_time_index = 0
+        self._macro_step_times.clear()
+        # Clear result lists
+        for out_name in self._result_tensors:
+            self._result_tensors[out_name] = []
     
     def _create_netcdf_files(self, year: Optional[int] = None) -> None:
         """Create empty NetCDF files with proper structure for streaming."""
+        if self.in_memory_mode:
+            # Skip file creation in in-memory mode
+            return
+            
         if not self.output_split_by_year and self._files_created:
             return
         
@@ -2757,8 +2946,10 @@ class StatisticsAggregator:
     
     def finalize_time_step(self, dt: Union[datetime, cftime.datetime]) -> None:
         """
-        Finalize the current time step by immediately writing to NetCDF files
-        and resetting mean storage for the next time step.
+        Finalize the current time step by writing results to output.
+        
+        In streaming mode: writes to NetCDF files incrementally.
+        In in-memory mode: copies current storage to result tensors.
         
         Args:
             dt: Time step to finalize (datetime or cftime.datetime)
@@ -2766,6 +2957,11 @@ class StatisticsAggregator:
         # Record this time step for argmax/argmin index-to-time conversion
         # This is called at the end of each outer loop iteration
         self._macro_step_times.append(dt)
+
+        # Handle in-memory mode
+        if self.in_memory_mode:
+            self._finalize_time_step_in_memory(dt)
+            return
 
         if self.output_split_by_year:
             if self._current_year is None:
@@ -2878,3 +3074,35 @@ class StatisticsAggregator:
                      print(f"  Failed to write time step {dt}: {exc}")
                      raise exc
              self._write_futures.clear()
+
+    def _finalize_time_step_in_memory(self, dt: Union[datetime, cftime.datetime]) -> None:
+        """
+        Finalize time step in in-memory mode by copying storage to result tensors.
+        
+        Args:
+            dt: Time step to finalize
+        """
+        # Increment macro step index for next iteration
+        self._macro_step_index += 1
+        
+        # Get dirty outputs to write
+        keys_to_write = [k for k in self._output_keys if k in self._dirty_outputs]
+        self._dirty_outputs.clear()
+        
+        # Append storage tensors to result lists
+        for out_name in keys_to_write:
+            if out_name not in self._result_tensors:
+                continue
+                
+            storage_tensor = self._storage[out_name]
+            
+            # Clone and move to result device (default CPU)
+            # This frees GPU memory and allows dynamic growth
+            result_copy = storage_tensor.detach().clone().to(self.result_device)
+            self._result_tensors[out_name].append(result_copy)
+        
+        # Advance time index
+        self._current_time_index += 1
+        
+        # Reset counters
+        self._current_macro_step_count = 0.0

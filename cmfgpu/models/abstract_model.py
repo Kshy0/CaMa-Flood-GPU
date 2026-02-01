@@ -99,6 +99,8 @@ class AbstractModel(BaseModel, ABC):
     max_pending_steps: int = Field(default=20, description="Maximum number of pending time steps for output buffering")
     output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(default=None, description="Time to start saving output")
     calendar: str = Field(default="standard", description="Calendar type for time handling (e.g., standard, noleap)")
+    in_memory_output: bool = Field(default=False, description="Store output in memory instead of writing to NC files")
+    result_device: Optional[torch.device] = Field(default=None, description="Device for in-memory results (default: CPU)")
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
 
@@ -700,6 +702,13 @@ class AbstractModel(BaseModel, ABC):
             mem_mb = mem_bytes / (1024 * 1024)
             total_memory += mem_bytes
             print(f"{module_name:<30} | {mem_mb:<15.2f}")
+        
+        # Add StatisticsAggregator memory usage
+        if self._statistics_aggregator is not None:
+            aggregator_mem = self._statistics_aggregator.get_memory_usage()
+            aggregator_mem_mb = aggregator_mem / (1024 * 1024)
+            total_memory += aggregator_mem
+            print(f"{'StatisticsAggregator':<30} | {aggregator_mem_mb:<15.2f}")
             
         print(f"{'-' * 50}")
         print(f"{'Total':<30} | {total_memory / (1024 * 1024):<15.2f} MB\n")
@@ -788,6 +797,8 @@ class AbstractModel(BaseModel, ABC):
             save_kernels=self.save_kernels,
             max_pending_steps=self.max_pending_steps,
             calendar=self.calendar,
+            in_memory_mode=self.in_memory_output,
+            result_device=self.result_device,
         )
 
         registered_vars = set()
@@ -1099,6 +1110,56 @@ class AbstractModel(BaseModel, ABC):
         """
         if self._statistics_aggregator is not None:
             self._statistics_aggregator.finalize_time_step(current_time)
+
+    def get_output_results(self, as_stacked: bool = True) -> Dict[str, torch.Tensor]:
+        """
+        Get the in-memory output results (only available when in_memory_output=True).
+        
+        Args:
+            as_stacked: If True (default), stack all time steps into a single tensor.
+                       If False, return list of per-time-step tensors.
+                            
+        Returns:
+            Dictionary mapping output names to result tensors.
+            Shape (when stacked): (time_steps, *actual_shape)
+            
+        Raises:
+            RuntimeError: If not in in_memory_output mode or aggregator not initialized.
+        """
+        if self._statistics_aggregator is None:
+            raise RuntimeError("Statistics aggregator not initialized")
+        return self._statistics_aggregator.get_results(as_stacked=as_stacked)
+    
+    def get_output_result(self, variable_name: str, op: str = "mean", as_stacked: bool = True) -> torch.Tensor:
+        """
+        Get a specific output result tensor by variable name and operation.
+        
+        Args:
+            variable_name: Name of the variable
+            op: Operation type (mean, max, min, last, etc.)
+            as_stacked: If True (default), stack all time steps into a single tensor.
+            
+        Returns:
+            Result tensor for the specified variable and operation.
+            
+        Raises:
+            RuntimeError: If not in in_memory_output mode or aggregator not initialized.
+            KeyError: If the specified variable/op combination doesn't exist.
+        """
+        if self._statistics_aggregator is None:
+            raise RuntimeError("Statistics aggregator not initialized")
+        return self._statistics_aggregator.get_result(variable_name, op, as_stacked=as_stacked)
+    
+    def get_output_time_index(self) -> int:
+        """Get the current output time index (number of finalized time steps)."""
+        if self._statistics_aggregator is None:
+            return 0
+        return self._statistics_aggregator.get_time_index()
+    
+    def reset_output_time_index(self) -> None:
+        """Reset the output time index to 0 for a new simulation run (in-memory mode only)."""
+        if self._statistics_aggregator is not None:
+            self._statistics_aggregator.reset_time_index()
 
     def shard_param(self) -> Dict[str, Any]:
         """
