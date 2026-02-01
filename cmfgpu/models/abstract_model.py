@@ -793,10 +793,11 @@ class AbstractModel(BaseModel, ABC):
         registered_vars = set()
 
         # Normalize variables_to_save (op -> vars) into var -> set[ops]
-        # Note: argmax/argmin are automatically created when max/min is requested
-        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "median"}
+        # Note: argmax/argmin can now be specified explicitly for timing information
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "median", "argmax", "argmin"}
         import re
         topk_pattern = re.compile(r'^(max|min)(\d+)$')
+        argtopk_pattern = re.compile(r'^arg(max|min)(\d*)$')  # argmax, argmin, argmax3, argmin3
         q_pattern = re.compile(r'^q\d+$')
 
         var_to_ops: Dict[str, List[str]] = {}
@@ -809,16 +810,28 @@ class AbstractModel(BaseModel, ABC):
             
             # Validate op parts
             for p in op_parts:
-                if p.startswith('argmax') or p.startswith('argmin'):
-                    raise ValueError(f"Invalid op '{op}': argmax/argmin cannot be specified directly. They are auto-generated with max/min.")
-                if p not in allowed_ops and not topk_pattern.match(p) and not q_pattern.match(p):
-                     raise ValueError(f"Invalid op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
+                # Check against allowed patterns
+                if p not in allowed_ops and not topk_pattern.match(p) and not argtopk_pattern.match(p) and not q_pattern.match(p):
+                     raise ValueError(f"Invalid op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)}, top-k pattern, or arg-top-k pattern.")
+
+            # Single operation (no underscore) - this is the inner aggregation
+            # arg and median operations are NOT allowed as inner operations
+            if len(op_parts) == 1:
+                single_op = op_parts[0]
+                if argtopk_pattern.match(single_op) or single_op in ('argmax', 'argmin'):
+                    raise ValueError(f"Invalid op '{op}': arg operations (argmax, argmin, argmax3, etc.) cannot be used alone. They are only valid as outer operations in compound form like 'argmax_mean'.")
+                if single_op == 'median':
+                    raise ValueError(f"Invalid op '{op}': 'median' cannot be used alone as inner operation. Use compound form like 'median_mean'.")
 
             if len(op_parts) > 1:
                 outer, inner = op_parts[0], op_parts[1]
-                # Check for inner restriction: top-k cannot be inner op
-                if topk_pattern.match(inner):
-                    raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k) cannot be used as an inner operation.")
+                # Check for inner restriction: top-k, arg-top-k, argmax/argmin, and median cannot be inner ops
+                if topk_pattern.match(inner) or argtopk_pattern.match(inner):
+                    raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k/arg-top-k) cannot be used as an inner operation.")
+                if inner in ('argmax', 'argmin'):
+                    raise ValueError(f"Invalid composite op '{op}': '{inner}' cannot be used as an inner operation. arg operations are only valid as outer ops.")
+                if inner == 'median':
+                    raise ValueError(f"Invalid composite op '{op}': 'median' cannot be used as an inner operation.")
                 if len(op_parts) > 2:
                     raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")
 
@@ -1408,9 +1421,10 @@ class AbstractModel(BaseModel, ABC):
         if self.variables_to_save is None:
             return self
         # Validate shape: dict[op -> vars]
-        # Note: argmax/argmin are automatically created when max/min is requested
-        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "median"}
+        # Note: argmax/argmin can now be specified explicitly for timing information
+        allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "median", "argmax", "argmin"}
         topk_pattern = re.compile(r'^(max|min)(\d+)$')
+        argtopk_pattern = re.compile(r'^arg(max|min)(\d*)$')  # argmax, argmin, argmax3, argmin3
         q_pattern = re.compile(r'^q\d+$')
 
         if not isinstance(self.variables_to_save, dict):
@@ -1424,14 +1438,27 @@ class AbstractModel(BaseModel, ABC):
                 op_parts = op_l.split('_')
                 
                 for p in op_parts:
-                    if p not in allowed_ops and not topk_pattern.match(p) and not q_pattern.match(p):
-                        raise ValueError(f"Invalid statistics op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)} or top-k pattern.")
+                    if p not in allowed_ops and not topk_pattern.match(p) and not argtopk_pattern.match(p) and not q_pattern.match(p):
+                        raise ValueError(f"Invalid statistics op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)}, top-k pattern, or arg-top-k pattern.")
                 
+                # Single operation (no underscore) - this is the inner aggregation
+                # arg and median operations are NOT allowed as inner operations
+                if len(op_parts) == 1:
+                    single_op = op_parts[0]
+                    if argtopk_pattern.match(single_op) or single_op in ('argmax', 'argmin'):
+                        raise ValueError(f"Invalid op '{op}': arg operations (argmax, argmin, argmax3, etc.) cannot be used alone. They are only valid as outer operations in compound form like 'argmax_mean'.")
+                    if single_op == 'median':
+                        raise ValueError(f"Invalid op '{op}': 'median' cannot be used alone as inner operation. Use compound form like 'median_mean'.")
+
                 if len(op_parts) > 1:
                     outer, inner = op_parts[0], op_parts[1]
-                    # Disallow top-k as inner ops
-                    if topk_pattern.match(inner):
-                        raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k) cannot be used as an inner operation.")
+                    # Disallow top-k, arg-top-k, argmax/argmin, and median as inner ops
+                    if topk_pattern.match(inner) or argtopk_pattern.match(inner):
+                        raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k/arg-top-k) cannot be used as an inner operation.")
+                    if inner in ('argmax', 'argmin'):
+                        raise ValueError(f"Invalid composite op '{op}': '{inner}' cannot be used as an inner operation. arg operations are only valid as outer ops.")
+                    if inner == 'median':
+                        raise ValueError(f"Invalid composite op '{op}': 'median' cannot be used as an inner operation.")
                     # Disallow more than 2 levels for now
                     if len(op_parts) > 2:
                         raise ValueError(f"Invalid composite op '{op}': Only 2 levels of operations are supported.")

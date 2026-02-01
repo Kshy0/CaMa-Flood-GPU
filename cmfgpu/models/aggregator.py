@@ -59,65 +59,47 @@ def sanitize_symbol(name: str) -> str:
     return name.strip('_')
 
 def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
-    (mean_var_name, time_step_data, output_path, time_datetime) = args
+    """Write a single time step to a NetCDF file. Each file contains a single variable."""
+    (var_name, time_step_data, output_path, time_datetime) = args
     
     with nc.Dataset(output_path, 'a') as ncfile:
-        safe = sanitize_symbol(mean_var_name)
+        safe = sanitize_symbol(var_name)
         time_var = ncfile.variables['time']
         
-        # Check if this is a multi-rank variable (k > 1)
-        # by looking for variables named safe_0, safe_1, etc.
-        if f"{safe}_0" in ncfile.variables:
-            # Multi-rank case: write to separate variables
-            k_val = time_step_data.shape[-1]  # Last dimension is k
-            current_len = len(ncfile.variables[f"{safe}_0"])
-            
-            for k_idx in range(k_val):
-                var_name_k = f"{safe}_{k_idx}"
-                nc_var = ncfile.variables[var_name_k]
-                # Extract the k-th slice (remove last dimension)
-                if time_step_data.ndim == 2:
-                    # (saved_points, k) -> (saved_points,)
-                    nc_var[current_len, :] = time_step_data[:, k_idx]
-                elif time_step_data.ndim == 3:
-                    # (saved_points, levels, k) -> (saved_points, levels)
-                    nc_var[current_len, :, :] = time_step_data[:, :, k_idx]
+        # Find the data variable
+        target_var = None
+        if var_name in ncfile.variables:
+            target_var = var_name
+        elif safe in ncfile.variables:
+            target_var = safe
         else:
-            # Single variable case
-            target_var = None
-            if mean_var_name in ncfile.variables:
-                target_var = mean_var_name
-            elif safe in ncfile.variables:
-                target_var = safe
-            else:
-                # Last resort: find first variable that is not dimension/coord related
-                for v in ncfile.variables:
-                    if v not in ('time', 'trial', 'saved_points', 'levels', 'catchment_id'):
-                        target_var = v
-                        break
-            
-            if target_var is None:
-                raise KeyError(f"Could not find variable for '{mean_var_name}' (safe: '{safe}') in {output_path}")
-
-            nc_var = ncfile.variables[target_var]
-            current_len = len(nc_var)
-            
-            # Append data
-            if time_step_data.ndim == 1:
-                nc_var[current_len, :] = time_step_data
-            elif time_step_data.ndim == 2:
-                nc_var[current_len, :, :] = time_step_data
-            elif time_step_data.ndim == 3:
-                nc_var[current_len, :, :, :] = time_step_data
+            # Find first variable that is not dimension/coord related
+            for v in ncfile.variables:
+                if v not in ('time', 'trial', 'saved_points', 'levels', 'catchment_id'):
+                    target_var = v
+                    break
         
-        # Append datetime (only once, same for all k)
+        if target_var is None:
+            raise KeyError(f"Could not find variable for '{var_name}' (safe: '{safe}') in {output_path}")
+
+        nc_var = ncfile.variables[target_var]
+        current_len = len(nc_var)
+        
+        # Append data
+        if time_step_data.ndim == 1:
+            nc_var[current_len, :] = time_step_data
+        elif time_step_data.ndim == 2:
+            nc_var[current_len, :, :] = time_step_data
+        elif time_step_data.ndim == 3:
+            nc_var[current_len, :, :, :] = time_step_data
+        
+        # Append datetime
         time_unit = time_var.getncattr("units")
         calendar = time_var.getncattr("calendar")
         time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
         time_var[current_len] = time_val
     
     # WSL optimization: Clear page cache for the written file to prevent memory bloat
-    # Windows does not automatically reclaim WSL page cache memory effectively
     if _is_wsl() and hasattr(os, 'posix_fadvise'):
         try:
             with open(output_path, 'rb') as f:
@@ -125,10 +107,10 @@ def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
         except Exception:
             pass
     
-    return (mean_var_name, current_len)
+    return (var_name, current_len)
 
 
-def _create_netcdf_file_process(args: Tuple) -> Path:
+def _create_netcdf_file_process(args: Tuple) -> Union[Path, List[Path]]:
     """
     Process function for creating empty NetCDF files with proper structure.
     This function runs in a separate process.
@@ -138,100 +120,98 @@ def _create_netcdf_file_process(args: Tuple) -> Path:
               output_dir, complevel, rank, year, calendar, time_unit, num_trials)
         
     Returns:
-        Path to the created NetCDF file
+        Path or List[Path] to the created NetCDF file(s)
     """
     (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials) = args
 
     safe_name = sanitize_symbol(mean_var_name)
 
-    if year is not None:
-        filename = f"{safe_name}_rank{rank}_{year}.nc"
-    else:
-        filename = f"{safe_name}_rank{rank}.nc"
-    output_path = output_dir / filename
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    actual_shape = metadata.get('actual_shape', ())  # Spatial shape
+    tensor_shape = metadata.get('tensor_shape', ())  # Logical grid shape
+    coord_name = metadata.get('save_coord', None)
+    dtype = metadata.get('dtype', 'f8')
+    k_val = metadata.get('k', 1)
     
-    with nc.Dataset(output_path, 'w', format='NETCDF4') as ncfile:
-        # Write global attributes
-        ncfile.setncattr('title', f'Time series for rank {rank}: {mean_var_name}')
-        ncfile.setncattr('original_variable_name', mean_var_name)
-
-        actual_shape = metadata.get('actual_shape', ())  # Spatial shape
-        tensor_shape = metadata.get('tensor_shape', ())  # Logical grid shape
-        coord_name = metadata.get('save_coord', None)
-        dtype = metadata.get('dtype', 'f8')
-        
-        # Create time dimension (unlimited for streaming)
-        ncfile.createDimension('time', None)
-        
-        # Create spatial/vertical dimensions based on actual shape
-        dim_names = ['time']  # Always start with time
-        
-        if num_trials > 1:
-            dim_names.append('trial')
-            ncfile.createDimension('trial', num_trials)
-            
-            dim_names.append('saved_points')
-            ncfile.createDimension('saved_points', actual_shape[1])
-            
-            if len(actual_shape) > 2:
-                dim_names.append('levels')
-                ncfile.createDimension('levels', actual_shape[2])
+    # Helper to create a single NetCDF file
+    def create_single_file(file_safe_name: str, file_var_name: str, description_suffix: str = "") -> Path:
+        if year is not None:
+            filename = f"{file_safe_name}_rank{rank}_{year}.nc"
         else:
-            if len(actual_shape) == 1:
-                # 1D spatial: time + saved points
-                dim_names.append('saved_points')
-                ncfile.createDimension('saved_points', actual_shape[0])
-            elif len(actual_shape) == 2:
-                # 2D: time + saved points + levels
-                dim_names.extend(['saved_points', 'levels'])
-                ncfile.createDimension('saved_points', actual_shape[0])
-                ncfile.createDimension('levels', actual_shape[1])
+            filename = f"{file_safe_name}_rank{rank}.nc"
+        output_path = output_dir / filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Handle K dimension by creating multiple variables instead of a rank dimension
-        k_val = metadata.get('k', 1)
+        with nc.Dataset(output_path, 'w', format='NETCDF4') as ncfile:
+            # Write global attributes
+            ncfile.setncattr('title', f'Time series for rank {rank}: {file_var_name}')
+            ncfile.setncattr('original_variable_name', file_var_name)
+
+            # Create time dimension (unlimited for streaming)
+            ncfile.createDimension('time', None)
+            
+            # Create spatial/vertical dimensions based on actual shape
+            dim_names = ['time']  # Always start with time
+            
+            if num_trials > 1:
+                dim_names.append('trial')
+                ncfile.createDimension('trial', num_trials)
                 
-        if coord_name and coord_values is not None:
-            coord_var = ncfile.createVariable(
-                coord_name,
-                coord_values.dtype,
-                ('saved_points',),
-            )
-            coord_var[:] = coord_values
+                dim_names.append('saved_points')
+                ncfile.createDimension('saved_points', actual_shape[1])
+                
+                if len(actual_shape) > 2:
+                    dim_names.append('levels')
+                    ncfile.createDimension('levels', actual_shape[2])
+            else:
+                if len(actual_shape) == 1:
+                    # 1D spatial: time + saved points
+                    dim_names.append('saved_points')
+                    ncfile.createDimension('saved_points', actual_shape[0])
+                elif len(actual_shape) == 2:
+                    # 2D: time + saved points + levels
+                    dim_names.extend(['saved_points', 'levels'])
+                    ncfile.createDimension('saved_points', actual_shape[0])
+                    ncfile.createDimension('levels', actual_shape[1])
+                    
+            if coord_name and coord_values is not None:
+                coord_var = ncfile.createVariable(
+                    coord_name,
+                    coord_values.dtype,
+                    ('saved_points',),
+                )
+                coord_var[:] = coord_values
 
-        time_var = ncfile.createVariable('time', 'f8', ('time',))
-        time_var.setncattr('units', time_unit)
-        time_var.setncattr('calendar', calendar)
-        
-        # Create data variables - if k > 1, create k separate variables
-        if k_val > 1:
-            for k_idx in range(k_val):
-                var_name_k = f"{safe_name}_{k_idx}"
-                nc_var = ncfile.createVariable(
-                    var_name_k,
-                    dtype,
-                    dim_names,
-                    zlib=True,
-                    complevel=complevel)
-                nc_var.setncattr('description', f"{metadata.get('description', '')} [rank {k_idx}]")
-                nc_var.setncattr('actual_shape', str(actual_shape))
-                nc_var.setncattr('tensor_shape', str(tensor_shape))
-                nc_var.setncattr('long_name', f"{mean_var_name}_{k_idx}")
-                nc_var.setncattr('rank_index', k_idx)
-        else:
-            # Single variable (k=1)
+            time_var = ncfile.createVariable('time', 'f8', ('time',))
+            time_var.setncattr('units', time_unit)
+            time_var.setncattr('calendar', calendar)
+            
+            # Create single data variable
             nc_var = ncfile.createVariable(
-                safe_name,
+                file_safe_name,
                 dtype,
                 dim_names,
                 zlib=True,
                 complevel=complevel)
-            nc_var.setncattr('description', metadata.get("description", ""))
+            desc = metadata.get("description", "") + description_suffix
+            nc_var.setncattr('description', desc)
             nc_var.setncattr('actual_shape', str(actual_shape))
             nc_var.setncattr('tensor_shape', str(tensor_shape))
-            nc_var.setncattr('long_name', mean_var_name)
+            nc_var.setncattr('long_name', file_var_name)
+        
+        return output_path
     
-    return output_path
+    # For k > 1, create separate files for each k index
+    if k_val > 1:
+        paths = []
+        for k_idx in range(k_val):
+            file_safe_name = f"{safe_name}_{k_idx}"
+            file_var_name = f"{mean_var_name}_{k_idx}"
+            desc_suffix = f" [rank {k_idx}]"
+            path = create_single_file(file_safe_name, file_var_name, desc_suffix)
+            paths.append(path)
+        return paths
+    else:
+        return create_single_file(safe_name, mean_var_name)
 
 class StatisticsAggregator:
     """
@@ -481,22 +461,31 @@ class StatisticsAggregator:
                 coord_values = self._coord_cache.get(coord_name, None)
                 args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials)
                 future = executor.submit(_create_netcdf_file_process, args)
-                creation_futures[future] = out_name
+                creation_futures[future] = (out_name, metadata.get('k', 1))
             
             # Collect results
             for future in as_completed(creation_futures):
-                mean_var_name = creation_futures[future]
+                out_name, k_val = creation_futures[future]
                 try:
-                    output_path = future.result()
-                    self._netcdf_files[mean_var_name] = output_path
-                    self._all_created_files.add(output_path)
-                    print(f"  Created {output_path.name}")
+                    result = future.result()
+                    # Handle both single path and list of paths (for k > 1)
+                    if isinstance(result, list):
+                        # Multiple files for k > 1
+                        self._netcdf_files[out_name] = result  # Store as list
+                        for p in result:
+                            self._all_created_files.add(p)
+                            print(f"  Created {p.name}")
+                    else:
+                        self._netcdf_files[out_name] = result
+                        self._all_created_files.add(result)
+                        print(f"  Created {result.name}")
                 except Exception as exc:
-                    print(f"  Failed to create file for {mean_var_name}: {exc}")
+                    print(f"  Failed to create file for {out_name}: {exc}")
                     raise exc
         
         self._files_created = True
-        print(f"Created {len(self._netcdf_files)} NetCDF files for streaming")
+        total_files = sum(len(v) if isinstance(v, list) else 1 for v in self._netcdf_files.values())
+        print(f"Created {total_files} NetCDF files for streaming")
     
     def _prepare_kernel_states(self) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
@@ -537,23 +526,16 @@ class StatisticsAggregator:
                 out_name = f"{var_name}_{op}"
                 required_tensors[out_name] = self._storage[out_name]
                 
-                # For max/min operations, also add their argmax/argmin storage
+                # For explicit argmax/argmin operations, add their auxiliary storage
                 op_parts = op.split('_')
                 outer_op = op_parts[0]
-                match_k = re.match(r'(max|min)(\d+)$', outer_op)
-                if match_k:
-                    base_op = match_k.group(1)
-                    arg_name = f"{var_name}_arg{op}"
-                    if arg_name in self._storage:
-                        required_tensors[arg_name] = self._storage[arg_name]
-                elif outer_op == 'max':
-                    arg_name = f"{var_name}_arg{op}"
-                    if arg_name in self._storage:
-                        required_tensors[arg_name] = self._storage[arg_name]
-                elif outer_op == 'min':
-                    arg_name = f"{var_name}_arg{op}"
-                    if arg_name in self._storage:
-                        required_tensors[arg_name] = self._storage[arg_name]
+                arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
+                if arg_match:
+                    arg_type = arg_match.group(1)
+                    arg_k_str = arg_match.group(2)
+                    aux_name = f"{var_name}_{arg_type}{arg_k_str or ''}_aux"
+                    if aux_name in self._storage:
+                        required_tensors[aux_name] = self._storage[aux_name]
                 
                 if op.startswith('median') or (op.startswith('q') and op[1:].isdigit()):
                     q_name = f"{var_name}_median_q_state"
@@ -634,6 +616,13 @@ class StatisticsAggregator:
             '- max/min ops automatically update corresponding argmax/argmin (step index)',
             '- argmax/argmin indices are converted to datetime on NC file write',
             '- For mid: stores val when is_middle is True',
+            '',
+            'Optimizations Applied:',
+            '- tl.static_range for compile-time loop unrolling (num_trials, bubble sort)',
+            '- Merged max3+argmax3 and min3+argmin3 when coexisting to share comparisons',
+            '- Base offset precomputation (shared across max/min/argmax/argmin for same var+K)',
+            '- Merged maxK+minK bubble insert in single loop with shared offset',
+            '- Precise mask for tl.store: mask & swap_mask to reduce write pressure',
             '"""',
             "",
             "import triton",
@@ -894,6 +883,9 @@ class StatisticsAggregator:
         Generate 1D variable processing code with conditions grouped for efficiency.
         All operations under the same condition are emitted in a single if block.
         Supports all ops including maxK/minK bubble insert and median P-Square.
+        
+        Optimization: arg operations (argmax, argmin, argmax3, etc.) can only be outer ops.
+        When max+argmax or max3+argmax3 coexist, they are merged to share comparisons.
         """
         from collections import defaultdict
         
@@ -902,8 +894,37 @@ class StatisticsAggregator:
             
         kernel_code_lines.append(f"{indent}# 1D variables")
         
+        # Phase 0: Analyze max/argmax pairs for merging optimization
+        # For each variable, detect which ops coexist to enable merging
+        var_op_analysis = {}  # var -> {'max': bool, 'argmax': bool, 'max3': int, 'argmax3': int, ...}
+        for var in dims_1d:
+            ops = self._variable_ops[var]
+            analysis = {
+                'max': 'max' in ops,
+                'argmax': 'argmax' in ops,
+                'min': 'min' in ops,
+                'argmin': 'argmin' in ops,
+                'maxK': {},   # k -> True
+                'argmaxK': {},  # k -> True
+                'minK': {},
+                'argminK': {},
+            }
+            for op in ops:
+                match_maxk = re.match(r'^max(\d+)$', op)
+                match_argmaxk = re.match(r'^argmax(\d+)$', op)
+                match_mink = re.match(r'^min(\d+)$', op)
+                match_argmink = re.match(r'^argmin(\d+)$', op)
+                if match_maxk:
+                    analysis['maxK'][int(match_maxk.group(1))] = True
+                if match_argmaxk:
+                    analysis['argmaxK'][int(match_argmaxk.group(1))] = True
+                if match_mink:
+                    analysis['minK'][int(match_mink.group(1))] = True
+                if match_argmink:
+                    analysis['argminK'][int(match_argmink.group(1))] = True
+            var_op_analysis[var] = analysis
+        
         # Phase 1: Emit variable loads (always needed vars)
-        # Collect which vars need unconditional load vs conditional load
         vars_need_val = set()  # vars that need val loaded unconditionally
         vars_conditional_only = set()  # vars only used in first/last/mid
         
@@ -944,17 +965,6 @@ class StatisticsAggregator:
             return f"{safe_v_name}_val"
         
         # Phase 2: Collect all operations grouped by condition
-        # Condition groups with order preserved:
-        # - 'unconditional': always executed (state updates, accumulations)
-        # - 'is_inner_first': init operations
-        # - 'not_is_inner_first': comparison operations  
-        # - 'is_inner_last': finalization and output
-        # - 'is_inner_last.is_outer_first': compound init
-        # - 'is_inner_last.not_is_outer_first': compound compare
-        # - 'is_inner_last.is_outer_last': final mean division
-        # - 'is_inner_last.not_is_outer_last': store accumulation
-        # - 'is_middle': mid operations
-        
         ops_unconditional = []
         ops_is_inner_first = []
         ops_not_is_inner_first = []
@@ -963,6 +973,7 @@ class StatisticsAggregator:
         
         # Special storage for maxK/minK operations (need for loop)
         self._maxk_ops = []
+        self._argmaxk_ops = []
         ops_is_inner_last_not_is_outer_first = []
         ops_is_inner_last_is_outer_last = []
         ops_is_inner_last_not_is_outer_last = []
@@ -971,10 +982,14 @@ class StatisticsAggregator:
         # Track which inner aggregations are needed
         inner_aggregations_needed = defaultdict(set)  # inner_type -> set of vars
         
+        # Track which merged operations we've already processed
+        processed_merged_ops = set()  # (var, op_type, k) tuples
+        
         for var in dims_1d:
             safe_var = self._get_safe_name(var)
             ops = self._variable_ops[var]
             out_offset = "t * n_saved_points + offs"
+            analysis = var_op_analysis[var]
             
             # Check for compound ops that need inner aggregation
             for op in ops:
@@ -992,60 +1007,85 @@ class StatisticsAggregator:
                     outer = op_parts[0]
                     inner = op_parts[1]
                     
-                    # Parse maxK/minK pattern
+                    # Parse maxK/minK/argmaxK/argminK pattern
                     k_val = 1
-                    match_k = re.match(r'(max|min)(\d+)$', outer)
+                    match_k = re.match(r'(arg)?(max|min)(\d+)$', outer)
+                    is_arg_compound = outer.startswith('arg')
                     if match_k:
-                        outer = match_k.group(1)
-                        k_val = int(match_k.group(2))
+                        is_arg_compound = match_k.group(1) is not None
+                        outer_base = match_k.group(2)  # 'max' or 'min'
+                        k_val = int(match_k.group(3))
+                    else:
+                        outer_base = outer.lstrip('arg')  # Remove 'arg' prefix if present
                     
                     val_var = f"val_for_{inner}"
                     
-                    if outer == 'max':
-                        arg_op = f"arg{op}"
+                    if is_arg_compound:
+                        # Compound argmax/argmin (e.g., argmax_mean, argmax3_mean)
+                        arg_type = outer_base  # 'max' or 'min'
+                        aux_ptr_base = f"{safe_var}_{arg_type}{k_val if k_val > 1 else ''}_aux_ptr"
+                        
                         if k_val == 1:
-                            arg_ptr = f"{safe_var}_{arg_op}_ptr + {out_offset}"
+                            aux_ptr = f"{aux_ptr_base} + {out_offset}"
+                            if arg_type == 'max':
+                                ops_is_inner_last_is_outer_first.extend([
+                                    f"tl.store({out_ptr}, macro_step_index, mask=mask)",
+                                    f"tl.store({aux_ptr}, {val_var}, mask=mask)",
+                                ])
+                                ops_is_inner_last_not_is_outer_first.extend([
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={val_var})",
+                                    f"{safe_var}_{op}_cond = {val_var} > {safe_var}_{op}_aux_old",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
+                                ])
+                            else:  # min
+                                ops_is_inner_last_is_outer_first.extend([
+                                    f"tl.store({out_ptr}, macro_step_index, mask=mask)",
+                                    f"tl.store({aux_ptr}, {val_var}, mask=mask)",
+                                ])
+                                ops_is_inner_last_not_is_outer_first.extend([
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={val_var})",
+                                    f"{safe_var}_{op}_cond = {val_var} < {safe_var}_{op}_aux_old",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
+                                ])
+                        else:
+                            # ArgmaxK/ArgminK compound bubble insert
+                            self._argmaxk_ops.append({
+                                'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
+                                'out_offset': out_offset, 'type': f'arg{arg_type}',
+                                'has_val_output': False  # compound arg doesn't need val output
+                            })
+                    elif outer_base == 'max':
+                        # Compound max without automatic arg (e.g., max_mean, max3_mean)
+                        if k_val == 1:
                             ops_is_inner_last_is_outer_first.append(
                                 f"tl.store({out_ptr}, {val_var}, mask=mask)")
-                            ops_is_inner_last_is_outer_first.append(
-                                f"tl.store({arg_ptr}, macro_step_index, mask=mask)")
                             ops_is_inner_last_not_is_outer_first.extend([
                                 f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                f"{safe_var}_{op}_cond = {val_var} > {safe_var}_{op}_old",
                                 f"tl.store({out_ptr}, tl.maximum({safe_var}_{op}_old, {val_var}), mask=mask)",
-                                f"tl.store({arg_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
                             ])
                         else:
-                            # maxK bubble insert - store as special op with metadata
-                            # Will be emitted as a for loop in the is_inner_last block
-                            if not hasattr(self, '_maxk_ops'):
-                                self._maxk_ops = []
+                            # maxK bubble insert without arg tracking
                             self._maxk_ops.append({
                                 'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
-                                'out_offset': out_offset, 'arg_op': arg_op, 'type': 'max'
+                                'out_offset': out_offset, 'type': 'max'
                             })
                             
-                    elif outer == 'min':
-                        arg_op = f"arg{op}"
+                    elif outer_base == 'min':
+                        # Compound min without automatic arg (e.g., min_mean, min3_mean)
                         if k_val == 1:
-                            arg_ptr = f"{safe_var}_{arg_op}_ptr + {out_offset}"
                             ops_is_inner_last_is_outer_first.append(
                                 f"tl.store({out_ptr}, {val_var}, mask=mask)")
-                            ops_is_inner_last_is_outer_first.append(
-                                f"tl.store({arg_ptr}, macro_step_index, mask=mask)")
                             ops_is_inner_last_not_is_outer_first.extend([
                                 f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                f"{safe_var}_{op}_cond = {val_var} < {safe_var}_{op}_old",
                                 f"tl.store({out_ptr}, tl.minimum({safe_var}_{op}_old, {val_var}), mask=mask)",
-                                f"tl.store({arg_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
                             ])
                         else:
-                            # minK bubble insert
-                            if not hasattr(self, '_maxk_ops'):
-                                self._maxk_ops = []
+                            # minK bubble insert without arg tracking
                             self._maxk_ops.append({
                                 'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
-                                'out_offset': out_offset, 'arg_op': arg_op, 'type': 'min'
+                                'out_offset': out_offset, 'type': 'min'
                             })
                             
                     elif outer == 'mean':
@@ -1067,7 +1107,7 @@ class StatisticsAggregator:
                         ])
                     continue
                 
-                # ===== Simple operations =====
+                # ===== Simple operations (non-compound) =====
                 if op == 'mean':
                     inner_ops = set(o.split('_')[1] for o in ops if '_' in o)
                     if 'mean' in inner_ops:
@@ -1088,32 +1128,203 @@ class StatisticsAggregator:
                         f"{safe_var}_sum_old = tl.where(is_inner_first, tl.zeros_like(val), tl.load({out_ptr}, mask=mask, other=0.0))",
                         f"tl.store({out_ptr}, {safe_var}_sum_old + val * weight, mask=mask)",
                     ])
-                    
+                
+                # ===== max/argmax MERGED handling =====
                 elif op == 'max':
-                    argmax_ptr = f"{safe_var}_argmax_ptr + {out_offset}"
+                    has_argmax = analysis['argmax']
+                    merge_key = (var, 'max', 1)
+                    if merge_key in processed_merged_ops:
+                        continue  # Already processed as merged
+                    processed_merged_ops.add(merge_key)
+                    
+                    if has_argmax:
+                        # MERGED: max + argmax share the same comparison
+                        aux_ptr = f"{safe_var}_max_aux_ptr + {out_offset}"
+                        argmax_ptr = f"{safe_var}_argmax_ptr + {out_offset}"
+                        ops_is_inner_first.extend([
+                            f"# Merged max + argmax for {safe_var}",
+                            f"tl.store({aux_ptr}, val, mask=mask)",  # aux stores the max value
+                            f"tl.store({out_ptr}, val, mask=mask)",  # max output
+                            f"tl.store({argmax_ptr}, macro_step_index, mask=mask)",  # argmax output
+                        ])
+                        ops_not_is_inner_first.extend([
+                            f"{safe_var}_max_old = tl.load({aux_ptr}, mask=mask, other=val)",
+                            f"{safe_var}_max_cond = val > {safe_var}_max_old",
+                            f"{safe_var}_max_new = tl.where({safe_var}_max_cond, val, {safe_var}_max_old)",
+                            f"tl.store({aux_ptr}, {safe_var}_max_new, mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_max_new, mask=mask)",
+                            f"tl.store({argmax_ptr}, macro_step_index, mask=mask & {safe_var}_max_cond)",
+                        ])
+                    else:
+                        # Simple max only (no argmax)
+                        ops_is_inner_first.extend([
+                            f"tl.store({out_ptr}, val, mask=mask)",
+                        ])
+                        ops_not_is_inner_first.extend([
+                            f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other=val)",
+                            f"tl.store({out_ptr}, tl.where(val > {safe_var}_max_old, val, {safe_var}_max_old), mask=mask)",
+                        ])
+                
+                elif op == 'argmax':
+                    has_max = analysis['max']
+                    merge_key = (var, 'max', 1)
+                    if has_max:
+                        # Will be handled by 'max' branch above
+                        processed_merged_ops.add(merge_key)
+                        continue
+                    
+                    # argmax only (no max)
+                    aux_ptr = f"{safe_var}_max_aux_ptr + {out_offset}"
                     ops_is_inner_first.extend([
-                        f"tl.store({out_ptr}, val, mask=mask)",
-                        f"tl.store({argmax_ptr}, macro_step_index, mask=mask)",
+                        f"tl.store({out_ptr}, macro_step_index, mask=mask)",
+                        f"tl.store({aux_ptr}, val, mask=mask)",
                     ])
                     ops_not_is_inner_first.extend([
-                        f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other=val)",
-                        f"{safe_var}_max_cond = val > {safe_var}_max_old",
-                        f"tl.store({out_ptr}, tl.where({safe_var}_max_cond, val, {safe_var}_max_old), mask=mask)",
-                        f"tl.store({argmax_ptr}, macro_step_index, mask=mask & {safe_var}_max_cond)",
+                        f"{safe_var}_argmax_aux_old = tl.load({aux_ptr}, mask=mask, other=val)",
+                        f"{safe_var}_argmax_cond = val > {safe_var}_argmax_aux_old",
+                        f"tl.store({aux_ptr}, tl.where({safe_var}_argmax_cond, val, {safe_var}_argmax_aux_old), mask=mask)",
+                        f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_argmax_cond)",
                     ])
                     
+                # ===== min/argmin MERGED handling =====
                 elif op == 'min':
-                    argmin_ptr = f"{safe_var}_argmin_ptr + {out_offset}"
+                    has_argmin = analysis['argmin']
+                    merge_key = (var, 'min', 1)
+                    if merge_key in processed_merged_ops:
+                        continue
+                    processed_merged_ops.add(merge_key)
+                    
+                    if has_argmin:
+                        # MERGED: min + argmin share the same comparison
+                        aux_ptr = f"{safe_var}_min_aux_ptr + {out_offset}"
+                        argmin_ptr = f"{safe_var}_argmin_ptr + {out_offset}"
+                        ops_is_inner_first.extend([
+                            f"# Merged min + argmin for {safe_var}",
+                            f"tl.store({aux_ptr}, val, mask=mask)",
+                            f"tl.store({out_ptr}, val, mask=mask)",
+                            f"tl.store({argmin_ptr}, macro_step_index, mask=mask)",
+                        ])
+                        ops_not_is_inner_first.extend([
+                            f"{safe_var}_min_old = tl.load({aux_ptr}, mask=mask, other=val)",
+                            f"{safe_var}_min_cond = val < {safe_var}_min_old",
+                            f"{safe_var}_min_new = tl.where({safe_var}_min_cond, val, {safe_var}_min_old)",
+                            f"tl.store({aux_ptr}, {safe_var}_min_new, mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_min_new, mask=mask)",
+                            f"tl.store({argmin_ptr}, macro_step_index, mask=mask & {safe_var}_min_cond)",
+                        ])
+                    else:
+                        # Simple min only (no argmin)
+                        ops_is_inner_first.extend([
+                            f"tl.store({out_ptr}, val, mask=mask)",
+                        ])
+                        ops_not_is_inner_first.extend([
+                            f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other=val)",
+                            f"tl.store({out_ptr}, tl.where(val < {safe_var}_min_old, val, {safe_var}_min_old), mask=mask)",
+                        ])
+                
+                elif op == 'argmin':
+                    has_min = analysis['min']
+                    merge_key = (var, 'min', 1)
+                    if has_min:
+                        # Will be handled by 'min' branch above
+                        processed_merged_ops.add(merge_key)
+                        continue
+                    
+                    # argmin only (no min)
+                    aux_ptr = f"{safe_var}_min_aux_ptr + {out_offset}"
                     ops_is_inner_first.extend([
-                        f"tl.store({out_ptr}, val, mask=mask)",
-                        f"tl.store({argmin_ptr}, macro_step_index, mask=mask)",
+                        f"tl.store({out_ptr}, macro_step_index, mask=mask)",
+                        f"tl.store({aux_ptr}, val, mask=mask)",
                     ])
                     ops_not_is_inner_first.extend([
-                        f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other=val)",
-                        f"{safe_var}_min_cond = val < {safe_var}_min_old",
-                        f"tl.store({out_ptr}, tl.where({safe_var}_min_cond, val, {safe_var}_min_old), mask=mask)",
-                        f"tl.store({argmin_ptr}, macro_step_index, mask=mask & {safe_var}_min_cond)",
+                        f"{safe_var}_argmin_aux_old = tl.load({aux_ptr}, mask=mask, other=val)",
+                        f"{safe_var}_argmin_cond = val < {safe_var}_argmin_aux_old",
+                        f"tl.store({aux_ptr}, tl.where({safe_var}_argmin_cond, val, {safe_var}_argmin_aux_old), mask=mask)",
+                        f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_argmin_cond)",
                     ])
+                
+                # ===== maxK / argmaxK handling =====
+                elif op.startswith('max') and re.match(r'^max(\d+)$', op):
+                    match = re.match(r'^max(\d+)$', op)
+                    k_val = int(match.group(1))
+                    has_argmaxk = k_val in analysis['argmaxK']
+                    merge_key = (var, 'max', k_val)
+                    if merge_key in processed_merged_ops:
+                        continue
+                    processed_merged_ops.add(merge_key)
+                    
+                    if has_argmaxk:
+                        # MERGED: maxK + argmaxK - store both val and idx in bubble insert
+                        self._argmaxk_ops.append({
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'out_offset': out_offset, 'type': 'argmax',
+                            'has_val_output': True,  # Also output max values
+                            'val_output_ptr': f"{safe_var}_max{k_val}_ptr"
+                        })
+                    else:
+                        # maxK only - simple bubble insert storing values
+                        self._maxk_ops.append({
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'out_offset': out_offset, 'type': 'max'
+                        })
+                
+                elif op.startswith('argmax') and re.match(r'^argmax(\d+)$', op):
+                    match = re.match(r'^argmax(\d+)$', op)
+                    k_val = int(match.group(1))
+                    has_maxk = k_val in analysis['maxK']
+                    merge_key = (var, 'max', k_val)
+                    if has_maxk:
+                        # Will be handled by maxK branch
+                        processed_merged_ops.add(merge_key)
+                        continue
+                    
+                    # argmaxK only - bubble insert with aux for values
+                    self._argmaxk_ops.append({
+                        'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                        'out_offset': out_offset, 'type': 'argmax',
+                        'has_val_output': False
+                    })
+                
+                # ===== minK / argminK handling =====
+                elif op.startswith('min') and re.match(r'^min(\d+)$', op):
+                    match = re.match(r'^min(\d+)$', op)
+                    k_val = int(match.group(1))
+                    has_argmink = k_val in analysis['argminK']
+                    merge_key = (var, 'min', k_val)
+                    if merge_key in processed_merged_ops:
+                        continue
+                    processed_merged_ops.add(merge_key)
+                    
+                    if has_argmink:
+                        # MERGED: minK + argminK
+                        self._argmaxk_ops.append({
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'out_offset': out_offset, 'type': 'argmin',
+                            'has_val_output': True,
+                            'val_output_ptr': f"{safe_var}_min{k_val}_ptr"
+                        })
+                    else:
+                        # minK only
+                        self._maxk_ops.append({
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'out_offset': out_offset, 'type': 'min'
+                        })
+                
+                elif op.startswith('argmin') and re.match(r'^argmin(\d+)$', op):
+                    match = re.match(r'^argmin(\d+)$', op)
+                    k_val = int(match.group(1))
+                    has_mink = k_val in analysis['minK']
+                    merge_key = (var, 'min', k_val)
+                    if has_mink:
+                        processed_merged_ops.add(merge_key)
+                        continue
+                    
+                    # argminK only
+                    self._argmaxk_ops.append({
+                        'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                        'out_offset': out_offset, 'type': 'argmin',
+                        'has_val_output': False
+                    })
                     
                 elif op == 'last':
                     if var in vars_conditional_only:
@@ -1250,9 +1461,10 @@ class StatisticsAggregator:
                 kernel_code_lines.append(f"{indent2}{line}")
         
         # Nested conditions for is_inner_last with outer conditions
+        has_argmaxk_ops = hasattr(self, '_argmaxk_ops') and self._argmaxk_ops
         has_inner_last_ops = (ops_is_inner_last or ops_is_inner_last_is_outer_first or 
                              ops_is_inner_last_not_is_outer_first or ops_is_inner_last_is_outer_last or
-                             ops_is_inner_last_not_is_outer_last or self._maxk_ops)
+                             ops_is_inner_last_not_is_outer_last or self._maxk_ops or has_argmaxk_ops)
         
         if has_inner_last_ops:
             kernel_code_lines.append(f"{indent}if is_inner_last:")
@@ -1281,48 +1493,160 @@ class StatisticsAggregator:
             for line in ops_is_inner_last:
                 kernel_code_lines.append(f"{indent2}{line}")
             
-            # MaxK/MinK bubble insert operations
+            # ================================================================
+            # Optimized MaxK/MinK + ArgmaxK/ArgminK bubble insert operations
+            
+            # Group by (var, k, out_offset) to share base offset across all operations
+            from collections import defaultdict
+            grouped_by_var_k = defaultdict(lambda: {'max': None, 'min': None, 'argmax': None, 'argmin': None})
+            
             for maxk_op in self._maxk_ops:
-                safe_var = maxk_op['var']
-                op = maxk_op['op']
-                k_val = maxk_op['k']
-                val_var = maxk_op['val_var']
-                out_offset = maxk_op['out_offset']
-                arg_op = maxk_op['arg_op']
-                op_type = maxk_op['type']  # 'max' or 'min'
+                key = (maxk_op['var'], maxk_op['k'], maxk_op['out_offset'])
+                grouped_by_var_k[key][maxk_op['type']] = maxk_op
+            
+            if hasattr(self, '_argmaxk_ops') and self._argmaxk_ops:
+                for argk_op in self._argmaxk_ops:
+                    key = (argk_op['var'], argk_op['k'], argk_op['out_offset'])
+                    op_type = 'argmax' if 'max' in argk_op['type'] else 'argmin'
+                    grouped_by_var_k[key][op_type] = argk_op
+            
+            # Process grouped operations with shared offset
+            for (safe_var, k_val, out_offset), ops_dict in grouped_by_var_k.items():
+                has_max = ops_dict['max'] is not None
+                has_min = ops_dict['min'] is not None
+                has_argmax = ops_dict['argmax'] is not None
+                has_argmin = ops_dict['argmin'] is not None
                 
-                inf_val = "-float('inf')" if op_type == 'max' else "float('inf')"
-                cmp_op = '>' if op_type == 'max' else '<'
+                # Get val_var from each operation (may differ: val for max/min, val_for_mean for argmax/argmin)
+                max_val_var = ops_dict['max']['val_var'] if has_max else None
+                min_val_var = ops_dict['min']['val_var'] if has_min else None
+                argmax_val_var = ops_dict['argmax']['val_var'] if has_argmax else None
+                argmin_val_var = ops_dict['argmin']['val_var'] if has_argmin else None
                 
-                # Wrap out_offset in parentheses for correct multiplication
+                # Compute shared base offset once
                 out_offset_k = f"({out_offset}) * {k_val}"
                 
-                kernel_code_lines.extend([
-                    f"{indent2}# Bubble Insert {op_type.upper()} K={k_val} for {safe_var}_{op}",
-                    f"{indent2}new_val_{safe_var} = {val_var}",
-                    f"{indent2}new_idx_{safe_var} = tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)",
-                    f"{indent2}if is_outer_first:",
-                    f"{indent3}tl.store({safe_var}_{op}_ptr + {out_offset_k}, new_val_{safe_var}, mask=mask)",
-                    f"{indent3}tl.store({safe_var}_{arg_op}_ptr + {out_offset_k}, new_idx_{safe_var}, mask=mask)",
-                ])
-                for k in range(1, k_val):
+                # Generate header comment
+                op_names = []
+                if has_max: op_names.append(f"max{k_val}")
+                if has_min: op_names.append(f"min{k_val}")
+                if has_argmax: op_names.append(f"argmax{k_val}")
+                if has_argmin: op_names.append(f"argmin{k_val}")
+                kernel_code_lines.append(f"{indent2}# Merged Bubble Insert [{'+'.join(op_names)}] for {safe_var} (shared offset, precise mask)")
+                
+                # Shared base offset computation
+                kernel_code_lines.append(f"{indent2}{safe_var}_k{k_val}_base_offs = {out_offset_k}")
+                
+                # Initialize new values for bubble insert (using correct val_var for each op type)
+                if has_max:
+                    kernel_code_lines.append(f"{indent2}new_val_max_{safe_var} = {max_val_var}")
+                if has_min:
+                    kernel_code_lines.append(f"{indent2}new_val_min_{safe_var} = {min_val_var}")
+                if has_argmax:
+                    kernel_code_lines.append(f"{indent2}new_val_argmax_{safe_var} = {argmax_val_var}")
+                if has_argmin:
+                    kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = {argmin_val_var}")
+                if has_argmax or has_argmin:
+                    kernel_code_lines.append(f"{indent2}new_idx_{safe_var} = tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)")
+                
+                # is_outer_first branch: initialize all arrays
+                kernel_code_lines.append(f"{indent2}if is_outer_first:")
+                
+                # First position stores the initial value
+                if has_max:
+                    max_ptr = f"{safe_var}_{ops_dict['max']['op']}_ptr"
+                    kernel_code_lines.append(f"{indent3}tl.store({max_ptr} + {safe_var}_k{k_val}_base_offs, new_val_max_{safe_var}, mask=mask)")
+                if has_min:
+                    min_ptr = f"{safe_var}_{ops_dict['min']['op']}_ptr"
+                    kernel_code_lines.append(f"{indent3}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs, new_val_min_{safe_var}, mask=mask)")
+                if has_argmax:
+                    argmax_op = ops_dict['argmax']
+                    argmax_aux_ptr = f"{safe_var}_max{k_val}_aux_ptr"
+                    argmax_idx_ptr = f"{safe_var}_{argmax_op['op']}_ptr"
+                    kernel_code_lines.append(f"{indent3}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_{safe_var}, mask=mask)")
+                    kernel_code_lines.append(f"{indent3}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
+                    if argmax_op.get('has_val_output') and argmax_op.get('val_output_ptr'):
+                        kernel_code_lines.append(f"{indent3}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
+                if has_argmin:
+                    argmin_op = ops_dict['argmin']
+                    argmin_aux_ptr = f"{safe_var}_min{k_val}_aux_ptr"
+                    argmin_idx_ptr = f"{safe_var}_{argmin_op['op']}_ptr"
+                    kernel_code_lines.append(f"{indent3}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_{safe_var}, mask=mask)")
+                    kernel_code_lines.append(f"{indent3}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
+                    if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
+                        kernel_code_lines.append(f"{indent3}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
+                
+                # Initialize remaining positions with inf/-inf
+                kernel_code_lines.append(f"{indent3}for k in tl.static_range(1, {k_val}):")
+                if has_max:
+                    kernel_code_lines.append(f"{indent4}tl.store({max_ptr} + {safe_var}_k{k_val}_base_offs + k, -float('inf'), mask=mask)")
+                if has_min:
+                    kernel_code_lines.append(f"{indent4}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
+                if has_argmax:
+                    kernel_code_lines.append(f"{indent4}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, 0, mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, -float('inf'), mask=mask)")
+                    if argmax_op.get('has_val_output') and argmax_op.get('val_output_ptr'):
+                        kernel_code_lines.append(f"{indent4}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, -float('inf'), mask=mask)")
+                if has_argmin:
+                    kernel_code_lines.append(f"{indent4}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, 0, mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
+                    if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
+                        kernel_code_lines.append(f"{indent4}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
+                
+                # else branch: bubble insert
+                kernel_code_lines.append(f"{indent2}else:")
+                kernel_code_lines.append(f"{indent3}for k in tl.static_range({k_val}):")
+                
+                # Load old values and compute swap masks
+                if has_max:
                     kernel_code_lines.extend([
-                        f"{indent3}tl.store({safe_var}_{op}_ptr + {out_offset_k} + {k}, {inf_val}, mask=mask)",
-                        f"{indent3}tl.store({safe_var}_{arg_op}_ptr + {out_offset_k} + {k}, 0, mask=mask)",
+                        f"{indent4}old_max_k = tl.load({max_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=-float('inf'))",
+                        f"{indent4}swap_max = new_val_max_{safe_var} > old_max_k",
+                        f"{indent4}max_to_store = tl.where(swap_max, new_val_max_{safe_var}, old_max_k)",
+                        f"{indent4}new_val_max_{safe_var} = tl.where(swap_max, old_max_k, new_val_max_{safe_var})",
+                        f"{indent4}tl.store({max_ptr} + {safe_var}_k{k_val}_base_offs + k, max_to_store, mask=mask & swap_max)",
                     ])
-                kernel_code_lines.extend([
-                    f"{indent2}else:",
-                    f"{indent3}for k in range({k_val}):",
-                    f"{indent4}old_k = tl.load({safe_var}_{op}_ptr + {out_offset_k} + k, mask=mask, other={inf_val})",
-                    f"{indent4}old_idx_k = tl.load({safe_var}_{arg_op}_ptr + {out_offset_k} + k, mask=mask, other=0)",
-                    f"{indent4}swap_mask = new_val_{safe_var} {cmp_op} old_k",
-                    f"{indent4}val_to_store = tl.where(swap_mask, new_val_{safe_var}, old_k)",
-                    f"{indent4}idx_to_store = tl.where(swap_mask, new_idx_{safe_var}, old_idx_k)",
-                    f"{indent4}new_val_{safe_var} = tl.where(swap_mask, old_k, new_val_{safe_var})",
-                    f"{indent4}new_idx_{safe_var} = tl.where(swap_mask, old_idx_k, new_idx_{safe_var})",
-                    f"{indent4}tl.store({safe_var}_{op}_ptr + {out_offset_k} + k, val_to_store, mask=mask)",
-                    f"{indent4}tl.store({safe_var}_{arg_op}_ptr + {out_offset_k} + k, idx_to_store, mask=mask)",
-                ])
+                if has_min:
+                    kernel_code_lines.extend([
+                        f"{indent4}old_min_k = tl.load({min_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('inf'))",
+                        f"{indent4}swap_min = new_val_min_{safe_var} < old_min_k",
+                        f"{indent4}min_to_store = tl.where(swap_min, new_val_min_{safe_var}, old_min_k)",
+                        f"{indent4}new_val_min_{safe_var} = tl.where(swap_min, old_min_k, new_val_min_{safe_var})",
+                        f"{indent4}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs + k, min_to_store, mask=mask & swap_min)",
+                    ])
+                if has_argmax:
+                    kernel_code_lines.extend([
+                        f"{indent4}old_argmax_aux_k = tl.load({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=-float('inf'))",
+                        f"{indent4}old_argmax_idx_k = tl.load({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=0)",
+                        f"{indent4}swap_argmax = new_val_argmax_{safe_var} > old_argmax_aux_k",
+                        f"{indent4}argmax_aux_store = tl.where(swap_argmax, new_val_argmax_{safe_var}, old_argmax_aux_k)",
+                        f"{indent4}argmax_idx_store = tl.where(swap_argmax, new_idx_{safe_var}, old_argmax_idx_k)",
+                        f"{indent4}new_val_argmax_{safe_var} = tl.where(swap_argmax, old_argmax_aux_k, new_val_argmax_{safe_var})",
+                        f"{indent4}new_idx_{safe_var} = tl.where(swap_argmax, old_argmax_idx_k, new_idx_{safe_var})",
+                        f"{indent4}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, argmax_aux_store, mask=mask & swap_argmax)",
+                        f"{indent4}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, argmax_idx_store, mask=mask & swap_argmax)",
+                    ])
+                    if argmax_op.get('has_val_output') and argmax_op.get('val_output_ptr'):
+                        kernel_code_lines.append(f"{indent4}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, argmax_aux_store, mask=mask & swap_argmax)")
+                if has_argmin:
+                    kernel_code_lines.extend([
+                        f"{indent4}old_argmin_aux_k = tl.load({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('inf'))",
+                        f"{indent4}old_argmin_idx_k = tl.load({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=0)",
+                        f"{indent4}swap_argmin = new_val_argmin_{safe_var} < old_argmin_aux_k",
+                        f"{indent4}argmin_aux_store = tl.where(swap_argmin, new_val_argmin_{safe_var}, old_argmin_aux_k)",
+                        f"{indent4}argmin_idx_store = tl.where(swap_argmin, new_idx_{safe_var}, old_argmin_idx_k)",
+                        f"{indent4}new_val_argmin_{safe_var} = tl.where(swap_argmin, old_argmin_aux_k, new_val_argmin_{safe_var})",
+                        f"{indent4}new_idx_{safe_var} = tl.where(swap_argmin, old_argmin_idx_k, new_idx_{safe_var})",
+                        f"{indent4}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, argmin_aux_store, mask=mask & swap_argmin)",
+                        f"{indent4}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, argmin_idx_store, mask=mask & swap_argmin)",
+                    ])
+                    if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
+                        kernel_code_lines.append(f"{indent4}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, argmin_aux_store, mask=mask & swap_argmin)")
+            
+            # Reset operation lists
+            self._maxk_ops = []
+            if hasattr(self, '_argmaxk_ops'):
+                self._argmaxk_ops = []
         
         # Phase 7: Emit inner median P-Square operations
         if hasattr(self, '_median_inner_ops') and self._median_inner_ops:
@@ -1420,32 +1744,26 @@ class StatisticsAggregator:
             safe_var = self._get_safe_name(var)
             # Track which extra state pointers have been added to avoid duplicates
             added_median_state = False
-            added_arg_ops = set()  # Track argmax/argmin ops already added
+            added_aux_ptrs = set()  # Track aux pointers already added (for explicit argmax/argmin)
             
             for op in self._variable_ops[var]:
                 kernel_code_lines.append(f"    {safe_var}_{op}_ptr,")
                 
-                # For max/min operations, also add corresponding argmax/argmin pointer
+                # For EXPLICIT argmax/argmin operators, add aux pointer for tracking values
+                # NO automatic argmax/argmin generation for max/min operations
                 op_parts = op.split('_')
                 outer_op = op_parts[0]
-                # Check for maxK/minK pattern
-                match_k = re.match(r'(max|min)(\d+)$', outer_op)
-                if match_k:
-                    base_op = match_k.group(1)
-                    arg_op_name = f"arg{op}"
-                    if arg_op_name not in added_arg_ops:
-                        kernel_code_lines.append(f"    {safe_var}_{arg_op_name}_ptr,")
-                        added_arg_ops.add(arg_op_name)
-                elif outer_op == 'max':
-                    arg_op_name = f"arg{op}"
-                    if arg_op_name not in added_arg_ops:
-                        kernel_code_lines.append(f"    {safe_var}_{arg_op_name}_ptr,")
-                        added_arg_ops.add(arg_op_name)
-                elif outer_op == 'min':
-                    arg_op_name = f"arg{op}"
-                    if arg_op_name not in added_arg_ops:
-                        kernel_code_lines.append(f"    {safe_var}_{arg_op_name}_ptr,")
-                        added_arg_ops.add(arg_op_name)
+                
+                # Check for explicit argmax/argmin (e.g., argmax, argmax3, argmin, argmin3)
+                arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
+                if arg_match:
+                    arg_type = arg_match.group(1)  # 'max' or 'min'
+                    arg_k_str = arg_match.group(2)  # '' or '3' etc
+                    # aux pointer name: {safe_var}_{arg_type}{k}_aux_ptr (e.g., var_max_aux_ptr, var_max3_aux_ptr)
+                    aux_name = f"{arg_type}{arg_k_str}_aux"  # e.g., 'max_aux', 'max3_aux'
+                    if aux_name not in added_aux_ptrs:
+                        kernel_code_lines.append(f"    {safe_var}_{aux_name}_ptr,")
+                        added_aux_ptrs.add(aux_name)
                         
                 if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
                      kernel_code_lines.append(f"    {safe_var}_median_q_state_ptr,")
@@ -1494,8 +1812,8 @@ class StatisticsAggregator:
             "",
         ])
 
-        # Loop over trials
-        kernel_code_lines.append("    for t in range(num_trials):")
+        # Loop over trials - use tl.static_range for compile-time unrolling
+        kernel_code_lines.append("    for t in tl.static_range(num_trials):")
         indent = "        "
         indent2 = indent + "    "
         indent3 = indent2 + "    "
@@ -1705,7 +2023,7 @@ class StatisticsAggregator:
                                     # Bubble Insert Max K with ArgMax
                                     argmax_op = f"arg{op}"
                                     kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Max K={k_val} with ArgMax",
+                                        f"{indent3}# Bubble Insert Max K={k_val} with ArgMax (static_range optimized)",
                                         f"{indent3}new_val = {val_var}",
                                         f"{indent3}new_idx = tl.full([BLOCK_SIZE], macro_step_index, tl.int32)",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
@@ -1715,11 +2033,11 @@ class StatisticsAggregator:
                                         f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
                                         f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent4}for k in range(1, {k_val}):",
+                                        f"{indent4}for k in tl.static_range(1, {k_val}):",
                                         f"{indent5}tl.store(base_ptr + k, -float('inf'), mask=mask)",
                                         f"{indent5}tl.store(idx_base_ptr + k, 0, mask=mask)",
                                         f"{indent3}else:",
-                                        f"{indent4}for k in range({k_val}):",
+                                        f"{indent4}for k in tl.static_range({k_val}):",
                                         f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=-float('inf'))",
                                         f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
                                         f"{indent5}swap_mask = new_val > old_k",
@@ -1750,7 +2068,7 @@ class StatisticsAggregator:
                                     # Min K with ArgMin
                                     argmin_op = f"arg{op}"
                                     kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Min K={k_val} with ArgMin",
+                                        f"{indent3}# Bubble Insert Min K={k_val} with ArgMin (static_range optimized)",
                                         f"{indent3}new_val = {val_var}",
                                         f"{indent3}new_idx = tl.full([BLOCK_SIZE], macro_step_index, tl.int32)",
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
@@ -1760,11 +2078,11 @@ class StatisticsAggregator:
                                         f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
                                         f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent4}for k in range(1, {k_val}):",
+                                        f"{indent4}for k in tl.static_range(1, {k_val}):",
                                         f"{indent5}tl.store(base_ptr + k, float('inf'), mask=mask)",
                                         f"{indent5}tl.store(idx_base_ptr + k, 0, mask=mask)",
                                         f"{indent3}else:",
-                                        f"{indent4}for k in range({k_val}):",
+                                        f"{indent4}for k in tl.static_range({k_val}):",
                                         f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=float('inf'))",
                                         f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
                                         f"{indent5}swap_mask = new_val < old_k",
@@ -1956,30 +2274,25 @@ class StatisticsAggregator:
             for var in var_list:
                 safe_var = self._get_safe_name(var)
                 added_median_state = False
-                added_arg_ops = set()  # Track argmax/argmin ops already added
+                added_aux_ptrs = set()  # Track aux pointers for explicit argmax/argmin
                 for op in self._variable_ops[var]:
                     kernel_code_lines.append(f"        {safe_var}_{op}_ptr=states['{var}_{op}'],")
                     
-                    # For max/min operations, also add corresponding argmax/argmin pointer
+                    # For EXPLICIT argmax/argmin operations, add aux pointer
+                    # NO automatic argmax/argmin generation for max/min operations
                     op_parts = op.split('_')
                     outer_op = op_parts[0]
-                    # Check for maxK/minK pattern
-                    match_k = re.match(r'(max|min)(\d+)$', outer_op)
-                    if match_k:
-                        arg_op_name = f"arg{op}"
-                        if arg_op_name not in added_arg_ops:
-                            kernel_code_lines.append(f"        {safe_var}_{arg_op_name}_ptr=states['{var}_{arg_op_name}'],")
-                            added_arg_ops.add(arg_op_name)
-                    elif outer_op == 'max':
-                        arg_op_name = f"arg{op}"
-                        if arg_op_name not in added_arg_ops:
-                            kernel_code_lines.append(f"        {safe_var}_{arg_op_name}_ptr=states['{var}_{arg_op_name}'],")
-                            added_arg_ops.add(arg_op_name)
-                    elif outer_op == 'min':
-                        arg_op_name = f"arg{op}"
-                        if arg_op_name not in added_arg_ops:
-                            kernel_code_lines.append(f"        {safe_var}_{arg_op_name}_ptr=states['{var}_{arg_op_name}'],")
-                            added_arg_ops.add(arg_op_name)
+                    
+                    # Check for explicit argmax/argmin (e.g., argmax, argmax3, argmin, argmin3)
+                    arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
+                    if arg_match:
+                        arg_type = arg_match.group(1)  # 'max' or 'min'
+                        arg_k_str = arg_match.group(2)  # '' or '3' etc
+                        aux_name = f"{arg_type}{arg_k_str or ''}_aux"  # e.g., 'max_aux', 'max3_aux'
+                        if aux_name not in added_aux_ptrs:
+                            aux_storage_key = f"{var}_{arg_type}{arg_k_str if arg_k_str else ''}_aux"
+                            kernel_code_lines.append(f"        {safe_var}_{aux_name}_ptr=states['{aux_storage_key}'],")
+                            added_aux_ptrs.add(aux_name)
                     
                     if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
                         kernel_code_lines.append(f"        {safe_var}_median_q_state_ptr=states['{var}_median_q_state'],")
@@ -2244,7 +2557,7 @@ class StatisticsAggregator:
                 op_parts = op.split('_')
                 outer_op = op_parts[0]
                 
-                # Check for K
+                # Check for K in max/min ops (e.g., max3, min3)
                 k_val = 1
                 match_k = re.match(r'(max|min)(\d+)$', outer_op)
                 if match_k:
@@ -2252,26 +2565,45 @@ class StatisticsAggregator:
                     k_val = int(match_k.group(2))
                     outer_op = outer_base # normalize for allocation logic below (mostly)
                 
+                # Check for explicit argmax/argmin operators (e.g., argmax, argmax3)
+                arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
+                arg_k_val = 1  # Default for arg ops
+                if arg_match:
+                    arg_k_str = arg_match.group(2)
+                    arg_k_val = int(arg_k_str) if arg_k_str else 1
+                
                 # Allocate storage by op
                 if k_val > 1:
                     alloc_shape = actual_shape + (k_val,)
                 else:
                     alloc_shape = actual_shape
 
-                if outer_op == 'max':
-                    # max or maxK - also create argmax storage automatically
+                if arg_match:
+                    # Explicit argmax/argmin operator - store integer indices only
+                    arg_type = arg_match.group(1)  # 'max' or 'min'
+                    arg_k_str = arg_match.group(2)  # '' or '3' etc
+                    # arg_k_val already computed above
+                    
+                    if arg_k_val > 1:
+                        arg_alloc_shape = actual_shape + (arg_k_val,)
+                    else:
+                        arg_alloc_shape = actual_shape
+                    
+                    # Store integer indices (macro step index within the window)
+                    init_tensor = torch.zeros(arg_alloc_shape, dtype=torch.int32, device=self.device)
+                    # Also need to track the corresponding extreme values for comparison
+                    aux_name = f"{var_name}_{arg_type}{arg_k_str or ''}_aux"
+                    if arg_type == 'max':
+                        self._storage[aux_name] = torch.full(arg_alloc_shape, -torch.inf, dtype=target_dtype, device=self.device)
+                    else:
+                        self._storage[aux_name] = torch.full(arg_alloc_shape, torch.inf, dtype=target_dtype, device=self.device)
+                    # aux is not an output, just internal state
+                elif outer_op == 'max':
+                    # max or maxK - NO automatic argmax
                     init_tensor = torch.full(alloc_shape, -torch.inf, dtype=target_dtype, device=self.device)
-                    # Create corresponding argmax storage (int32 to store macro step index)
-                    argmax_name = f"{var_name}_arg{op}"  # e.g., var_argmax, var_argmax_mean, var_argmax3_mean
-                    self._storage[argmax_name] = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
-                    self._output_keys.append(argmax_name)
                 elif outer_op == 'min':
-                    # min or minK - also create argmin storage automatically  
+                    # min or minK - NO automatic argmin
                     init_tensor = torch.full(alloc_shape, torch.inf, dtype=target_dtype, device=self.device)
-                    # Create corresponding argmin storage
-                    argmin_name = f"{var_name}_arg{op}"
-                    self._storage[argmin_name] = torch.zeros(alloc_shape, dtype=torch.int32, device=self.device)
-                    self._output_keys.append(argmin_name)
                 elif outer_op == 'first':
                     # Similar to 'last', we just need storage. Zero initialization is fine as it will be overwritten on is_first.
                     init_tensor = torch.zeros(alloc_shape, dtype=target_dtype, device=self.device)
@@ -2343,60 +2675,27 @@ class StatisticsAggregator:
                     self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
                 
                 out_dtype = torch_to_numpy_dtype(target_dtype)
+                
+                # Check if this is an argmax/argmin op and determine the k value
+                is_arg_op = arg_match is not None
+                # For arg ops, use arg_k_val; otherwise use k_val
+                effective_k = arg_k_val if is_arg_op else k_val
 
                 meta = {
                     'original_variable': var_name,
                     'op': op,
                     'save_idx': save_idx,
                     'tensor_shape': tensor_shape,
-                    'dtype': out_dtype,
+                    'dtype': 'i4' if is_arg_op else out_dtype,  # int32 for arg ops
                     'actual_shape': actual_shape,
                     'actual_ndim': actual_ndim,
                     'save_coord': save_coord,
                     'description': f"{description} ({op})",
                     'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
-                    'k': k_val,
-                    'is_time_index': False,  # This is a regular value output
+                    'k': effective_k,
+                    'is_time_index': is_arg_op,  # argmax/argmin store integer indices
                 }
                 self._metadata[out_name] = meta
-                
-                # For max/min ops, also create metadata for their argmax/argmin counterparts
-                if outer_op == 'max':
-                    argmax_name = f"{var_name}_arg{op}"
-                    argmax_meta = {
-                        'original_variable': var_name,
-                        'op': f"arg{op}",
-                        'save_idx': save_idx,
-                        'tensor_shape': tensor_shape,
-                        'dtype': 'f8',  # float64 for time values (converted from step indices)
-                        'actual_shape': actual_shape,
-                        'actual_ndim': actual_ndim,
-                        'save_coord': save_coord,
-                        'description': f"{description} (time of argmax for {op})",
-                        'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
-                        'k': k_val,
-                        'is_time_index': True,  # This stores macro step indices, converted to time on write
-                    }
-                    self._metadata[argmax_name] = argmax_meta
-                    self._output_is_outer[argmax_name] = len(op_parts) > 1
-                elif outer_op == 'min':
-                    argmin_name = f"{var_name}_arg{op}"
-                    argmin_meta = {
-                        'original_variable': var_name,
-                        'op': f"arg{op}",
-                        'save_idx': save_idx,
-                        'tensor_shape': tensor_shape,
-                        'dtype': 'f8',  # float64 for time values
-                        'actual_shape': actual_shape,
-                        'actual_ndim': actual_ndim,
-                        'save_coord': save_coord,
-                        'description': f"{description} (time of argmin for {op})",
-                        'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
-                        'k': k_val,
-                        'is_time_index': True,
-                    }
-                    self._metadata[argmin_name] = argmin_meta
-                    self._output_is_outer[argmin_name] = len(op_parts) > 1
                 
                 # Classify as outer if it is a compound op (e.g. max_mean)
                 self._output_is_outer[out_name] = len(op_parts) > 1
@@ -2423,6 +2722,11 @@ class StatisticsAggregator:
         
         if _is_inner_first:
             self._step_count = 0
+        
+        # Reset macro_step_index at the start of each outer statistics period
+        # This ensures argmax/argmin indices are always relative to the start of the period
+        if is_outer_first:
+            self._macro_step_index = 0
             
         if _is_inner_last:
              for out_name, is_outer in self._output_is_outer.items():
@@ -2462,18 +2766,25 @@ class StatisticsAggregator:
         # Record this time step for argmax/argmin index-to-time conversion
         # This is called at the end of each outer loop iteration
         self._macro_step_times.append(dt)
-        
-        # Increment macro step index for next iteration
-        self._macro_step_index += 1
 
         if self.output_split_by_year:
-            if self._current_year != dt.year:
+            if self._current_year is None:
+                # First call - set up files
                 self._create_netcdf_files(year=dt.year)
                 self._current_year = dt.year
+            elif self._current_year != dt.year:
+                # Year transition - create new files for new year
+                self._create_netcdf_files(year=dt.year)
+                self._current_year = dt.year
+                self._macro_step_times = []  # Reset time mapping for new year
         else:
             # Create NetCDF files if not already created
             if not self._files_created:
                 self._create_netcdf_files()
+        
+        # Increment macro step index for next iteration
+        # (Note: index is reset to 0 in update_statistics when is_outer_first=True)
+        self._macro_step_index += 1
         
         # Write all outputs that are marked dirty
         # Use explicit list of output keys to maintain order/determinism
@@ -2487,42 +2798,58 @@ class StatisticsAggregator:
 
             if out_name not in self._netcdf_files:
                 continue
-            output_path = self._netcdf_files[out_name]
+            output_paths = self._netcdf_files[out_name]
             
             # Check if this is a time index variable (argmax/argmin)
             metadata = self._metadata.get(out_name, {})
             is_time_index = metadata.get('is_time_index', False)
+            k_val = metadata.get('k', 1)
             
+            # Convert tensor to numpy
+            raw_data = tensor.detach().cpu().numpy()
+            
+            # For time index variables, keep as integer indices (no conversion to time)
+            # They will be stored as int32 in the NC file
             if is_time_index:
-                # Convert integer indices to time values
-                # The indices are macro step numbers; convert to NC time values
-                idx_data = tensor.detach().cpu().numpy().astype(np.int32)
-                # Create time values array
-                time_data = np.zeros_like(idx_data, dtype=np.float64)
-                
-                # Convert each index to corresponding time
-                for idx_val in np.unique(idx_data):
-                    if 0 <= idx_val < len(self._macro_step_times):
-                        step_dt = self._macro_step_times[idx_val]
-                        time_val = nc.date2num(step_dt, units=self.time_unit, calendar=self.calendar)
-                        time_data[idx_data == idx_val] = time_val
-                    else:
-                        # For indices out of range (shouldn't happen), use NaN or the current time
-                        time_data[idx_data == idx_val] = nc.date2num(dt, units=self.time_unit, calendar=self.calendar)
-                
-                time_step_data = time_data
+                time_step_data = raw_data.astype(np.int32)
             else:
-                time_step_data = tensor.detach().cpu().numpy()
+                time_step_data = raw_data
             
-            # Select executor based on variable name hash to ensure serialization
-            # This avoids the need for file locks, as all writes for a specific variable
-            # will always go to the same single-threaded executor.
-            idx = abs(hash(out_name)) % len(self._write_executors)
-            executor = self._write_executors[idx]
-            
-            args = (out_name, time_step_data, output_path, dt)
-            future = executor.submit(_write_time_step_netcdf_process, args)
-            self._write_futures.append(future)
+            # Handle k > 1 case: write to separate files
+            if k_val > 1 and isinstance(output_paths, list):
+                for k_idx, output_path in enumerate(output_paths):
+                    # Extract k-th slice (last dimension is k)
+                    if time_step_data.ndim == 2:
+                        # (saved_points, k) -> (saved_points,)
+                        k_data = time_step_data[:, k_idx]
+                    elif time_step_data.ndim == 3:
+                        # (trials, saved_points, k) or (saved_points, levels, k)
+                        k_data = time_step_data[:, :, k_idx]
+                    elif time_step_data.ndim == 4:
+                        # (trials, saved_points, levels, k)
+                        k_data = time_step_data[:, :, :, k_idx]
+                    else:
+                        k_data = time_step_data[..., k_idx]
+                    
+                    # Use a unique key for executor selection
+                    exec_key = f"{out_name}_{k_idx}"
+                    idx = abs(hash(exec_key)) % len(self._write_executors)
+                    executor = self._write_executors[idx]
+                    
+                    file_var_name = f"{out_name}_{k_idx}"
+                    args = (file_var_name, k_data, output_path, dt)
+                    future = executor.submit(_write_time_step_netcdf_process, args)
+                    self._write_futures.append(future)
+            else:
+                # Single file case (k=1 or legacy)
+                output_path = output_paths if not isinstance(output_paths, list) else output_paths[0]
+                
+                idx = abs(hash(out_name)) % len(self._write_executors)
+                executor = self._write_executors[idx]
+                
+                args = (out_name, time_step_data, output_path, dt)
+                future = executor.submit(_write_time_step_netcdf_process, args)
+                self._write_futures.append(future)
             
         # Reset counters
         self._current_macro_step_count = 0.0

@@ -775,6 +775,72 @@ class MultiRankStatsReader:
     # ----------------------------------------------------------------------------------
     # Basic info
     # ----------------------------------------------------------------------------------
+    @staticmethod
+    def discover_k_variants(base_dir: Union[str, Path], base_var_name: str) -> List[str]:
+        """
+        Discover all k-indexed variants of a variable (e.g., for maxK operations).
+        
+        For a variable like 'river_depth_max3', this will find:
+        - river_depth_max3_0
+        - river_depth_max3_1
+        - river_depth_max3_2
+        
+        Args:
+            base_dir: Directory containing the NetCDF files
+            base_var_name: Base variable name (e.g., 'river_depth_max3')
+            
+        Returns:
+            List of variant names sorted by k index, or [base_var_name] if no k variants found
+        """
+        base_dir = Path(base_dir)
+        # Pattern to match k-indexed files: {base_var_name}_{k}_rank*.nc
+        pattern = f"{base_var_name}_*_rank*.nc"
+        files = list(base_dir.glob(pattern))
+        
+        # Extract unique k indices
+        k_pattern = re.compile(rf"^{re.escape(base_var_name)}_(\d+)_rank\d+.*\.nc$")
+        k_indices = set()
+        for f in files:
+            m = k_pattern.match(f.name)
+            if m:
+                k_indices.add(int(m.group(1)))
+        
+        if k_indices:
+            # Return sorted list of variant names
+            return [f"{base_var_name}_{k}" for k in sorted(k_indices)]
+        else:
+            # No k variants found, check if base file exists
+            base_pattern = f"{base_var_name}_rank*.nc"
+            if list(base_dir.glob(base_pattern)):
+                return [base_var_name]
+            return []
+    
+    @staticmethod
+    def list_available_variables(base_dir: Union[str, Path]) -> List[str]:
+        """
+        List all unique variable names available in the directory.
+        
+        This scans for files matching *_rank*.nc and extracts variable names.
+        
+        Args:
+            base_dir: Directory containing the NetCDF files
+            
+        Returns:
+            Sorted list of unique variable names
+        """
+        base_dir = Path(base_dir)
+        files = list(base_dir.glob("*_rank*.nc"))
+        
+        # Pattern to extract variable name: {var_name}_rank{rank}[_{year}].nc
+        var_pattern = re.compile(r"^(.+)_rank\d+(?:_\d{4})?\.nc$")
+        var_names = set()
+        for f in files:
+            m = var_pattern.match(f.name)
+            if m:
+                var_names.add(m.group(1))
+        
+        return sorted(var_names)
+
     @property
     def num_ranks(self) -> int:
         return len(self._rank_files)
