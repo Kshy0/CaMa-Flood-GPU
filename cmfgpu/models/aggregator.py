@@ -1207,7 +1207,8 @@ class StatisticsAggregator:
                     else:
                         outer_base = outer.lstrip('arg')  # Remove 'arg' prefix if present
                     
-                    val_var = f"val_for_{inner}"
+                    # Use variable-specific inner aggregation result
+                    val_var = f"val_for_{safe_var}_{inner}"
                     
                     if is_arg_compound:
                         # Compound argmax/argmin (e.g., argmax_mean, argmax3_mean)
@@ -1300,22 +1301,22 @@ class StatisticsAggregator:
                 if op == 'mean':
                     inner_ops = set(o.split('_')[1] for o in ops if '_' in o)
                     if 'mean' in inner_ops:
-                        # Reuse val_for_mean from inner aggregation
-                        ops_is_inner_last.append(f"tl.store({out_ptr}, val_for_mean, mask=mask)")
+                        # Reuse val_for_{safe_var}_mean from inner aggregation
+                        ops_is_inner_last.append(f"tl.store({out_ptr}, val_for_{safe_var}_mean, mask=mask)")
                     else:
-                        # Standalone mean - needs state
+                        # Standalone mean - needs state (use variable-specific val)
                         ops_unconditional.extend([
                             f"# Standalone mean for {safe_var}",
-                            f"{safe_var}_mean_old = tl.where(is_inner_first, tl.zeros_like(val), tl.load({out_ptr}, mask=mask, other=0.0))",
-                            f"{safe_var}_mean_new = {safe_var}_mean_old + val * weight",
+                            f"{safe_var}_mean_old = tl.where(is_inner_first, tl.zeros_like({safe_var}_val), tl.load({out_ptr}, mask=mask, other=0.0))",
+                            f"{safe_var}_mean_new = {safe_var}_mean_old + {safe_var}_val * weight",
                             f"{safe_var}_mean_out = tl.where(is_inner_last, {safe_var}_mean_new / total_weight, {safe_var}_mean_new)",
                         ])
                         ops_unconditional.append(f"tl.store({out_ptr}, {safe_var}_mean_out, mask=mask)")
                         
                 elif op == 'sum':
                     ops_unconditional.extend([
-                        f"{safe_var}_sum_old = tl.where(is_inner_first, tl.zeros_like(val), tl.load({out_ptr}, mask=mask, other=0.0))",
-                        f"tl.store({out_ptr}, {safe_var}_sum_old + val * weight, mask=mask)",
+                        f"{safe_var}_sum_old = tl.where(is_inner_first, tl.zeros_like({safe_var}_val), tl.load({out_ptr}, mask=mask, other=0.0))",
+                        f"tl.store({out_ptr}, {safe_var}_sum_old + {safe_var}_val * weight, mask=mask)",
                     ])
                 
                 # ===== max/argmax MERGED handling =====
@@ -1332,14 +1333,14 @@ class StatisticsAggregator:
                         argmax_ptr = f"{safe_var}_argmax_ptr + {out_offset}"
                         ops_is_inner_first.extend([
                             f"# Merged max + argmax for {safe_var}",
-                            f"tl.store({aux_ptr}, val, mask=mask)",  # aux stores the max value
-                            f"tl.store({out_ptr}, val, mask=mask)",  # max output
+                            f"tl.store({aux_ptr}, {safe_var}_val, mask=mask)",  # aux stores the max value
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",  # max output
                             f"tl.store({argmax_ptr}, macro_step_index, mask=mask)",  # argmax output
                         ])
                         ops_not_is_inner_first.extend([
-                            f"{safe_var}_max_old = tl.load({aux_ptr}, mask=mask, other=val)",
-                            f"{safe_var}_max_cond = val > {safe_var}_max_old",
-                            f"{safe_var}_max_new = tl.where({safe_var}_max_cond, val, {safe_var}_max_old)",
+                            f"{safe_var}_max_old = tl.load({aux_ptr}, mask=mask, other={safe_var}_val)",
+                            f"{safe_var}_max_cond = {safe_var}_val > {safe_var}_max_old",
+                            f"{safe_var}_max_new = tl.where({safe_var}_max_cond, {safe_var}_val, {safe_var}_max_old)",
                             f"tl.store({aux_ptr}, {safe_var}_max_new, mask=mask)",
                             f"tl.store({out_ptr}, {safe_var}_max_new, mask=mask)",
                             f"tl.store({argmax_ptr}, macro_step_index, mask=mask & {safe_var}_max_cond)",
@@ -1347,11 +1348,11 @@ class StatisticsAggregator:
                     else:
                         # Simple max only (no argmax)
                         ops_is_inner_first.extend([
-                            f"tl.store({out_ptr}, val, mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
                         ])
                         ops_not_is_inner_first.extend([
-                            f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other=val)",
-                            f"tl.store({out_ptr}, tl.where(val > {safe_var}_max_old, val, {safe_var}_max_old), mask=mask)",
+                            f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other={safe_var}_val)",
+                            f"tl.store({out_ptr}, tl.where({safe_var}_val > {safe_var}_max_old, {safe_var}_val, {safe_var}_max_old), mask=mask)",
                         ])
                 
                 elif op == 'argmax':
@@ -1366,12 +1367,12 @@ class StatisticsAggregator:
                     aux_ptr = f"{safe_var}_max_aux_ptr + {out_offset}"
                     ops_is_inner_first.extend([
                         f"tl.store({out_ptr}, macro_step_index, mask=mask)",
-                        f"tl.store({aux_ptr}, val, mask=mask)",
+                        f"tl.store({aux_ptr}, {safe_var}_val, mask=mask)",
                     ])
                     ops_not_is_inner_first.extend([
-                        f"{safe_var}_argmax_aux_old = tl.load({aux_ptr}, mask=mask, other=val)",
-                        f"{safe_var}_argmax_cond = val > {safe_var}_argmax_aux_old",
-                        f"tl.store({aux_ptr}, tl.where({safe_var}_argmax_cond, val, {safe_var}_argmax_aux_old), mask=mask)",
+                        f"{safe_var}_argmax_aux_old = tl.load({aux_ptr}, mask=mask, other={safe_var}_val)",
+                        f"{safe_var}_argmax_cond = {safe_var}_val > {safe_var}_argmax_aux_old",
+                        f"tl.store({aux_ptr}, tl.where({safe_var}_argmax_cond, {safe_var}_val, {safe_var}_argmax_aux_old), mask=mask)",
                         f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_argmax_cond)",
                     ])
                     
@@ -1389,14 +1390,14 @@ class StatisticsAggregator:
                         argmin_ptr = f"{safe_var}_argmin_ptr + {out_offset}"
                         ops_is_inner_first.extend([
                             f"# Merged min + argmin for {safe_var}",
-                            f"tl.store({aux_ptr}, val, mask=mask)",
-                            f"tl.store({out_ptr}, val, mask=mask)",
+                            f"tl.store({aux_ptr}, {safe_var}_val, mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
                             f"tl.store({argmin_ptr}, macro_step_index, mask=mask)",
                         ])
                         ops_not_is_inner_first.extend([
-                            f"{safe_var}_min_old = tl.load({aux_ptr}, mask=mask, other=val)",
-                            f"{safe_var}_min_cond = val < {safe_var}_min_old",
-                            f"{safe_var}_min_new = tl.where({safe_var}_min_cond, val, {safe_var}_min_old)",
+                            f"{safe_var}_min_old = tl.load({aux_ptr}, mask=mask, other={safe_var}_val)",
+                            f"{safe_var}_min_cond = {safe_var}_val < {safe_var}_min_old",
+                            f"{safe_var}_min_new = tl.where({safe_var}_min_cond, {safe_var}_val, {safe_var}_min_old)",
                             f"tl.store({aux_ptr}, {safe_var}_min_new, mask=mask)",
                             f"tl.store({out_ptr}, {safe_var}_min_new, mask=mask)",
                             f"tl.store({argmin_ptr}, macro_step_index, mask=mask & {safe_var}_min_cond)",
@@ -1404,11 +1405,11 @@ class StatisticsAggregator:
                     else:
                         # Simple min only (no argmin)
                         ops_is_inner_first.extend([
-                            f"tl.store({out_ptr}, val, mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
                         ])
                         ops_not_is_inner_first.extend([
-                            f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other=val)",
-                            f"tl.store({out_ptr}, tl.where(val < {safe_var}_min_old, val, {safe_var}_min_old), mask=mask)",
+                            f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other={safe_var}_val)",
+                            f"tl.store({out_ptr}, tl.where({safe_var}_val < {safe_var}_min_old, {safe_var}_val, {safe_var}_min_old), mask=mask)",
                         ])
                 
                 elif op == 'argmin':
@@ -1423,12 +1424,12 @@ class StatisticsAggregator:
                     aux_ptr = f"{safe_var}_min_aux_ptr + {out_offset}"
                     ops_is_inner_first.extend([
                         f"tl.store({out_ptr}, macro_step_index, mask=mask)",
-                        f"tl.store({aux_ptr}, val, mask=mask)",
+                        f"tl.store({aux_ptr}, {safe_var}_val, mask=mask)",
                     ])
                     ops_not_is_inner_first.extend([
-                        f"{safe_var}_argmin_aux_old = tl.load({aux_ptr}, mask=mask, other=val)",
-                        f"{safe_var}_argmin_cond = val < {safe_var}_argmin_aux_old",
-                        f"tl.store({aux_ptr}, tl.where({safe_var}_argmin_cond, val, {safe_var}_argmin_aux_old), mask=mask)",
+                        f"{safe_var}_argmin_aux_old = tl.load({aux_ptr}, mask=mask, other={safe_var}_val)",
+                        f"{safe_var}_argmin_cond = {safe_var}_val < {safe_var}_argmin_aux_old",
+                        f"tl.store({aux_ptr}, tl.where({safe_var}_argmin_cond, {safe_var}_val, {safe_var}_argmin_aux_old), mask=mask)",
                         f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_argmin_cond)",
                     ])
                 
@@ -1445,7 +1446,7 @@ class StatisticsAggregator:
                     if has_argmaxk:
                         # MERGED: maxK + argmaxK - store both val and idx in bubble insert
                         self._argmaxk_ops.append({
-                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'argmax',
                             'has_val_output': True,  # Also output max values
                             'val_output_ptr': f"{safe_var}_max{k_val}_ptr"
@@ -1453,7 +1454,7 @@ class StatisticsAggregator:
                     else:
                         # maxK only - simple bubble insert storing values
                         self._maxk_ops.append({
-                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'max'
                         })
                 
@@ -1469,7 +1470,7 @@ class StatisticsAggregator:
                     
                     # argmaxK only - bubble insert with aux for values
                     self._argmaxk_ops.append({
-                        'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                        'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                         'out_offset': out_offset, 'type': 'argmax',
                         'has_val_output': False
                     })
@@ -1487,7 +1488,7 @@ class StatisticsAggregator:
                     if has_argmink:
                         # MERGED: minK + argminK
                         self._argmaxk_ops.append({
-                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'argmin',
                             'has_val_output': True,
                             'val_output_ptr': f"{safe_var}_min{k_val}_ptr"
@@ -1495,7 +1496,7 @@ class StatisticsAggregator:
                     else:
                         # minK only
                         self._maxk_ops.append({
-                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'min'
                         })
                 
@@ -1510,7 +1511,7 @@ class StatisticsAggregator:
                     
                     # argminK only
                     self._argmaxk_ops.append({
-                        'var': safe_var, 'op': op, 'k': k_val, 'val_var': 'val',
+                        'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                         'out_offset': out_offset, 'type': 'argmin',
                         'has_val_output': False
                     })
@@ -1524,7 +1525,7 @@ class StatisticsAggregator:
                             f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
                         ])
                     else:
-                        ops_is_inner_last.append(f"tl.store({out_ptr}, val, mask=mask)")
+                        ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         
                 elif op == 'first':
                     if var in vars_conditional_only:
@@ -1534,7 +1535,7 @@ class StatisticsAggregator:
                             f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
                         ])
                     else:
-                        ops_is_inner_first.append(f"tl.store({out_ptr}, val, mask=mask)")
+                        ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         
                 elif op == 'mid':
                     if var in vars_conditional_only:
@@ -1544,7 +1545,7 @@ class StatisticsAggregator:
                             f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
                         ])
                     else:
-                        ops_is_middle.append(f"tl.store({out_ptr}, val, mask=mask)")
+                        ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                 
                 # ===== Median/Quantile operations =====
                 elif op.startswith('median') or (op.startswith('q') and len(op) > 1 and op[1:].isdigit()):
@@ -1566,65 +1567,67 @@ class StatisticsAggregator:
             safe_first = self._get_safe_name(first_var)
             kernel_code_lines.append(f"{indent}val = {safe_first}_val")
         
-        # Phase 4: Emit inner aggregation state updates
+        # Phase 4: Emit inner aggregation state updates (per-variable)
+        # Each variable gets its own inner aggregation state (val_for_{safe_var}_{inner_type})
         for inner_type, inner_vars in inner_aggregations_needed.items():
-            # Get representative var for state pointers
             for var in inner_vars:
                 safe_var = self._get_safe_name(var)
                 out_offset = "t * n_saved_points + offs"
                 inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                val_for_var_inner = f"val_for_{safe_var}_{inner_type}"
+                var_val = f"{safe_var}_val"
                 
-                kernel_code_lines.append(f"{indent}val_for_{inner_type} = tl.zeros_like(val)")
+                kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                 
                 if inner_type == 'mean':
                     weight_ptr = f"{safe_var}_{inner_type}_weight_state_ptr + {out_offset}"
                     kernel_code_lines.extend([
-                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                        f"{indent}weight_{inner_type}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                        f"{indent}inner_{inner_type}_new = inner_{inner_type}_old + val * weight",
-                        f"{indent}weight_{inner_type}_new = weight_{inner_type}_old + weight",
+                        f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                        f"{indent}{safe_var}_weight_{inner_type}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = {safe_var}_inner_{inner_type}_old + {var_val} * weight",
+                        f"{indent}{safe_var}_weight_{inner_type}_new = {safe_var}_weight_{inner_type}_old + weight",
                     ])
                     # Store based on condition - use tl.where for efficiency
                     kernel_code_lines.extend([
-                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, inner_{inner_type}_new), mask=mask)",
-                        f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, weight_{inner_type}_new), mask=mask)",
-                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new / weight_{inner_type}_new, val_for_{inner_type})",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_inner_{inner_type}_new), mask=mask)",
+                        f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_weight_{inner_type}_new), mask=mask)",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new / {safe_var}_weight_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'sum':
                     kernel_code_lines.extend([
-                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                        f"{indent}inner_{inner_type}_new = inner_{inner_type}_old + val * weight",
-                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, inner_{inner_type}_new), mask=mask)",
-                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new, val_for_{inner_type})",
+                        f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = {safe_var}_inner_{inner_type}_old + {var_val} * weight",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_inner_{inner_type}_new), mask=mask)",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'max':
                     kernel_code_lines.extend([
-                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                        f"{indent}inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), val, tl.maximum(inner_{inner_type}_old, val))",
-                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, -float('inf'), inner_{inner_type}_new), mask=mask)",
-                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new, val_for_{inner_type})",
+                        f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, tl.maximum({safe_var}_inner_{inner_type}_old, {var_val}))",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, -float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'min':
                     kernel_code_lines.extend([
-                        f"{indent}inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                        f"{indent}inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), val, tl.minimum(inner_{inner_type}_old, val))",
-                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, float('inf'), inner_{inner_type}_new), mask=mask)",
-                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, inner_{inner_type}_new, val_for_{inner_type})",
+                        f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, tl.minimum({safe_var}_inner_{inner_type}_old, {var_val}))",
+                        f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'mid':
                     kernel_code_lines.extend([
-                        f"{indent}tl.store({inner_ptr}, val, mask=mask & is_middle)",
-                        f"{indent}val_for_{inner_type} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), val_for_{inner_type})",
+                        f"{indent}tl.store({inner_ptr}, {var_val}, mask=mask & is_middle)",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
                     ])
                 elif inner_type == 'last':
-                    kernel_code_lines.append(f"{indent}val_for_{inner_type} = tl.where(is_inner_last, val, val_for_{inner_type})")
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {var_val}, {val_for_var_inner})")
                 elif inner_type == 'median':
                     # Inner P-Square median - use step_count_val as step index
                     # Track for deferred generation (all inner median ops share state)
                     if not hasattr(self, '_median_inner_ops'):
                         self._median_inner_ops = {}
                     self._median_inner_ops[safe_var] = out_offset
-                break  # Only emit once per inner_type
+                # Note: removed 'break' - now generate for each variable in inner_vars
         
         # Phase 5: Emit unconditional ops
         for line in ops_unconditional:
@@ -1842,7 +1845,9 @@ class StatisticsAggregator:
             kernel_code_lines.append(f"{indent}# Inner Median P-Square Algorithm")
             kernel_code_lines.append(f"{indent}inner_step = step_count_val.to(tl.int32)")
             for safe_var, out_offset in self._median_inner_ops.items():
-                kernel_code_lines.append(f"{indent}val_for_median = tl.zeros_like(val)")
+                var_val = f"{safe_var}_val"
+                val_for_var_median = f"val_for_{safe_var}_median"
+                kernel_code_lines.append(f"{indent}{val_for_var_median} = tl.zeros_like({var_val})")
                 q_ptr = f"{safe_var}_median_inner_q_state_ptr"
                 n_ptr = f"{safe_var}_median_inner_n_state_ptr"
                 stride_k = "n_saved_points"
@@ -1850,13 +1855,13 @@ class StatisticsAggregator:
                 
                 self._generate_psquare_code(
                     kernel_code_lines, safe_var, q_ptr, n_ptr,
-                    "val", "inner_step", None, stride_k, offset_expr,
+                    var_val, "inner_step", None, stride_k, offset_expr,
                     indent, indent2, indent3
                 )
                 # Extract median on is_inner_last
                 kernel_code_lines.extend([
                     f"{indent}if is_inner_last:",
-                    f"{indent2}val_for_median = tl.load({q_ptr} + 2 * {stride_k} + {offset_expr}, mask=mask, other=0.0)",
+                    f"{indent2}{val_for_var_median} = tl.load({q_ptr} + 2 * {stride_k} + {offset_expr}, mask=mask, other=0.0)",
                 ])
             self._median_inner_ops = {}  # Reset
         
