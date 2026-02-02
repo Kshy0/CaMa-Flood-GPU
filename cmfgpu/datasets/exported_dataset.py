@@ -52,10 +52,13 @@ class ExportedDataset(NetCDFDataset):
         suffix: str = "rank0.nc",
         time_to_key: Optional[Callable[[datetime], str]] = exported_time_to_key,
         coord_name: str = "catchment_id",
+        in_memory: bool = False,
         *args,
         **kwargs,
     ):
         self.coord_name = coord_name
+        self._in_memory = in_memory
+        self._memory_cache: Optional[np.ndarray] = None  # Shape: (total_time_steps, num_catchments)
         super().__init__(
             base_dir=base_dir,
             start_date=start_date,
@@ -217,7 +220,57 @@ class ExportedDataset(NetCDFDataset):
             print(f"[ExportedDataset] Mapped {len(desired_catchment_ids)} catchments "
                   f"from {len(file_catchment_ids)} in file")
         
+        # Auto-load to memory if in_memory mode is enabled
+        if self._in_memory:
+            self.load_to_memory()
+        
         return None  # No matrix needed
+
+    def load_to_memory(self) -> None:
+        """Load all data into memory for faster repeated access.
+        
+        This method reads the entire dataset into a numpy array cached in memory.
+        Subsequent __getitem__ calls will return slices from this cache instead
+        of reading from disk.
+        
+        Note: build_local_runoff_matrix should be called first to set up
+        the column reordering indices.
+        """
+        if self._memory_cache is not None:
+            if is_rank_zero():
+                print("[ExportedDataset] Data already in memory, skipping reload.")
+            return
+        
+        # Read all data at once
+        key = self.time_to_key(self.start_date)
+        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+        
+        with Dataset(path, "r") as ds:
+            var = ds.variables[self.var_name]
+            dims = tuple(d.lower() for d in var.dimensions)
+            t_idx = dims.index("time")
+            c_idx = dims.index("saved_points")
+            
+            # Read entire variable
+            arr = var[:]
+            if isinstance(arr, np.ma.MaskedArray):
+                arr = arr.filled(0.0)
+            else:
+                arr = np.nan_to_num(np.asarray(arr), nan=0.0)
+            
+            # Ensure (T, C) format
+            arr = self._ensure_tc(arr, t_idx, c_idx)
+        
+        # Reorder columns if indices are set
+        if self._local_runoff_indices is not None:
+            arr = arr[:, self._local_runoff_indices]
+        
+        # Store in cache with correct dtype and C-contiguous layout
+        self._memory_cache = np.ascontiguousarray(arr.astype(self.out_dtype, copy=False))
+        
+        if is_rank_zero():
+            mem_mb = self._memory_cache.nbytes / (1024 * 1024)
+            print(f"[ExportedDataset] Loaded {self._memory_cache.shape} to memory ({mem_mb:.1f} MB)")
 
     def shard_forcing(
         self,
@@ -254,11 +307,32 @@ class ExportedDataset(NetCDFDataset):
         
         If build_local_runoff_matrix has been called, returns data reordered to
         match desired catchment order. Otherwise, returns data in file order.
+        
+        If in_memory mode is enabled (and load_to_memory has been called),
+        returns a slice from the memory cache instead of reading from disk.
         """
         if idx < 0:
             idx += len(self)
         
         N = self.data_size
+        
+        # Use memory cache if available
+        if self._memory_cache is not None:
+            # Calculate time indices for this chunk
+            start_time_idx = idx * self.chunk_len
+            end_time_idx = min(start_time_idx + self.chunk_len, self._memory_cache.shape[0])
+            
+            data = self._memory_cache[start_time_idx:end_time_idx]
+            T = data.shape[0]
+            
+            if T < self.chunk_len:
+                pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
+                data = np.vstack([data, pad]) if data.size else pad
+            
+            # Already C-contiguous from load_to_memory, but slice may not be
+            return np.ascontiguousarray(data)
+        
+        # Fall back to reading from disk
         data = self.read_chunk(idx)
         
         if data.ndim != 2 or data.shape[1] != N:
@@ -268,4 +342,4 @@ class ExportedDataset(NetCDFDataset):
         if T < self.chunk_len:
             pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
             data = np.vstack([data, pad]) if data.size else pad
-        return data
+        return np.ascontiguousarray(data)

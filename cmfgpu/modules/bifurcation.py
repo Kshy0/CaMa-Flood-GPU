@@ -94,7 +94,7 @@ class BifurcationModule(AbstractModule):
         description="Basin ID for each bifurcation path (used to group paths by basin)",
         dtype="int",
         category="topology",
-        mode="discard",
+        mode="cpu",
     )
 
     # ------------------------------------------------------------------ #
@@ -111,14 +111,14 @@ class BifurcationModule(AbstractModule):
         description="Upstream catchment IDs for each bifurcation path",
         dtype="int",
         category="topology",
-        mode="discard",
+        mode="cpu",
     )
 
     bifurcation_downstream_id: torch.Tensor = BifurcationField(
         description="Downstream catchment IDs for each bifurcation path",
         dtype="int",
         category="topology",
-        mode="discard",
+        mode="cpu",
     )
 
     # ------------------------------------------------------------------ #

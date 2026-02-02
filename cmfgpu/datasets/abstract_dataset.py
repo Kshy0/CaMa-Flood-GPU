@@ -1099,8 +1099,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         # Clip negative values to zero if enabled
         if self.clip_negative:
             np.maximum(data, 0, out=data)
-        
-        return data
+            
+        return np.ascontiguousarray(data)
 
     def __len__(self) -> int:
         real_len = self._real_len()

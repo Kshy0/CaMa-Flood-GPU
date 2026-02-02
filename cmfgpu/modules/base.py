@@ -108,7 +108,7 @@ class BaseModule(AbstractModule):
         description="ID of immediate downstream catchment (points to self at river mouth)",
         dtype="int",
         category="topology",
-        mode="discard",
+        mode="cpu",
     )
 
     # --------------------------------------------------------------------- #
