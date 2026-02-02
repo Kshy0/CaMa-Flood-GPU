@@ -817,14 +817,22 @@ def crop_parameters_nc(
         num_kept_catchments =  np.sum(keep_mask)
         print(f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})")
         
-        # Prepare catchment_save_mask based on only_save_pois logic
+        # Prepare catchment_save_id and catchment_save_basin_id based on only_save_pois logic
         # We need to compute it for the KEPT catchments only.
         kept_catchment_ids = catchment_id[keep_mask]
+        kept_catchment_basin_ids = catchment_basin_id[keep_mask]
         
         if only_save_pois:
-            new_save_mask = np.isin(kept_catchment_ids, target_cids)
+            # Filter target_cids to those in kept catchments, preserving order
+            save_mask = np.isin(target_cids, kept_catchment_ids)
+            new_save_ids = target_cids[save_mask]
+            # Compute basin IDs for saved catchments
+            ti = find_indices_in(new_save_ids, kept_catchment_ids)
+            new_save_basin_ids = kept_catchment_basin_ids[ti]
         else:
-            new_save_mask = np.ones(num_kept_catchments, dtype=np.bool_)
+            # Save all catchments
+            new_save_ids = kept_catchment_ids.copy()
+            new_save_basin_ids = kept_catchment_basin_ids.copy()
 
         with Dataset(output_nc, 'w') as dst:
             dst.setncatts(src.__dict__)
@@ -846,8 +854,12 @@ def crop_parameters_nc(
                 elif name == 'bifurcation_path': pass
                 elif name == 'levee': pass
                 elif name == 'gauge': pass
+                elif name == 'saved_catchment': pass  # Will be created below
                 else:
                     dst.createDimension(name, len(dim) if not dim.isunlimited() else None)
+            
+            # Create saved_catchment dimension (always present now)
+            dst.createDimension('saved_catchment', len(new_save_ids))
             
             bif_mask = None
             if 'bifurcation_basin_id' in src.variables:
@@ -880,10 +892,12 @@ def crop_parameters_nc(
                      dst[name][:] = np.array(num_merged_basins, dtype=var.dtype)
                      continue
 
+                # Skip old catchment_save_mask if present
                 if name == 'catchment_save_mask':
-                    # Always overwrite with our computed mask
-                    dst.createVariable(name, 'u1', dims, zlib=True) # force bool/u1
-                    dst[name][:] = new_save_mask.astype('u1')
+                    continue
+                
+                # Skip old catchment_save_id/catchment_save_basin_id - we'll write our own
+                if name in ('catchment_save_id', 'catchment_save_basin_id'):
                     continue
 
                 if primary_dim == 'catchment':
@@ -927,6 +941,17 @@ def crop_parameters_nc(
                 else:
                      dst.createVariable(name, var.dtype, dims, zlib=True)
                      dst[name][:] = data
+            
+            # Write catchment_save_id and catchment_save_basin_id (always present)
+            # Remap basin IDs for saved catchments
+            idx_in_kept = np.searchsorted(old_unique_basins, new_save_basin_ids)
+            remapped_save_basin_ids = map_idx_to_new[idx_in_kept].astype(np.int64)
+            
+            var = dst.createVariable('catchment_save_id', np.int64, ('saved_catchment',), zlib=True)
+            var[:] = new_save_ids
+            
+            var = dst.createVariable('catchment_save_basin_id', np.int64, ('saved_catchment',), zlib=True)
+            var[:] = remapped_save_basin_ids
             
             # Update global attr
             dst.setncattr("num_basins", int(num_merged_basins))

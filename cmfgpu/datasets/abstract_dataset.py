@@ -449,6 +449,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         # Store the local runoff indices for use in __getitem__
         self._local_runoff_indices = non_zero_cols
         
+        # Store the desired catchment IDs for use in export_catchment_runoff
+        self._desired_catchment_ids = np.asarray(desired_catchment_ids)
+        
         # Extract final submatrix with only non-zero columns and transpose
         # Shape: (num_runoff_grids, num_catchments)
         final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
@@ -477,7 +480,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self,
         out_dir: str | Path,
         local_runoff_matrix: torch.Tensor,
-        catchment_ids: Optional[np.ndarray] = None,
         var_name: str = "var",
         dtype: Literal["float32", "float64"] = "float32",
         complevel: int = 4,
@@ -491,17 +493,15 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         Export catchment-aggregated runoff to a NetCDF file readable by MultiRankStatsReader.
         
-        Uses the local_runoff_matrix returned by build_local_runoff_matrix().
+        Requires build_local_runoff_matrix() to be called first.
 
         - Output filename: {filename}_rank0.nc or {var_name}_rank0.nc if filename not specified
           (or with _{year} suffix if split_by_year)
         - Dimensions: time (unlimited), saved_points
         - Variables:
             * time: numeric with units and calendar
-            * save_coord: (saved_points,) linear catchment IDs (compatible with nx, ny)
-            * {var_name}: (time, saved_points) aggregated runoff (area-weighted mean in mm)
-
-        Time range: uses the dataset's inherent length (e.g., defined by its __len__), no extra arguments.
+            * catchment_id: (saved_points,) catchment IDs
+            * {var_name}: (time, saved_points) aggregated runoff (area-weighted mean)
 
         GPU acceleration:
         - Set `device="cuda:0"` (or any CUDA device) to enable GPU-accelerated sparse matmul.
@@ -510,7 +510,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         Args:
             out_dir: Output directory for NetCDF files
             local_runoff_matrix: Sparse tensor from build_local_runoff_matrix(), shape (n_grids, n_catchments)
-            catchment_ids: Array of catchment IDs. If None, reads from the mapping file used in build_local_runoff_matrix()
             var_name: Variable name in output NetCDF
             dtype: Output data type
             complevel: Compression level (0-9)
@@ -521,18 +520,16 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             description: Optional description for the output variable
             filename: Optional custom filename prefix (default: var_name)
         """
+        # Require build_local_runoff_matrix() to be called first
+        if not hasattr(self, '_desired_catchment_ids') or self._desired_catchment_ids is None:
+            raise ValueError(
+                "build_local_runoff_matrix() must be called before export_catchment_runoff(). "
+                "This sets the catchment IDs and runoff mapping."
+            )
+        
+        catchment_ids = self._desired_catchment_ids
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Auto-load catchment_ids from mapping file if not provided
-        if catchment_ids is None:
-            if not hasattr(self, '_runoff_mapping_file') or self._runoff_mapping_file is None:
-                raise ValueError(
-                    "catchment_ids not provided and no mapping file available. "
-                    "Please call build_local_runoff_matrix() first or provide catchment_ids explicitly."
-                )
-            mapping_data = np.load(self._runoff_mapping_file)
-            catchment_ids = mapping_data['catchment_ids']
         
         n_catch = len(catchment_ids)
         n_cols = self.data_size  # This is the compressed size after build_local_runoff_matrix

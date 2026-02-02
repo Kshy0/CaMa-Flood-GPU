@@ -143,7 +143,8 @@ class MERITMap(BaseModel):
         "catchment_basin_id",
         "basin_sizes",
         "num_basins",
-        "catchment_save_mask",
+        "catchment_save_id",
+        "catchment_save_basin_id",
         "river_depth",
         "river_width",
         "river_length",
@@ -237,7 +238,9 @@ class MERITMap(BaseModel):
         self.num_catchments = len(catchment_id)
         self.river_mouth_id = river_mouth_id
         self.is_river_mouth = (self.downstream_id < 0)
-        self.catchment_save_mask = np.ones(self.num_catchments, dtype=bool)
+        # Default: save all catchments (will be updated in filter_to_poi_basins if only_save_pois)
+        self.catchment_save_id = catchment_id.copy()
+        self.catchment_save_basin_id = None  # Will be set after basin_id is computed
         
 
         print(f"Loaded {len(catchment_id)} catchments")
@@ -339,8 +342,10 @@ class MERITMap(BaseModel):
         # Mouths should point to themselves
         self.downstream_id[self.is_river_mouth] = self.catchment_id[self.is_river_mouth]
 
-        # 5) Mask
-        self.catchment_save_mask = self.catchment_save_mask[sorted_idx]
+        # 5) Update catchment_save_id to match reordered catchment_id (default: save all)
+        # Also set catchment_save_basin_id
+        self.catchment_save_id = self.catchment_id.copy()
+        self.catchment_save_basin_id = self.catchment_basin_id.copy()
 
         # 6) If bifurcation arrays exist, align their basin ids with the new catchment ordering
         if self.num_bifurcation_paths > 0:
@@ -607,13 +612,20 @@ class MERITMap(BaseModel):
         self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
         self.downstream_idx[self.is_river_mouth] = -1
 
-        # Create catchment_save_mask after filtering (mark target catchments)
+        # Update catchment_save_id and catchment_save_basin_id after filtering
+        # If only_save_pois is True, save only target catchments (preserving their order)
+        # Otherwise, save all catchments (default)
         if self.only_save_pois:
-            self.catchment_save_mask = np.zeros(self.num_catchments, dtype=bool)
-            ti = find_indices_in(self.target_cids, self.catchment_id)
-            # ti should be valid as we sliced catchment_id to kept basins containing targets
-            valid_ti = ti[ti >= 0]
-            self.catchment_save_mask[valid_ti] = True
+            # target_cids are the POI catchments; filter to those in kept basins
+            valid_mask = np.isin(self.target_cids, self.catchment_id)
+            self.catchment_save_id = self.target_cids[valid_mask]
+            # Compute basin IDs for saved catchments
+            ti = find_indices_in(self.catchment_save_id, self.catchment_id)
+            self.catchment_save_basin_id = self.catchment_basin_id[ti]
+        else:
+            # Save all catchments
+            self.catchment_save_id = self.catchment_id.copy()
+            self.catchment_save_basin_id = self.catchment_basin_id.copy()
 
         # Filter bifurcation paths to kept basins and remap their basin ids to the new contiguous ids
         if self.num_bifurcation_paths > 0:
@@ -748,6 +760,10 @@ class MERITMap(BaseModel):
 
             if self.num_gauges > 0:
                 ds.createDimension("gauge", self.num_gauges)
+            
+            # Saved catchment dimension (always present)
+            num_saved_catchments = len(self.catchment_save_id)
+            ds.createDimension("saved_catchment", num_saved_catchments)
 
             # Helper to map data shapes to dims
             def infer_dims(arr: np.ndarray):
@@ -765,6 +781,8 @@ class MERITMap(BaseModel):
                         return ("levee",)
                     if self.num_gauges > 0 and shape[0] == self.num_gauges:
                         return ("gauge",)
+                    if num_saved_catchments > 0 and shape[0] == num_saved_catchments:
+                        return ("saved_catchment",)
                     if shape[0] == self.flood_depth_table.shape[1]:
                         return ("flood_level",)
                 elif len(shape) == 2:
@@ -788,7 +806,7 @@ class MERITMap(BaseModel):
                         raise ValueError(f"Missing required field: {key}")
                     yield key
                 for key in getattr(self, "output_optional", []):
-                    if hasattr(self, key):
+                    if hasattr(self, key) and getattr(self, key) is not None:
                         yield key
 
             for key in _vars_to_write():

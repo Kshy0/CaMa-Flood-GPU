@@ -161,12 +161,16 @@ class BaseModule(AbstractModule):
         mode="cpu",
     )
 
-    # Output-control mask
-    catchment_save_mask: Optional[torch.Tensor] = BaseField(
-        description="Boolean mask of catchments for which output will be saved",
-        dtype="bool",
-        default=None,
+    catchment_save_id: torch.Tensor = BaseField(
+        description="Catchment IDs for which output will be saved. Order is preserved in output.",
+        dtype="int",
+        group_by="catchment_save_basin_id",
+        save_idx=None,
+        save_coord=None,
+        dim_coords=None,
+        shape=("num_saved_catchments",),
         category="topology",
+        mode="cpu",
     )
 
     # --------------------------------------------------------------------- #
@@ -277,7 +281,7 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def num_saved_catchments(self) -> int:
-        return len(self.catchment_save_idx)
+        return self.catchment_save_id.shape[0]
     
     @computed_field(
         description="Number of flood levels represented in the lookup tables."
@@ -313,28 +317,10 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def catchment_save_idx(self) -> torch.Tensor:
-        if self.catchment_save_mask is None:
-            return torch.arange(self.num_catchments, dtype=torch.int64, device=self.device)
-        catchment_save_idx = torch.nonzero(self.catchment_save_mask, as_tuple=False).squeeze(-1).to(self.device)
-        if catchment_save_idx.numel() == 0:
-            return None
-        else:
-            return catchment_save_idx
-        
-    @computed_base_field(
-        description="Catchment IDs for which output will be saved",
-        shape=("num_saved_catchments",),
-        dtype="int",
-        category="topology",
-    )
-    @cached_property
-    def catchment_save_id(self) -> torch.Tensor:
         """
-        Returns the catchment IDs for which output will be saved.
+        Returns the indices (into catchment_id) of catchments to save.
         """
-        if self.catchment_save_mask is None:
-            return self.catchment_id
-        return self.catchment_id[self.catchment_save_idx]
+        return find_indices_in_torch(self.catchment_save_id, self.catchment_id)
     
     @computed_base_field(
         description="Boolean mask for catchments governed by levee physics",
@@ -498,6 +484,18 @@ class BaseModule(AbstractModule):
             diffs = torch.diff(self.flood_depth_table, dim=1)
             if not torch.all(diffs >= 0):
                 raise ValueError("flood_depth_table must be monotonically increasing along the columns (flood levels)")
+        return self
+
+    @model_validator(mode="after")
+    def validate_catchment_save_id(self) -> Self:
+        if torch.unique(self.catchment_save_id).numel() != self.catchment_save_id.numel():
+            raise ValueError("catchment_save_id must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def validate_catchment_save_idx(self) -> Self:
+        if torch.any(self.catchment_save_idx < 0):
+            raise ValueError("catchment_save_idx contains invalid indices (< 0). Check that catchment_save_id matches catchment_id.")
         return self
 
     # ------------------------------------------------------------------ #
