@@ -229,6 +229,10 @@ class NetCDFDataset(AbstractDataset):
         # Each chunk plan is a list of (file_key, abs_time_indices) operations.
         # We read exact timesteps per file using fancy indexing once per file.
         self._chunk_plan = []
+        
+        # Bounding box for optimized spatial reading (computed lazily)
+        self._bbox: Optional[Tuple[int, int, int, int]] = None  # (y_min, y_max, x_min, x_max)
+        self._bbox_local_indices: Optional[np.ndarray] = None  # indices relative to bbox
 
         # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
         super().__init__(
@@ -311,11 +315,53 @@ class NetCDFDataset(AbstractDataset):
             shape = var.shape
             return (shape[y_idx], shape[x_idx])
 
+    def _compute_bbox_from_indices(self) -> None:
+        """Compute 2D bounding box from _local_runoff_indices for optimized reading.
+        
+        This method converts the 1D flattened indices to 2D (y, x) coordinates,
+        finds the minimal bounding box, and creates a mapping from the original
+        indices to indices relative to the bounding box.
+        
+        After calling this method:
+        - self._bbox: (y_min, y_max, x_min, x_max) - inclusive bounds
+        - self._bbox_local_indices: indices relative to the bounding box flatten
+        """
+        if self._local_runoff_indices is None:
+            self._bbox = None
+            self._bbox_local_indices = None
+            return
+        
+        ny, nx = self._grid_shape
+        
+        # Convert 1D indices to 2D coordinates
+        # index = y * nx + x (C-order, row-major)
+        y_coords = self._local_runoff_indices // nx
+        x_coords = self._local_runoff_indices % nx
+        
+        # Compute bounding box
+        y_min, y_max = int(y_coords.min()), int(y_coords.max())
+        x_min, x_max = int(x_coords.min()), int(x_coords.max())
+        
+        self._bbox = (y_min, y_max, x_min, x_max)
+        
+        # Compute new width of the bounding box
+        bbox_nx = x_max - x_min + 1
+        
+        # Convert global indices to bbox-local indices
+        # new_index = (y - y_min) * bbox_nx + (x - x_min)
+        local_y = y_coords - y_min
+        local_x = x_coords - x_min
+        self._bbox_local_indices = (local_y * bbox_nx + local_x).astype(np.int64)
+
     def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
         """Execute per-file reads using absolute time indices.
 
         Each op is (file_key, abs_indices). We'll fetch exactly these time steps
         from the file in a single fancy-indexing operation along the time axis.
+        
+        When _local_runoff_indices is set and a bounding box has been computed,
+        this method reads only the bounding box region instead of the full grid,
+        significantly reducing I/O for spatially concentrated catchments.
         
         Returns:
         - If _local_runoff_indices is set: (T, N) compressed array
@@ -325,6 +371,15 @@ class NetCDFDataset(AbstractDataset):
         """
         ny, nx = self._grid_shape
         compressed = self._local_runoff_indices is not None
+        
+        # Lazily compute bounding box on first read if compressed mode is active
+        if compressed and self._bbox is None:
+            self._compute_bbox_from_indices()
+        
+        # Check if bounding box optimization is available
+        use_bbox = (compressed and 
+                    self._bbox is not None and 
+                    self._bbox_local_indices is not None)
         
         if not ops:
             if compressed:
@@ -351,6 +406,13 @@ class NetCDFDataset(AbstractDataset):
                 abs_idx = np.asarray(abs_indices, dtype=np.int32)
                 sel = [slice(None)] * var.ndim
                 sel[t_idx] = abs_idx
+                
+                if use_bbox:
+                    # Read only the bounding box region
+                    y_min, y_max, x_min, x_max = self._bbox
+                    sel[y_idx] = slice(y_min, y_max + 1)
+                    sel[x_idx] = slice(x_min, x_max + 1)
+                
                 arr = var[tuple(sel)]
                 
                 # Fill masks / NaNs
@@ -360,14 +422,20 @@ class NetCDFDataset(AbstractDataset):
                     arr = np.nan_to_num(np.asarray(arr), nan=0.0)
                 arr = np.asarray(arr)
                 
-                # Normalize to (T, Y, X)
+                # Normalize to (T, Y, X) - note: Y, X may be bbox dimensions if use_bbox
                 arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
                 
                 if compressed:
                     # Flatten and extract active columns: (T, Y, X) -> (T, N)
                     T, Y, X = arr.shape
                     flat = arr.reshape(T, Y * X)
-                    out = flat[:, self._local_runoff_indices]
+                    
+                    if use_bbox:
+                        # Use bbox-relative indices
+                        out = flat[:, self._bbox_local_indices]
+                    else:
+                        # Use global indices (fallback, should not happen normally)
+                        out = flat[:, self._local_runoff_indices]
                 else:
                     # Keep as (T, Y, X)
                     out = arr
