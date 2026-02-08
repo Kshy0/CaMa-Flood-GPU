@@ -726,9 +726,15 @@ class StatisticsAggregator:
                     if aux_name in self._storage:
                         required_tensors[aux_name] = self._storage[aux_name]
                 
-                if op.startswith('median') or (op.startswith('q') and op[1:].isdigit()):
-                    q_name = f"{var_name}_median_q_state"
-                    n_name = f"{var_name}_median_n_state"
+                if op.startswith('median') or re.match(r'^q\d+', op):
+                    # Compound median ops use per-inner state
+                    if '_' in op:
+                        inner = op.split('_')[1]
+                        q_name = f"{var_name}_median_{inner}_q_state"
+                        n_name = f"{var_name}_median_{inner}_n_state"
+                    else:
+                        q_name = f"{var_name}_median_q_state"
+                        n_name = f"{var_name}_median_n_state"
                     required_tensors[q_name] = self._storage[q_name]
                     required_tensors[n_name] = self._storage[n_name]
 
@@ -736,11 +742,14 @@ class StatisticsAggregator:
                 if '_' in op:
                     parts = op.split('_')
                     inner = parts[1]
-                    inner_name = f"{var_name}_{inner}_inner_state"
-                    if inner_name in self._storage:
-                        required_tensors[inner_name] = self._storage[inner_name]
-                        # Also add weight state if needed
-                        if inner in ('mean', 'first', 'last', 'mid'):
+                    # 'last' inner op doesn't need cross-step state
+                    # 'median' inner op uses its own q/n state, not generic inner_state
+                    if inner not in ('last', 'median'):
+                        inner_name = f"{var_name}_{inner}_inner_state"
+                        if inner_name in self._storage:
+                            required_tensors[inner_name] = self._storage[inner_name]
+                        # Only 'mean' needs weight state
+                        if inner == 'mean':
                             w_name = f"{var_name}_{inner}_weight_state"
                             if w_name in self._storage:
                                 required_tensors[w_name] = self._storage[w_name]
@@ -947,11 +956,15 @@ class StatisticsAggregator:
         emitted.add(var_name)
     
     def _generate_psquare_code(self, lines: List[str], var: str, q_ptr: str, n_ptr: str,
-                               val_var: str, step_var: str, out_ptr: str, stride_expr: str,
+                               val_var: str, step_var: str, out_ptrs: 'dict[int, str] | str | None',
+                               stride_expr: str,
                                offset_expr: str, indent: str, indent2: str, indent3: str) -> None:
         """
         Generate P-Square algorithm code for median/quantile computation.
         This is a reusable helper for both outer and inner median operations.
+        
+        The 5 markers track quantiles at positions 0, 0.25, 0.5, 0.75, 1.0.
+        - q0 = min, q1 = 25th percentile, q2 = median, q3 = 75th percentile, q4 = max
         
         Args:
             lines: List to append code lines to
@@ -960,11 +973,21 @@ class StatisticsAggregator:
             n_ptr: Base pointer for n state
             val_var: Variable containing the value to insert
             step_var: Variable containing the step index
-            out_ptr: Output pointer for result (if None, only state update)
+            out_ptrs: Output pointer(s) for result. Can be:
+                - None: only state update, no output store
+                - str: store q2 (median) to this pointer
+                - dict: {marker_index: ptr} e.g. {1: q25_ptr, 2: median_ptr, 3: q75_ptr}
             stride_expr: Expression for stride between q/n values
             offset_expr: Expression for base offset
             indent, indent2, indent3: Indentation strings
         """
+        # Normalize out_ptrs to dict form
+        if out_ptrs is None:
+            out_ptrs_dict = {}
+        elif isinstance(out_ptrs, str):
+            out_ptrs_dict = {2: out_ptrs}  # median = q2
+        else:
+            out_ptrs_dict = out_ptrs
         lines.extend([
             f"{indent}# P-Square Median Update",
             f"{indent}if {step_var} < 5:",
@@ -1001,8 +1024,9 @@ class StatisticsAggregator:
             f"{indent3}tl.store({n_ptr} + 3 * {stride_expr} + {offset_expr}, 3, mask=mask)",
             f"{indent3}tl.store({n_ptr} + 4 * {stride_expr} + {offset_expr}, 4, mask=mask)",
         ])
-        if out_ptr:
-            lines.append(f"{indent3}tl.store({out_ptr}, q2, mask=mask)")
+        q_names = {0: 'q0', 1: 'q1', 2: 'q2', 3: 'q3', 4: 'q4'}
+        for qi, ptr in out_ptrs_dict.items():
+            lines.append(f"{indent3}tl.store({ptr}, {q_names[qi]}, mask=mask)")
         
         lines.extend([
             f"{indent}elif {step_var} >= 5:",
@@ -1063,8 +1087,8 @@ class StatisticsAggregator:
             f"{indent2}tl.store({n_ptr} + 3 * {stride_expr} + {offset_expr}, n3.to(tl.int32), mask=mask)",
             f"{indent2}tl.store({n_ptr} + 4 * {stride_expr} + {offset_expr}, n4.to(tl.int32), mask=mask)",
         ])
-        if out_ptr:
-            lines.append(f"{indent2}tl.store({out_ptr}, q2, mask=mask)")
+        for qi, ptr in out_ptrs_dict.items():
+            lines.append(f"{indent2}tl.store({ptr}, {q_names[qi]}, mask=mask)")
 
     def _generate_1d_vars_grouped(self, kernel_code_lines: List[str], dims_1d: List[str],
                                     indent: str, indent2: str, indent3: str, indent4: str, indent5: str) -> None:
@@ -1113,17 +1137,33 @@ class StatisticsAggregator:
                     analysis['argminK'][int(match_argmink.group(1))] = True
             var_op_analysis[var] = analysis
         
-        # Phase 1: Emit variable loads (always needed vars)
-        vars_need_val = set()  # vars that need val loaded unconditionally
-        vars_conditional_only = set()  # vars only used in first/last/mid
+        # Phase 1: Classify variables by when their value is needed
+        vars_need_val = set()  # vars that need val loaded unconditionally (every sub-step)
+        vars_conditional_only = set()  # vars only used conditionally (first/last/mid or compound with last/first/mid inner)
+        
+        # Simple ops that are conditional (only need val at specific points)
+        simple_conditional_ops = {'first', 'last', 'mid'}
+        # Inner op types that only need the value conditionally (at is_inner_last)
+        conditional_inner_ops = {'last', 'first', 'mid'}
         
         for var in dims_1d:
             ops = self._variable_ops[var]
-            conditional_only_ops = {'first', 'last', 'mid'}
-            if all(op in conditional_only_ops for op in ops):
-                vars_conditional_only.add(var)
-            else:
+            needs_unconditional = False
+            for op in ops:
+                if op in simple_conditional_ops:
+                    continue  # Conditional simple op
+                op_parts = op.split('_')
+                if len(op_parts) > 1:
+                    inner = op_parts[1]
+                    if inner in conditional_inner_ops:
+                        continue  # Compound op with conditional inner type
+                # Any other op needs unconditional val (mean, sum, max, min, median, etc.)
+                needs_unconditional = True
+                break
+            if needs_unconditional:
                 vars_need_val.add(var)
+            else:
+                vars_conditional_only.add(var)
         
         # Helper to emit variable value load
         emitted_vars = set()
@@ -1208,7 +1248,11 @@ class StatisticsAggregator:
                         outer_base = outer.lstrip('arg')  # Remove 'arg' prefix if present
                     
                     # Use variable-specific inner aggregation result
-                    val_var = f"val_for_{safe_var}_{inner}"
+                    # For 'last' inner type, directly use the variable value (no intermediate state)
+                    if inner == 'last':
+                        val_var = f"{safe_var}_val"
+                    else:
+                        val_var = f"val_for_{safe_var}_{inner}"
                     
                     if is_arg_compound:
                         # Compound argmax/argmin (e.g., argmax_mean, argmax3_mean)
@@ -1295,6 +1339,33 @@ class StatisticsAggregator:
                             f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other=0.0)",
                             f"tl.store({out_ptr}, {safe_var}_{op}_old + {val_var}, mask=mask)",
                         ])
+                    elif outer == 'median':
+                        # Compound median (e.g., median_mean, median_max)
+                        # Track for deferred P-Square generation inside is_inner_last block
+                        if not hasattr(self, '_median_compound_ops'):
+                            self._median_compound_ops = {}
+                        key = (safe_var, inner)
+                        if key not in self._median_compound_ops:
+                            self._median_compound_ops[key] = []
+                        self._median_compound_ops[key].append((op, out_ptr, val_var, 2))  # marker index 2 = median
+                    elif outer in ('q25', 'q75'):
+                        # Compound quantile (e.g., q25_mean, q75_mean)
+                        # Same P-Square state as median, different marker output
+                        if not hasattr(self, '_median_compound_ops'):
+                            self._median_compound_ops = {}
+                        key = (safe_var, inner)
+                        if key not in self._median_compound_ops:
+                            self._median_compound_ops[key] = []
+                        qi = 1 if outer == 'q25' else 3  # q1=25th, q3=75th
+                        self._median_compound_ops[key].append((op, out_ptr, val_var, qi))
+                    elif outer == 'last':
+                        # Compound last (e.g., last_mean) — store the last inner value
+                        # Simply overwrite on every is_inner_last step
+                        ops_is_inner_last.append(f"tl.store({out_ptr}, {val_var}, mask=mask)")
+                    elif outer == 'first':
+                        # Compound first (e.g., first_mean) — store only at is_outer_first
+                        ops_is_inner_last_is_outer_first.append(
+                            f"tl.store({out_ptr}, {val_var}, mask=mask)")
                     continue
                 
                 # ===== Simple operations (non-compound) =====
@@ -1359,8 +1430,7 @@ class StatisticsAggregator:
                     has_max = analysis['max']
                     merge_key = (var, 'max', 1)
                     if has_max:
-                        # Will be handled by 'max' branch above
-                        processed_merged_ops.add(merge_key)
+                        # Will be handled by 'max' branch
                         continue
                     
                     # argmax only (no max)
@@ -1416,8 +1486,7 @@ class StatisticsAggregator:
                     has_min = analysis['min']
                     merge_key = (var, 'min', 1)
                     if has_min:
-                        # Will be handled by 'min' branch above
-                        processed_merged_ops.add(merge_key)
+                        # Will be handled by 'min' branch
                         continue
                     
                     # argmin only (no min)
@@ -1446,7 +1515,7 @@ class StatisticsAggregator:
                     if has_argmaxk:
                         # MERGED: maxK + argmaxK - store both val and idx in bubble insert
                         self._argmaxk_ops.append({
-                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
+                            'var': safe_var, 'op': f'argmax{k_val}', 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'argmax',
                             'has_val_output': True,  # Also output max values
                             'val_output_ptr': f"{safe_var}_max{k_val}_ptr"
@@ -1465,7 +1534,6 @@ class StatisticsAggregator:
                     merge_key = (var, 'max', k_val)
                     if has_maxk:
                         # Will be handled by maxK branch
-                        processed_merged_ops.add(merge_key)
                         continue
                     
                     # argmaxK only - bubble insert with aux for values
@@ -1488,7 +1556,7 @@ class StatisticsAggregator:
                     if has_argmink:
                         # MERGED: minK + argminK
                         self._argmaxk_ops.append({
-                            'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
+                            'var': safe_var, 'op': f'argmin{k_val}', 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'argmin',
                             'has_val_output': True,
                             'val_output_ptr': f"{safe_var}_min{k_val}_ptr"
@@ -1506,7 +1574,7 @@ class StatisticsAggregator:
                     has_mink = k_val in analysis['minK']
                     merge_key = (var, 'min', k_val)
                     if has_mink:
-                        processed_merged_ops.add(merge_key)
+                        # Will be handled by minK branch
                         continue
                     
                     # argminK only
@@ -1518,22 +1586,40 @@ class StatisticsAggregator:
                     
                 elif op == 'last':
                     if var in vars_conditional_only:
-                        # Load inline
-                        in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
-                        ops_is_inner_last.extend([
-                            f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
-                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
-                        ])
+                        # Check if this var also has compound ops with 'last' inner type
+                        # If so, the deferred load inside is_inner_last block will already load the val
+                        has_compound_last = any(
+                            '_last' in other_op and other_op != 'last' 
+                            for other_op in self._variable_ops[var]
+                        )
+                        if has_compound_last:
+                            # Reuse the val loaded by deferred load (no duplicate load needed)
+                            ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
+                        else:
+                            # Load inline
+                            in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
+                            ops_is_inner_last.extend([
+                                f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
+                                f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
+                            ])
                     else:
                         ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         
                 elif op == 'first':
                     if var in vars_conditional_only:
-                        in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
-                        ops_is_inner_first.extend([
-                            f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
-                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
-                        ])
+                        has_compound_first = any(
+                            '_first' in other_op and other_op != 'first'
+                            for other_op in self._variable_ops[var]
+                        )
+                        if has_compound_first:
+                            # Val will be loaded elsewhere (from unconditional or conditional load)
+                            ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
+                        else:
+                            in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
+                            ops_is_inner_first.extend([
+                                f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
+                                f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
+                            ])
                     else:
                         ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         
@@ -1548,9 +1634,9 @@ class StatisticsAggregator:
                         ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                 
                 # ===== Median/Quantile operations =====
-                elif op.startswith('median') or (op.startswith('q') and len(op) > 1 and op[1:].isdigit()):
+                elif op in ('median', 'q25', 'q75') or (op.startswith('q') and len(op) > 1 and op[1:].isdigit()):
                     # Outer median/quantile - P-Square algorithm applied to macro_step_index
-                    # Track for deferred generation (all median ops for a var share state)
+                    # Track for deferred generation (all median/quantile ops for a var share state)
                     if not hasattr(self, '_median_outer_ops'):
                         self._median_outer_ops = {}
                     if safe_var not in self._median_outer_ops:
@@ -1561,26 +1647,41 @@ class StatisticsAggregator:
         for var in vars_need_val:
             emit_val(var, kernel_code_lines)
         
-        # Assign val for the first var that needs it (for shared ops)
-        if vars_need_val:
+        # For conditional-only vars used in compound ops with 'last' inner type,
+        # ensure the variable val is emitted (will be loaded inside is_inner_last block later)
+        # We need to track them but NOT emit unconditional loads here.
+        # The load will be emitted inside the is_inner_last block in Phase 6.
+        
+        # Check if 'val' is needed (for 2D processing or outer median ops)
+        needs_val_alias = False
+        if hasattr(self, '_median_outer_ops') and self._median_outer_ops:
+            needs_val_alias = True
+        # 'val' is also used in 2D variable processing
+        # (that code path sets val independently, so we only need it for median here)
+        if needs_val_alias and vars_need_val:
             first_var = next(iter(vars_need_val))
             safe_first = self._get_safe_name(first_var)
             kernel_code_lines.append(f"{indent}val = {safe_first}_val")
         
         # Phase 4: Emit inner aggregation state updates (per-variable)
         # Each variable gets its own inner aggregation state (val_for_{safe_var}_{inner_type})
+        # For 'last' inner type, no state is needed - the value is simply the current variable value
+        # used directly inside the `if is_inner_last:` block.
         for inner_type, inner_vars in inner_aggregations_needed.items():
             for var in inner_vars:
                 safe_var = self._get_safe_name(var)
                 out_offset = "t * n_saved_points + offs"
-                inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
                 val_for_var_inner = f"val_for_{safe_var}_{inner_type}"
                 var_val = f"{safe_var}_val"
                 
-                kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
-                
-                if inner_type == 'mean':
+                if inner_type == 'last':
+                    # 'last' is the simplest: val_for_X_last == X_val at is_inner_last.
+                    # No state storage, no load/store needed.
+                    pass
+                elif inner_type == 'mean':
+                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
                     weight_ptr = f"{safe_var}_{inner_type}_weight_state_ptr + {out_offset}"
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
                         f"{indent}{safe_var}_weight_{inner_type}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
@@ -1594,6 +1695,8 @@ class StatisticsAggregator:
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new / {safe_var}_weight_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'sum':
+                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
                         f"{indent}{safe_var}_inner_{inner_type}_new = {safe_var}_inner_{inner_type}_old + {var_val} * weight",
@@ -1601,6 +1704,8 @@ class StatisticsAggregator:
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'max':
+                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
                         f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, tl.maximum({safe_var}_inner_{inner_type}_old, {var_val}))",
@@ -1608,19 +1713,29 @@ class StatisticsAggregator:
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'min':
+                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
                         f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, tl.minimum({safe_var}_inner_{inner_type}_old, {var_val}))",
                         f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
+                elif inner_type == 'first':
+                    # 'first' inner: store the value at is_inner_first, read it back at is_inner_last
+                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
+                    kernel_code_lines.extend([
+                        f"{indent}tl.store({inner_ptr}, {var_val}, mask=mask & is_inner_first)",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
+                    ])
                 elif inner_type == 'mid':
+                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
+                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}tl.store({inner_ptr}, {var_val}, mask=mask & is_middle)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
                     ])
-                elif inner_type == 'last':
-                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {var_val}, {val_for_var_inner})")
                 elif inner_type == 'median':
                     # Inner P-Square median - use step_count_val as step index
                     # Track for deferred generation (all inner median ops share state)
@@ -1652,6 +1767,33 @@ class StatisticsAggregator:
             for line in ops_is_middle:
                 kernel_code_lines.append(f"{indent2}{line}")
         
+        # Phase 6.5: Emit inner median P-Square operations BEFORE is_inner_last block
+        # (because compound ops like max_median reference val_for_x_median inside is_inner_last)
+        has_median_inner = hasattr(self, '_median_inner_ops') and self._median_inner_ops
+        if has_median_inner:
+            kernel_code_lines.append(f"{indent}# Inner Median P-Square Algorithm")
+            kernel_code_lines.append(f"{indent}inner_step = step_count_val.to(tl.int32)")
+            for safe_var, out_offset in self._median_inner_ops.items():
+                var_val = f"{safe_var}_val"
+                val_for_var_median = f"val_for_{safe_var}_median"
+                kernel_code_lines.append(f"{indent}{val_for_var_median} = tl.zeros_like({var_val})")
+                q_ptr = f"{safe_var}_median_inner_q_state_ptr"
+                n_ptr = f"{safe_var}_median_inner_n_state_ptr"
+                stride_k = "n_saved_points"
+                offset_expr = "offs"
+                
+                self._generate_psquare_code(
+                    kernel_code_lines, safe_var, q_ptr, n_ptr,
+                    var_val, "inner_step", None, stride_k, offset_expr,
+                    indent, indent2, indent3
+                )
+                # Extract median on is_inner_last
+                kernel_code_lines.extend([
+                    f"{indent}if is_inner_last:",
+                    f"{indent2}{val_for_var_median} = tl.load({q_ptr} + 2 * {stride_k} + {offset_expr}, mask=mask, other=0.0)",
+                ])
+            self._median_inner_ops = {}  # Reset
+        
         # Nested conditions for is_inner_last with outer conditions
         has_argmaxk_ops = hasattr(self, '_argmaxk_ops') and self._argmaxk_ops
         has_inner_last_ops = (ops_is_inner_last or ops_is_inner_last_is_outer_first or 
@@ -1660,6 +1802,18 @@ class StatisticsAggregator:
         
         if has_inner_last_ops:
             kernel_code_lines.append(f"{indent}if is_inner_last:")
+            
+            # Emit deferred loads for conditional-only vars used in compound ops
+            # These vars are only needed inside is_inner_last, so we load them here
+            for var in dims_1d:
+                if var in vars_conditional_only and var in inner_aggregations_needed.get('last', set()):
+                    emit_val(var, kernel_code_lines)
+                    # Patch the emitted line to use is_inner_last indentation
+                    # The emit_val appends to kernel_code_lines with 'indent' (8 spaces)
+                    # We need it at indent2 (12 spaces) since we're inside 'if is_inner_last:'
+                    if kernel_code_lines and kernel_code_lines[-1].startswith(indent) and not kernel_code_lines[-1].startswith(indent2):
+                        last_line = kernel_code_lines.pop()
+                        kernel_code_lines.append(f"{indent2}{last_line.lstrip()}")
             
             # is_outer_first / not is_outer_first
             if ops_is_inner_last_is_outer_first or ops_is_inner_last_not_is_outer_first:
@@ -1840,45 +1994,55 @@ class StatisticsAggregator:
             if hasattr(self, '_argmaxk_ops'):
                 self._argmaxk_ops = []
         
-        # Phase 7: Emit inner median P-Square operations
-        if hasattr(self, '_median_inner_ops') and self._median_inner_ops:
-            kernel_code_lines.append(f"{indent}# Inner Median P-Square Algorithm")
-            kernel_code_lines.append(f"{indent}inner_step = step_count_val.to(tl.int32)")
-            for safe_var, out_offset in self._median_inner_ops.items():
-                var_val = f"{safe_var}_val"
-                val_for_var_median = f"val_for_{safe_var}_median"
-                kernel_code_lines.append(f"{indent}{val_for_var_median} = tl.zeros_like({var_val})")
-                q_ptr = f"{safe_var}_median_inner_q_state_ptr"
-                n_ptr = f"{safe_var}_median_inner_n_state_ptr"
-                stride_k = "n_saved_points"
-                offset_expr = "offs"
+        # Phase 8: Emit compound median/quantile P-Square operations (inside is_inner_last)
+        has_median_compound = hasattr(self, '_median_compound_ops') and self._median_compound_ops
+        if has_median_compound:
+            # Ensure we're inside is_inner_last
+            if not has_inner_last_ops:
+                kernel_code_lines.append(f"{indent}if is_inner_last:")
+            kernel_code_lines.append(f"{indent2}# Compound Median/Quantile P-Square Algorithm")
+            for (safe_var, inner), ops_list in self._median_compound_ops.items():
+                q_ptr = f"{safe_var}_median_{inner}_q_state_ptr"
+                n_ptr = f"{safe_var}_median_{inner}_n_state_ptr"
+                stride_k = "(num_trials * n_saved_points)"
+                offset_expr = "(t * n_saved_points + offs)"
+                val_var = ops_list[0][2]  # val_for_{var}_{inner}
+                
+                # Build out_ptrs dict: {marker_index: out_ptr}
+                out_ptrs = {}
+                for (op, out_ptr, _, qi) in ops_list:
+                    out_ptrs[qi] = out_ptr
                 
                 self._generate_psquare_code(
                     kernel_code_lines, safe_var, q_ptr, n_ptr,
-                    var_val, "inner_step", None, stride_k, offset_expr,
-                    indent, indent2, indent3
+                    val_var, "macro_step_index", out_ptrs, stride_k, offset_expr,
+                    indent2, indent3, indent4
                 )
-                # Extract median on is_inner_last
-                kernel_code_lines.extend([
-                    f"{indent}if is_inner_last:",
-                    f"{indent2}{val_for_var_median} = tl.load({q_ptr} + 2 * {stride_k} + {offset_expr}, mask=mask, other=0.0)",
-                ])
-            self._median_inner_ops = {}  # Reset
+            self._median_compound_ops = {}
         
-        # Phase 8: Emit outer median P-Square operations
+        # Phase 9: Emit outer median/quantile P-Square operations (standalone)
         if hasattr(self, '_median_outer_ops') and self._median_outer_ops:
-            kernel_code_lines.append(f"{indent}# Outer Median P-Square Algorithm")
+            kernel_code_lines.append(f"{indent}# Outer Median/Quantile P-Square Algorithm")
             for safe_var, ops_list in self._median_outer_ops.items():
                 q_ptr = f"{safe_var}_median_q_state_ptr"
                 n_ptr = f"{safe_var}_median_n_state_ptr"
                 stride_k = "(num_trials * n_saved_points)"
                 offset_expr = "(t * n_saved_points + offs)"
                 
-                # Generate P-Square with first output pointer
-                out_ptr = ops_list[0][1] if ops_list else None
+                # Build out_ptrs dict: {marker_index: out_ptr}
+                out_ptrs = {}
+                for (op, out_ptr) in ops_list:
+                    # Determine marker index from op name
+                    if op.startswith('q25'):
+                        out_ptrs[1] = out_ptr
+                    elif op.startswith('q75'):
+                        out_ptrs[3] = out_ptr
+                    else:  # 'median' or default
+                        out_ptrs[2] = out_ptr
+                
                 self._generate_psquare_code(
                     kernel_code_lines, safe_var, q_ptr, n_ptr,
-                    "val", "macro_step_index", out_ptr, stride_k, offset_expr,
+                    "val", "macro_step_index", out_ptrs, stride_k, offset_expr,
                     indent, indent2, indent3
                 )
             self._median_outer_ops = {}  # Reset
@@ -1959,19 +2123,31 @@ class StatisticsAggregator:
                         kernel_code_lines.append(f"    {safe_var}_{aux_name}_ptr,")
                         added_aux_ptrs.add(aux_name)
                         
-                if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
-                     kernel_code_lines.append(f"    {safe_var}_median_q_state_ptr,")
-                     kernel_code_lines.append(f"    {safe_var}_median_n_state_ptr,")
-                     added_median_state = True
+                if (op.startswith('median') or re.match(r'^q\d+', op)):
+                     if '_' in op:
+                         # Compound median/quantile: per-inner state
+                         inner = op.split('_')[1]
+                         cmp_key = f"median_{inner}"
+                         if cmp_key not in added_aux_ptrs:
+                             kernel_code_lines.append(f"    {safe_var}_median_{inner}_q_state_ptr,")
+                             kernel_code_lines.append(f"    {safe_var}_median_{inner}_n_state_ptr,")
+                             added_aux_ptrs.add(cmp_key)
+                     elif not added_median_state:
+                         kernel_code_lines.append(f"    {safe_var}_median_q_state_ptr,")
+                         kernel_code_lines.append(f"    {safe_var}_median_n_state_ptr,")
+                         added_median_state = True
             
-            # Inner state pointers
+            # Inner state pointers (only for ops that need cross-step state)
             added_inner = set()
             for op in self._variable_ops[var]:
                 if '_' in op:
                     inner = op.split('_')[1]
                     if inner not in added_inner:
-                        kernel_code_lines.append(f"    {safe_var}_{inner}_inner_state_ptr,")
-                        if inner in ('mean', 'first', 'last', 'mid'):
+                        # 'last' inner op directly uses current value, no state needed
+                        # 'median' inner op uses its own q/n state, not generic inner_state
+                        if inner not in ('last', 'median'):
+                            kernel_code_lines.append(f"    {safe_var}_{inner}_inner_state_ptr,")
+                        if inner == 'mean':
                             kernel_code_lines.append(f"    {safe_var}_{inner}_weight_state_ptr,")
                         if inner == 'median':
                             kernel_code_lines.append(f"    {safe_var}_median_inner_q_state_ptr,")
@@ -2488,19 +2664,31 @@ class StatisticsAggregator:
                             kernel_code_lines.append(f"        {safe_var}_{aux_name}_ptr=states['{aux_storage_key}'],")
                             added_aux_ptrs.add(aux_name)
                     
-                    if (op.startswith('median') or (op.startswith('q') and op[1:].isdigit())) and not added_median_state:
-                        kernel_code_lines.append(f"        {safe_var}_median_q_state_ptr=states['{var}_median_q_state'],")
-                        kernel_code_lines.append(f"        {safe_var}_median_n_state_ptr=states['{var}_median_n_state'],")
-                        added_median_state = True
+                    if (op.startswith('median') or re.match(r'^q\d+', op)):
+                        if '_' in op:
+                            # Compound median/quantile: per-inner state
+                            inner = op.split('_')[1]
+                            cmp_key = f"median_{inner}"
+                            if cmp_key not in added_aux_ptrs:
+                                kernel_code_lines.append(f"        {safe_var}_median_{inner}_q_state_ptr=states['{var}_median_{inner}_q_state'],")
+                                kernel_code_lines.append(f"        {safe_var}_median_{inner}_n_state_ptr=states['{var}_median_{inner}_n_state'],")
+                                added_aux_ptrs.add(cmp_key)
+                        elif not added_median_state:
+                            kernel_code_lines.append(f"        {safe_var}_median_q_state_ptr=states['{var}_median_q_state'],")
+                            kernel_code_lines.append(f"        {safe_var}_median_n_state_ptr=states['{var}_median_n_state'],")
+                            added_median_state = True
                 
-                # Inner state pointers
+                # Inner state pointers (only for ops that need cross-step state)
                 added_inner = set()
                 for op in self._variable_ops[var]:
                     if '_' in op:
                         inner = op.split('_')[1]
                         if inner not in added_inner:
-                             kernel_code_lines.append(f"        {safe_var}_{inner}_inner_state_ptr=states['{var}_{inner}_inner_state'],")
-                             if inner in ('mean', 'first', 'last', 'mid'):
+                             # 'last' inner op directly uses current value, no state needed
+                             # 'median' inner op uses its own q/n state, not generic inner_state
+                             if inner not in ('last', 'median'):
+                                 kernel_code_lines.append(f"        {safe_var}_{inner}_inner_state_ptr=states['{var}_{inner}_inner_state'],")
+                             if inner == 'mean':
                                  kernel_code_lines.append(f"        {safe_var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
                              if inner == 'median':
                                  kernel_code_lines.append(f"        {safe_var}_median_inner_q_state_ptr=states['{var}_median_inner_q_state'],")
@@ -2807,8 +2995,15 @@ class StatisticsAggregator:
                     q_shape = (5,) + actual_shape
                     n_shape = (5,) + actual_shape
                     
-                    q_state_name = f"{var_name}_median_q_state"
-                    n_state_name = f"{var_name}_median_n_state"
+                    # For compound median ops (e.g., median_max, median_mean),
+                    # each inner op needs its own P-Square state
+                    if len(op_parts) > 1:
+                        inner_op = op_parts[1]
+                        q_state_name = f"{var_name}_median_{inner_op}_q_state"
+                        n_state_name = f"{var_name}_median_{inner_op}_n_state"
+                    else:
+                        q_state_name = f"{var_name}_median_q_state"
+                        n_state_name = f"{var_name}_median_n_state"
                     
                     if q_state_name not in self._storage:
                         # q state holds marker heights
@@ -2824,8 +3019,23 @@ class StatisticsAggregator:
                 # For compound ops, allocate inner state
                 if len(op_parts) > 1:
                     inner_op = op_parts[1]
+                    # 'last' inner op doesn't need cross-step state - it directly uses current value
+                    # 'median' inner op uses its own q/n state, not generic inner_state
+                    needs_inner_state = inner_op not in ('last', 'median')
                     inner_state_name = f"{var_name}_{inner_op}_inner_state"
-                    if inner_state_name not in self._storage:
+                    
+                    # Allocate inner median q/n state separately
+                    if inner_op == 'median':
+                        q_shape = (5,) + actual_shape
+                        n_shape = (5,) + actual_shape
+                        q_inner_name = f"{var_name}_median_inner_q_state"
+                        n_inner_name = f"{var_name}_median_inner_n_state"
+                        if q_inner_name not in self._storage:
+                            self._storage[q_inner_name] = torch.zeros(q_shape, dtype=target_dtype, device=self.device)
+                        if n_inner_name not in self._storage:
+                            self._storage[n_inner_name] = torch.zeros(n_shape, dtype=torch.int32, device=self.device)
+                    
+                    if needs_inner_state and inner_state_name not in self._storage:
                          # Initialize inner state
                          if inner_op == 'mean':
                              init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
@@ -2835,31 +3045,15 @@ class StatisticsAggregator:
                              init_inner = torch.full(actual_shape, torch.inf, dtype=target_dtype, device=self.device)
                          elif inner_op == 'sum':
                              init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
-                         elif inner_op in ('first', 'last', 'mid'):
-                             init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
-                         elif inner_op == 'median':
-                             # Inner P-Square Median State
-                             # We need Q (markers) and N (positions) for inner loop
-                             # Shape: (5, *actual_shape)
-                             q_shape = (5,) + actual_shape
-                             n_shape = (5,) + actual_shape
-                             
-                             q_inner_name = f"{var_name}_median_inner_q_state"
-                             n_inner_name = f"{var_name}_median_inner_n_state"
-                             
-                             if q_inner_name not in self._storage:
-                                 self._storage[q_inner_name] = torch.zeros(q_shape, dtype=target_dtype, device=self.device)
-                             if n_inner_name not in self._storage:
-                                 self._storage[n_inner_name] = torch.zeros(n_shape, dtype=torch.int32, device=self.device)
-                             
+                         elif inner_op in ('first', 'mid'):
                              init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          else:
                              # Should be caught by validator, but safe fallback
                              init_inner = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
                          self._storage[inner_state_name] = init_inner
                          
-                         # Allocate weight state if inner op is mean (to calculate weighted average)
-                         if inner_op in ('mean', 'max', 'min', 'first', 'last', 'mid'):
+                         # Allocate weight state only for inner ops that need it (mean)
+                         if inner_op == 'mean':
                              weight_state_name = f"{var_name}_{inner_op}_weight_state"
                              if weight_state_name not in self._storage:
                                  self._storage[weight_state_name] = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
@@ -2921,6 +3115,7 @@ class StatisticsAggregator:
         # This ensures argmax/argmin indices are always relative to the start of the period
         if is_outer_first:
             self._macro_step_index = 0
+            self._current_macro_step_count = 0.0
             
         if _is_inner_last:
              for out_name, is_outer in self._output_is_outer.items():
@@ -3052,8 +3247,7 @@ class StatisticsAggregator:
                 future = executor.submit(_write_time_step_netcdf_process, args)
                 self._write_futures.append(future)
             
-        # Reset counters
-        self._current_macro_step_count = 0.0
+        # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True
         
         # Manage backlog: Wait if too many steps are pending
         batch_n = len(self._storage)
@@ -3109,5 +3303,4 @@ class StatisticsAggregator:
         # Advance time index
         self._current_time_index += 1
         
-        # Reset counters
-        self._current_macro_step_count = 0.0
+        # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True

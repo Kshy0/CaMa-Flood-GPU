@@ -833,9 +833,14 @@ class AbstractModel(BaseModel, ABC):
                     raise ValueError(f"Invalid op '{op}': arg operations (argmax, argmin, argmax3, etc.) cannot be used alone. They are only valid as outer operations in compound form like 'argmax_mean'.")
                 if single_op == 'median':
                     raise ValueError(f"Invalid op '{op}': 'median' cannot be used alone as inner operation. Use compound form like 'median_mean'.")
+                if q_pattern.match(single_op):
+                    raise ValueError(f"Invalid op '{op}': quantile operations (q25, q75, etc.) cannot be used alone. Use compound form like 'q25_mean'.")
 
             if len(op_parts) > 1:
                 outer, inner = op_parts[0], op_parts[1]
+                # Check for outer restriction: mid cannot be an outer op
+                if outer == 'mid':
+                    raise ValueError(f"Invalid composite op '{op}': 'mid' cannot be used as an outer operation. It is only valid as an inner op (standalone 'mid').")
                 # Check for inner restriction: top-k, arg-top-k, argmax/argmin, and median cannot be inner ops
                 if topk_pattern.match(inner) or argtopk_pattern.match(inner):
                     raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k/arg-top-k) cannot be used as an inner operation.")
@@ -1513,6 +1518,9 @@ class AbstractModel(BaseModel, ABC):
 
                 if len(op_parts) > 1:
                     outer, inner = op_parts[0], op_parts[1]
+                    # Disallow mid as outer op
+                    if outer == 'mid':
+                        raise ValueError(f"Invalid composite op '{op}': 'mid' cannot be used as an outer operation. It is only valid as an inner op (standalone 'mid').")
                     # Disallow top-k, arg-top-k, argmax/argmin, and median as inner ops
                     if topk_pattern.match(inner) or argtopk_pattern.match(inner):
                         raise ValueError(f"Invalid composite op '{op}': '{inner}' (top-k/arg-top-k) cannot be used as an inner operation.")
