@@ -8,7 +8,7 @@ from cmfgpu.params.merit_map import MERITMap
 print("=== Generating Map Parameters ===")
 
 # --- Configuration Start ---
-map_resolution = "glb_06min"
+map_resolution = "glb_15min"
 map_dir = f"/home/eat/cmf_v420_pkg/map/{map_resolution}"
 out_dir = f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"
 

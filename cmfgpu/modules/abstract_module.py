@@ -468,8 +468,10 @@ class AbstractModule(BaseModel, ABC):
         Calculate the memory usage of the module in bytes.
         Excludes intermediate tensors.
         Only counts tensors currently on the active computing device.
+        Uses data_ptr deduplication to avoid double-counting shared tensors.
         """
         total_bytes = 0
+        seen_ptrs: set = set()
         
         # Combine fields and computed fields
         all_fields = self.get_model_fields().copy()
@@ -486,7 +488,10 @@ class AbstractModule(BaseModel, ABC):
             if isinstance(value, torch.Tensor):
                 # Only count if on the main computing device
                 if value.device == self.device:
-                    total_bytes += value.element_size() * value.nelement()
+                    ptr = value.data_ptr()
+                    if ptr not in seen_ptrs:
+                        seen_ptrs.add(ptr)
+                        total_bytes += value.element_size() * value.nelement()
                 
         return total_bytes
 

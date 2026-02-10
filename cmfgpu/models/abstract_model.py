@@ -688,30 +688,55 @@ class AbstractModel(BaseModel, ABC):
     def print_memory_summary(self) -> None:
         """
         Print a summary of memory usage by module.
+        
+        Uses ``data_ptr`` de-duplication across all modules so that tensors
+        shared between modules (e.g. a computed field that returns a view of
+        another module's tensor) are counted only once.
         """
         total_memory = 0
+        global_seen_ptrs: set = set()
         print(f"\n[rank {self.rank}] Memory Usage Summary:")
-        print(f"{'Module':<30} | {'Memory (MB)':<15}")
-        print(f"{'-' * 50}")
+        print(f"{'Module':<30} | {'Memory (MB)':<15} | {'Unique (MB)':<15}")
+        print(f"{'-' * 65}")
         
         for module_name in self.opened_modules:
             if module_name not in self._modules:
                 continue
             module = self._modules[module_name]
+            # Module-local memory (may include tensors shared with other modules)
             mem_bytes = module.get_memory_usage()
             mem_mb = mem_bytes / (1024 * 1024)
-            total_memory += mem_bytes
-            print(f"{module_name:<30} | {mem_mb:<15.2f}")
+            
+            # Count only tensors not yet seen globally
+            unique_bytes = 0
+            all_fields = module.get_model_fields().copy()
+            all_fields.update(module.get_model_computed_fields())
+            for name, field_info in all_fields.items():
+                if not hasattr(module, name):
+                    continue
+                value = getattr(module, name)
+                if isinstance(value, torch.Tensor) and value.device == module.device:
+                    ptr = value.data_ptr()
+                    if ptr not in global_seen_ptrs:
+                        global_seen_ptrs.add(ptr)
+                        unique_bytes += value.element_size() * value.nelement()
+            
+            total_memory += unique_bytes
+            unique_mb = unique_bytes / (1024 * 1024)
+            if unique_bytes != mem_bytes:
+                print(f"{module_name:<30} | {mem_mb:<15.2f} | {unique_mb:<15.2f} (shared)")
+            else:
+                print(f"{module_name:<30} | {mem_mb:<15.2f} | {unique_mb:<15.2f}")
         
         # Add StatisticsAggregator memory usage
         if self._statistics_aggregator is not None:
             aggregator_mem = self._statistics_aggregator.get_memory_usage()
             aggregator_mem_mb = aggregator_mem / (1024 * 1024)
             total_memory += aggregator_mem
-            print(f"{'StatisticsAggregator':<30} | {aggregator_mem_mb:<15.2f}")
+            print(f"{'StatisticsAggregator':<30} | {aggregator_mem_mb:<15.2f} | {aggregator_mem_mb:<15.2f}")
             
-        print(f"{'-' * 50}")
-        print(f"{'Total':<30} | {total_memory / (1024 * 1024):<15.2f} MB\n")
+        print(f"{'-' * 65}")
+        print(f"{'Total':<30} | {'':<15} | {total_memory / (1024 * 1024):<15.2f} MB\n")
 
     def get_module(self, module_name: str) -> AbstractModule:
         return self._modules[module_name] if module_name in self.opened_modules else None

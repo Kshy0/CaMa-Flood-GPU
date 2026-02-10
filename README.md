@@ -37,7 +37,12 @@ cd CaMa-Flood-GPU
 
 ### 2. Install PyTorch
 
-It is recommended to use a virtual environment (`venv` or `conda`).
+It is recommended to use a virtual environment (`venv` or `conda`):
+
+```shell
+conda create -n CMF python=3.14.*
+conda activate CMF
+```
 
 Please follow the official [PyTorch installation guide](https://pytorch.org/get-started/locally/) for your environment. 
 For CUDA 13.0, you may use:

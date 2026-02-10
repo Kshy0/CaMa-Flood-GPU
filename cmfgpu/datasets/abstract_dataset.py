@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from scipy.sparse import csr_matrix
+from tqdm import tqdm
 
 from cmfgpu.utils import binread, find_indices_in, is_rank_zero, read_map
 
@@ -604,7 +605,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         current_year = None
         write_idx = 0
         total_steps = self.num_main_steps + self.num_spin_up_steps
-        processed_steps = 0
 
         try:
             if not split_by_year:
@@ -613,6 +613,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 created_files.append(nc_path)
 
             n_chunks = len(self)
+            pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
             for ci in range(n_chunks):
                 base_idx = ci * self.chunk_len
                 block = self.read_chunk(ci)
@@ -655,13 +656,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                     time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
                     time_var[write_idx] = time_val
                     write_idx += 1
-                    processed_steps += 1
-                
-                # Print progress
-                progress = processed_steps / total_steps * 100
-                print(f"\rExporting: {processed_steps}/{total_steps} steps ({progress:.1f}%)", end="", flush=True)
+                    pbar.update(1)
             
-            print()  # New line after progress completes
+            pbar.close()
         finally:
             if ds:
                 ds.close()

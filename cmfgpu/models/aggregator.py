@@ -329,32 +329,33 @@ class StatisticsAggregator:
 
     def get_memory_usage(self) -> int:
         """
-        Calculate GPU/CPU memory usage by this aggregator's core buffers.
+        Calculate GPU/CPU memory usage by this aggregator's **own** buffers.
         
-        This returns only the memory used by accumulation buffers and kernel states,
-        NOT including in-memory result tensors (use get_result_memory_usage for that).
+        Only counts tensors in ``_storage`` that are exclusively owned by the
+        aggregator (accumulation buffers, inner-state buffers, weight buffers,
+        etc.).  ``_kernel_states`` is intentionally excluded because it is
+        merely a dict of *references* to tensors already present in
+        ``_storage`` or ``_tensor_registry`` (module source tensors), and
+        counting them again would lead to double-counting.
+        
+        In-memory result tensors are also excluded; use
+        ``get_result_memory_usage()`` for those.
         
         Returns:
             Total memory usage in bytes.
         """
         total_bytes = 0
+        seen_ptrs: set = set()
         
-        # Storage tensors (accumulation buffers)
+        # Storage tensors (accumulation buffers) – these are owned by the aggregator
         for name, tensor in self._storage.items():
             if isinstance(tensor, torch.Tensor):
-                total_bytes += tensor.element_size() * tensor.numel()
-        
-        # Kernel states (cached tensors for kernel execution)
-        if self._kernel_states is not None:
-            for name, tensor in self._kernel_states.items():
-                if isinstance(tensor, torch.Tensor):
+                ptr = tensor.data_ptr()
+                if ptr not in seen_ptrs:
+                    seen_ptrs.add(ptr)
                     total_bytes += tensor.element_size() * tensor.numel()
         
-        # Note: In-memory result tensors are NOT included here.
-        # Use get_result_memory_usage() to get the memory used by results.
-        
-        # Tensor registry (registered source tensors - these are references, not owned)
-        # We don't count these as they are owned by modules
+        # _kernel_states is NOT counted here.
         
         return total_bytes
     

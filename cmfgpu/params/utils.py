@@ -321,6 +321,7 @@ def plot_basins_common(
     bifurcations: Optional[Dict[str, np.ndarray]] = None, # keys: x1, y1, x2, y2
     removed_bifurcations: Optional[Dict[str, np.ndarray]] = None,
     pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None, # Points of interest markers
+    river_mouths_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None, # River mouths markers
     # Configuration
     longitude: Optional[np.ndarray] = None,
     latitude: Optional[np.ndarray] = None,
@@ -406,7 +407,7 @@ def plot_basins_common(
     default_cmap.set_bad(alpha=0.0)
 
     # Plot
-    plt.figure(figsize=(12, 10))
+    plt.figure(figsize=(12, 10), dpi=600)
     
     if color_by_upstream_area and uparea_map is not None:
          # Use LogNorm for better visualization of large ranges in upstream area
@@ -419,7 +420,7 @@ def plot_basins_common(
          
          plt.imshow(img_data, origin='upper', cmap='plasma', interpolation='nearest',
                    norm=norm, extent=extent)
-         plt.colorbar(label='Upstream Area ($m^2$)')
+         plt.colorbar(label='Upstream Area ($m^2$)', shrink=0.5)
     else:
         plt.imshow(np.ma.masked_invalid(basin_map).T, origin='upper', cmap=default_cmap, interpolation='nearest',
                 vmin=-0.5, vmax=num_basins - 0.5, extent=extent)
@@ -474,7 +475,14 @@ def plot_basins_common(
         if use_lonlat: px, py = idx_to_lon(px), idx_to_lat(py)
         m = within_extent(px, py)
         if np.any(m):
-            plt.scatter(px[m], py[m], c="#C10000", s=0.3, label='Points of Interest', zorder=6)
+            plt.scatter(px[m], py[m], c="#C10000", s=5.0, label='Points of Interest', zorder=6)
+
+    if river_mouths_xy:
+        rmx, rmy = river_mouths_xy
+        if use_lonlat: rmx, rmy = idx_to_lon(rmx), idx_to_lat(rmy)
+        m = within_extent(rmx, rmy)
+        if np.any(m):
+             plt.scatter(rmx[m], rmy[m], edgecolors='cyan', facecolors='none', s=1.0, marker='s', linewidths=0.2, label='River Mouth', zorder=7)
 
     def plot_bifs(bifs, color, linestyle, label):
         if not bifs: return
@@ -499,6 +507,10 @@ def plot_basins_common(
 
     plot_bifs(bifurcations, '#0000FF', '--', 'Bifurcation Paths')
     plot_bifs(removed_bifurcations, '#FF0000', ':', 'Removed Paths')
+
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if labels: plt.legend(loc='lower right')
+    plt.tight_layout()
 
     # Interactive
     if interactive:
@@ -622,11 +634,10 @@ def plot_basins_common(
             
         plt.gcf().canvas.mpl_connect("button_press_event", on_click)
         plt.show()
+        if save_path:
+             print(f"Warning: Interactive mode is on. Image will not be saved to {save_path} automatically. Use the UI to save.")
         return
 
-    handles, labels = plt.gca().get_legend_handles_labels()
-    if labels: plt.legend(loc='lower right')
-    plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=600, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
@@ -638,6 +649,7 @@ def visualize_nc_basins(
     visualize_gauges: bool = True,
     visualize_bifurcations: bool = True,
     visualize_levees: bool = True,
+    visualize_river_mouths: bool = False,
     interactive: bool = False,
     pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     color_by_upstream_area: bool = False
@@ -693,6 +705,23 @@ def visualize_nc_basins(
         if 'upstream_area' in ds.variables:
             upstream_area = ds['upstream_area'][:]
 
+        river_mouths_xy = None
+        if visualize_river_mouths:
+            # User requested identification by catchment_id == downstream_id
+            if 'catchment_id' in ds.variables and 'downstream_id' in ds.variables:
+                cid = ds['catchment_id'][:]
+                did = ds['downstream_id'][:]
+                # Mouth condition: downstream is self or invalid (-1)
+                mask = (cid == did) | (did < 0)
+                if np.any(mask):
+                    river_mouths_xy = (catchment_x[mask], catchment_y[mask])
+            elif 'is_river_mouth' in ds.variables:
+                is_mouth = ds['is_river_mouth'][:]
+                if np.any(is_mouth):
+                     # is_river_mouth is likely a boolean mask or 1/0
+                     mask = (is_mouth == 1) | (is_mouth == True)
+                     river_mouths_xy = (catchment_x[mask], catchment_y[mask])
+
         catchment_id = None
         downstream_id = None
         if interactive:
@@ -715,6 +744,7 @@ def visualize_nc_basins(
             title=f"Basins (from {Path(nc_path).name})",
             interactive=interactive,
             pois_xy=pois_xy,
+            river_mouths_xy=river_mouths_xy,
             upstream_area=upstream_area,
             catchment_id=catchment_id,
             downstream_id=downstream_id,
@@ -728,6 +758,7 @@ def crop_parameters_nc(
     visualize: bool = False,
     only_save_pois: bool = False,
     interactive_basin_picker: bool = False,
+    visualize_river_mouths: bool = False,
     color_by_upstream_area: bool = False
 ) -> None:
     """
@@ -744,24 +775,32 @@ def crop_parameters_nc(
         catchment_basin_id = src['catchment_basin_id'][:]
         
         # Resolve target CIDs using shared logic
-        target_cids = resolve_target_cids_from_poi(
-            points_of_interest, 
-            catchment_id, 
-            catchment_x, 
-            catchment_y,
-            gauge_info=None 
-        )
-        
-        if len(target_cids) == 0:
-            print("No valid target catchments found to crop to. Aborting.")
-            return
+        if points_of_interest:
+            target_cids = resolve_target_cids_from_poi(
+                points_of_interest, 
+                catchment_id, 
+                catchment_x, 
+                catchment_y,
+                gauge_info=None 
+            )
+            
+            if len(target_cids) == 0:
+                print("No valid target catchments found to crop to. Aborting.")
+                return
 
-        # Find basins containing these catchments
-        kept_basin_ids = get_kept_basin_ids(target_cids, catchment_id, catchment_basin_id)
-        
-        if len(kept_basin_ids) == 0:
-             print("Target catchments not found in map. Aborting.")
-             return
+            # Find basins containing these catchments
+            kept_basin_ids = get_kept_basin_ids(target_cids, catchment_id, catchment_basin_id)
+            
+            if len(kept_basin_ids) == 0:
+                 print("Target catchments not found in map. Aborting.")
+                 return
+        else:
+            print("No points_of_interest provided or empty. Keeping all basins.")
+            target_cids = np.array([], dtype=np.int64)
+            kept_basin_ids = np.unique(catchment_basin_id)
+            if only_save_pois:
+                 print("Warning: only_save_pois=True but no POIs provided. Switching to saving all catchments.")
+                 only_save_pois = False
 
         if 'bifurcation_catchment_id' in src.variables and 'bifurcation_downstream_id' in src.variables:
             bif_up_cid = src['bifurcation_catchment_id'][:]
@@ -967,4 +1006,4 @@ def crop_parameters_nc(
                    pois_xy = (catchment_x[poi_idx], catchment_y[poi_idx])
 
          img_path = output_nc.parent / (output_nc.stem + ".png")
-         visualize_nc_basins(output_nc, save_path=img_path, pois_xy=pois_xy, interactive=interactive_basin_picker, color_by_upstream_area=color_by_upstream_area)
+         visualize_nc_basins(output_nc, save_path=img_path, pois_xy=pois_xy, interactive=interactive_basin_picker, color_by_upstream_area=color_by_upstream_area, visualize_river_mouths=visualize_river_mouths)
