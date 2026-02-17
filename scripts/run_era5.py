@@ -10,9 +10,9 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from cmfgpu.datasets.era5_land_dataset import ERA5LandDataset
-from cmfgpu.models.cama_flood_model import CaMaFlood
-from cmfgpu.params.input_proxy import InputProxy
+from cmfgpu.datasets import ERA5LandDataset
+from cmfgpu.models import CaMaFlood
+from cmfgpu.params import InputProxy
 from cmfgpu.utils import setup_distributed
 
 
@@ -119,7 +119,7 @@ def main():
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
                     stat_is_first=(current_time.hour == 0),
-                    stat_is_last=(current_time.hour == 0),
+                    stat_is_last=(current_time.hour == 23),
                     output_enabled=not is_spin_up
                 )
     if save_state:  

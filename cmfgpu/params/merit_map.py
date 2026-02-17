@@ -10,7 +10,7 @@ MERIT-based map parameter generation using Pydantic v2.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence
+from typing import Any, ClassVar, Dict, List, Optional
 
 import numpy as np
 from netCDF4 import Dataset
@@ -70,6 +70,15 @@ class MERITMap(BaseModel):
     basin_use_file: bool = Field(
         default=False,
         description="If True, use basin.bin file to cut bifurcations crossing basin boundaries."
+    )
+
+    satellite_width_file: Optional[str] = Field(
+        default="width.bin",
+        description=(
+            "Filename (relative to map_dir) of satellite-derived river width "
+            "(e.g. GWD-LR width.bin).  Stored as satellite_width in the output "
+            "for later use by estimate_river_geometry().  Set to None to skip."
+        ),
     )
 
     levee_flag: bool = Field(
@@ -145,16 +154,12 @@ class MERITMap(BaseModel):
         "num_basins",
         "catchment_save_id",
         "catchment_save_basin_id",
-        "river_depth",
-        "river_width",
         "river_length",
-        "river_height",
         "flood_depth_table",
         "catchment_elevation",
         "catchment_area",
         "upstream_area",
         "downstream_distance",
-        "river_storage",
         "river_mouth_id",
     ]
 
@@ -181,6 +186,11 @@ class MERITMap(BaseModel):
         "gauge_catchment_id",
         "longitude",
         "latitude",
+        "satellite_width",
+        "river_width",
+        "river_height",
+        "river_depth",
+        "river_storage",
     ]
     # === Data Type Configuration ===
     idx_precision: ClassVar[str] = "<i4"
@@ -682,8 +692,26 @@ class MERITMap(BaseModel):
             data = read_map(file_path, (self.nx, self.ny), precision=self.map_precision)
             return data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y]
         self.river_length = _read_2d_map("rivlen.bin")
-        self.river_width = _read_2d_map("rivwth_gwdlr.bin")
-        self.river_height = _read_2d_map("rivhgt.bin")
+
+        # River height (optional — will be estimated by update_river_params if missing)
+        rivhgt_path = self.map_dir / "rivhgt.bin"
+        if rivhgt_path.exists():
+            self.river_height = _read_2d_map("rivhgt.bin")
+            print(f"Loaded river_height from rivhgt.bin")
+
+        # River width (optional — will be estimated by update_river_params if missing)
+        rivwth_path = self.map_dir / "rivwth_gwdlr.bin"
+        if rivwth_path.exists():
+            self.river_width = _read_2d_map("rivwth_gwdlr.bin")
+            print(f"Loaded river_width from rivwth_gwdlr.bin")
+
+        # Satellite-derived width (optional, stored for estimate_river_geometry)
+        if self.satellite_width_file is not None:
+            sat_path = self.map_dir / self.satellite_width_file
+            if sat_path.exists():
+                self.satellite_width = _read_2d_map(self.satellite_width_file)
+                n_sat = int(np.count_nonzero(self.satellite_width > 0))
+                print(f"Loaded satellite_width ({n_sat}/{self.num_catchments} valid cells)")
         self.catchment_elevation = _read_2d_map("elevtn.bin")
         self.catchment_area = _read_2d_map("ctmare.bin")
         self.upstream_area = _read_2d_map("uparea.bin")
@@ -728,6 +756,9 @@ class MERITMap(BaseModel):
 
     def init_river_depth(self) -> None:
         """Initialize river depth based on elevation gradients."""
+        if not hasattr(self, 'river_height') or not hasattr(self, 'river_width'):
+            print("Skipping init_river_depth (river_height/river_width not yet estimated)")
+            return
         self.river_depth = compute_init_river_depth(
             self.catchment_elevation,
             self.river_height,

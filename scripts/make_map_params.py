@@ -3,7 +3,7 @@ Script to generate model parameters from CaMa-Flood map data.
 """
 
 
-from cmfgpu.params.merit_map import MERITMap
+from cmfgpu.params import MERITMap
 
 print("=== Generating Map Parameters ===")
 

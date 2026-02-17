@@ -4,6 +4,6 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from cmfgpu.models.cama_flood_model import CaMaFlood
+from cmfgpu.aggregator.aggregator import StatisticsAggregator
 
-__all__ = ["CaMaFlood"]
+__all__ = ["StatisticsAggregator"]

@@ -477,6 +477,127 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         
         return local_runoff_matrix
 
+    def export_runoff_climatology(
+        self,
+        out_path: Union[str, Path],
+        local_runoff_matrix: torch.Tensor,
+        var_name: str = "runoff_clm",
+        dtype: Literal["float32", "float64"] = "float32",
+        complevel: int = 4,
+        device: Union[str, torch.device] = "cpu",
+        units: str = "m3/s",
+        description: Optional[str] = None,
+    ) -> Path:
+        """
+        Compute the temporal-mean (climatological average) runoff and export to NetCDF.
+
+        This mirrors the logic of CaMa-Flood's ``calc_outclm.F90``: iterate over
+        every timestep in the dataset, accumulate the sum, and divide by the number
+        of steps to obtain the daily-mean runoff climatology mapped to catchments.
+
+        Requires ``build_local_runoff_matrix()`` to be called first.
+        The compressed runoff is mapped to catchments via sparse matmul and then
+        time-averaged.  Output NetCDF has dimension ``(saved_points,)`` with a
+        ``catchment_id`` coordinate variable.
+
+        Args:
+            out_path: Full path (including filename) for the output NetCDF file.
+            local_runoff_matrix: Sparse tensor returned by ``build_local_runoff_matrix()``,
+                shape ``(n_grids, n_catchments)``.
+            var_name: Variable name written into the NetCDF file.
+            dtype: Output data type (``"float32"`` or ``"float64"``).
+            complevel: zlib compression level (0–9).
+            device: Device for computation (``"cpu"`` or ``"cuda:X"``).
+            units: Units attribute written to the output variable.
+            description: Optional long description attribute.
+
+        Returns:
+            Path to the created NetCDF file.
+        """
+        if not hasattr(self, '_desired_catchment_ids') or self._desired_catchment_ids is None:
+            raise ValueError(
+                "build_local_runoff_matrix() must be called before "
+                "export_runoff_climatology()."
+            )
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        catchment_ids = self._desired_catchment_ids
+        n_catch = len(catchment_ids)
+
+        torch_dtype = torch.float32 if dtype == "float32" else torch.float64
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            print("[export_runoff_climatology] CUDA not available; falling back to CPU.")
+            dev = torch.device("cpu")
+
+        # Prepare transposed mapping matrix: (n_catch, n_grids)
+        t_mapping = local_runoff_matrix.to(dev).to(torch_dtype)
+        t_mapping_T = t_mapping.t().coalesce()
+
+        # ----- Accumulate mean over all chunks -----
+        n_chunks = len(self)
+        total_steps = 0
+        accumulator = torch.zeros(n_catch, dtype=torch.float64, device=dev)
+
+        pbar = tqdm(range(n_chunks), desc="Computing climatology", unit="chunk")
+        for ci in pbar:
+            block = self.read_chunk(ci)  # (T, n_grids)
+
+            # Determine how many valid steps in this block
+            base_idx = ci * self.chunk_len
+            T = block.shape[0]
+            valid_T = sum(
+                1 for k in range(T) if self.is_valid_time_index(base_idx + k)
+            )
+            if valid_T == 0:
+                continue
+
+            block = block[:valid_T]
+
+            # block: (T, n_grids)
+            block_t = torch.as_tensor(block, dtype=torch_dtype, device=dev)
+            # (n_catch, n_grids) @ (n_grids, T) -> (n_catch, T)
+            agg = torch.sparse.mm(t_mapping_T, block_t.T)
+            accumulator += agg.sum(dim=1).to(torch.float64)
+
+            total_steps += valid_T
+
+        pbar.close()
+
+        if total_steps == 0:
+            raise RuntimeError("No valid timesteps found — cannot compute climatology.")
+
+        mean_data = (accumulator / total_steps).cpu().numpy()
+        print(f"[export_runoff_climatology] Averaged over {total_steps} timesteps")
+
+        # ----- Write NetCDF -----
+        dtype_nc = "f4" if dtype == "float32" else "f8"
+        desc = description if description else f"Time-averaged {var_name} over {total_steps} steps"
+
+        with nc.Dataset(str(out_path), "w", format="NETCDF4") as ds:
+            ds.setncattr("title", f"Runoff climatology ({var_name})")
+            ds.setncattr("total_timesteps", total_steps)
+
+            ds.createDimension("saved_points", n_catch)
+
+            cid_var = ds.createVariable("catchment_id", "i8", ("saved_points",))
+            cid_var[:] = catchment_ids
+
+            out_var = ds.createVariable(
+                var_name, dtype_nc, ("saved_points",),
+                zlib=True, complevel=int(complevel),
+            )
+            out_var[:] = mean_data.astype(
+                np.float32 if dtype == "float32" else np.float64
+            )
+            out_var.setncattr("description", desc)
+            out_var.setncattr("units", units)
+
+        print(f"[export_runoff_climatology] Saved to {out_path}")
+        return out_path
+
     def export_catchment_runoff(
         self,
         out_dir: str | Path,
@@ -487,7 +608,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         normalized: bool = False,
         device: str | torch.device = "cpu",
         split_by_year: bool = False,
-        units: str = "mm",
+        units: str = "m3/s",
         description: Optional[str] = None,
         filename: Optional[str] = None,
     ) -> Union[Path, List[Path]]:

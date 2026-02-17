@@ -10,9 +10,9 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from cmfgpu.datasets.netcdf_dataset import NetCDFDataset
-from cmfgpu.models.cama_flood_model import CaMaFlood
-from cmfgpu.params.input_proxy import InputProxy
+from cmfgpu.datasets import NetCDFDataset
+from cmfgpu.models import CaMaFlood
+from cmfgpu.params import InputProxy
 from cmfgpu.utils import setup_distributed
 
 

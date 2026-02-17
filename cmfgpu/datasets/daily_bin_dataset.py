@@ -6,29 +6,62 @@
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
+import cftime
 import numpy as np
 
 from cmfgpu.datasets.abstract_dataset import AbstractDataset
+from cmfgpu.datasets.utils import daily_time_to_key, single_file_key
 
 
 class DailyBinDataset(AbstractDataset):
     """
-    Example of a Dataset class that reads daily binary files.
-    Each bin file contains one day's data.
+    Dataset class that reads daily binary files.
+
+    By default each binary file contains one day's data, with filenames
+    ``{prefix}{YYYYMMDD}{suffix}``.  The ``time_to_key`` callable controls
+    the mapping from date to filename key:
+
+    * **One file per day** (default): ``time_to_key = daily_time_to_key``
+      → every date gets a unique key, each file has one frame.
+    * **Single file** (e.g. 365-day climatology): use a constant key
+      ``time_to_key = lambda dt: ""``  (or any constant string).
+      Consecutive frames are read from the file by offset.
     """
 
+    def _build_file_mapping(self):
+        """Map each simulation date to ``(file_key, frame_index)``."""
+        self._dt_to_loc = {}
+        key_frame_count: dict = {}
+        t = self.start_date
+        while t <= self.end_date:
+            key = self.time_to_key(t)
+            if key not in key_frame_count:
+                key_frame_count[key] = 0
+            self._dt_to_loc[t] = (key, key_frame_count[key])
+            key_frame_count[key] += 1
+            t += self.time_interval
+
+        # Also handle spin-up dates
+        if self.spin_up_cycles > 0 and self.spin_up_start_date and self.spin_up_end_date:
+            t = self.spin_up_start_date
+            while t <= self.spin_up_end_date:
+                if t not in self._dt_to_loc:
+                    key = self.time_to_key(t)
+                    if key not in key_frame_count:
+                        key_frame_count[key] = 0
+                    self._dt_to_loc[t] = (key, key_frame_count[key])
+                    key_frame_count[key] += 1
+                t += self.time_interval
+
     def _validate_files_exist(self):
-        """
-        Validates that all expected files between start_date and end_date exist.
-        """
-        def file_path_gen(dt: datetime) -> Path:
-            filename = f"{self.prefix}{dt:%Y%m%d}{self.suffix}"
-            return Path(self.base_dir) / filename
-            
-        self.validate_files_in_range(file_path_gen)
-        
+        """Validate that all required files exist."""
+        unique_files = set()
+        for key, _ in self._dt_to_loc.values():
+            unique_files.add(Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}")
+        self.validate_files_exist(list(unique_files))
+
     def __init__(self,
                  base_dir: str,
                  shape: List[int],
@@ -41,6 +74,7 @@ class DailyBinDataset(AbstractDataset):
                  out_dtype: str = "float32",
                  calendar: str = "standard",
                  lat_south_to_north: bool = False,  # If True, latitude goes from south to north
+                 time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = daily_time_to_key,
                  *args, **kwargs):
 
         self.base_dir = base_dir
@@ -50,7 +84,9 @@ class DailyBinDataset(AbstractDataset):
         self.prefix = prefix
         self.suffix = suffix
         self.lat_south_to_north = lat_south_to_north
+        self.time_to_key = time_to_key if time_to_key is not None else single_file_key
         super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, calendar=calendar, *args, **kwargs)
+        self._build_file_mapping()
         self._validate_files_exist()
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -68,10 +104,8 @@ class DailyBinDataset(AbstractDataset):
         res_lon = 360.0 / nx
         # Cell centers
         if self.lat_south_to_north:
-            # South to north: start at (-90 + res/2), end at (90 - res/2)
             lat = np.linspace(-90 + res_lat / 2, 90 - res_lat / 2, ny)
         else:
-            # North to south: start at (90 - res/2), end at (-90 + res/2)
             lat = np.linspace(90 - res_lat / 2, -90 + res_lat / 2, ny)
         lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
         return lon, lat
@@ -87,18 +121,25 @@ class DailyBinDataset(AbstractDataset):
         """
         if chunk_len != 1:
             raise ValueError("DailyBinDataset only supports chunk_len=1 (one day per file)")
-        filename = f"{self.prefix}{current_time:%Y%m%d}{self.suffix}"
+
+        key, frame_idx = self._dt_to_loc[current_time]
+        filename = f"{self.prefix}{key}{self.suffix}"
         file_path = Path(self.base_dir) / filename
-        data = np.fromfile(file_path, dtype=self.bin_dtype)
+
+        ny, nx = self.shape
+        frame_size = ny * nx
+        element_size = np.dtype(self.bin_dtype).itemsize
+
+        data = np.fromfile(
+            file_path, dtype=self.bin_dtype,
+            count=frame_size, offset=frame_idx * frame_size * element_size,
+        )
         data[~(data >= 0)] = 0.0
         data = data.astype(self.out_dtype) / self.unit_factor
         
         if self._local_runoff_indices is not None:
-            # Return compressed (1, N)
             return data[self._local_runoff_indices][None, :]
         else:
-            # Return full grid (1, Y, X)
-            ny, nx = self.shape
             return data.reshape(1, ny, nx)
     
     def close(self):

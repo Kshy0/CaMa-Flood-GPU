@@ -11,11 +11,8 @@ import cftime
 import numpy as np
 
 from cmfgpu.datasets.netcdf_dataset import NetCDFDataset
+from cmfgpu.datasets.utils import monthly_time_to_key
 
-
-def monthly_time_to_key(dt: datetime) -> str:
-    dt = dt
-    return dt.strftime("%Y_%m")
 
 class ERA5LandDataset(NetCDFDataset):
     """

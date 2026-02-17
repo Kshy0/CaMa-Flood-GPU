@@ -14,11 +14,7 @@ import numpy as np
 from netCDF4 import Dataset, num2date
 
 from cmfgpu.datasets.abstract_dataset import AbstractDataset
-
-
-def yearly_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
-    """Default time-to-file key: one file per year."""
-    return f"{dt.year}"
+from cmfgpu.datasets.utils import single_file_key, yearly_time_to_key
 
 
 class NetCDFDataset(AbstractDataset):
@@ -220,7 +216,7 @@ class NetCDFDataset(AbstractDataset):
         self.var_name = var_name
         self.prefix = prefix
         self.suffix = suffix
-        self.time_to_key = time_to_key
+        self.time_to_key = time_to_key if time_to_key is not None else single_file_key
 
         # Runtime metadata
         self._file_times = {}

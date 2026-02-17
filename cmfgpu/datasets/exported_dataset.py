@@ -8,19 +8,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from netCDF4 import Dataset
 
 from cmfgpu.datasets.netcdf_dataset import NetCDFDataset
+from cmfgpu.datasets.utils import single_file_key
 from cmfgpu.utils import find_indices_in, is_rank_zero
 
-
-def exported_time_to_key(dt: datetime) -> str:
-    """Constant key for exported format; we always use a single file path (prefix + suffix)."""
-    return ""
 
 class ExportedDataset(NetCDFDataset):
     """Dataset for pre-aggregated catchment runoff (time, saved_points).
@@ -50,7 +47,7 @@ class ExportedDataset(NetCDFDataset):
         var_name: str = "runoff",
         prefix: Optional[str] = "runoff_",
         suffix: str = "rank0.nc",
-        time_to_key: Optional[Callable[[datetime], str]] = exported_time_to_key,
+        time_to_key: Optional[Callable[[datetime], str]] = single_file_key,
         coord_name: str = "catchment_id",
         in_memory: bool = False,
         *args,
@@ -229,7 +226,8 @@ class ExportedDataset(NetCDFDataset):
     def load_to_memory(self) -> None:
         """Load all data into memory for faster repeated access.
         
-        This method reads the entire dataset into a numpy array cached in memory.
+        This method reads the entire dataset into a numpy array cached in memory,
+        covering ALL files that span the [start_date, end_date] range.
         Subsequent __getitem__ calls will return slices from this cache instead
         of reading from disk.
         
@@ -241,36 +239,175 @@ class ExportedDataset(NetCDFDataset):
                 print("[ExportedDataset] Data already in memory, skipping reload.")
             return
         
-        # Read all data at once
-        key = self.time_to_key(self.start_date)
-        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-        
-        with Dataset(path, "r") as ds:
-            var = ds.variables[self.var_name]
-            dims = tuple(d.lower() for d in var.dimensions)
-            t_idx = dims.index("time")
-            c_idx = dims.index("saved_points")
-            
-            # Read entire variable
-            arr = var[:]
-            if isinstance(arr, np.ma.MaskedArray):
-                arr = arr.filled(0.0)
-            else:
-                arr = np.nan_to_num(np.asarray(arr), nan=0.0)
-            
-            # Ensure (T, C) format
-            arr = self._ensure_tc(arr, t_idx, c_idx)
-        
-        # Reorder columns if indices are set
-        if self._local_runoff_indices is not None:
-            arr = arr[:, self._local_runoff_indices]
+        # Read ALL time steps across all files using the multi-file infrastructure.
+        ops = self._ops_from_times(self._global_times)
+        all_data = self._read_ops(ops)
         
         # Store in cache with correct dtype and C-contiguous layout
-        self._memory_cache = np.ascontiguousarray(arr.astype(self.out_dtype, copy=False))
+        self._memory_cache = np.ascontiguousarray(all_data.astype(self.out_dtype, copy=False))
         
         if is_rank_zero():
+            n_files = len(ops)
             mem_mb = self._memory_cache.nbytes / (1024 * 1024)
-            print(f"[ExportedDataset] Loaded {self._memory_cache.shape} to memory ({mem_mb:.1f} MB)")
+            print(f"[ExportedDataset] Loaded {self._memory_cache.shape} from {n_files} file(s) "
+                  f"to memory ({mem_mb:.1f} MB)")
+
+    def export_quantiles(
+        self,
+        out_path: Union[str, Path],
+        quantiles: Sequence[float] = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0),
+        var_name: Optional[str] = None,
+        dtype: Literal["float32", "float64"] = "float32",
+        complevel: int = 4,
+        max_buffer_mb: float = 4096.0,
+    ) -> Path:
+        """Compute per-catchment temporal quantiles and save to NetCDF.
+
+        For each catchment, computes the specified quantile values across the
+        time dimension and writes the result to a single NetCDF file.
+
+        Output format (consistent with ExportedDataset conventions):
+          - Dimensions: ``quantile`` (Q), ``saved_points`` (C)
+          - Variables:
+            * ``quantile``     (Q,)    - quantile levels (e.g. 0.0 … 1.0)
+            * ``catchment_id`` (C,)    - catchment IDs (int64)
+            * ``{var_name}``   (Q, C)  - quantile values
+
+        If ``build_local_runoff_matrix`` has been called, the output follows the
+        reordered catchment order; otherwise it uses the file's native order.
+
+        Exact quantile computation requires the full time series per catchment.
+        When the full (T, C) array exceeds ``max_buffer_mb``, catchments are
+        processed in column-batches whose size is automatically computed so that
+        each batch (T × batch_catchments) fits within the buffer limit.
+
+        Args:
+            out_path: Output NetCDF file path.
+            quantiles: Sequence of quantile levels in [0, 1].
+            var_name: Variable name in output file (default: ``self.var_name``).
+            dtype: Output data type.
+            complevel: zlib compression level (0-9).
+            max_buffer_mb: Maximum memory buffer in MB for reading data.
+                When the full dataset exceeds this limit, catchments are
+                processed in column-batches automatically. Default 4096 (4 GB).
+
+        Returns:
+            Path to the created NetCDF file.
+        """
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        var_name = var_name or self.var_name
+        quantiles_arr = np.asarray(quantiles, dtype=np.float64)
+        Q = len(quantiles_arr)
+        elem_bytes = 4 if dtype == "float32" else 8
+
+        # ---- catchment IDs (respecting column reorder) ----
+        file_catchment_ids, _ = self.get_coordinates()
+        if self._local_runoff_indices is not None:
+            catchment_ids = file_catchment_ids[self._local_runoff_indices]
+        else:
+            catchment_ids = file_catchment_ids
+        C_total = len(catchment_ids)
+        T_total = self.num_main_steps
+
+        # ---- determine whether full (T, C) fits in buffer ----
+        max_buffer_bytes = max_buffer_mb * 1024 * 1024
+        full_size = T_total * C_total * elem_bytes
+        fits_in_memory = (self._memory_cache is not None or full_size <= max_buffer_bytes)
+
+        if not fits_in_memory:
+            # Column-batch mode: compute batch_size (num catchments per batch)
+            # so that T_total × batch_size × elem_bytes <= max_buffer_bytes
+            batch_size = max(1, int(max_buffer_bytes / (T_total * elem_bytes)))
+            n_batches = (C_total + batch_size - 1) // batch_size
+            if is_rank_zero():
+                print(f"[ExportedDataset] Dataset {full_size / 1e9:.1f} GB > "
+                      f"buffer {max_buffer_mb:.0f} MB, "
+                      f"processing {C_total} catchments in {n_batches} column-batches "
+                      f"({batch_size} catchments/batch)")
+
+        # ---- create output NetCDF ----
+        dtype_nc = "f4" if dtype == "float32" else "f8"
+        out_ds = Dataset(str(out_path), "w", format="NETCDF4")
+        try:
+            out_ds.createDimension("quantile", Q)
+            out_ds.createDimension("saved_points", C_total)
+
+            q_var = out_ds.createVariable("quantile", "f8", ("quantile",))
+            q_var[:] = quantiles_arr
+            q_var.long_name = "quantile level"
+
+            cid_var = out_ds.createVariable("catchment_id", "i8", ("saved_points",))
+            cid_var[:] = catchment_ids
+
+            data_var = out_ds.createVariable(
+                var_name, dtype_nc, ("quantile", "saved_points"),
+                zlib=True, complevel=complevel,
+            )
+            data_var.long_name = f"{var_name} quantile values"
+
+            if fits_in_memory:
+                # ---- fits in memory: use __getitem__ with original chunk_len ----
+                n_chunks = self._real_len()
+                spin_up_offset = self.num_spin_up_chunks
+                pieces: List[np.ndarray] = []
+                for i in range(n_chunks):
+                    pieces.append(self[spin_up_offset + i])
+                all_data = np.concatenate(pieces, axis=0)[:T_total]
+                q_values = np.quantile(all_data, quantiles_arr, axis=0)  # (Q, C)
+                data_var[:] = q_values.astype(dtype)
+            else:
+                # ---- too large: batch by catchments (columns) ----
+                # Exact quantile needs full time axis, so we read ALL time steps
+                # for a subset of catchments per batch.
+                ops = self._ops_from_times(self._global_times)
+                for c_start in range(0, C_total, batch_size):
+                    c_end = min(c_start + batch_size, C_total)
+                    batch_cols = slice(c_start, c_end)
+
+                    if self._local_runoff_indices is not None:
+                        file_col_indices = self._local_runoff_indices[c_start:c_end]
+                    else:
+                        file_col_indices = np.arange(c_start, c_end, dtype=np.int64)
+
+                    sort_order = np.argsort(file_col_indices)
+                    sorted_cols = file_col_indices[sort_order]
+                    unsort_order = np.argsort(sort_order)
+
+                    file_chunks: List[np.ndarray] = []
+                    for key, abs_indices in ops:
+                        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+                        with Dataset(path, "r") as ds_in:
+                            var_in = ds_in.variables[self.var_name]
+                            dims_in = tuple(d.lower() for d in var_in.dimensions)
+                            t_idx = dims_in.index("time")
+                            c_idx = dims_in.index("saved_points")
+
+                            sel = [slice(None)] * var_in.ndim
+                            sel[t_idx] = np.asarray(abs_indices, dtype=np.int32)
+                            sel[c_idx] = sorted_cols
+                            arr = var_in[tuple(sel)]
+                            if isinstance(arr, np.ma.MaskedArray):
+                                arr = arr.filled(0.0)
+                            else:
+                                arr = np.nan_to_num(np.asarray(arr), nan=0.0)
+                            batch_data = self._ensure_tc(arr, t_idx, c_idx)
+                            batch_data = batch_data[:, unsort_order]
+                            file_chunks.append(batch_data)
+
+                    all_batch = np.concatenate(file_chunks, axis=0) if len(file_chunks) > 1 else file_chunks[0]
+                    q_batch = np.quantile(all_batch, quantiles_arr, axis=0)
+                    data_var[:, batch_cols] = q_batch.astype(dtype)
+
+        finally:
+            out_ds.close()
+
+        if is_rank_zero():
+            print(f"[ExportedDataset] Saved quantiles to {out_path}")
+            print(f"  Levels: {quantiles_arr.tolist()}")
+            print(f"  Shape: ({Q}, {C_total})")
+
+        return out_path
 
     def shard_forcing(
         self,
