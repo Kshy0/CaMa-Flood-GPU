@@ -12,13 +12,16 @@ import re
 import sys
 import tempfile
 from datetime import datetime
-from typing import Any, Dict, List, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Set
+
+if TYPE_CHECKING:
+    from cmfgpu.aggregator.aggregator import StatisticsAggregator
 
 
 class KernelCodegenMixin:
     """Mixin providing Triton kernel code generation and compilation."""
 
-    def _generate_kernel_header(self) -> List[str]:
+    def _generate_kernel_header(self: StatisticsAggregator) -> List[str]:
         """Generate the header for the kernel file with documentation."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         var_list = sorted(list(self._variables))
@@ -59,7 +62,7 @@ class KernelCodegenMixin:
         return header
     
 
-    def _save_kernel_file(self, kernel_code: str) -> None:
+    def _save_kernel_file(self: StatisticsAggregator, kernel_code: str) -> None:
         """
         Save the generated kernel code to a permanent file for inspection.
         
@@ -77,7 +80,7 @@ class KernelCodegenMixin:
 
     
 
-    def _write_and_import_kernels(self, kernel_code: str) -> None:
+    def _write_and_import_kernels(self: StatisticsAggregator, kernel_code: str) -> None:
         """
         Write kernel code to a temporary file and import the module.
         
@@ -104,7 +107,7 @@ class KernelCodegenMixin:
         self._aggregator_generated = True
 
 
-    def _transform_pow_expr(self, expr: str) -> str:
+    def _transform_pow_expr(self: StatisticsAggregator, expr: str) -> str:
         """
         Transform power operations in an expression string to Triton-compatible tl.exp(log()).
         Power operator ** or ^ is transformed.
@@ -144,7 +147,7 @@ class KernelCodegenMixin:
             return safe_expr
 
 
-    def _emit_variable_load(self, var_name: str, code_lines: List[str], emitted: Set[str], is_2d: bool = False):
+    def _emit_variable_load(self: StatisticsAggregator, var_name: str, code_lines: List[str], emitted: Set[str], is_2d: bool = False):
         """Helper to emit load instructions or expression evaluation recursively."""
         if var_name in emitted:
             return
@@ -184,7 +187,7 @@ class KernelCodegenMixin:
         emitted.add(var_name)
     
 
-    def _generate_1d_vars_grouped(self, kernel_code_lines: List[str], dims_1d: List[str],
+    def _generate_1d_vars_grouped(self: StatisticsAggregator, kernel_code_lines: List[str], dims_1d: List[str],
                                     indent: str, indent2: str, indent3: str, indent4: str, indent5: str) -> None:
         """
         Generate 1D variable processing code with conditions grouped for efficiency.
@@ -1018,7 +1021,7 @@ class KernelCodegenMixin:
         kernel_code_lines.append("")
 
 
-    def _generate_kernel_for_group(self, kernel_code_lines: List[str], kernel_name: str,
+    def _generate_kernel_for_group(self: StatisticsAggregator, kernel_code_lines: List[str], kernel_name: str,
                                    save_idx: str, var_list: List[str],
                                    tensor_info: Dict[str, Dict[str, Any]]) -> None:
         """Generate kernel code for a specific save_idx group supporting ops."""
@@ -1529,7 +1532,7 @@ class KernelCodegenMixin:
         kernel_code_lines.append("")
 
 
-    def _generate_main_function(self, kernel_code_lines: List[str],
+    def _generate_main_function(self: StatisticsAggregator, kernel_code_lines: List[str],
                                 grouped_by_save_idx: Dict[str, List[str]],
                                 tensor_info: Dict[str, Dict[str, Any]]) -> None:
         """Generate the main python function that calls kernels."""
@@ -1660,7 +1663,7 @@ class KernelCodegenMixin:
             ])
 
 
-    def _generate_aggregator_function(self) -> None:
+    def _generate_aggregator_function(self: StatisticsAggregator) -> None:
         """
         Generate and compile the aggregation kernel function.
         """

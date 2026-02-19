@@ -64,7 +64,6 @@ from netCDF4 import Dataset
 from cmfgpu.params.utils import compute_init_river_depth
 from cmfgpu.utils import find_indices_in
 
-
 # ---------------------------------------------------------------------------
 # Numba-accelerated kernels
 # ---------------------------------------------------------------------------
@@ -209,6 +208,77 @@ def _fuse_satellite_width(
                 out = max_width
             fused[i] = out
     return fused
+
+
+def _update_bifurcation_elevation(
+    bif_elv: np.ndarray,
+    bif_wth: np.ndarray,
+    bif_cid: np.ndarray,
+    bif_did: np.ndarray,
+    param_cids: np.ndarray,
+    new_height: np.ndarray,
+) -> np.ndarray:
+    """Recompute bifurcation level-0 elevation using updated river heights.
+
+    Mirrors the Fortran ``set_bifparam`` logic:
+
+    .. code-block:: text
+
+        dph = clamp(log10(wth[0]) * 2.5 - 4.0, 0.5,
+                    max(rivhgt_up, rivhgt_dn))
+        elv_level0 = pelv - dph
+
+    Only level 0 depends on ``river_height``; higher levels are
+    ``pelv + (ilev - 1)`` and remain unchanged.
+    """
+    out = bif_elv.copy()
+    w0 = bif_wth[:, 0]
+    pos = w0 > 0.0
+    if not np.any(pos):
+        return out
+
+    # Map bif endpoints to param indices
+    up_idx = find_indices_in(bif_cid, param_cids)
+    dn_idx = find_indices_in(bif_did, param_cids)
+
+    # Recover pelv from the original table:
+    #   original: elv[i, 0] = pelv[i] - dph_old[i]
+    #   and for ilev>=1: elv[i, ilev] = pelv[i] + (ilev - 1)
+    # Use level-1 if available (more reliable: pelv = elv[i,1] - 0 = elv[i,1])
+    if bif_elv.shape[1] >= 2:
+        # pelv = elv[:,1] when wth[:,1]>0; otherwise derive from level 0
+        has_lev1 = bif_wth[:, 1] > 0.0
+        pelv = np.where(has_lev1, bif_elv[:, 1], np.nan)
+        # For paths without valid level-1, we cannot recover pelv reliably;
+        # leave their elevation unchanged.
+        can_update = pos & has_lev1 & (up_idx >= 0) & (dn_idx >= 0)
+    else:
+        # Only 1 level — cannot recover pelv; skip
+        return out
+
+    if not np.any(can_update):
+        return out
+
+    # Recompute dph with new heights
+    dph_raw = np.log10(w0[can_update]) * 2.5 - 4.0
+    dph_raw = np.maximum(dph_raw, 0.5)
+    h_up = new_height[up_idx[can_update]].astype(np.float64)
+    h_dn = new_height[dn_idx[can_update]].astype(np.float64)
+    dph_max = np.maximum(h_up, h_dn)
+    dph_new = np.minimum(dph_raw, dph_max)
+
+    out[can_update, 0] = pelv[can_update] - dph_new
+    return out
+
+
+def _infer_catchment_dim(ds: Dataset, n_catch: int) -> tuple:
+    """Find the dimension name matching *n_catch* in an open NetCDF dataset."""
+    for dim_name, dim in ds.dimensions.items():
+        if len(dim) == n_catch:
+            return (dim_name,)
+    raise ValueError(
+        f"Cannot find a dimension of size {n_catch} in the NetCDF file."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,77 +556,6 @@ def estimate_river_geometry(
               f"river_depth, river_storage to {target}")
 
     return target
-
-
-def _update_bifurcation_elevation(
-    bif_elv: np.ndarray,
-    bif_wth: np.ndarray,
-    bif_cid: np.ndarray,
-    bif_did: np.ndarray,
-    param_cids: np.ndarray,
-    new_height: np.ndarray,
-) -> np.ndarray:
-    """Recompute bifurcation level-0 elevation using updated river heights.
-
-    Mirrors the Fortran ``set_bifparam`` logic:
-
-    .. code-block:: text
-
-        dph = clamp(log10(wth[0]) * 2.5 - 4.0, 0.5,
-                    max(rivhgt_up, rivhgt_dn))
-        elv_level0 = pelv - dph
-
-    Only level 0 depends on ``river_height``; higher levels are
-    ``pelv + (ilev - 1)`` and remain unchanged.
-    """
-    out = bif_elv.copy()
-    w0 = bif_wth[:, 0]
-    pos = w0 > 0.0
-    if not np.any(pos):
-        return out
-
-    # Map bif endpoints to param indices
-    up_idx = find_indices_in(bif_cid, param_cids)
-    dn_idx = find_indices_in(bif_did, param_cids)
-
-    # Recover pelv from the original table:
-    #   original: elv[i, 0] = pelv[i] - dph_old[i]
-    #   and for ilev>=1: elv[i, ilev] = pelv[i] + (ilev - 1)
-    # Use level-1 if available (more reliable: pelv = elv[i,1] - 0 = elv[i,1])
-    if bif_elv.shape[1] >= 2:
-        # pelv = elv[:,1] when wth[:,1]>0; otherwise derive from level 0
-        has_lev1 = bif_wth[:, 1] > 0.0
-        pelv = np.where(has_lev1, bif_elv[:, 1], np.nan)
-        # For paths without valid level-1, we cannot recover pelv reliably;
-        # leave their elevation unchanged.
-        can_update = pos & has_lev1 & (up_idx >= 0) & (dn_idx >= 0)
-    else:
-        # Only 1 level — cannot recover pelv; skip
-        return out
-
-    if not np.any(can_update):
-        return out
-
-    # Recompute dph with new heights
-    dph_raw = np.log10(w0[can_update]) * 2.5 - 4.0
-    dph_raw = np.maximum(dph_raw, 0.5)
-    h_up = new_height[up_idx[can_update]].astype(np.float64)
-    h_dn = new_height[dn_idx[can_update]].astype(np.float64)
-    dph_max = np.maximum(h_up, h_dn)
-    dph_new = np.minimum(dph_raw, dph_max)
-
-    out[can_update, 0] = pelv[can_update] - dph_new
-    return out
-
-
-def _infer_catchment_dim(ds: Dataset, n_catch: int) -> tuple:
-    """Find the dimension name matching *n_catch* in an open NetCDF dataset."""
-    for dim_name, dim in ds.dimensions.items():
-        if len(dim) == n_catch:
-            return (dim_name,)
-    raise ValueError(
-        f"Cannot find a dimension of size {n_catch} in the NetCDF file."
-    )
 
 
 # ---------------------------------------------------------------------------

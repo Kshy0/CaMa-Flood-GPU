@@ -7,17 +7,20 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
 
-from cmfgpu.models.utils import torch_to_numpy_dtype
+from cmfgpu.utils import torch_to_numpy_dtype
+
+if TYPE_CHECKING:
+    from cmfgpu.aggregator.aggregator import StatisticsAggregator
 
 
 class StatisticsMixin:
     """Mixin providing statistics initialization, kernel state preparation, and update logic."""
 
-    def _prepare_kernel_states(self) -> None:
+    def _prepare_kernel_states(self: StatisticsAggregator) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
         required_tensors: Dict[str, torch.Tensor] = {}
 
@@ -115,7 +118,7 @@ class StatisticsMixin:
 
     
 
-    def initialize_statistics(self, variable_ops: Dict[str, List[str]]) -> None:
+    def initialize_statistics(self: StatisticsAggregator, variable_ops: Dict[str, List[str]]) -> None:
         """Initialize aggregation tensors and metadata for provided variables and ops."""
         # Reset generic state
         self._variables = set()
@@ -380,7 +383,7 @@ class StatisticsMixin:
 
     
 
-    def update_statistics(self, weight: float, total_weight: float = 0.0, 
+    def update_statistics(self: StatisticsAggregator, weight: float, total_weight: float = 0.0, 
                           is_inner_first: bool = False, is_inner_last: bool = False, 
                           is_outer_first: bool = False, is_outer_last: bool = False,
                           BLOCK_SIZE: int = 128, custom_step_index: Optional[int] = None,

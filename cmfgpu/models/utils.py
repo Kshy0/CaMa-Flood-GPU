@@ -7,19 +7,8 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 from numba import njit
 
-
-def torch_to_numpy_dtype(torch_dtype):
-    dtype_mapping = {
-        torch.float32: np.float32,
-        torch.float64: np.float64,
-        torch.float16: np.float16,
-    }
-    if torch_dtype not in dtype_mapping:
-        raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
-    return dtype_mapping[torch_dtype]
 
 @njit
 def compute_group_to_rank(world_size: int, group_assignments: np.ndarray):

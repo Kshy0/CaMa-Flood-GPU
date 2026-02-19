@@ -10,13 +10,16 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import cftime
 import netCDF4 as nc
 import numpy as np
 
 from cmfgpu.aggregator.utils import is_wsl, sanitize_symbol
+
+if TYPE_CHECKING:
+    from cmfgpu.aggregator.aggregator import StatisticsAggregator
 
 
 def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
@@ -180,7 +183,7 @@ def _create_netcdf_file_process(args: Tuple) -> Union[Path, List[Path]]:
 class NetCDFIOMixin:
     """Mixin providing NetCDF file creation and streaming write functionality."""
 
-    def _create_netcdf_files(self, year: Optional[int] = None) -> None:
+    def _create_netcdf_files(self: StatisticsAggregator, year: Optional[int] = None) -> None:
         """Create empty NetCDF files with proper structure for streaming."""
         if self.in_memory_mode:
             # Skip file creation in in-memory mode
@@ -231,7 +234,7 @@ class NetCDFIOMixin:
         print(f"Created {total_files} NetCDF files for streaming")
 
 
-    def _finalize_time_step_in_memory(self, dt: Union[datetime, cftime.datetime]) -> None:
+    def _finalize_time_step_in_memory(self: StatisticsAggregator, dt: Union[datetime, cftime.datetime]) -> None:
         """
         Finalize time step in in-memory mode by copying storage to result tensors.
         
@@ -263,7 +266,7 @@ class NetCDFIOMixin:
         # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True
     
 
-    def finalize_time_step(self, dt: Union[datetime, cftime.datetime]) -> None:
+    def finalize_time_step(self: StatisticsAggregator, dt: Union[datetime, cftime.datetime]) -> None:
         """
         Finalize the current time step by writing results to output.
         

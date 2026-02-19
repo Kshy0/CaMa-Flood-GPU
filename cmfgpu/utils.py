@@ -99,6 +99,18 @@ def find_indices_in(a, b):
 
     return index
 
+
+def torch_to_numpy_dtype(torch_dtype):
+    dtype_mapping = {
+        torch.float32: np.float32,
+        torch.float64: np.float64,
+        torch.float16: np.float16,
+    }
+    if torch_dtype not in dtype_mapping:
+        raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
+    return dtype_mapping[torch_dtype]
+
+
 def find_indices_in_torch(a, b):
     
     sorted_b, order = torch.sort(b)

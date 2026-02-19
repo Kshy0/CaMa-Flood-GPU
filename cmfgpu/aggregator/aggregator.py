@@ -19,10 +19,10 @@ import numpy as np
 import torch
 from pydantic.fields import FieldInfo
 
-from cmfgpu.aggregator.utils import sanitize_symbol
-from cmfgpu.aggregator.netcdf_io import NetCDFIOMixin
 from cmfgpu.aggregator.kernel_codegen import KernelCodegenMixin
+from cmfgpu.aggregator.netcdf_io import NetCDFIOMixin
 from cmfgpu.aggregator.statistics import StatisticsMixin
+from cmfgpu.aggregator.utils import sanitize_symbol
 
 
 class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
@@ -36,7 +36,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
        Results are dynamically appended, no need to pre-specify total time steps.
     """
 
-    def __init__(self, device: torch.device, output_dir: Path, rank: int, 
+    def __init__(self, device: torch.device, output_dir: Optional[Path] = None, rank: int = 0, 
                  num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
                  output_split_by_year: bool = False, num_trials: int = 1,
                  max_pending_steps: int = 10, calendar: str = "standard",
@@ -47,7 +47,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         
         Args:
             device: PyTorch device for computations
-            output_dir: Output directory for NetCDF files
+            output_dir: Output directory for NetCDF files (required for streaming mode, optional for in-memory mode)
             rank: Process rank identifier (int)
             num_workers: Number of worker processes for parallel NetCDF writing
             complevel: Compression level (1-9)
@@ -89,6 +89,8 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
 
         # Create kernels directory if saving is enabled
         if self.save_kernels:
+            if self.output_dir is None:
+                raise ValueError("output_dir is required when save_kernels=True")
             self.kernels_dir = self.output_dir / "generated_kernels"
             self.kernels_dir.mkdir(parents=True, exist_ok=True)
 
