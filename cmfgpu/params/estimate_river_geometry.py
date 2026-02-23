@@ -24,7 +24,7 @@ to downstream along the river network.
 2. Read the river network (``catchment_id``, ``downstream_id``) from
    :class:`MERITMap`'s ``parameters.nc``.
 3. Accumulate local runoff from upstream to downstream to obtain mean
-   discharge *Q* at every catchment.
+   discharge *Q* at every catchment (see :func:`accumulate_discharge`).
 4. Apply the power-law relationship to compute ``river_width`` and
    ``river_height``.
 5. Write the results back into the parameters NetCDF (overwrite in-place
@@ -43,7 +43,13 @@ runoff per catchment.  The stored units depend on the dataset's
 
 Example
 -------
->>> from cmfgpu.params.calc_rivwth import estimate_river_geometry
+>>> from cmfgpu.params.estimate_river_geometry import accumulate_discharge
+>>> discharge, cids, ds_idx = accumulate_discharge(
+...     climatology_nc="output/runoff_clm.nc",
+...     parameter_nc="inp/glb_15min/parameters.nc",
+...     output_nc="output/discharge.nc",   # optional export
+... )
+>>> from cmfgpu.params.estimate_river_geometry import estimate_river_geometry
 >>> estimate_river_geometry(
 ...     climatology_nc="output/runoff_clm.nc",
 ...     parameter_nc="inp/glb_15min/parameters.nc",
@@ -285,10 +291,167 @@ def _infer_catchment_dim(ds: Dataset, n_catch: int) -> tuple:
 # Public API
 # ---------------------------------------------------------------------------
 
+def accumulate_discharge(
+    climatology_nc: Union[str, Path],
+    parameter_nc: Union[str, Path],
+    output_nc: Optional[Union[str, Path]] = None,
+    clm_var: str = "runoff_clm",
+    runoff_to_m3s: float = 1.0,
+    verbose: bool = True,
+) -> tuple:
+    """Accumulate local runoff along the river network to obtain mean discharge.
+
+    Reads catchment-level mean runoff from a climatology NetCDF and the
+    river network topology from a parameter NetCDF, then accumulates
+    local runoff from upstream to downstream to compute mean annual
+    discharge *Q* (m³/s) at every catchment.
+
+    The result can optionally be exported to a NetCDF file containing
+    ``catchment_id`` and ``discharge`` variables.
+
+    Parameters
+    ----------
+    climatology_nc : path
+        NetCDF produced by ``AbstractDataset.export_runoff_climatology``.
+        Must contain ``catchment_id`` and the variable *clm_var*.
+    parameter_nc : path
+        ``parameters.nc`` produced by :class:`MERITMap`.  Must contain
+        ``catchment_id`` and ``downstream_id``.
+    output_nc : path or None
+        If not *None*, write the accumulated discharge to this NetCDF file
+        (catchment-scale statistics with ``catchment_id`` and ``discharge``).
+    clm_var : str
+        Variable name inside *climatology_nc* (default ``"runoff_clm"``).
+    runoff_to_m3s : float
+        Multiplicative factor to convert the values stored in *climatology_nc*
+        to **m³/s**.  Default ``1.0``.
+    verbose : bool
+        Print progress information.
+
+    Returns
+    -------
+    discharge : (N,) float64
+        Accumulated discharge at each catchment (m³/s), in the same order
+        as ``catchment_id`` in *parameter_nc*.
+    param_cids : (N,) int64
+        Catchment IDs from *parameter_nc*.
+    downstream_idx : (N,) int64
+        Index-based downstream mapping (into the same array).  River mouths
+        are self-loops (``downstream_idx[i] == i``).
+
+    Example
+    -------
+    >>> from cmfgpu.params.estimate_river_geometry import accumulate_discharge
+    >>> discharge, cids, ds_idx = accumulate_discharge(
+    ...     climatology_nc="output/runoff_clm.nc",
+    ...     parameter_nc="inp/glb_15min/parameters.nc",
+    ...     output_nc="output/discharge.nc",
+    ... )
+    """
+    climatology_nc = Path(climatology_nc)
+    parameter_nc = Path(parameter_nc)
+
+    if not climatology_nc.exists():
+        raise FileNotFoundError(f"Climatology file not found: {climatology_nc}")
+    if not parameter_nc.exists():
+        raise FileNotFoundError(f"Parameter file not found: {parameter_nc}")
+
+    # ------------------------------------------------------------------
+    # 1. Read climatology (catchment_id → mean runoff)
+    # ------------------------------------------------------------------
+    with Dataset(str(climatology_nc), "r") as ds:
+        clm_cids = np.asarray(ds.variables["catchment_id"][:]).astype(np.int64)
+        clm_vals = np.asarray(ds.variables[clm_var][:]).astype(np.float64)
+
+    if verbose:
+        print(f"[accumulate] Loaded climatology: {len(clm_cids)} catchments "
+              f"from {climatology_nc.name}")
+
+    # ------------------------------------------------------------------
+    # 2. Read river network from parameters.nc
+    # ------------------------------------------------------------------
+    with Dataset(str(parameter_nc), "r") as ds:
+        param_cids = np.asarray(ds.variables["catchment_id"][:]).astype(np.int64)
+        param_dsid = np.asarray(ds.variables["downstream_id"][:]).astype(np.int64)
+
+    n_catch = len(param_cids)
+
+    if verbose:
+        print(f"[accumulate] Loaded parameters: {n_catch} catchments "
+              f"from {parameter_nc.name}")
+
+    # ------------------------------------------------------------------
+    # 3. Map climatology values onto the parameter catchment array
+    # ------------------------------------------------------------------
+    clm_to_param = find_indices_in(clm_cids, param_cids)
+    valid = clm_to_param >= 0
+    if not np.all(valid):
+        n_miss = int((~valid).sum())
+        print(f"[accumulate] Warning: {n_miss} climatology catchments "
+              "not found in parameter file — ignored.")
+
+    local_runoff = np.zeros(n_catch, dtype=np.float64)
+    local_runoff[clm_to_param[valid]] = clm_vals[valid] * runoff_to_m3s
+
+    # ------------------------------------------------------------------
+    # 4. Build downstream index array and accumulate discharge
+    # ------------------------------------------------------------------
+    downstream_idx = find_indices_in(param_dsid, param_cids)
+
+    discharge = _accumulate_discharge(local_runoff, downstream_idx)
+
+    if verbose:
+        q_pos = discharge[discharge > 0]
+        if len(q_pos) > 0:
+            print(f"[accumulate] Discharge stats (m³/s): "
+                  f"min={q_pos.min():.4f}, median={np.median(q_pos):.4f}, "
+                  f"max={q_pos.max():.4f}")
+        else:
+            print("[accumulate] Warning: all discharge values are zero!")
+
+    # ------------------------------------------------------------------
+    # 5. Optionally export to NetCDF
+    # ------------------------------------------------------------------
+    if output_nc is not None:
+        out_path = Path(output_nc)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with Dataset(str(out_path), "w") as ds:
+            ds.createDimension("catchment", n_catch)
+            v_cid = ds.createVariable(
+                "catchment_id", "i8", ("catchment",), zlib=True, complevel=4,
+            )
+            v_cid[:] = param_cids
+            v_cid.setncattr("long_name", "catchment identifier")
+
+            v_q = ds.createVariable(
+                "discharge", "f8", ("catchment",), zlib=True, complevel=4,
+            )
+            v_q[:] = discharge
+            v_q.setncattr("units", "m3/s")
+            v_q.setncattr("long_name", "accumulated mean annual discharge")
+
+            v_lr = ds.createVariable(
+                "local_runoff", "f8", ("catchment",), zlib=True, complevel=4,
+            )
+            v_lr[:] = local_runoff
+            v_lr.setncattr("units", "m3/s")
+            v_lr.setncattr("long_name", "local runoff contribution")
+
+            ds.setncattr("source_climatology", str(climatology_nc))
+            ds.setncattr("source_parameters", str(parameter_nc))
+            ds.setncattr("runoff_to_m3s", runoff_to_m3s)
+
+        if verbose:
+            print(f"[accumulate] Exported discharge to {out_path}")
+
+    return discharge, param_cids, downstream_idx
+
+
 def estimate_river_geometry(
     climatology_nc: Union[str, Path],
     parameter_nc: Union[str, Path],
     output_nc: Optional[Union[str, Path]] = None,
+    discharge_nc: Optional[Union[str, Path]] = None,
     clm_var: str = "runoff_clm",
     runoff_to_m3s: float = 1.0,
     HC: float = 0.1,
@@ -302,6 +465,10 @@ def estimate_river_geometry(
     verbose: bool = True,
 ) -> Path:
     """Estimate river width, height from climatology.
+
+    Internally calls :func:`accumulate_discharge` to compute mean annual
+    discharge from climatology, then applies a power-law relationship to
+    derive river geometry.
 
     Parameters
     ----------
@@ -319,6 +486,10 @@ def estimate_river_geometry(
 
         * *None* → overwrite *parameter_nc* in-place.
         * otherwise → copy *parameter_nc* to *output_nc*, then update.
+    discharge_nc : path or None
+        If not *None*, the accumulated discharge will also be exported to
+        this NetCDF file (catchment-scale statistics).  Passed through to
+        :func:`accumulate_discharge`.
     clm_var : str
         Variable name inside *climatology_nc* (default ``"runoff_clm"``).
     runoff_to_m3s : float
@@ -340,72 +511,24 @@ def estimate_river_geometry(
     Path
         Path to the written NetCDF file.
     """
-    climatology_nc = Path(climatology_nc)
     parameter_nc = Path(parameter_nc)
 
-    if not climatology_nc.exists():
-        raise FileNotFoundError(f"Climatology file not found: {climatology_nc}")
-    if not parameter_nc.exists():
-        raise FileNotFoundError(f"Parameter file not found: {parameter_nc}")
-
     # ------------------------------------------------------------------
-    # 1. Read climatology (catchment_id → mean runoff)
+    # 1. Accumulate discharge via the dedicated API
     # ------------------------------------------------------------------
-    with Dataset(str(climatology_nc), "r") as ds:
-        clm_cids = np.asarray(ds.variables["catchment_id"][:]).astype(np.int64)
-        clm_vals = np.asarray(ds.variables[clm_var][:]).astype(np.float64)
-
-    if verbose:
-        print(f"[calc_rivwth] Loaded climatology: {len(clm_cids)} catchments "
-              f"from {climatology_nc.name}")
-
-    # ------------------------------------------------------------------
-    # 2. Read river network from parameters.nc
-    # ------------------------------------------------------------------
-    with Dataset(str(parameter_nc), "r") as ds:
-        param_cids = np.asarray(ds.variables["catchment_id"][:]).astype(np.int64)
-        param_dsid = np.asarray(ds.variables["downstream_id"][:]).astype(np.int64)
+    discharge, param_cids, downstream_idx = accumulate_discharge(
+        climatology_nc=climatology_nc,
+        parameter_nc=parameter_nc,
+        output_nc=discharge_nc,
+        clm_var=clm_var,
+        runoff_to_m3s=runoff_to_m3s,
+        verbose=verbose,
+    )
 
     n_catch = len(param_cids)
 
-    if verbose:
-        print(f"[calc_rivwth] Loaded parameters: {n_catch} catchments "
-              f"from {parameter_nc.name}")
-
     # ------------------------------------------------------------------
-    # 3. Map climatology values onto the parameter catchment array
-    # ------------------------------------------------------------------
-    # clm_cids may be a subset or the same set as param_cids.
-    clm_to_param = find_indices_in(clm_cids, param_cids)
-    valid = clm_to_param >= 0
-    if not np.all(valid):
-        n_miss = int((~valid).sum())
-        print(f"[calc_rivwth] Warning: {n_miss} climatology catchments "
-              "not found in parameter file — ignored.")
-
-    local_runoff = np.zeros(n_catch, dtype=np.float64)
-    local_runoff[clm_to_param[valid]] = clm_vals[valid] * runoff_to_m3s
-
-    # ------------------------------------------------------------------
-    # 4. Build downstream index array and accumulate discharge
-    # ------------------------------------------------------------------
-    downstream_idx = find_indices_in(param_dsid, param_cids)
-    # River mouths: downstream_id == self → downstream_idx == self index
-    # They are treated as self-loops in _accumulate_discharge (no transfer).
-
-    discharge = _accumulate_discharge(local_runoff, downstream_idx)
-
-    if verbose:
-        q_pos = discharge[discharge > 0]
-        if len(q_pos) > 0:
-            print(f"[calc_rivwth] Discharge stats (m³/s): "
-                  f"min={q_pos.min():.4f}, median={np.median(q_pos):.4f}, "
-                  f"max={q_pos.max():.4f}")
-        else:
-            print("[calc_rivwth] Warning: all discharge values are zero!")
-
-    # ------------------------------------------------------------------
-    # 5. Compute river width and height via power law
+    # 2. Compute river width and height via power law
     # ------------------------------------------------------------------
     new_width, new_height = _power_law(
         discharge, HC, HP, HO, HMIN, WC, WP, WO, WMIN,
@@ -422,7 +545,7 @@ def estimate_river_geometry(
               f"[{new_width.min():.2f}, {new_width.max():.2f}] m")
 
     # ------------------------------------------------------------------
-    # 5b. Fuse with satellite-derived width (if present in parameter_nc)
+    # 2b. Fuse with satellite-derived width (if present in parameter_nc)
     # ------------------------------------------------------------------
     with Dataset(str(parameter_nc), "r") as ds:
         has_sat = "satellite_width" in ds.variables
@@ -438,7 +561,7 @@ def estimate_river_geometry(
                   f"final width range [{new_width.min():.2f}, {new_width.max():.2f}] m")
 
     # ------------------------------------------------------------------
-    # 6. Recompute river_depth and river_storage
+    # 3. Recompute river_depth and river_storage
     #    (they depend on river_height and river_width)
     # ------------------------------------------------------------------
     with Dataset(str(parameter_nc), "r") as ds:
@@ -457,7 +580,7 @@ def estimate_river_geometry(
               f"[{new_storage.min():.2f}, {new_storage.max():.2f}] m³")
 
     # ------------------------------------------------------------------
-    # 7. Optionally update bifurcation_elevation level-0
+    # 4. Optionally update bifurcation_elevation level-0
     #    Level-0 elevation = pelv - dph, where
     #    dph = clamp(log10(wth[0]) * 2.5 - 4, 0.5, max(rivhgt_up, rivhgt_dn))
     #    When river_height changes, the upper bound of the clamp changes.
@@ -482,7 +605,7 @@ def estimate_river_geometry(
                   "bifurcation level-0 elevations")
 
     # ------------------------------------------------------------------
-    # 8. Write results to NetCDF
+    # 5. Write results to NetCDF
     # ------------------------------------------------------------------
     if output_nc is None:
         target = parameter_nc

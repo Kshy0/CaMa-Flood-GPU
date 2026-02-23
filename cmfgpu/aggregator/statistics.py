@@ -350,7 +350,11 @@ class StatisticsMixin:
                     coord_tensor = self._tensor_registry[save_coord]
                     self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
                 
-                out_dtype = torch_to_numpy_dtype(target_dtype)
+                # Downcast to save_precision if specified (e.g. float64 -> float32)
+                save_dtype = target_dtype
+                if self.save_precision is not None and target_dtype.is_floating_point:
+                    save_dtype = self.save_precision
+                out_dtype = torch_to_numpy_dtype(save_dtype)
                 
                 # Check if this is an argmax/argmin op and determine the k value
                 is_arg_op = arg_match is not None

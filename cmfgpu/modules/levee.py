@@ -79,7 +79,11 @@ class LeveeModule(AbstractModule):
     description: ClassVar[str] = "Levee protection module with protected storage states"
     dependencies: ClassVar[list[str]] = ["base"]
 
-    base: Optional[BaseModule] = Field(default=None, exclude=True, description="Reference to BaseModule")
+    base: Optional[BaseModule] = Field(
+        default=None,
+        exclude=True,
+        description="Reference to BaseModule",
+    )
 
     # ------------------------------------------------------------------ #
     # Levee metadata and topology

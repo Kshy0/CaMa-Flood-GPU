@@ -24,7 +24,7 @@ from cmfgpu.utils import find_indices_in_torch
 def BaseField(
     description: str,
     shape: Tuple[str, ...] = ("num_catchments",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
     group_by: Optional[str] = "catchment_basin_id",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
@@ -50,7 +50,7 @@ def BaseField(
 def computed_base_field(
     description: str,
     shape: Tuple[str, ...] = ("num_catchments",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
     dim_coords: Optional[str] = "catchment_id",
@@ -204,18 +204,21 @@ class BaseModule(AbstractModule):
         description="Current water volume in river channels, including any above bankfull depth (m³).",
         default=0,
         category="init_state",
+        dtype="hpfloat",
     )
 
     flood_storage: torch.Tensor = BaseField(
         description="Current water volume stored on floodplains (m³)",
         default=0,
         category="init_state",
+        dtype="hpfloat",
     )
 
     protected_storage: torch.Tensor = BaseField(
         description="Current water volume stored in protected areas (m³)",
         default=0,
         category="init_state",
+        dtype="hpfloat",
     )
 
     protected_depth: torch.Tensor = BaseField(
@@ -343,6 +346,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Total water storage per catchment (m³)",
         category="state",
+        dtype="hpfloat",
     )
     @cached_property
     def total_storage(self) -> torch.Tensor:
@@ -352,10 +356,11 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Total outflow via all bifurcation paths (m³ s⁻¹)",
         category="state",
+        dtype="hpfloat",
     )
     @cached_property
     def global_bifurcation_outflow(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
+        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(
         description="Levee surface elevation (m a.s.l.)",
@@ -370,10 +375,11 @@ class BaseModule(AbstractModule):
                      "Can not be saved, as it is a temporary state."),
         save_idx=None,
         category="state",
+        dtype="hpfloat",
     )
     @cached_property
     def outgoing_storage(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
+        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(
         description="Water-surface elevation (m a.s.l.)",
@@ -402,10 +408,11 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Total inflow into river channels (m³ s⁻¹)",
         category="state",
+        dtype="hpfloat",
     )
     @cached_property
     def river_inflow(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
+        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(
         description="Total flooded area (m²)",
@@ -427,10 +434,11 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Total inflow to floodplains (m³ s⁻¹)",
         category="state",
+        dtype="hpfloat",
     )
     @cached_property
     def flood_inflow(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
+        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(
         description="Total outflow from catchment (river + flood) (m³ s⁻¹)",

@@ -7,6 +7,8 @@
 import triton
 import triton.language as tl
 
+from cmfgpu.phys.utils import typed_sqrt
+
 
 # -----------------------------------------------------------------------------
 # Kernel: Compute flood stage, river/flood storage, depths, and flood fraction
@@ -121,7 +123,7 @@ def compute_flood_stage_kernel(
         (next_flood_depth - prev_flood_depth) / width_increment
     )
 
-    diff_width = tl.sqrt(
+    diff_width = typed_sqrt(
         prev_total_width * prev_total_width +
         2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
     ) - prev_total_width
@@ -293,7 +295,7 @@ def compute_flood_stage_log_kernel(
         (next_flood_depth - prev_flood_depth) / width_increment
     )
     
-    diff_width = tl.sqrt(
+    diff_width = typed_sqrt(
         prev_total_width * prev_total_width +
         2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
     ) - prev_total_width
@@ -473,7 +475,7 @@ def compute_flood_stage_batched_kernel(
         (next_flood_depth - prev_flood_depth) / width_increment
     )
 
-    diff_width = tl.sqrt(
+    diff_width = typed_sqrt(
         prev_total_width * prev_total_width +
         2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
     ) - prev_total_width

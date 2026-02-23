@@ -13,6 +13,7 @@ scripts_hpc/
 temp/
 inp/
 etc/
+fortran/
 *_cpu.py
 *cutile.py
 cmfgpu/phys/cutile/

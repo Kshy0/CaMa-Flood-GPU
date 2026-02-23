@@ -7,6 +7,8 @@
 import triton
 import triton.language as tl
 
+from cmfgpu.phys.utils import typed_sqrt
+
 
 @triton.jit
 def compute_adaptive_time_step_kernel(
@@ -29,8 +31,14 @@ def compute_adaptive_time_step_kernel(
     downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=float('inf'))
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
+
+    # Upcast to fp32 for intermediate computation:
+    # time_step (86400) exceeds fp16 max (65504), so fp16 would overflow.
+    downstream_distance = downstream_distance.to(tl.float32)
+    river_depth = river_depth.to(tl.float32)
+
     depth = tl.maximum(river_depth, 0.01)
-    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
+    dt = adaptive_time_factor * downstream_distance / typed_sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
     
     min_dt = tl.min(dt_clamped)
@@ -74,8 +82,14 @@ def compute_adaptive_time_step_batched_kernel(
     downstream_distance = tl.load(downstream_distance_ptr + (trial_offset if batched_downstream_distance else 0) + offs, mask=mask, other=float('inf'))
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + trial_offset + offs, mask=mask, other=0)
+
+    # Upcast to fp32 for intermediate computation:
+    # time_step (86400) exceeds fp16 max (65504), so fp16 would overflow.
+    downstream_distance = downstream_distance.to(tl.float32)
+    river_depth = river_depth.to(tl.float32)
+
     depth = tl.maximum(river_depth, 0.01)
-    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
+    dt = adaptive_time_factor * downstream_distance / typed_sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
     
     min_dt = tl.min(dt_clamped)

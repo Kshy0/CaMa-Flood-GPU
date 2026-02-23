@@ -22,7 +22,7 @@ from pydantic.fields import FieldInfo
 def TensorField(
     description: str,
     shape: Tuple[str, ...],
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
     group_by: Optional[str] = None,
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
@@ -52,7 +52,7 @@ def TensorField(
                   - 'discard': Set to None after initialization to maximize memory saving
         **kwargs: Additional Field parameters
     """
-    if dtype != "float":
+    if dtype not in ("float", "hpfloat"):
         save_idx = None
 
     if save_idx is None:
@@ -76,7 +76,7 @@ def TensorField(
 def computed_tensor_field(
     description: str,
     shape: Tuple[str, ...],
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
@@ -106,7 +106,7 @@ def computed_tensor_field(
     if expr is not None and category != "virtual":
         raise ValueError("expr can only be provided when category is 'virtual'")
 
-    if dtype != "float":
+    if dtype not in ("float", "hpfloat"):
         save_idx = None
 
     if save_idx is None:
@@ -157,14 +157,57 @@ class AbstractModule(BaseModel, ABC):
     conflicts: ClassVar[List[str]] = []  # List of modules that cannot co-exist with this module
     group_by: ClassVar[Optional[str]] = None  # Variable indicating basin membership
     nc_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "device", "precision", "rank"
+        "opened_modules", "device", "precision", "mixed_precision", "rank"
     ]  # Fields to exclude from HDF5
 
-    opened_modules: List[str] = Field(default_factory=list)
-    rank: int = Field(default=0, description="Current process rank in distributed setup")
-    device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
-    precision: torch.dtype = Field(default=torch.float32, description="Data type for tensors")
-    num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
+    opened_modules: List[str] = Field(
+        default_factory=list,
+    )
+    rank: int = Field(
+        default=0,
+        description="Current process rank in distributed setup",
+    )
+    device: torch.device = Field(
+        default=torch.device("cpu"),
+        description="Device for tensors (e.g., 'cuda:0', 'cpu')",
+    )
+    precision: torch.dtype = Field(
+        default=torch.float32,
+        description="Data type for tensors",
+    )
+    mixed_precision: bool = Field(
+        default=False,
+        description=(
+            "Enable mixed precision for hpfloat tensors (storage variables).\n"
+            "When True, hpfloat tensors are promoted one level above base precision:\n"
+            "  bfloat16 → float32, float32 → float64, float64 → float64 (no promotion)."
+        ),
+    )
+    num_trials: Optional[int] = Field(
+        default=None,
+        description="Number of parallel simulations (ensemble members)",
+    )
+
+    @property
+    def high_precision(self) -> torch.dtype:
+        """Return the dtype for hpfloat tensors.
+
+        When ``mixed_precision`` is False (default), hpfloat uses the same
+        dtype as ``precision`` — all tensors share one precision level.
+
+        When ``mixed_precision`` is True, hpfloat is promoted one level:
+          bfloat16 → float32, float32 → float64, float64 → float64.
+        This mirrors Fortran CaMa-Flood's JPRD (double-precision) for
+        storage variables (P2RIVSTO, P2FLDSTO, etc.).
+        """
+        if not self.mixed_precision:
+            return self.precision
+        _hp_map = {
+            torch.bfloat16: torch.float32,
+            torch.float32: torch.float64,
+            torch.float64: torch.float64,
+        }
+        return _hp_map.get(self.precision, self.precision)
     
     _expanded_params: set = PrivateAttr(default_factory=set)
 
@@ -216,6 +259,7 @@ class AbstractModule(BaseModel, ABC):
             tensor_dtype = field_info.json_schema_extra.get('tensor_dtype', 'float')
             dtype_map = {
                 'float': self.precision,
+                'hpfloat': self.high_precision,
                 'int': torch.int64,
                 'bool': torch.bool
             }
@@ -303,6 +347,7 @@ class AbstractModule(BaseModel, ABC):
         
         dtype_map = {
             'float': self.precision,
+            'hpfloat': self.high_precision,
             'int': torch.int64,
             'bool': torch.bool
         }

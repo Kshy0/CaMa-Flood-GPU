@@ -6,7 +6,8 @@
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+from cmfgpu.phys.utils import typed_pow, typed_sqrt
 
 
 @triton.jit
@@ -65,8 +66,8 @@ def compute_bifurcation_outflow_kernel(
         updated_bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
         # Calculate semi-implicit flow depth for bifurcation
         bifurcation_semi_implicit_flow_depth = tl.maximum(
-            tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
-            tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
+            typed_sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
+            typed_sqrt(updated_bifurcation_cross_section_depth * 0.01)
         )
         bifurcation_width = tl.load(bifurcation_width_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask, other=0.0)
@@ -78,7 +79,7 @@ def compute_bifurcation_outflow_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * libdevice.pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
+                    * typed_pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
@@ -212,8 +213,8 @@ def compute_bifurcation_outflow_batched_kernel(
         updated_bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
         # Calculate semi-implicit flow depth for bifurcation
         bifurcation_semi_implicit_flow_depth = tl.maximum(
-            tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
-            tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
+            typed_sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
+            typed_sqrt(updated_bifurcation_cross_section_depth * 0.01)
         )
         bifurcation_width = tl.load(bifurcation_width_ptr + width_base + level_idx, mask=mask, other=0.0)
         bifurcation_outflow = tl.load(bifurcation_outflow_ptr + trial_offset_levels + level_idx, mask=mask, other=0.0)
@@ -225,7 +226,7 @@ def compute_bifurcation_outflow_batched_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * libdevice.pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
+                    * typed_pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)

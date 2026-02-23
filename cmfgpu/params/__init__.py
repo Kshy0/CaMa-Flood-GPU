@@ -5,8 +5,25 @@
 #
 
 from cmfgpu.params.allocation.hires_map import HiResMap
-from cmfgpu.params.estimate_river_geometry import estimate_river_geometry
+from cmfgpu.params.estimate_river_geometry import (
+    accumulate_discharge,
+    estimate_river_geometry,
+)
+from cmfgpu.params.export_bin import (
+    export_inpmat,
+    export_map_params,
+    export_to_cama_bin,
+)
 from cmfgpu.params.input_proxy import InputProxy
 from cmfgpu.params.merit_map import MERITMap
 
-__all__ = ["HiResMap", "InputProxy", "MERITMap", "estimate_river_geometry"]
+__all__ = [
+    "HiResMap",
+    "InputProxy",
+    "MERITMap",
+    "accumulate_discharge",
+    "estimate_river_geometry",
+    "export_inpmat",
+    "export_map_params",
+    "export_to_cama_bin",
+]

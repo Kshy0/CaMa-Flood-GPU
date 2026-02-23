@@ -77,30 +77,103 @@ class AbstractModel(BaseModel, ABC):
     group_by: ClassVar[str] = "group_id"  # Default group variable, override in subclasses
 
     # Instance fields
-    experiment_name: str = Field(default="experiment", description="Name of the experiment")
-    input_proxy: InputProxy = Field(default=..., description="InputProxy object containing model data")
-    output_dir: Path = Field(default_factory=lambda: Path("./out"), description="Path to the output directory")
-    opened_modules: List[str] = Field(default_factory=list, description="List of active modules")
+    experiment_name: str = Field(
+        default="experiment",
+        description="Name of the experiment",
+    )
+    input_proxy: InputProxy = Field(
+        default=...,
+        description="InputProxy object containing model data",
+    )
+    output_dir: Path = Field(
+        default_factory=lambda: Path("./out"),
+        description="Path to the output directory",
+    )
+    opened_modules: List[str] = Field(
+        default_factory=list,
+        description="List of active modules",
+    )
     # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
     # one variable can appear under multiple ops.
     variables_to_save: Optional[Dict[str, Union[str, List[Union[str, Dict[str, str]]]]]] = Field(
-        None, description="Statistics to save, in the form {op: [vars...]}. Supported ops: mean, max, min, last, first, mid, sum. For max/min, argmax/argmin are automatically computed. Variables can be strings or {alias: expr} dicts."
+        default=None,
+        description=(
+            "Statistics to save, in the form {op: [vars...]}. "
+            "Supported ops: mean, max, min, last, first, mid, sum. "
+            "For max/min, argmax/argmin are automatically computed. "
+            "Variables can be strings or {alias: expr} dicts."
+        ),
     )
-    precision: Literal["float32"] = Field(default="float32", description="Precision of the model")
-    world_size: int = Field(default=1, description="Total number of distributed processes")
-    rank: int = Field(default=0, description="Current process rank in distributed setup")
-    device: torch.device = Field(default=torch.device("cpu"), description="Device for tensors (e.g., 'cuda:0', 'cpu')")
-    BLOCK_SIZE: int = Field(default=256, description="GPU block size for kernels")
-    output_workers: int = Field(default=2, description="Number of workers for writing output files")
-    output_complevel: int = Field(default=4, description="Compression level for output NetCDF files", ge=0, le=9)
-    output_split_by_year: bool = Field(default=False, description="Whether to split output files by year")
-    num_trials: Optional[int] = Field(default=None, description="Number of parallel simulations (ensemble members)")
-    save_kernels: bool = Field(default=False, description="Whether to save generated Triton kernels")
-    max_pending_steps: int = Field(default=20, description="Maximum number of pending time steps for output buffering")
-    output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(default=None, description="Time to start saving output")
-    calendar: str = Field(default="standard", description="Calendar type for time handling (e.g., standard, noleap)")
-    in_memory_output: bool = Field(default=False, description="Store output in memory instead of writing to NC files")
-    result_device: Optional[torch.device] = Field(default=None, description="Device for in-memory results (default: CPU)")
+    precision: Literal["bfloat16", "float32", "float64"] = Field(
+        default="float32",
+        description="Base precision of the model",
+    )
+    mixed_precision: bool = Field(
+        default=False,
+        description=(
+            "Enable mixed precision for hpfloat (storage) tensors.\n"
+            "When True, hpfloat tensors are promoted one level above base precision:\n"
+            "  bfloat16 → float32, float32 → float64, float64 → float64 (no promotion)."
+        ),
+    )
+    world_size: int = Field(
+        default=1,
+        description="Total number of distributed processes",
+    )
+    rank: int = Field(
+        default=0,
+        description="Current process rank in distributed setup",
+    )
+    device: torch.device = Field(
+        default=torch.device("cpu"),
+        description="Device for tensors (e.g., 'cuda:0', 'cpu')",
+    )
+    BLOCK_SIZE: int = Field(
+        default=256,
+        description="GPU block size for kernels",
+    )
+    output_workers: int = Field(
+        default=2,
+        description="Number of workers for writing output files",
+    )
+    output_complevel: int = Field(
+        default=4,
+        description="Compression level for output NetCDF files",
+        ge=0,
+        le=9,
+    )
+    output_split_by_year: bool = Field(
+        default=False,
+        description="Whether to split output files by year",
+    )
+    num_trials: Optional[int] = Field(
+        default=None,
+        description="Number of parallel simulations (ensemble members)",
+    )
+    save_kernels: bool = Field(
+        default=False,
+        description="Whether to save generated Triton kernels",
+    )
+    max_pending_steps: int = Field(
+        default=20,
+        description="Maximum number of pending time steps for output buffering",
+    )
+    output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(
+        default=None,
+        description="Time to start saving output",
+    )
+    calendar: str = Field(
+        default="standard",
+        description="Calendar type for time handling (e.g., standard, noleap)",
+    )
+    in_memory_output: bool = Field(
+        default=False,
+        description="Store output in memory instead of writing to NC files",
+    )
+    result_device: Optional[torch.device] = Field(
+        default=None,
+        description="Device for in-memory results (default: CPU)",
+    )
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
 
@@ -589,7 +662,12 @@ class AbstractModel(BaseModel, ABC):
 
     @cached_property
     def dtype(self) -> torch.dtype:
-        return torch.float32 if self.precision == "float32" else torch.float64
+        _dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+            "float64": torch.float64,
+        }
+        return _dtype_map[self.precision]
 
     @cached_property
     def output_full_dir(self) -> Path:
@@ -669,6 +747,7 @@ class AbstractModel(BaseModel, ABC):
                 device=self.device,
                 world_size=self.world_size,
                 precision=self.dtype,
+                mixed_precision=self.mixed_precision,
                 num_trials=self.num_trials,
                 **self._modules,
                 **module_data
@@ -826,6 +905,7 @@ class AbstractModel(BaseModel, ABC):
             calendar=self.calendar,
             in_memory_mode=self.in_memory_output,
             result_device=self.result_device,
+            save_precision=self.dtype,
         )
 
         registered_vars = set()

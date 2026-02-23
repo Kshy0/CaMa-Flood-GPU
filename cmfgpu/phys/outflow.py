@@ -6,7 +6,8 @@
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+from cmfgpu.phys.utils import typed_pow, typed_sqrt
 
 
 @triton.jit
@@ -113,7 +114,7 @@ def compute_outflow_kernel(
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
     updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
-    river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
+    river_semi_implicit_flow_depth = tl.maximum(typed_sqrt(
         updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
@@ -122,7 +123,7 @@ def compute_outflow_kernel(
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(
-        tl.sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
+        typed_sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
         1e-6
     )
 
@@ -133,7 +134,7 @@ def compute_outflow_kernel(
         flood_storage / river_length - flood_depth * river_width,
         0.0
     )
-    flood_implicit_area = tl.maximum(tl.sqrt(
+    flood_implicit_area = tl.maximum(typed_sqrt(
         updated_flood_cross_section_area * tl.maximum(flood_cross_section_area, 1e-6)
     ), 1e-6)
 
@@ -151,9 +152,9 @@ def compute_outflow_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use libdevice.pow() for power calculation
+    # Use typed_pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * libdevice.pow(river_semi_implicit_flow_depth, -7.0/3.0)
+                      * typed_pow(river_semi_implicit_flow_depth, -7.0/3.0)
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -165,9 +166,9 @@ def compute_outflow_kernel(
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     
-    # Use libdevice.pow() for power calculation
+    # Use typed_pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * libdevice.pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
+                      * typed_pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
@@ -224,7 +225,8 @@ def compute_inflow_kernel(
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
-    total_storage_ptr,             # *f32: Total storage
+    river_storage_ptr,             # *f64: River storage (rivsto)
+    flood_storage_ptr,             # *f64: Flood storage (fldsto)
     outgoing_storage_ptr,          # *f32: Outgoing storage
     river_inflow_ptr,              # *f32: River inflow (output, atomic add)
     flood_inflow_ptr,              # *f32: Flood inflow (output, atomic add)
@@ -239,17 +241,19 @@ def compute_inflow_kernel(
     # -------- Load for limiting --------
     river_outflow   = tl.load(river_outflow_ptr      + offs, mask=mask, other=0.0)
     flood_outflow   = tl.load(flood_outflow_ptr      + offs, mask=mask, other=0.0)
-    total_storage = tl.load(total_storage_ptr      + offs, mask=mask, other=0.0)
     outgoing_storage = tl.load(outgoing_storage_ptr   + offs, mask=mask, other=0.0)
 
+    # d2rate: Fortran uses (rivsto + fldsto) / p2stoout — excludes levsto
+    rate_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0) + tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
+
     # Local limit
-    limit_rate = tl.where(outgoing_storage > 1e-8, tl.minimum(total_storage / outgoing_storage, 1.0), 1.0)
+    limit_rate = tl.where(outgoing_storage > 1e-8, tl.minimum(rate_storage / outgoing_storage, 1.0), 1.0)
 
     # Downstream limiting
     downstream_idx   = tl.load(downstream_idx_ptr        + offs, mask=mask, other=0)
     outgoing_storage_downstream   = tl.load(outgoing_storage_ptr + downstream_idx,  mask=mask, other=0.0)
-    total_storage_downstream   = tl.load(total_storage_ptr     + downstream_idx,  mask=mask, other=0.0)
-    limit_rate_downstream = tl.where(outgoing_storage_downstream > 1e-8, tl.minimum(total_storage_downstream / outgoing_storage_downstream, 1.0), 1.0)
+    rate_storage_downstream = tl.load(river_storage_ptr + downstream_idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx, mask=mask, other=0.0)
+    limit_rate_downstream = tl.where(outgoing_storage_downstream > 1e-8, tl.minimum(rate_storage_downstream / outgoing_storage_downstream, 1.0), 1.0)
 
     # Apply limits
     updated_river_outflow = tl.where(river_outflow >= 0.0, river_outflow * limit_rate,   river_outflow * limit_rate_downstream)
@@ -386,7 +390,7 @@ def compute_outflow_batched_kernel(
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
     updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
-    river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
+    river_semi_implicit_flow_depth = tl.maximum(typed_sqrt(
         updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
@@ -395,7 +399,7 @@ def compute_outflow_batched_kernel(
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(
-        tl.sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
+        typed_sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
         1e-6
     )
 
@@ -406,7 +410,7 @@ def compute_outflow_batched_kernel(
         flood_storage / river_length - flood_depth * river_width,
         0.0
     )
-    flood_implicit_area = tl.maximum(tl.sqrt(
+    flood_implicit_area = tl.maximum(typed_sqrt(
         updated_flood_cross_section_area * tl.maximum(flood_cross_section_area, 1e-6)
     ), 1e-6)
 
@@ -424,9 +428,9 @@ def compute_outflow_batched_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use libdevice.pow() for power calculation
+    # Use typed_pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * libdevice.pow(river_semi_implicit_flow_depth, -7.0/3.0)
+                      * typed_pow(river_semi_implicit_flow_depth, -7.0/3.0)
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -438,9 +442,9 @@ def compute_outflow_batched_kernel(
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     
-    # Use libdevice.pow() for power calculation
+    # Use typed_pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * libdevice.pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
+                      * typed_pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
@@ -496,7 +500,8 @@ def compute_inflow_batched_kernel(
     downstream_idx_ptr,            # *i32: Downstream indices
     river_outflow_ptr,             # *f32: River outflow (in/out)
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
-    total_storage_ptr,             # *f32: Total storage
+    river_storage_ptr,             # *f64: River storage (rivsto)
+    flood_storage_ptr,             # *f64: Flood storage (fldsto)
     outgoing_storage_ptr,          # *f32: Outgoing storage
     river_inflow_ptr,              # *f32: River inflow (output, atomic add)
     flood_inflow_ptr,              # *f32: Flood inflow (output, atomic add)
@@ -514,11 +519,13 @@ def compute_inflow_batched_kernel(
     # -------- Load for limiting --------
     river_outflow   = tl.load(river_outflow_ptr      + idx, mask=mask, other=0.0)
     flood_outflow   = tl.load(flood_outflow_ptr      + idx, mask=mask, other=0.0)
-    total_storage = tl.load(total_storage_ptr      + idx, mask=mask, other=0.0)
     outgoing_storage = tl.load(outgoing_storage_ptr   + idx, mask=mask, other=0.0)
 
+    # d2rate: Fortran uses (rivsto + fldsto) / p2stoout — excludes levsto
+    rate_storage = tl.load(river_storage_ptr + idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + idx, mask=mask, other=0.0)
+
     # Local limit
-    limit_rate = tl.where(outgoing_storage > 1e-8, tl.minimum(total_storage / outgoing_storage, 1.0), 1.0)
+    limit_rate = tl.where(outgoing_storage > 1e-8, tl.minimum(rate_storage / outgoing_storage, 1.0), 1.0)
 
     # Downstream limiting
     # Topology is never batched
@@ -529,8 +536,8 @@ def compute_inflow_batched_kernel(
     downstream_idx_global = trial_offset + downstream_idx
     
     outgoing_storage_downstream   = tl.load(outgoing_storage_ptr + downstream_idx_global,  mask=mask, other=0.0)
-    total_storage_downstream   = tl.load(total_storage_ptr     + downstream_idx_global,  mask=mask, other=0.0)
-    limit_rate_downstream = tl.where(outgoing_storage_downstream > 1e-8, tl.minimum(total_storage_downstream / outgoing_storage_downstream, 1.0), 1.0)
+    rate_storage_downstream = tl.load(river_storage_ptr + downstream_idx_global, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx_global, mask=mask, other=0.0)
+    limit_rate_downstream = tl.where(outgoing_storage_downstream > 1e-8, tl.minimum(rate_storage_downstream / outgoing_storage_downstream, 1.0), 1.0)
 
     # Apply limits
     updated_river_outflow = tl.where(river_outflow >= 0.0, river_outflow * limit_rate,   river_outflow * limit_rate_downstream)

@@ -8,7 +8,8 @@
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+from cmfgpu.phys.utils import typed_pow, typed_sqrt
 
 
 @triton.jit
@@ -169,7 +170,7 @@ def compute_levee_stage_kernel(
     # --- Logic for Case 3 (Search B Results) ---
     dsto_add_B = total_storage - dsto_fil_B
     term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / (gradient_B + 1e-9)
-    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
+    dwth_add_B = -dwth_fil_B + typed_sqrt(tl.maximum(term_B, 0.0))
     ddph_add_B = dwth_add_B * gradient_B
     p_dph_B_found = levee_base_height + ddph_fil_B + ddph_add_B
     f_frc_B_found = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
@@ -402,7 +403,7 @@ def compute_levee_stage_log_kernel(
     # --- Logic for Case 3 (Search B Results) ---
     dsto_add_B = total_storage - dsto_fil_B
     term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / (gradient_B + 1e-9)
-    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
+    dwth_add_B = -dwth_fil_B + typed_sqrt(tl.maximum(term_B, 0.0))
     ddph_add_B = dwth_add_B * gradient_B
     p_dph_B_found = levee_base_height + ddph_fil_B + ddph_add_B
     f_frc_B_found = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
@@ -555,8 +556,8 @@ def compute_levee_bifurcation_outflow_kernel(
         
         if level == 0:
             bifurcation_semi_implicit_flow_depth = tl.maximum(
-                tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
-                tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
+                typed_sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
+                typed_sqrt(updated_bifurcation_cross_section_depth * 0.01)
             )
         else:
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth
@@ -571,7 +572,7 @@ def compute_levee_bifurcation_outflow_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * libdevice.pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
+                    * typed_pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
@@ -778,7 +779,7 @@ def compute_levee_stage_batched_kernel(
     # --- Logic for Case 3 (Search B Results) ---
     dsto_add_B = total_storage - dsto_fil_B
     term_B = dwth_fil_B * dwth_fil_B + 2.0 * dsto_add_B / river_length / (gradient_B + 1e-9)
-    dwth_add_B = -dwth_fil_B + tl.sqrt(tl.maximum(term_B, 0.0))
+    dwth_add_B = -dwth_fil_B + typed_sqrt(tl.maximum(term_B, 0.0))
     ddph_add_B = dwth_add_B * gradient_B
     p_dph_B_found = levee_base_height + ddph_fil_B + ddph_add_B
     f_frc_B_found = (dwth_fil_B + levee_distance) / (dwth_inc * num_flood_levels)
@@ -944,8 +945,8 @@ def compute_levee_bifurcation_outflow_batched_kernel(
         
         if level == 0:
             bifurcation_semi_implicit_flow_depth = tl.maximum(
-                tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
-                tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
+                typed_sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
+                typed_sqrt(updated_bifurcation_cross_section_depth * 0.01)
             )
         else:
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth
@@ -960,7 +961,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * libdevice.pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
+                    * typed_pow(bifurcation_semi_implicit_flow_depth, -7.0/3.0)
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)

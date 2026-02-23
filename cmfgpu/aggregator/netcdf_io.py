@@ -294,7 +294,7 @@ class NetCDFIOMixin:
                 # Year transition - create new files for new year
                 self._create_netcdf_files(year=dt.year)
                 self._current_year = dt.year
-                self._macro_step_times = []  # Reset time mapping for new year
+                self._macro_step_times = [dt]  # Reset time mapping for new year (keep current dt)
         else:
             # Create NetCDF files if not already created
             if not self._files_created:

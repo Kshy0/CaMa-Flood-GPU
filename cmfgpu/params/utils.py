@@ -407,7 +407,8 @@ def plot_basins_common(
     default_cmap.set_bad(alpha=0.0)
 
     # Plot
-    plt.figure(figsize=(12, 10), dpi=600)
+    display_dpi = 150 if interactive else 600
+    plt.figure(figsize=(12, 10), dpi=display_dpi)
     
     if color_by_upstream_area and uparea_map is not None:
          # Use LogNorm for better visualization of large ranges in upstream area
@@ -754,7 +755,7 @@ def visualize_nc_basins(
 def crop_parameters_nc(
     input_nc: Union[str, Path],
     output_nc: Union[str, Path],
-    points_of_interest: Dict[str, Any],
+    points_of_interest: Dict[str, Any] = None,
     visualize: bool = False,
     only_save_pois: bool = False,
     interactive_basin_picker: bool = False,

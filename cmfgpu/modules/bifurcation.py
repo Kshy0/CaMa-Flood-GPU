@@ -78,7 +78,11 @@ class BifurcationModule(AbstractModule):
     description: ClassVar[str] = "Bifurcation flow module with multi-level channel calculations"
     dependencies: ClassVar[list] = ["base"]
 
-    base: Optional[BaseModule] = Field(default=None, exclude=True, description="Reference to BaseModule")
+    base: Optional[BaseModule] = Field(
+        default=None,
+        exclude=True,
+        description="Reference to BaseModule",
+    )
 
     # ------------------------------------------------------------------ #
     # IDs
