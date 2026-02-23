@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 from abc import ABC
-from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
@@ -23,45 +22,14 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       field_validator, model_validator)
 
 from cmfgpu.aggregator import StatisticsAggregator
-from cmfgpu.models.utils import compute_group_to_rank
+from cmfgpu.models.utils import (ActivePlan, ParameterPlanMixin, PlanItem,
+                                  ProgressMixin, ProgressTracker,
+                                  compute_group_to_rank)
 from cmfgpu.modules.abstract_module import AbstractModule
 from cmfgpu.params.input_proxy import InputProxy
-from cmfgpu.utils import find_indices_in_torch
 
 
-@dataclass
-class PlanItem:
-    # User inputs
-    variable_name: str
-    start_time: Union[datetime, cftime.datetime]
-    active_steps: int = 1
-    delta: Union[float, torch.Tensor] = 0.0
-    target_value: Optional[Union[float, torch.Tensor]] = None
-    target_ids: Optional[Union[List[int], torch.Tensor]] = None
-    
-    # Cached execution context (resolved once)
-    _module: Optional[Any] = None
-    _attr_name: str = ""
-    _indices: Optional[torch.Tensor] = None
-    _is_ready: bool = False
-
-    @property
-    def is_set_value(self) -> bool:
-        return self.target_value is not None
-
-    @property
-    def is_incremental(self) -> bool:
-        return not self.is_set_value
-
-@dataclass
-class ActivePlan:
-    item: PlanItem
-    steps_executed: int = 0
-    executed_once: bool = False
-
-
-
-class AbstractModel(BaseModel, ABC):
+class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
     """
     Master controller for CaMa-Flood-GPU workflow using the AbstractModule hierarchy.
     """
@@ -185,6 +153,9 @@ class AbstractModel(BaseModel, ABC):
     _next_plan_idx: int = PrivateAttr(default=0)
     _cached_grouped_plans: Optional[Dict[Tuple[int, str], List[ActivePlan]]] = PrivateAttr(default=None)
 
+    # Progress Tracking
+    _progress: Optional[ProgressTracker] = PrivateAttr(default=None)
+
     @model_validator(mode='after')
     def align_output_start_time(self) -> Self:
         """
@@ -243,423 +214,6 @@ class AbstractModel(BaseModel, ABC):
                     if name not in module_class.nc_excluded_fields:
                         yield module_name, module_class, name, info
 
-    def _apply_grouped_changes(self, module: Any, attr: str, plans: List[ActivePlan]):
-        try:
-            current_val = getattr(module, attr)
-            is_tensor = isinstance(current_val, torch.Tensor)
-            
-            # Optimization: Calculate global delta and set value first
-            global_delta = 0.0
-            global_set_value = None
-            
-            # Separate sparse updates
-            sparse_updates = [] # List of (indices, value, is_set)
-
-            # Sort plans: Set values first, then Incremental
-            # This ensures that if we have Set and Add in the same step, Add is applied on top of Set
-            plans.sort(key=lambda x: x.item.is_incremental)
-
-            for active in plans:
-                item = active.item
-                
-                # Determine value and type
-                if item.is_set_value:
-                    val = item.target_value
-                    is_set = True
-                else:
-                    val = item.delta
-                    is_set = False
-                
-                # Update execution counters
-                active.steps_executed += 1
-                active.executed_once = True
-
-                # Check if global or sparse
-                if item._indices is None:
-                    if is_set:
-                        global_set_value = val
-                        global_delta = 0.0 # Reset delta if global set happens? 
-                        # Logic: Set establishes baseline. Previous deltas are overwritten by Set.
-                        # Subsequent deltas (in sorted order) will add to this baseline.
-                    else:
-                        global_delta += val
-                else:
-                    sparse_updates.append((item._indices, val, is_set))
-
-            # Apply Global Changes
-            if is_tensor:
-                if global_set_value is not None:
-                    current_val.fill_(global_set_value)
-                
-                if global_delta != 0.0:
-                    current_val.add_(global_delta)
-                
-                # Apply Sparse Changes
-                for indices, val, is_set in sparse_updates:
-                    if is_set:
-                        current_val[indices] = val
-                    else:
-                        current_val[indices] += val
-            else:
-                # Scalar handling
-                new_val = current_val
-                if global_set_value is not None:
-                    new_val = global_set_value
-                new_val += global_delta
-                
-                if sparse_updates:
-                     print(f"ParameterChangePlan Warning: Sparse updates ignored for scalar variable {attr}.")
-                
-                setattr(module, attr, new_val)
-
-        except Exception as e:
-            print(f"ParameterChangePlan Error: Failed to update {attr}. {e}")
-
-    def execute_parameter_change_plan(self, current_time: Union[datetime, cftime.datetime]) -> None:
-        """
-        Execute the plans for the current time step.
-        """
-        if current_time is None:
-            return
-
-        plans_changed = False
-
-        # 1. Activate new plans
-        while self._next_plan_idx < len(self._plans):
-            plan = self._plans[self._next_plan_idx]
-            if current_time >= plan.start_time:
-                self._active_plans.append(ActivePlan(item=plan))
-                self._next_plan_idx += 1
-                plans_changed = True
-            else:
-                break
-        
-        if not self._active_plans:
-            self._cached_grouped_plans = None
-            return
-
-        # 2. Filter finished plans and check if grouping update is needed
-        # Use list comprehension for better performance
-        initial_count = len(self._active_plans)
-        self._active_plans = [
-            active for active in self._active_plans
-            if active.steps_executed < active.item.active_steps
-        ]
-        if len(self._active_plans) != initial_count:
-            plans_changed = True
-
-        if not self._active_plans:
-            self._cached_grouped_plans = None
-            return
-
-        # 3. Update cached grouping if needed
-        if plans_changed or self._cached_grouped_plans is None:
-            grouped_plans: Dict[Tuple[int, str], List[ActivePlan]] = {}
-            for active in self._active_plans:
-                if active.item._is_ready:
-                    # Use id(module) as key because Pydantic models are not hashable
-                    key = (id(active.item._module), active.item._attr_name)
-                    # Use setdefault for cleaner and slightly more efficient code
-                    grouped_plans.setdefault(key, []).append(active)
-            self._cached_grouped_plans = grouped_plans
-
-        # 4. Execute grouped plans
-        for (_, attr), plans in self._cached_grouped_plans.items():
-            if not plans:
-                continue
-            module = plans[0].item._module
-            self._apply_grouped_changes(module, attr, plans)
-
-    def _resolve_id_tensor(self, module: Any, id_attr: Optional[str]) -> Optional[torch.Tensor]:
-        """
-        Helper to resolve the ID tensor from a module given an attribute path.
-        If not found locally, attempts to find it globally via variable_map.
-        """
-        if not id_attr:
-            return None
-            
-        # 1. Try local resolution (supports nested attributes)
-        if "." in id_attr:
-            # Try to resolve nested attribute
-            parts = id_attr.split(".")
-            curr = module
-            found = True
-            for part in parts:
-                if hasattr(curr, part):
-                    curr = getattr(curr, part)
-                else:
-                    found = False
-                    break
-            if found and isinstance(curr, torch.Tensor):
-                return curr
-        elif hasattr(module, id_attr):
-            val = getattr(module, id_attr)
-            if isinstance(val, torch.Tensor):
-                return val
-
-        # 2. Try global resolution
-        if id_attr in self.variable_map:
-            mod_inst, field, _ = self.variable_map[id_attr]
-            if hasattr(mod_inst, field):
-                val = getattr(mod_inst, field)
-                if isinstance(val, torch.Tensor):
-                    return val
-
-        return None
-
-    def _resolve_plan_item(self, item: PlanItem):
-        variable_map = self.variable_map
-        
-        if item.variable_name in variable_map:
-            module, attr, id_attr = variable_map[item.variable_name]
-            item._module = module
-            item._attr_name = attr
-            
-            if item.target_ids is not None:
-                # Handle nested attributes (e.g. base.levee_catchment_id)
-                id_tensor = self._resolve_id_tensor(module, id_attr)
-                
-                if id_tensor is not None:
-                    if item.target_ids.device != id_tensor.device:
-                        item.target_ids = item.target_ids.to(id_tensor.device)
-                    
-                    indices = find_indices_in_torch(item.target_ids, id_tensor)
-                    
-                    # Strict check: All IDs must be found
-                    if torch.any(indices < 0):
-                        raise ValueError(f"ParameterChangePlan Error: Some target_ids for {item.variable_name} were not found in {id_attr}.")
-                        
-                    item._indices = indices
-                else:
-                    print(f"ParameterChangePlan Warning: Cannot find ID tensor '{id_attr}' for {item.variable_name}. Applying to ALL.")
-            
-            # Move tensor values to correct device
-            if isinstance(item.delta, torch.Tensor):
-                item.delta = item.delta.to(module.device)
-            if isinstance(item.target_value, torch.Tensor):
-                item.target_value = item.target_value.to(module.device)
-
-            item._is_ready = True
-        else:
-            print(f"ParameterChangePlan Warning: Variable {item.variable_name} not found in model.")
-
-    def add_parameter_change_plan(
-        self,
-        variable_name: str,
-        start_time: Union[datetime, cftime.datetime],
-        active_steps: int = 1,
-        delta: Union[float, torch.Tensor] = 0.0,
-        target_value: Optional[Union[float, torch.Tensor]] = None,
-        target_ids: Optional[Union[List[int], torch.Tensor]] = None,
-    ) -> None:
-        """
-        Add a parameter change plan.
-        """
-        if active_steps < 1:
-            raise ValueError("active_steps must be >= 1")
-
-        if target_ids is not None and not isinstance(target_ids, torch.Tensor):
-            target_ids = torch.tensor(target_ids, dtype=torch.int64)
-
-        # Ensure tensor values are on the correct device if possible, 
-        # but we don't have easy access to the module's device here until resolve.
-        # We will handle device movement in _resolve_plan_item or execution.
-
-        item = PlanItem(
-            variable_name=variable_name,
-            start_time=start_time,
-            active_steps=active_steps,
-            delta=delta,
-            target_value=target_value,
-            target_ids=target_ids
-        )
-        
-        self._resolve_plan_item(item)
-        self._plans.append(item)
-        # Keep plans sorted by start time for efficient activation
-        self._plans.sort(key=lambda x: x.start_time)
-        # Reset execution pointer if plans change
-        self._next_plan_idx = 0
-        self._active_plans.clear()
-
-    def get_variable(self, variable_name: str) -> Any:
-        if variable_name not in self.variable_map:
-            raise ValueError(f"Variable '{variable_name}' not found in model.")
-            
-        module, attr, _ = self.variable_map[variable_name]
-        return getattr(module, attr)
-
-    def set_variable_value(
-        self,
-        variable_name: str,
-        value: Union[float, torch.Tensor],
-        target_ids: Optional[Union[List[int], torch.Tensor]] = None,
-    ) -> None:
-        """
-        Directly set the value of a variable for specific IDs immediately.
-        
-        Args:
-            variable_name: Name of the variable to update.
-            value: New value (scalar or tensor).
-            target_ids: List of IDs to apply the change to. If None, applies to all.
-            
-        Raises:
-            ValueError: If variable not found or IDs not found.
-        """
-        if variable_name not in self.variable_map:
-            raise ValueError(f"Variable '{variable_name}' not found in model.")
-            
-        module, attr, id_attr = self.variable_map[variable_name]
-        current_val = getattr(module, attr)
-        
-        # Prepare value
-        if isinstance(value, torch.Tensor):
-            value = value.to(self.device)
-        
-        # Case 1: Global update
-        if target_ids is None:
-            if isinstance(current_val, torch.Tensor):
-                current_val[:] = value
-            else:
-                setattr(module, attr, value)
-            return
-
-        # Case 2: Sparse update (requires ID resolution)
-        if not isinstance(current_val, torch.Tensor):
-            print(f"Warning: Ignoring target_ids for scalar variable '{variable_name}'. Updating globally.")
-            setattr(module, attr, value)
-            return
-
-        # Resolve ID tensor
-        id_tensor = self._resolve_id_tensor(module, id_attr)
-        
-        if id_tensor is None:
-             raise ValueError(f"Cannot resolve ID tensor '{id_attr}' for variable '{variable_name}', so target_ids cannot be used.")
-
-        # Prepare target_ids
-        if not isinstance(target_ids, torch.Tensor):
-            target_ids = torch.tensor(target_ids, dtype=torch.int64, device=self.device)
-        else:
-            target_ids = target_ids.to(self.device)
-            
-        # Ensure id_tensor is on correct device (should be)
-        if id_tensor.device != target_ids.device:
-            target_ids = target_ids.to(id_tensor.device)
-
-        # Find indices
-        indices = find_indices_in_torch(target_ids, id_tensor)
-        
-        # Validate
-        if torch.any(indices < 0):
-            raise ValueError(f"Some target_ids for '{variable_name}' were not found in '{id_attr}'.")
-            
-        # Apply
-        current_val[indices] = value
-
-    def summarize_plan(self) -> None:
-        """
-        Print a summary of the parameter change plan and check for conflicts.
-        Raises ValueError if conflicts are detected (e.g. setting the same variable twice at the same time for the same location).
-        """
-        print(f"\n[rank {self.rank}] === Parameter Change Plan Summary ===")
-        
-        if not self._plans:
-            print("No parameter change plans defined.")
-            return
-
-        # Sort by time
-        sorted_plans = sorted(self._plans, key=lambda x: x.start_time)
-        
-        # Conflict Detection
-        # Group SET plans by (variable, time)
-        set_plans_map = {}
-        
-        for plan in sorted_plans:
-            if plan.is_set_value:
-                key = (plan.variable_name, plan.start_time)
-                # Use setdefault for cleaner and more efficient code
-                set_plans_map.setdefault(key, []).append(plan)
-
-        conflicts = []
-        
-        for (var_name, time), plans in set_plans_map.items():
-            if len(plans) > 1:
-                # Check overlaps
-                for i in range(len(plans)):
-                    for j in range(i + 1, len(plans)):
-                        p1 = plans[i]
-                        p2 = plans[j]
-                        
-                        # If either targets ALL (None), it conflicts with everything
-                        if p1.target_ids is None or p2.target_ids is None:
-                            conflicts.append(f"Conflict: Variable '{var_name}' set multiple times at {time}. One or both plans target ALL.")
-                            continue
-                            
-                        # Check intersection of IDs
-                        # Ensure tensors are on CPU for set operation
-                        ids1 = p1.target_ids
-                        if isinstance(ids1, torch.Tensor):
-                            ids1 = ids1.detach().cpu().numpy()
-                        else:
-                            ids1 = np.array(ids1)
-                            
-                        ids2 = p2.target_ids
-                        if isinstance(ids2, torch.Tensor):
-                            ids2 = ids2.detach().cpu().numpy()
-                        else:
-                            ids2 = np.array(ids2)
-                        
-                        # Use numpy intersect1d
-                        intersection = np.intersect1d(ids1, ids2)
-                        if intersection.size > 0:
-                            sample_conflict = intersection[:5].tolist()
-                            conflicts.append(f"Conflict: Variable '{var_name}' set multiple times at {time} for IDs {sample_conflict}...")
-
-        # Print Summary Table
-        print(f"{'Time':<25} | {'Variable':<20} | {'Type':<8} | {'Value':<10} | {'Steps':<10} | {'Target'}")
-        print("-" * 100)
-        
-        for plan in sorted_plans:
-            type_str = "SET" if plan.is_set_value else "ADD"
-            
-            # Handle Tensor values for display
-            val = plan.target_value if plan.is_set_value else plan.delta
-            if isinstance(val, torch.Tensor):
-                if val.numel() == 1:
-                    val_str = f"{val.item():.4g}"
-                else:
-                    val_str = "Tensor"
-            else:
-                val_str = f"{val:.4g}"
-
-            dur_str = f"{plan.active_steps}" if plan.is_incremental else "-"
-            
-            if plan.target_ids is None:
-                target_str = "ALL"
-            else:
-                count = len(plan.target_ids)
-                # Resolve ID attribute name for display
-                id_attr_name = "IDs"
-                if plan.variable_name in self.variable_map:
-                    _, _, id_attr = self.variable_map[plan.variable_name]
-                    if id_attr:
-                        id_attr_name = id_attr
-
-                if count <= 5:
-                    # Show IDs
-                    ids_list = plan.target_ids.tolist() if isinstance(plan.target_ids, torch.Tensor) else plan.target_ids
-                    target_str = f"{str(ids_list)} ({id_attr_name})"
-                else:
-                    target_str = f"{count} {id_attr_name}"
-            
-            print(f"{str(plan.start_time):<25} | {plan.variable_name:<20} | {type_str:<8} | {val_str:<10} | {dur_str:<10} | {target_str}")
-            
-        print("-" * 100)
-
-        if conflicts:
-            error_msg = "\n".join(conflicts)
-            raise ValueError(f"Parameter Plan Conflicts Detected:\n{error_msg}")
-
     @cached_property
     def dtype(self) -> torch.dtype:
         _dtype_map = {
@@ -708,7 +262,7 @@ class AbstractModel(BaseModel, ABC):
             else:
                 field_definitions[field_name] = (module_name, field_info)
 
-    def model_post_init(self, __context):
+    def model_post_init(self, __context: Any) -> None:
         """
         Post-initialization hook to validate opened modules and register them.
         """
@@ -819,7 +373,7 @@ class AbstractModel(BaseModel, ABC):
         print(f"{'-' * 65}")
         print(f"{'Total':<30} | {'':<15} | {total_memory / (1024 * 1024):<15.2f} MB\n")
 
-    def get_module(self, module_name: str) -> AbstractModule:
+    def get_module(self, module_name: str) -> Optional[AbstractModule]:
         return self._modules[module_name] if module_name in self.opened_modules else None
 
     @cached_property

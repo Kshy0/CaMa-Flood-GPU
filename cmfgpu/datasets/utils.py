@@ -12,7 +12,7 @@ from typing import Union
 import cftime
 
 
-def single_file_key(dt) -> str:
+def single_file_key(dt: Union[datetime, cftime.datetime]) -> str:
     """Constant key for single-file mode."""
     return ""
 

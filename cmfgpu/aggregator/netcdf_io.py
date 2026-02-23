@@ -10,7 +10,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import cftime
 import netCDF4 as nc
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from cmfgpu.aggregator.aggregator import StatisticsAggregator
 
 
-def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
+def _write_time_step_netcdf_process(args: Tuple[Any, ...]) -> Tuple[str, int]:
     """Write a single time step to a NetCDF file. Each file contains a single variable."""
     (var_name, time_step_data, output_path, time_datetime) = args
     
@@ -75,7 +75,7 @@ def _write_time_step_netcdf_process(args: Tuple) -> Tuple[str, int]:
 
 
 
-def _create_netcdf_file_process(args: Tuple) -> Union[Path, List[Path]]:
+def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]]:
     """
     Process function for creating empty NetCDF files with proper structure.
     This function runs in a separate process.

@@ -74,6 +74,7 @@ def benchmark_block_sizes():
         prefix=prefix,
         suffix=suffix,
     )
+    model.set_total_steps(len(dataset))
 
     local_runoff_matrix = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,

@@ -148,7 +148,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
 
 
 
-    def _cleanup_temp_files(self):
+    def _cleanup_temp_files(self) -> None:
         """Remove temporary kernel files."""
         if self._temp_kernel_file and os.path.exists(self._temp_kernel_file):
             try:
@@ -157,7 +157,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
                 pass
 
 
-    def _cleanup_lock_files(self):
+    def _cleanup_lock_files(self) -> None:
         """Remove lock files associated with NetCDF outputs."""
         # Use _all_created_files if available, fallback to _netcdf_files
         paths = getattr(self, '_all_created_files', None)
@@ -174,7 +174,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
                         pass
     
 
-    def _cleanup_executor(self):
+    def _cleanup_executor(self) -> None:
         """Clean up the write executor."""
         if self._write_executors:
             # Wait for pending writes to complete
@@ -192,7 +192,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
             self._write_futures = []
     
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Clean up temporary files and executor when the object is destroyed."""
         self._cleanup_temp_files()
         self._cleanup_executor()

@@ -86,6 +86,7 @@ def main():
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year
     )
+    model.set_total_steps(len(dataset))
 
     local_runoff_matrix = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,

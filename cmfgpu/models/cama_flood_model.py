@@ -250,8 +250,13 @@ class CaMaFlood(AbstractModel):
             if self.rank == 0 and output_enabled:
                 self.log.write_step(self.log_path)
         if self.rank == 0:
-            msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
-            print(f"\r{msg:<80}", end="", flush=True)
+            self.progress_tick()
+            progress = self.format_progress()
+            if progress:
+                msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps} | {progress}"
+            else:
+                msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
+            print(f"\r\033[K{msg}", end="", flush=True)
     def do_one_sub_step(self, time_sub_step: float, runoff: torch.Tensor, sub_step: int, output_enabled: bool = True) -> None:
         """Execute one sub time step calculation"""
         # Outflow computation

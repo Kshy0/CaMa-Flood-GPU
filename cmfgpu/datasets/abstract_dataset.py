@@ -8,7 +8,7 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 import cftime
 import netCDF4 as nc
@@ -174,7 +174,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         return True
 
-    def time_iter(self):
+    def time_iter(self) -> Iterator[Tuple[datetime, bool, bool]]:
         """Returns an iterator that yields (time, is_valid, is_spin_up) tuples step-by-step."""
         valid_steps_count = 0
         
@@ -340,7 +340,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def build_local_runoff_matrix(self, 
                                   runoff_mapping_file: str, 
                                   desired_catchment_ids: Optional[np.ndarray] = None, 
-                                  device: torch.device = None,
+                                  device: Optional[torch.device] = None,
                                   precision: Literal["float32", "float64"]="float32") -> torch.Tensor:
         """
         Build PyTorch sparse matrix for mapping runoff data to specified catchments.
