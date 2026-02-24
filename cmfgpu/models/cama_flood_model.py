@@ -113,6 +113,7 @@ class CaMaFlood(AbstractModel):
             return None
         return lambda META: (triton.cdiv(self.base.num_levees * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
+    @torch.inference_mode()
     def step_advance(
         self,
         runoff: torch.Tensor,
@@ -522,7 +523,7 @@ class CaMaFlood(AbstractModel):
                 batched_river_width=self.base.batched_river_width,
                 batched_river_length=self.base.batched_river_length,
             )
-        elif self.log is not None and output_enabled:
+        elif self.log is not None and output_enabled and compute_flood_stage_log_kernel is not None:
             compute_flood_stage_log_kernel[self.base_grid](
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
@@ -559,6 +560,7 @@ class CaMaFlood(AbstractModel):
                 current_step=sub_step,
                 num_catchments=self.base.num_catchments,
                 num_flood_levels=self.base.num_flood_levels,
+                log_buffer_size=self.log.log_buffer_size,
                 BLOCK_SIZE=self.BLOCK_SIZE
             )
         else:

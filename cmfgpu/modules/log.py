@@ -52,7 +52,7 @@ class LogModule(AbstractModule):
     dependencies: ClassVar[list] = ["base"]
 
     log_buffer_size: int = Field(
-        default=1000,
+        default=4000,
         description="Size of the log buffer",
         ge=0,
     )
@@ -96,7 +96,7 @@ class LogModule(AbstractModule):
         ]
         if num_steps > self.log_buffer_size:
             old_size = self.log_buffer_size
-            self.log_buffer_size = num_steps + 20
+            self.log_buffer_size = num_steps + 1000
             for field in self.log_vars:
                 tensor = getattr(self, field)
                 tensor.resize_(self.log_buffer_size)
