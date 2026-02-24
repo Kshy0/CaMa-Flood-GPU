@@ -407,7 +407,11 @@ class AbstractModule(BaseModel, ABC):
                 tensor = tensor.contiguous()
                 
             # 3. Auto-fix device mismatch
-            if tensor.device != self.device:
+            if tensor.device.type != self.device.type or (
+                tensor.device.index is not None
+                and self.device.index is not None
+                and tensor.device.index != self.device.index
+            ):
                 tensor = tensor.to(self.device)
                 
             # 4. Auto-fix precision for floating-point tensors
@@ -445,7 +449,11 @@ class AbstractModule(BaseModel, ABC):
             tensor = getattr(self, field_name)
             if not isinstance(tensor, torch.Tensor):
                 continue
-            if tensor.device != self.device:
+            if tensor.device.type != self.device.type or (
+                tensor.device.index is not None
+                and self.device.index is not None
+                and tensor.device.index != self.device.index
+            ):
                 raise ValueError(
                     f"Computed field {field_name} must be on device {self.device}, "
                     f"but is on {tensor.device}"
@@ -532,7 +540,7 @@ class AbstractModule(BaseModel, ABC):
             # Check if it's a tensor
             if isinstance(value, torch.Tensor):
                 # Only count if on the main computing device
-                if value.device == self.device:
+                if value.device.type == self.device.type:
                     ptr = value.data_ptr()
                     if ptr not in seen_ptrs:
                         seen_ptrs.add(ptr)

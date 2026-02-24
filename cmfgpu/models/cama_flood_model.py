@@ -13,9 +13,13 @@ from typing import Callable, ClassVar, Dict, Optional, Self, Type, Union
 
 import cftime
 import torch
-import triton
 from pydantic import PrivateAttr, computed_field, model_validator
 from torch import distributed as dist
+
+def _cdiv(n: int, d: int) -> int:
+    """Ceiling division, equivalent to triton.cdiv."""
+    return (n + d - 1) // d
+
 
 from cmfgpu.models.abstract_model import AbstractModel
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
@@ -99,19 +103,19 @@ class CaMaFlood(AbstractModel):
 
     @cached_property
     def base_grid(self) -> Callable:
-        return lambda META: (triton.cdiv(self.base.num_catchments * (self.num_trials or 1), META["BLOCK_SIZE"]),)
+        return lambda META: (_cdiv(self.base.num_catchments * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
     @cached_property
     def bifurcation_grid(self) -> Callable:
         if not self.bifurcation_flag:
             return None
-        return lambda META: (triton.cdiv(self.bifurcation.num_bifurcation_paths * (self.num_trials or 1), META["BLOCK_SIZE"]),)
+        return lambda META: (_cdiv(self.bifurcation.num_bifurcation_paths * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
     @cached_property
     def levee_grid(self) -> Callable:
         if not self.levee_flag:
             return None
-        return lambda META: (triton.cdiv(self.base.num_levees * (self.num_trials or 1), META["BLOCK_SIZE"]),)
+        return lambda META: (_cdiv(self.base.num_levees * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
     @torch.inference_mode()
     def step_advance(

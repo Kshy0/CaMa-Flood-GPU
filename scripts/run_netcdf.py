@@ -4,6 +4,7 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 import torch
@@ -53,7 +54,12 @@ def main():
 
     batch_size = loader_workers
     local_rank, rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}")
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     input_proxy = InputProxy.from_nc(input_file)
 
@@ -103,11 +109,11 @@ def main():
         prefetch_factor=prefetch_factor, 
     )
 
-    stream = torch.cuda.Stream(device=device)
+    stream_ctx = torch.cuda.stream(torch.cuda.Stream(device=device)) if device.type == "cuda" else nullcontext()
     time_iter = dataset.time_iter()
     last_valid_time = start_date
     for batch_runoff in loader:
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, world_size)
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)

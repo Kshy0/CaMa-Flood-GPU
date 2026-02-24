@@ -5,6 +5,7 @@
 #
 
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 import torch
@@ -45,7 +46,12 @@ def benchmark_block_sizes():
 
     batch_size = loader_workers
     local_rank, rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}")
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     input_proxy = InputProxy.from_nc(input_file)
 
@@ -101,12 +107,15 @@ def benchmark_block_sizes():
         last_valid_time = start_date
         if rank == 0:
             print(f"Benchmarking BLOCK_SIZE={block_size}...")
-        stream = torch.cuda.Stream(device=device)
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            stream_ctx = torch.cuda.stream(torch.cuda.Stream(device=device))
+            torch.cuda.synchronize()
+        else:
+            stream_ctx = nullcontext()
         start = time.time()
 
         for batch_runoff in loader:
-            with torch.cuda.stream(stream):
+            with stream_ctx:
                 batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, world_size)
                 for runoff in batch_runoff:
                     if current_time > end_date:
@@ -120,7 +129,8 @@ def benchmark_block_sizes():
                     )
                     current_time += timedelta(seconds=time_step)
 
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         end = time.time()
 
         elapsed_ms = (end - start) * 1000

@@ -49,6 +49,7 @@ def _resolve_backend() -> str:
 
 
 KERNEL_BACKEND: str = _resolve_backend()
+os.environ.setdefault("CMFGPU_BACKEND", KERNEL_BACKEND)
 
 
 class TorchAdapter:
@@ -95,12 +96,14 @@ class TorchAdapter:
 def _torch_compile(fn: Callable) -> Callable:
     """Apply torch.compile with inference-optimized settings.
 
-    Uses ``reduce-overhead`` (CUDA-graph replay) for minimal kernel-launch
-    overhead on repeated forward calls, and ``fullgraph=True`` so graph
-    breaks become hard errors rather than silent performance cliffs.
+    Uses ``reduce-overhead`` (CUDA-graph replay) on CUDA for minimal
+    kernel-launch overhead.  Falls back to the default compile mode on
+    non-CUDA devices (MPS, CPU) where CUDA graphs are not supported.
     """
     import torch
-    return torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+    if torch.cuda.is_available():
+        return torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+    return torch.compile(fn)
 
 
 def adapt_torch_kernel(kernel_func: Callable, *, compile: bool = True) -> TorchAdapter:
