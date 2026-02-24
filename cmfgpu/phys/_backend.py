@@ -97,13 +97,14 @@ def _torch_compile(fn: Callable) -> Callable:
     """Apply torch.compile with inference-optimized settings.
 
     Uses ``reduce-overhead`` (CUDA-graph replay) on CUDA for minimal
-    kernel-launch overhead.  Falls back to the default compile mode on
-    non-CUDA devices (MPS, CPU) where CUDA graphs are not supported.
+    kernel-launch overhead.  On non-CUDA devices (MPS, CPU) we still
+    use ``fullgraph=True`` so that compilation errors surface at the
+    first call rather than lazily on a rare code-path hours later.
     """
     import torch
     if torch.cuda.is_available():
         return torch.compile(fn, mode="reduce-overhead", fullgraph=True)
-    return torch.compile(fn)
+    return torch.compile(fn, fullgraph=True)
 
 
 def adapt_torch_kernel(kernel_func: Callable, *, compile: bool = True) -> TorchAdapter:

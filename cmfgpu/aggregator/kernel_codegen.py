@@ -2272,16 +2272,21 @@ class KernelCodegenMixin:
         kernel_code = "\n".join(lines)
         self._write_and_import_kernels(kernel_code)
 
-        # Apply torch.compile for better performance (inference-only, CUDA graph replay)
+        # Apply torch.compile for better performance.
+        # CUDA: reduce-overhead (CUDA-graph replay) for minimal launch overhead.
+        # Non-CUDA (MPS / CPU): default mode (no CUDA graphs).
+        # fullgraph=False because the aggregator has boolean control-flow
+        # (is_inner_first / is_inner_last branches).
         import torch
         raw_fn = self._aggregator_function
-        try:
+        if torch.cuda.is_available():
             self._aggregator_function = torch.compile(
                 raw_fn, mode="reduce-overhead", fullgraph=False
             )
-        except Exception:
-            # Fall back to uncompiled if compile fails (e.g. unsupported platform)
-            self._aggregator_function = raw_fn
+        else:
+            self._aggregator_function = torch.compile(
+                raw_fn, fullgraph=False
+            )
 
         if self.save_kernels:
             self._save_kernel_file(kernel_code)

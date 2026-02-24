@@ -186,6 +186,30 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 pass
         return self
 
+    @model_validator(mode='after')
+    def validate_backend_precision(self) -> Self:
+        """Non-triton backends only support float32, no mixed precision.
+
+        MPS / CPU backends cannot handle float64 (MPS inductor rejects it
+        outright) or bfloat16 reliably.  Fail fast at model creation rather
+        than crashing mid-simulation.
+        """
+        from cmfgpu.phys._backend import KERNEL_BACKEND
+        if KERNEL_BACKEND != "triton":
+            if self.precision != "float32":
+                raise ValueError(
+                    f"Backend '{KERNEL_BACKEND}' only supports float32 precision, "
+                    f"got '{self.precision}'. Use the triton (CUDA) backend for "
+                    f"float64 or bfloat16."
+                )
+            if self.mixed_precision:
+                raise ValueError(
+                    f"Backend '{KERNEL_BACKEND}' does not support mixed precision "
+                    f"(mixed_precision=True promotes hpfloat to float64). "
+                    f"Set mixed_precision=False or use the triton backend."
+                )
+        return self
+
     @field_validator('num_trials')
     @classmethod
     def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:

@@ -19,8 +19,10 @@ if KERNEL_BACKEND == "torch":
         compute_bifurcation_outflow_kernel as _compute_bifurcation_outflow_kernel,
         compute_bifurcation_inflow_kernel as _compute_bifurcation_inflow_kernel,
     )
-    compute_bifurcation_outflow_kernel = adapt_torch_kernel(_compute_bifurcation_outflow_kernel)
-    compute_bifurcation_inflow_kernel = adapt_torch_kernel(_compute_bifurcation_inflow_kernel)
+    # compile=False: these kernels split their compilable body from
+    # scatter_add_ and handle torch.compile internally.
+    compute_bifurcation_outflow_kernel = adapt_torch_kernel(_compute_bifurcation_outflow_kernel, compile=False)
+    compute_bifurcation_inflow_kernel = adapt_torch_kernel(_compute_bifurcation_inflow_kernel, compile=False)
     compute_bifurcation_outflow_batched_kernel = None
     compute_bifurcation_inflow_batched_kernel = None
 else:

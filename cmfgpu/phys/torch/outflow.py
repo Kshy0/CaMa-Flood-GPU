@@ -4,16 +4,25 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""Pure PyTorch implementation of outflow kernels.
+"""Pure PyTorch implementation of outflow kernels, optimised for MPS.
 
-All operations are vectorized over catchments. The kernels mutate tensors
-in-place to match the Triton/TileLang calling convention.
+The computation-heavy *body* of each kernel is compiled with
+``torch.compile``.  ``scatter_add_`` calls (which ``torch._dynamo``
+cannot trace on MPS) are executed **outside** the compiled graph so
+that the bulk of the arithmetic still benefits from JIT fusion while
+the scatter runs eagerly without triggering recompilation storms.
 """
 
 import torch
 
+from cmfgpu.phys._backend import _torch_compile
 
-def compute_outflow_kernel(
+
+# ======================================================================
+# Outflow kernel
+# ======================================================================
+
+def _compute_outflow_body(
     downstream_idx: torch.Tensor,
     river_inflow: torch.Tensor,
     river_outflow: torch.Tensor,
@@ -43,8 +52,17 @@ def compute_outflow_kernel(
     gravity: float,
     time_step: float,
     num_catchments: int,
-    BLOCK_SIZE: int = 128,
-) -> None:
+) -> torch.Tensor:
+    """Compilable body – all computation *except* ``scatter_add_``.
+
+    Returns
+    -------
+    to_scatter : Tensor
+        Values to ``scatter_add_`` into *outgoing_storage* keyed by
+        ``downstream_idx``.  River-mouth entries are zeroed so that
+        scattering the full array is equivalent to the original
+        masked scatter.
+    """
     N = num_catchments
     idx = torch.arange(N, device=downstream_idx.device)
     is_river_mouth = downstream_idx == idx
@@ -115,7 +133,7 @@ def compute_outflow_kernel(
     upd_riv_out = torch.where(is_neg, upd_riv_out * limit_rate, upd_riv_out)
     upd_fld_out = torch.where(is_neg, upd_fld_out * limit_rate, upd_fld_out)
 
-    # (10) Store results
+    # (10) Store results (in-place ops – fine for torch.compile)
     river_outflow.copy_(upd_riv_out)
     flood_outflow.copy_(upd_fld_out)
     water_surface_elevation.copy_(wse)
@@ -128,16 +146,94 @@ def compute_outflow_kernel(
     flood_inflow.zero_()
     global_bifurcation_outflow.zero_()
 
-    # (11) Outgoing storage
+    # (11) Outgoing storage – non-scatter part
     pos = torch.clamp(upd_riv_out, min=0.0) + torch.clamp(upd_fld_out, min=0.0)
     neg = torch.clamp(upd_riv_out, max=0.0) + torch.clamp(upd_fld_out, max=0.0)
     outgoing_storage += pos * time_step
-    # scatter-add negative flow to downstream (non-river-mouth only)
-    to_add = torch.where(~is_river_mouth, -neg * time_step, 0.0)
-    outgoing_storage.scatter_add_(0, ds, to_add)
+
+    # River-mouth entries are zeroed so scatter_add_ is a harmless
+    # no-op for them (they scatter to themselves).
+    to_scatter = torch.where(is_river_mouth, 0.0, -neg * time_step)
+    return to_scatter
 
 
-def compute_inflow_kernel(
+_compute_outflow_compiled = _torch_compile(_compute_outflow_body)
+
+
+def compute_outflow_kernel(
+    downstream_idx: torch.Tensor,
+    river_inflow: torch.Tensor,
+    river_outflow: torch.Tensor,
+    river_manning: torch.Tensor,
+    river_depth: torch.Tensor,
+    river_width: torch.Tensor,
+    river_length: torch.Tensor,
+    river_height: torch.Tensor,
+    river_storage: torch.Tensor,
+    flood_inflow: torch.Tensor,
+    flood_outflow: torch.Tensor,
+    flood_manning: torch.Tensor,
+    flood_depth: torch.Tensor,
+    protected_depth: torch.Tensor,
+    catchment_elevation: torch.Tensor,
+    downstream_distance: torch.Tensor,
+    flood_storage: torch.Tensor,
+    protected_storage: torch.Tensor,
+    river_cross_section_depth: torch.Tensor,
+    flood_cross_section_depth: torch.Tensor,
+    flood_cross_section_area: torch.Tensor,
+    global_bifurcation_outflow: torch.Tensor,
+    total_storage: torch.Tensor,
+    outgoing_storage: torch.Tensor,
+    water_surface_elevation: torch.Tensor,
+    protected_water_surface_elevation: torch.Tensor,
+    gravity: float,
+    time_step: float,
+    num_catchments: int,
+    BLOCK_SIZE: int = 128,
+) -> None:
+    """Outflow kernel: compiled body + eager scatter."""
+    to_scatter = _compute_outflow_compiled(
+        downstream_idx=downstream_idx,
+        river_inflow=river_inflow,
+        river_outflow=river_outflow,
+        river_manning=river_manning,
+        river_depth=river_depth,
+        river_width=river_width,
+        river_length=river_length,
+        river_height=river_height,
+        river_storage=river_storage,
+        flood_inflow=flood_inflow,
+        flood_outflow=flood_outflow,
+        flood_manning=flood_manning,
+        flood_depth=flood_depth,
+        protected_depth=protected_depth,
+        catchment_elevation=catchment_elevation,
+        downstream_distance=downstream_distance,
+        flood_storage=flood_storage,
+        protected_storage=protected_storage,
+        river_cross_section_depth=river_cross_section_depth,
+        flood_cross_section_depth=flood_cross_section_depth,
+        flood_cross_section_area=flood_cross_section_area,
+        global_bifurcation_outflow=global_bifurcation_outflow,
+        total_storage=total_storage,
+        outgoing_storage=outgoing_storage,
+        water_surface_elevation=water_surface_elevation,
+        protected_water_surface_elevation=protected_water_surface_elevation,
+        gravity=gravity,
+        time_step=time_step,
+        num_catchments=num_catchments,
+    )
+    # Scatter downstream negative outflow (eager – not compiled)
+    ds = downstream_idx.long()
+    outgoing_storage.scatter_add_(0, ds, to_scatter)
+
+
+# ======================================================================
+# Inflow kernel
+# ======================================================================
+
+def _compute_inflow_body(
     downstream_idx: torch.Tensor,
     river_outflow: torch.Tensor,
     flood_outflow: torch.Tensor,
@@ -148,8 +244,13 @@ def compute_inflow_kernel(
     flood_inflow: torch.Tensor,
     limit_rate: torch.Tensor,
     num_catchments: int,
-    BLOCK_SIZE: int = 128,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compilable body – returns values to scatter into inflows.
+
+    Instead of boolean-indexing ``ds[non_mouth]`` (which creates
+    dynamic-shaped tensors), river-mouth entries are zeroed before
+    scatter so the operation covers the full array with a fixed shape.
+    """
     N = num_catchments
     idx = torch.arange(N, device=downstream_idx.device)
     ds = downstream_idx.long()
@@ -175,12 +276,48 @@ def compute_inflow_kernel(
     flood_outflow.copy_(upd_fld)
     limit_rate.copy_(lr)
 
-    # Accumulate inflows via scatter_add
-    non_mouth = ~is_river_mouth
-    river_inflow.scatter_add_(0, ds[non_mouth], upd_riv[non_mouth])
-    flood_inflow.scatter_add_(0, ds[non_mouth], upd_fld[non_mouth])
+    # Zero out river-mouth entries so scatter_add_ over the full
+    # array is equivalent to the original masked scatter.
+    scatter_riv = torch.where(is_river_mouth, 0.0, upd_riv)
+    scatter_fld = torch.where(is_river_mouth, 0.0, upd_fld)
+    return scatter_riv, scatter_fld
 
 
-# Batched variants set to None (user said to ignore batch)
+_compute_inflow_compiled = _torch_compile(_compute_inflow_body)
+
+
+def compute_inflow_kernel(
+    downstream_idx: torch.Tensor,
+    river_outflow: torch.Tensor,
+    flood_outflow: torch.Tensor,
+    river_storage: torch.Tensor,
+    flood_storage: torch.Tensor,
+    outgoing_storage: torch.Tensor,
+    river_inflow: torch.Tensor,
+    flood_inflow: torch.Tensor,
+    limit_rate: torch.Tensor,
+    num_catchments: int,
+    BLOCK_SIZE: int = 128,
+) -> None:
+    """Inflow kernel: compiled body + eager scatter."""
+    scatter_riv, scatter_fld = _compute_inflow_compiled(
+        downstream_idx=downstream_idx,
+        river_outflow=river_outflow,
+        flood_outflow=flood_outflow,
+        river_storage=river_storage,
+        flood_storage=flood_storage,
+        outgoing_storage=outgoing_storage,
+        river_inflow=river_inflow,
+        flood_inflow=flood_inflow,
+        limit_rate=limit_rate,
+        num_catchments=num_catchments,
+    )
+    # Accumulate inflows via scatter_add_ (eager – not compiled)
+    ds = downstream_idx.long()
+    river_inflow.scatter_add_(0, ds, scatter_riv)
+    flood_inflow.scatter_add_(0, ds, scatter_fld)
+
+
+# Batched variants not implemented for MPS / torch backend
 compute_outflow_batched_kernel = None
 compute_inflow_batched_kernel = None

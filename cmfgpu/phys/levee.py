@@ -22,7 +22,9 @@ if KERNEL_BACKEND == "torch":
     )
     compute_levee_stage_kernel = adapt_torch_kernel(_compute_levee_stage_kernel)
     compute_levee_stage_log_kernel = adapt_torch_kernel(_compute_levee_stage_log_kernel)
-    compute_levee_bifurcation_outflow_kernel = adapt_torch_kernel(_compute_levee_bifurcation_outflow_kernel)
+    # compile=False: this kernel splits its compilable body from
+    # scatter_add_ and handles torch.compile internally.
+    compute_levee_bifurcation_outflow_kernel = adapt_torch_kernel(_compute_levee_bifurcation_outflow_kernel, compile=False)
     compute_levee_stage_batched_kernel = None
     compute_levee_bifurcation_outflow_batched_kernel = None
 else:

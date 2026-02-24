@@ -4,9 +4,17 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""Pure PyTorch implementation of levee-aware flood stage kernels."""
+"""Pure PyTorch implementation of levee-aware flood stage kernels.
+
+``compute_levee_bifurcation_outflow_kernel`` uses ``scatter_add_``
+which ``torch._dynamo`` cannot trace on MPS.  Its compilable body is
+separated so that ``torch.compile`` can fuse the heavy arithmetic
+while scatter operations run eagerly.
+"""
 
 import torch
+
+from cmfgpu.phys._backend import _torch_compile
 
 
 def compute_levee_stage_kernel(
@@ -274,7 +282,7 @@ def compute_levee_stage_log_kernel(
     total_stage_error_sum[current_step] += (total_new - total_pre).sum() * 1e-9
 
 
-def compute_levee_bifurcation_outflow_kernel(
+def _levee_bifurcation_outflow_body(
     bifurcation_catchment_idx: torch.Tensor,
     bifurcation_downstream_idx: torch.Tensor,
     bifurcation_manning: torch.Tensor,
@@ -286,13 +294,14 @@ def compute_levee_bifurcation_outflow_kernel(
     water_surface_elevation: torch.Tensor,
     protected_water_surface_elevation: torch.Tensor,
     total_storage: torch.Tensor,
-    outgoing_storage: torch.Tensor,
     gravity: float,
     time_step: float,
     num_bifurcation_paths: int,
     num_bifurcation_levels: int,
-    BLOCK_SIZE: int = 128,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compilable body – returns scatter values instead of calling
+    ``scatter_add_``.
+    """
     P = num_bifurcation_paths
     L = num_bifurcation_levels
 
@@ -340,7 +349,7 @@ def compute_levee_bifurcation_outflow_kernel(
         den = 1.0 + gt * (bman ** 2) * torch.abs(unit_bout) * torch.pow(b_semi, -7.0 / 3.0)
 
         upd_bout = torch.where(b_semi > 1e-5, num / den, 0.0)
-        sum_bif_out += upd_bout
+        sum_bif_out = sum_bif_out + upd_bout
 
         bifurcation_cross_section_depth[:, level] = upd_bcs
         bifurcation_outflow[:, level] = upd_bout
@@ -355,8 +364,56 @@ def compute_levee_bifurcation_outflow_kernel(
 
     pos = torch.clamp(sum_bif_out, min=0.0)
     neg = torch.clamp(sum_bif_out, max=0.0)
-    outgoing_storage.scatter_add_(0, bci, pos * time_step)
-    outgoing_storage.scatter_add_(0, bdi, -neg * time_step)
+
+    scatter_pos = pos * time_step
+    scatter_neg = -neg * time_step
+    return scatter_pos, scatter_neg
+
+
+_levee_bifurcation_outflow_compiled = _torch_compile(_levee_bifurcation_outflow_body)
+
+
+def compute_levee_bifurcation_outflow_kernel(
+    bifurcation_catchment_idx: torch.Tensor,
+    bifurcation_downstream_idx: torch.Tensor,
+    bifurcation_manning: torch.Tensor,
+    bifurcation_outflow: torch.Tensor,
+    bifurcation_width: torch.Tensor,
+    bifurcation_length: torch.Tensor,
+    bifurcation_elevation: torch.Tensor,
+    bifurcation_cross_section_depth: torch.Tensor,
+    water_surface_elevation: torch.Tensor,
+    protected_water_surface_elevation: torch.Tensor,
+    total_storage: torch.Tensor,
+    outgoing_storage: torch.Tensor,
+    gravity: float,
+    time_step: float,
+    num_bifurcation_paths: int,
+    num_bifurcation_levels: int,
+    BLOCK_SIZE: int = 128,
+) -> None:
+    """Levee bifurcation outflow: compiled body + eager scatter."""
+    scatter_pos, scatter_neg = _levee_bifurcation_outflow_compiled(
+        bifurcation_catchment_idx=bifurcation_catchment_idx,
+        bifurcation_downstream_idx=bifurcation_downstream_idx,
+        bifurcation_manning=bifurcation_manning,
+        bifurcation_outflow=bifurcation_outflow,
+        bifurcation_width=bifurcation_width,
+        bifurcation_length=bifurcation_length,
+        bifurcation_elevation=bifurcation_elevation,
+        bifurcation_cross_section_depth=bifurcation_cross_section_depth,
+        water_surface_elevation=water_surface_elevation,
+        protected_water_surface_elevation=protected_water_surface_elevation,
+        total_storage=total_storage,
+        gravity=gravity,
+        time_step=time_step,
+        num_bifurcation_paths=num_bifurcation_paths,
+        num_bifurcation_levels=num_bifurcation_levels,
+    )
+    bci = bifurcation_catchment_idx.long()
+    bdi = bifurcation_downstream_idx.long()
+    outgoing_storage.scatter_add_(0, bci, scatter_pos)
+    outgoing_storage.scatter_add_(0, bdi, scatter_neg)
 
 
 # Batched variants not implemented
