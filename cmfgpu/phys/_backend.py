@@ -61,36 +61,96 @@ class TorchAdapter:
       3. Drops unknown kwargs (``BLOCK_SIZE``, batch flags, etc.).
       4. Passes scalars directly (no buffer conversion needed).
 
-    The wrapped function should be ``torch.compile``-friendly.
+    On the first call (or when the set of keyword arguments changes), a
+    specialised caller function is generated via ``exec`` that maps caller
+    kwargs directly to kernel parameters **without** building an intermediate
+    dict.  Subsequent calls with the same kwarg keys hit the cached fast-path.
     """
+
+    __slots__ = (
+        "_kernel",
+        "_kernel_raw",
+        "_param_names",
+        "_key_map",
+        "_cached_key",
+        "_fast_caller",
+    )
 
     def __init__(self, kernel_func: Callable, *, compile: bool = True):
         import inspect
         self._kernel_raw = kernel_func
         sig = inspect.signature(kernel_func)
-        self._param_names = set(sig.parameters.keys())
+        self._param_names: set[str] = set(sig.parameters.keys())
+        self._key_map: dict[str, str] = {}  # caller key -> kernel param name
+        self._cached_key: tuple[str, ...] | None = None
+        self._fast_caller: Callable | None = None
         if compile:
             self._kernel = _torch_compile(kernel_func)
         else:
             self._kernel = kernel_func
 
+    # ------------------------------------------------------------------
+    # Key resolution (lazy-cached)
+    # ------------------------------------------------------------------
+
+    def _resolve_key(self, key: str) -> str:
+        """Map a caller kwarg name to the kernel parameter name.
+
+        Returns the mapped name, or an empty string if the key should be
+        dropped (e.g. ``BLOCK_SIZE``).
+        """
+        try:
+            return self._key_map[key]
+        except KeyError:
+            pass
+        base_key = key[:-4] if key.endswith("_ptr") else key
+        if base_key in self._param_names:
+            self._key_map[key] = base_key
+            return base_key
+        if key in self._param_names:
+            self._key_map[key] = key
+            return key
+        self._key_map[key] = ""  # sentinel: drop this kwarg
+        return ""
+
+    # ------------------------------------------------------------------
+    # Fast-caller generation
+    # ------------------------------------------------------------------
+
+    def _build_fast_caller(self, kwargs_keys: tuple[str, ...]) -> Callable:
+        """Generate a specialised function that avoids per-call dict building.
+
+        The generated function has the form::
+
+            def _fast(kw, _k=_kernel):
+                return _k(param_a=kw['a_ptr'], param_b=kw['b_ptr'], ...)
+        """
+        pairs = []
+        for k in kwargs_keys:
+            mapped = self._resolve_key(k)
+            if mapped:
+                pairs.append((k, mapped))
+
+        args_str = ", ".join(f"{m}=_kw['{k}']" for k, m in pairs)
+        code = f"def _fast(_kw, _k=_kernel): return _k({args_str})"
+        ns: dict[str, Any] = {"_kernel": self._kernel}
+        exec(code, ns)  # noqa: S102 – generated code is fully controlled
+        return ns["_fast"]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def __getitem__(self, grid):
+        """Accept ``kernel[grid]`` syntax; grid is unused."""
         return self
 
     def __call__(self, **kwargs: Any):
-        import torch
-        adapted: dict[str, Any] = {}
-
-        for key, value in kwargs.items():
-            base_key = key[:-4] if key.endswith("_ptr") else key
-
-            if base_key in self._param_names:
-                adapted[base_key] = value
-            elif key in self._param_names:
-                adapted[key] = value
-            # else: silently drop (BLOCK_SIZE, batch flags, etc.)
-
-        return self._kernel(**adapted)
+        key = tuple(kwargs.keys())  # dict ordering is guaranteed (Python 3.7+)
+        if key != self._cached_key:
+            self._fast_caller = self._build_fast_caller(key)
+            self._cached_key = key
+        return self._fast_caller(kwargs)  # type: ignore[misc]
 
 
 def _torch_compile(fn: Callable) -> Callable:
