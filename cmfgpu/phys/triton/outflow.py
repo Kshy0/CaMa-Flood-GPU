@@ -46,7 +46,7 @@ def compute_outflow_kernel(
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
-    gravity,                                # f32 scalar gravity acceleration
+    gravity: tl.constexpr,                  # f32 scalar gravity acceleration
     time_step,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     BLOCK_SIZE: tl.constexpr                # block size
@@ -306,7 +306,7 @@ def compute_outflow_batched_kernel(
     outgoing_storage_ptr,                   # *f32 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
-    gravity,                                # f32 scalar gravity acceleration
+    gravity: tl.constexpr,                  # f32 scalar gravity acceleration
     time_step,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     num_trials: tl.constexpr,                             # number of trials

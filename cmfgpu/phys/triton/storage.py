@@ -67,11 +67,7 @@ def compute_flood_stage_kernel(
         tl.maximum(river_storage_updated + flood_storage_updated, 0.0),
         river_storage_updated
     )
-    flood_storage_updated = tl.where(
-        flood_storage_updated < 0.0,
-        0.0,
-        flood_storage_updated
-    )
+    flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
@@ -412,11 +408,7 @@ def compute_flood_stage_batched_kernel(
         tl.maximum(river_storage_updated + flood_storage_updated, 0.0),
         river_storage_updated
     )
-    flood_storage_updated = tl.where(
-        flood_storage_updated < 0.0,
-        0.0,
-        flood_storage_updated
-    )
+    flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
