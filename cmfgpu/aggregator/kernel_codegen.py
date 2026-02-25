@@ -1782,7 +1782,7 @@ class KernelCodegenMixin:
             f'               is_inner_first, is_inner_last, is_middle,',
             f'               is_outer_first, is_outer_last,',
             f'               macro_step_index, step_count_val, num_trials, stride_input):',
-            f'    idx = states["{save_idx}"].long()',
+            f'    idx = states["{save_idx}"]',
             f'    n = len(idx)',
             '',
         ])

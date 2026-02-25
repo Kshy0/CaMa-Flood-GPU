@@ -121,7 +121,7 @@ def find_indices_in_torch(a, b):
     valid_mask = pos < len(sorted_b)
     hit_mask = torch.zeros_like(a, dtype=torch.bool)
     hit_mask[valid_mask] = (sorted_b[pos[valid_mask]] == a[valid_mask])
-    index = torch.full_like(pos, -1, dtype=torch.int64)
-    index[hit_mask] = order[pos[hit_mask]]
+    index = torch.full_like(pos, -1, dtype=torch.int32)
+    index[hit_mask] = order[pos[hit_mask]].to(torch.int32)
 
     return index

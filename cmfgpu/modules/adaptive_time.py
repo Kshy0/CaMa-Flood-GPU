@@ -38,7 +38,7 @@ class AdaptiveTimeModule(AbstractModule):
         description="Maximum number of sub-steps across all processes",
         shape=("one",),
         category="shared_state",
-        dtype="int",
+        dtype="idx",
     )
     @cached_property
     def max_sub_steps(self) -> torch.Tensor:

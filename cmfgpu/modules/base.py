@@ -305,7 +305,7 @@ class BaseModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @computed_base_field(
         description="Indices of immediate downstream catchments",
-        dtype="int",
+        dtype="idx",
         category="topology",
     )
     @cached_property
@@ -315,7 +315,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Indices of catchments for which output will be saved",
         shape=("num_saved_catchments",),
-        dtype="int",
+        dtype="idx",
         category="topology",
     )
     @cached_property

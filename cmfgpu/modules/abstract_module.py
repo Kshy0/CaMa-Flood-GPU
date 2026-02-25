@@ -261,6 +261,7 @@ class AbstractModule(BaseModel, ABC):
                 'float': self.precision,
                 'hpfloat': self.high_precision,
                 'int': torch.int64,
+                'idx': torch.int32,
                 'bool': torch.bool
             }
             target_dtype = dtype_map.get(tensor_dtype)
@@ -349,6 +350,7 @@ class AbstractModule(BaseModel, ABC):
             'float': self.precision,
             'hpfloat': self.high_precision,
             'int': torch.int64,
+            'idx': torch.int32,
             'bool': torch.bool
         }
         

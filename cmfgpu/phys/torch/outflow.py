@@ -74,7 +74,7 @@ def _compute_outflow_body(
     tot_sto = river_storage + flood_storage + protected_storage
 
     # Downstream
-    ds = downstream_idx.long()
+    ds = downstream_idx
     river_depth_ds = river_depth[ds]
     river_height_ds = river_height[ds]
     elev_ds = catchment_elevation[ds]
@@ -225,7 +225,7 @@ def compute_outflow_kernel(
         num_catchments=num_catchments,
     )
     # Scatter downstream negative outflow (eager – not compiled)
-    ds = downstream_idx.long()
+    ds = downstream_idx
     outgoing_storage.scatter_add_(0, ds, to_scatter)
 
 
@@ -253,7 +253,7 @@ def _compute_inflow_body(
     """
     N = num_catchments
     idx = torch.arange(N, device=downstream_idx.device)
-    ds = downstream_idx.long()
+    ds = downstream_idx
     is_river_mouth = ds == idx
 
     riv_out = river_outflow
@@ -313,7 +313,7 @@ def compute_inflow_kernel(
         num_catchments=num_catchments,
     )
     # Accumulate inflows via scatter_add_ (eager – not compiled)
-    ds = downstream_idx.long()
+    ds = downstream_idx
     river_inflow.scatter_add_(0, ds, scatter_riv)
     flood_inflow.scatter_add_(0, ds, scatter_fld)
 

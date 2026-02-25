@@ -174,7 +174,7 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @computed_bifurcation_field(
         description="Indices of upstream catchments for each bifurcation path",
-        dtype="int",
+        dtype="idx",
         category="topology",
     )
     @cached_property
@@ -183,7 +183,7 @@ class BifurcationModule(AbstractModule):
 
     @computed_bifurcation_field(
         description="Indices of downstream catchments for each bifurcation path",
-        dtype="int",
+        dtype="idx",
         category="topology",
     )
     @cached_property
@@ -193,14 +193,14 @@ class BifurcationModule(AbstractModule):
     @computed_bifurcation_field(
         description="Indices of bifurcation paths to save in output",
         shape=("num_saved_bifurcation_paths",),
-        dtype="int",
+        dtype="idx",
         category="topology",
     )
     @cached_property
     def bifurcation_path_save_idx(self) -> torch.Tensor:
         if self.bifurcation_save_mask is None:
-            return torch.arange(self.num_bifurcation_paths, dtype=torch.int64, device=self.device)
-        return torch.nonzero(self.bifurcation_save_mask, as_tuple=False).squeeze(-1)
+            return torch.arange(self.num_bifurcation_paths, dtype=torch.int32, device=self.device)
+        return torch.nonzero(self.bifurcation_save_mask, as_tuple=False).squeeze(-1).to(torch.int32)
     
     @computed_bifurcation_field(
         description="Indices of bifurcation paths to save in output",

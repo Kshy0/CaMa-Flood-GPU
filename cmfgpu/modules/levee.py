@@ -132,7 +132,7 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed tensors (levee-aligned)
     # ------------------------------------------------------------------ #
-    @computed_levee_field(description="Indices of catchments hosting each levee", dtype="int", category="topology")
+    @computed_levee_field(description="Indices of catchments hosting each levee", dtype="idx", category="topology")
     @cached_property
     def levee_catchment_idx(self) -> torch.Tensor:
         return find_indices_in_torch(self.base.levee_catchment_id, self.base.catchment_id)
@@ -148,7 +148,7 @@ class LeveeModule(AbstractModule):
         # Clamp position to valid range [0, num_flood_levels]
         position = torch.clamp(position, 0.0, float(self.base.num_flood_levels))
         
-        lower = torch.floor(position).to(torch.int64)
+        lower = torch.floor(position).to(torch.int32)
         upper = lower + 1
         
         frac = position - lower
@@ -286,7 +286,7 @@ class LeveeModule(AbstractModule):
         # Interpolate
         position = self.levee_fraction * self.base.num_flood_levels
         
-        lower = torch.floor(position).to(torch.int64)
+        lower = torch.floor(position).to(torch.int32)
         upper = lower + 1
         frac = position - lower
         
@@ -332,15 +332,15 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @computed_levee_field(
         description="Indices of levees whose outputs are saved",
-        dtype="int",
+        dtype="idx",
         shape=("num_saved_levees",),
         category="topology",
     )
     @cached_property
     def levee_save_idx(self) -> Optional[torch.Tensor]:
         if self.levee_save_mask is None:
-            return torch.arange(self.base.num_levees, dtype=torch.int64, device=self.device)
-        idx = torch.nonzero(self.levee_save_mask, as_tuple=False).squeeze(-1).to(torch.int64)
+            return torch.arange(self.base.num_levees, dtype=torch.int32, device=self.device)
+        idx = torch.nonzero(self.levee_save_mask, as_tuple=False).squeeze(-1).to(torch.int32)
         return idx if idx.numel() > 0 else None
 
     @computed_levee_field(

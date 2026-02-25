@@ -39,7 +39,7 @@ def compute_levee_stage_kernel(
     BLOCK_SIZE: int = 128,
 ) -> None:
     NL = num_levees
-    lci = levee_catchment_idx.long()
+    lci = levee_catchment_idx
 
     rl = river_length[lci]
     rw = river_width[lci]
@@ -242,7 +242,7 @@ def compute_levee_stage_log_kernel(
     BLOCK_SIZE: int = 128,
 ) -> None:
     NL = num_levees
-    lci = levee_catchment_idx.long()
+    lci = levee_catchment_idx
     ca = catchment_area[lci]
 
     total_pre = river_storage[lci] + flood_storage[lci]
@@ -305,8 +305,8 @@ def _levee_bifurcation_outflow_body(
     P = num_bifurcation_paths
     L = num_bifurcation_levels
 
-    bci = bifurcation_catchment_idx.long()
-    bdi = bifurcation_downstream_idx.long()
+    bci = bifurcation_catchment_idx
+    bdi = bifurcation_downstream_idx
 
     blen = bifurcation_length
     bwse = water_surface_elevation[bci]
@@ -410,8 +410,8 @@ def compute_levee_bifurcation_outflow_kernel(
         num_bifurcation_paths=num_bifurcation_paths,
         num_bifurcation_levels=num_bifurcation_levels,
     )
-    bci = bifurcation_catchment_idx.long()
-    bdi = bifurcation_downstream_idx.long()
+    bci = bifurcation_catchment_idx
+    bdi = bifurcation_downstream_idx
     outgoing_storage.scatter_add_(0, bci, scatter_pos)
     outgoing_storage.scatter_add_(0, bdi, scatter_neg)
 

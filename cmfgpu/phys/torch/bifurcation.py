@@ -50,8 +50,8 @@ def _bifurcation_outflow_body(
     P = num_bifurcation_paths
     L = num_bifurcation_levels
 
-    bci = bifurcation_catchment_idx.long()
-    bdi = bifurcation_downstream_idx.long()
+    bci = bifurcation_catchment_idx
+    bdi = bifurcation_downstream_idx
 
     blen = bifurcation_length
 
@@ -146,8 +146,8 @@ def compute_bifurcation_outflow_kernel(
         num_bifurcation_paths=num_bifurcation_paths,
         num_bifurcation_levels=num_bifurcation_levels,
     )
-    bci = bifurcation_catchment_idx.long()
-    bdi = bifurcation_downstream_idx.long()
+    bci = bifurcation_catchment_idx
+    bdi = bifurcation_downstream_idx
     outgoing_storage.scatter_add_(0, bci, scatter_pos)
     outgoing_storage.scatter_add_(0, bdi, scatter_neg)
 
@@ -170,8 +170,8 @@ def _bifurcation_inflow_body(
     P = num_bifurcation_paths
     L = num_bifurcation_levels
 
-    bci = bifurcation_catchment_idx.long()
-    bdi = bifurcation_downstream_idx.long()
+    bci = bifurcation_catchment_idx
+    bdi = bifurcation_downstream_idx
 
     lr = limit_rate[bci]
     lr_ds = limit_rate[bdi]
@@ -209,8 +209,8 @@ def compute_bifurcation_inflow_kernel(
         num_bifurcation_paths=num_bifurcation_paths,
         num_bifurcation_levels=num_bifurcation_levels,
     )
-    bci = bifurcation_catchment_idx.long()
-    bdi = bifurcation_downstream_idx.long()
+    bci = bifurcation_catchment_idx
+    bdi = bifurcation_downstream_idx
     global_bifurcation_outflow.scatter_add_(0, bci, sum_bif_out)
     global_bifurcation_outflow.scatter_add_(0, bdi, -sum_bif_out)
 
