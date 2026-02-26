@@ -7,7 +7,7 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import typed_pow, typed_sqrt
+from cmfgpu.phys.triton.utils import typed_pow, typed_sqrt, to_compute_dtype
 
 
 @triton.jit
@@ -15,25 +15,25 @@ def compute_outflow_kernel(
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
-    river_inflow_ptr,                       # *f32 river inflow (turn to zero)
+    river_inflow_ptr,                       # *f64 river inflow (turn to zero)
     river_outflow_ptr,                      # *f32 in/out river outflow
     river_manning_ptr,                      # *f32 river Manning coefficient
     river_depth_ptr,                        # *f32 river depth
     river_width_ptr,                        # *f32 river width
     river_length_ptr,                       # *f32 river length
     river_height_ptr,                       # *f32 river bank height
-    river_storage_ptr,                      # *f32 river storage
+    river_storage_ptr,                      # *f64 river storage
 
     # flood variables
-    flood_inflow_ptr,                       # *f32 flood inflow (turn to zero)
+    flood_inflow_ptr,                       # *f64 flood inflow (turn to zero)
     flood_outflow_ptr,                      # *f32 in/out flood outflow
     flood_manning_ptr,                      # *f32 flood Manning coefficient
     flood_depth_ptr,                        # *f32 flood depth
     protected_depth_ptr,                    # *f32 protected depth
     catchment_elevation_ptr,                # *f32 catchment ground elevation
     downstream_distance_ptr,                # *f32 distance to downstream unit
-    flood_storage_ptr,                      # *f32 flood storage
-    protected_storage_ptr,                  # *f32 protected storage
+    flood_storage_ptr,                      # *f64 flood storage
+    protected_storage_ptr,                  # *f64 protected storage
 
     # previous time step variables
     river_cross_section_depth_ptr,     # *f32 previous river cross-section depth
@@ -41,9 +41,9 @@ def compute_outflow_kernel(
     flood_cross_section_area_ptr,      # *f32 previous flood cross-section area
 
     # other 
-    global_bifurcation_outflow_ptr,          # *f32 global bifurcation outflow (turn to zero)
-    total_storage_ptr,
-    outgoing_storage_ptr,                   # *f32 output for storage (fused part)
+    global_bifurcation_outflow_ptr,          # *f64 global bifurcation outflow (turn to zero)
+    total_storage_ptr,                       # *f64 total storage
+    outgoing_storage_ptr,                   # *f64 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
@@ -84,6 +84,12 @@ def compute_outflow_kernel(
     river_cross_section_depth = tl.load(river_cross_section_depth_ptr + offs, mask=mask, other=0.0)
     flood_cross_section_depth = tl.load(flood_cross_section_depth_ptr + offs, mask=mask, other=0.0)
     flood_cross_section_area = tl.load(flood_cross_section_area_ptr + offs, mask=mask, other=0.0)
+
+    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    river_storage = to_compute_dtype(river_storage, river_outflow)
+    flood_storage = to_compute_dtype(flood_storage, river_outflow)
+    protected_storage = to_compute_dtype(protected_storage, river_outflow)
+
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
     #----------------------------------------------------------------------
@@ -227,9 +233,9 @@ def compute_inflow_kernel(
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
     river_storage_ptr,             # *f64: River storage (rivsto)
     flood_storage_ptr,             # *f64: Flood storage (fldsto)
-    outgoing_storage_ptr,          # *f32: Outgoing storage
-    river_inflow_ptr,              # *f32: River inflow (output, atomic add)
-    flood_inflow_ptr,              # *f32: Flood inflow (output, atomic add)
+    outgoing_storage_ptr,          # *f64: Outgoing storage
+    river_inflow_ptr,              # *f64: River inflow (output, atomic add)
+    flood_inflow_ptr,              # *f64: Flood inflow (output, atomic add)
     limit_rate_ptr,                # *f32: Limit rate (reference)
     num_catchments: tl.constexpr,  # Total number of units
     BLOCK_SIZE: tl.constexpr       # Block size
@@ -241,18 +247,24 @@ def compute_inflow_kernel(
     # -------- Load for limiting --------
     river_outflow   = tl.load(river_outflow_ptr      + offs, mask=mask, other=0.0)
     flood_outflow   = tl.load(flood_outflow_ptr      + offs, mask=mask, other=0.0)
-    outgoing_storage = tl.load(outgoing_storage_ptr   + offs, mask=mask, other=0.0)
+    outgoing_storage = to_compute_dtype(tl.load(outgoing_storage_ptr + offs, mask=mask, other=0.0), river_outflow)
 
-    # d2rate: Fortran uses (rivsto + fldsto) / p2stoout — excludes levsto
-    rate_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0) + tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
+    # d2rate: Fortran uses DSTO=REAL((P2RIVSTO+P2FLDSTO), KIND=JPRB); DOUT=REAL(P2STOOUT, KIND=JPRB)
+    rate_storage = to_compute_dtype(
+        tl.load(river_storage_ptr + offs, mask=mask, other=0.0) + tl.load(flood_storage_ptr + offs, mask=mask, other=0.0),
+        river_outflow
+    )
 
     # Local limit
     limit_rate = tl.where(outgoing_storage > 1e-8, tl.minimum(rate_storage / outgoing_storage, 1.0), 1.0)
 
     # Downstream limiting
     downstream_idx   = tl.load(downstream_idx_ptr        + offs, mask=mask, other=0)
-    outgoing_storage_downstream   = tl.load(outgoing_storage_ptr + downstream_idx,  mask=mask, other=0.0)
-    rate_storage_downstream = tl.load(river_storage_ptr + downstream_idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx, mask=mask, other=0.0)
+    outgoing_storage_downstream = to_compute_dtype(tl.load(outgoing_storage_ptr + downstream_idx, mask=mask, other=0.0), river_outflow)
+    rate_storage_downstream = to_compute_dtype(
+        tl.load(river_storage_ptr + downstream_idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx, mask=mask, other=0.0),
+        river_outflow
+    )
     limit_rate_downstream = tl.where(outgoing_storage_downstream > 1e-8, tl.minimum(rate_storage_downstream / outgoing_storage_downstream, 1.0), 1.0)
 
     # Apply limits
@@ -275,25 +287,25 @@ def compute_outflow_batched_kernel(
     downstream_idx_ptr,                     # *i32 downstream index
 
     # river variables
-    river_inflow_ptr,                       # *f32 river inflow (turn to zero)
+    river_inflow_ptr,                       # *f64 river inflow (turn to zero)
     river_outflow_ptr,                      # *f32 in/out river outflow
     river_manning_ptr,                      # *f32 river Manning coefficient
     river_depth_ptr,                        # *f32 river depth
     river_width_ptr,                        # *f32 river width
     river_length_ptr,                       # *f32 river length
     river_height_ptr,                       # *f32 river bank height
-    river_storage_ptr,                      # *f32 river storage
+    river_storage_ptr,                      # *f64 river storage
 
     # flood variables
-    flood_inflow_ptr,                       # *f32 flood inflow (turn to zero)
+    flood_inflow_ptr,                       # *f64 flood inflow (turn to zero)
     flood_outflow_ptr,                      # *f32 in/out flood outflow
     flood_manning_ptr,                      # *f32 flood Manning coefficient
     flood_depth_ptr,                        # *f32 flood depth
     protected_depth_ptr,                    # *f32 protected depth
     catchment_elevation_ptr,                # *f32 catchment ground elevation
     downstream_distance_ptr,                # *f32 distance to downstream unit
-    flood_storage_ptr,                      # *f32 flood storage
-    protected_storage_ptr,                  # *f32 protected storage
+    flood_storage_ptr,                      # *f64 flood storage
+    protected_storage_ptr,                  # *f64 protected storage
 
     # previous time step variables
     river_cross_section_depth_ptr,     # *f32 previous river cross-section depth
@@ -301,9 +313,9 @@ def compute_outflow_batched_kernel(
     flood_cross_section_area_ptr,      # *f32 previous flood cross-section area
 
     # other 
-    global_bifurcation_outflow_ptr,          # *f32 global bifurcation outflow (turn to zero)
-    total_storage_ptr,
-    outgoing_storage_ptr,                   # *f32 output for storage (fused part)
+    global_bifurcation_outflow_ptr,          # *f64 global bifurcation outflow (turn to zero)
+    total_storage_ptr,                       # *f64 total storage
+    outgoing_storage_ptr,                   # *f64 output for storage (fused part)
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
@@ -356,6 +368,12 @@ def compute_outflow_batched_kernel(
     river_cross_section_depth = tl.load(river_cross_section_depth_ptr + idx, mask=mask, other=0.0)
     flood_cross_section_depth = tl.load(flood_cross_section_depth_ptr + idx, mask=mask, other=0.0)
     flood_cross_section_area = tl.load(flood_cross_section_area_ptr + idx, mask=mask, other=0.0)
+
+    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    river_storage = to_compute_dtype(river_storage, river_outflow)
+    flood_storage = to_compute_dtype(flood_storage, river_outflow)
+    protected_storage = to_compute_dtype(protected_storage, river_outflow)
+
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
     #----------------------------------------------------------------------
@@ -502,9 +520,9 @@ def compute_inflow_batched_kernel(
     flood_outflow_ptr,             # *f32: Flood outflow (in/out)
     river_storage_ptr,             # *f64: River storage (rivsto)
     flood_storage_ptr,             # *f64: Flood storage (fldsto)
-    outgoing_storage_ptr,          # *f32: Outgoing storage
-    river_inflow_ptr,              # *f32: River inflow (output, atomic add)
-    flood_inflow_ptr,              # *f32: Flood inflow (output, atomic add)
+    outgoing_storage_ptr,          # *f64: Outgoing storage
+    river_inflow_ptr,              # *f64: River inflow (output, atomic add)
+    flood_inflow_ptr,              # *f64: Flood inflow (output, atomic add)
     limit_rate_ptr,                # *f32: Limit rate (reference)
     num_catchments: tl.constexpr,  # Total number of units
     num_trials: tl.constexpr,
@@ -519,10 +537,13 @@ def compute_inflow_batched_kernel(
     # -------- Load for limiting --------
     river_outflow   = tl.load(river_outflow_ptr      + idx, mask=mask, other=0.0)
     flood_outflow   = tl.load(flood_outflow_ptr      + idx, mask=mask, other=0.0)
-    outgoing_storage = tl.load(outgoing_storage_ptr   + idx, mask=mask, other=0.0)
+    outgoing_storage = to_compute_dtype(tl.load(outgoing_storage_ptr + idx, mask=mask, other=0.0), river_outflow)
 
-    # d2rate: Fortran uses (rivsto + fldsto) / p2stoout — excludes levsto
-    rate_storage = tl.load(river_storage_ptr + idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + idx, mask=mask, other=0.0)
+    # d2rate: Fortran uses DSTO=REAL((P2RIVSTO+P2FLDSTO), KIND=JPRB); DOUT=REAL(P2STOOUT, KIND=JPRB)
+    rate_storage = to_compute_dtype(
+        tl.load(river_storage_ptr + idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + idx, mask=mask, other=0.0),
+        river_outflow
+    )
 
     # Local limit
     limit_rate = tl.where(outgoing_storage > 1e-8, tl.minimum(rate_storage / outgoing_storage, 1.0), 1.0)
@@ -535,8 +556,11 @@ def compute_inflow_batched_kernel(
     trial_offset = (idx // num_catchments) * num_catchments
     downstream_idx_global = trial_offset + downstream_idx
     
-    outgoing_storage_downstream   = tl.load(outgoing_storage_ptr + downstream_idx_global,  mask=mask, other=0.0)
-    rate_storage_downstream = tl.load(river_storage_ptr + downstream_idx_global, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx_global, mask=mask, other=0.0)
+    outgoing_storage_downstream = to_compute_dtype(tl.load(outgoing_storage_ptr + downstream_idx_global, mask=mask, other=0.0), river_outflow)
+    rate_storage_downstream = to_compute_dtype(
+        tl.load(river_storage_ptr + downstream_idx_global, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx_global, mask=mask, other=0.0),
+        river_outflow
+    )
     limit_rate_downstream = tl.where(outgoing_storage_downstream > 1e-8, tl.minimum(rate_storage_downstream / outgoing_storage_downstream, 1.0), 1.0)
 
     # Apply limits

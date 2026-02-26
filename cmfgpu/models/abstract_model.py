@@ -72,7 +72,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             "Variables can be strings or {alias: expr} dicts."
         ),
     )
-    precision: Literal["bfloat16", "float32", "float64"] = Field(
+    precision: Literal["float32", "float64"] = Field(
         default="float32",
         description="Base precision of the model",
     )
@@ -81,7 +81,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         description=(
             "Enable mixed precision for hpfloat (storage) tensors.\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
-            "  bfloat16 → float32, float32 → float64, float64 → float64 (no promotion)."
+            "  float32 → float64, float64 → float64 (no promotion)."
         ),
     )
     world_size: int = Field(
@@ -191,7 +191,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         """Non-triton backends only support float32, no mixed precision.
 
         MPS / CPU backends cannot handle float64 (MPS inductor rejects it
-        outright) or bfloat16 reliably.  Fail fast at model creation rather
+        outright).  Fail fast at model creation rather
         than crashing mid-simulation.
         """
         from cmfgpu.phys._backend import KERNEL_BACKEND
@@ -200,7 +200,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 raise ValueError(
                     f"Backend '{KERNEL_BACKEND}' only supports float32 precision, "
                     f"got '{self.precision}'. Use the triton (CUDA) backend for "
-                    f"float64 or bfloat16."
+                    f"float64."
                 )
             if self.mixed_precision:
                 raise ValueError(
@@ -241,7 +241,6 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
     @cached_property
     def dtype(self) -> torch.dtype:
         _dtype_map = {
-            "bfloat16": torch.bfloat16,
             "float32": torch.float32,
             "float64": torch.float64,
         }
@@ -346,28 +345,24 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         """
         Print a summary of memory usage by module.
         
-        Uses ``data_ptr`` de-duplication across all modules so that tensors
-        shared between modules (e.g. a computed field that returns a view of
-        another module's tensor) are counted only once.
+        Each variable is attributed to the first module where it appears;
+        duplicates (shared tensors) are skipped so total is never over-counted.
         """
         if self.rank != 0:
             return
         total_memory = 0
         global_seen_ptrs: set = set()
         print(f"\n[rank {self.rank}] Memory Usage Summary:")
-        print(f"{'Module':<30} | {'Memory (MB)':<15} | {'Unique (MB)':<15}")
-        print(f"{'-' * 65}")
+        print(f"{'Module':<30} | {'Memory (MB)':<15}")
+        print(f"{'-' * 48}")
         
         for module_name in self.opened_modules:
             if module_name not in self._modules:
                 continue
             module = self._modules[module_name]
-            # Module-local memory (may include tensors shared with other modules)
-            mem_bytes = module.get_memory_usage()
-            mem_mb = mem_bytes / (1024 * 1024)
             
             # Count only tensors not yet seen globally
-            unique_bytes = 0
+            module_bytes = 0
             all_fields = module.get_model_fields().copy()
             all_fields.update(module.get_model_computed_fields())
             for name, field_info in all_fields.items():
@@ -378,24 +373,19 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     ptr = value.data_ptr()
                     if ptr not in global_seen_ptrs:
                         global_seen_ptrs.add(ptr)
-                        unique_bytes += value.element_size() * value.nelement()
+                        module_bytes += value.element_size() * value.nelement()
             
-            total_memory += unique_bytes
-            unique_mb = unique_bytes / (1024 * 1024)
-            if unique_bytes != mem_bytes:
-                print(f"{module_name:<30} | {mem_mb:<15.2f} | {unique_mb:<15.2f} (shared)")
-            else:
-                print(f"{module_name:<30} | {mem_mb:<15.2f} | {unique_mb:<15.2f}")
+            total_memory += module_bytes
+            print(f"{module_name:<30} | {module_bytes / (1024 * 1024):<15.2f}")
         
         # Add StatisticsAggregator memory usage
         if self._statistics_aggregator is not None:
             aggregator_mem = self._statistics_aggregator.get_memory_usage()
-            aggregator_mem_mb = aggregator_mem / (1024 * 1024)
             total_memory += aggregator_mem
-            print(f"{'StatisticsAggregator':<30} | {aggregator_mem_mb:<15.2f} | {aggregator_mem_mb:<15.2f}")
+            print(f"{'StatisticsAggregator':<30} | {aggregator_mem / (1024 * 1024):<15.2f}")
             
-        print(f"{'-' * 65}")
-        print(f"{'Total':<30} | {'':<15} | {total_memory / (1024 * 1024):<15.2f} MB\n")
+        print(f"{'-' * 48}")
+        print(f"{'Total':<30} | {total_memory / (1024 * 1024):<15.2f} MB\n")
 
     def get_module(self, module_name: str) -> Optional[AbstractModule]:
         return self._modules[module_name] if module_name in self.opened_modules else None

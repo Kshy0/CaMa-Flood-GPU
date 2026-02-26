@@ -9,15 +9,15 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import typed_pow, typed_sqrt
+from cmfgpu.phys.triton.utils import typed_pow, typed_sqrt, to_compute_dtype
 
 
 @triton.jit
 def compute_levee_stage_kernel(
     levee_catchment_idx_ptr,
-    river_storage_ptr,
-    flood_storage_ptr,
-    protected_storage_ptr,
+    river_storage_ptr,                      # *f64
+    flood_storage_ptr,                      # *f64
+    protected_storage_ptr,                  # *f64
     river_depth_ptr,
     flood_depth_ptr,
     protected_depth_ptr,
@@ -58,6 +58,10 @@ def compute_levee_stage_kernel(
     flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
+    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
+    flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
+
     total_storage = river_storage_curr + flood_storage_curr
     
     # Derived parameters
@@ -242,9 +246,9 @@ def compute_levee_stage_kernel(
 @triton.jit
 def compute_levee_stage_log_kernel(
     levee_catchment_idx_ptr,
-    river_storage_ptr,
-    flood_storage_ptr,
-    protected_storage_ptr,
+    river_storage_ptr,                      # *f64
+    flood_storage_ptr,                      # *f64
+    protected_storage_ptr,                  # *f64
     river_depth_ptr,
     flood_depth_ptr,
     protected_depth_ptr,
@@ -291,6 +295,10 @@ def compute_levee_stage_log_kernel(
     flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
+    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
+    flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
+
     total_storage = river_storage_curr + flood_storage_curr
     
     # Derived parameters
@@ -493,8 +501,8 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
     water_surface_elevation_ptr,                # *f32: River depth
     protected_water_surface_elevation_ptr,      # *f32: Protected water surface elevation
-    total_storage_ptr,                          # *f32: Total storage (in/out)
-    outgoing_storage_ptr,                       # *f32: Outgoing storage (in/out)
+    total_storage_ptr,                          # *f64: Total storage (in/out)
+    outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
     time_step,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
@@ -528,8 +536,8 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
-    bifurcation_total_storage_downstream = tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+    bifurcation_total_storage = to_compute_dtype(tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage_downstream = to_compute_dtype(tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     for level in tl.static_range(num_bifurcation_levels):
@@ -597,9 +605,9 @@ def compute_levee_bifurcation_outflow_kernel(
 @triton.jit
 def compute_levee_stage_batched_kernel(
     levee_catchment_idx_ptr,
-    river_storage_ptr,
-    flood_storage_ptr,
-    protected_storage_ptr,
+    river_storage_ptr,                      # *f64
+    flood_storage_ptr,                      # *f64
+    protected_storage_ptr,                  # *f64
     river_depth_ptr,
     flood_depth_ptr,
     protected_depth_ptr,
@@ -664,6 +672,10 @@ def compute_levee_stage_batched_kernel(
     flood_storage_curr = tl.load(flood_storage_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
     flood_depth_curr = tl.load(flood_depth_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
     
+    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
+    flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
+
     total_storage = river_storage_curr + flood_storage_curr
     
     # Derived parameters
@@ -861,8 +873,8 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
     water_surface_elevation_ptr,                # *f32: River depth
     protected_water_surface_elevation_ptr,      # *f32: Protected water surface elevation
-    total_storage_ptr,                          # *f32: Total storage (in/out)
-    outgoing_storage_ptr,                       # *f32: Outgoing storage (in/out)
+    total_storage_ptr,                          # *f64: Total storage (in/out)
+    outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
     time_step,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
@@ -912,8 +924,8 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0)
-    bifurcation_total_storage_downstream = tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0)
+    bifurcation_total_storage = to_compute_dtype(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage_downstream = to_compute_dtype(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     # Base offsets for level-dependent arrays

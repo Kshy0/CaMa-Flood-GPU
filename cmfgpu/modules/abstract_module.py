@@ -180,7 +180,7 @@ class AbstractModule(BaseModel, ABC):
         description=(
             "Enable mixed precision for hpfloat tensors (storage variables).\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
-            "  bfloat16 → float32, float32 → float64, float64 → float64 (no promotion)."
+            "  float32 → float64, float64 → float64 (no promotion)."
         ),
     )
     num_trials: Optional[int] = Field(
@@ -196,14 +196,13 @@ class AbstractModule(BaseModel, ABC):
         dtype as ``precision`` — all tensors share one precision level.
 
         When ``mixed_precision`` is True, hpfloat is promoted one level:
-          bfloat16 → float32, float32 → float64, float64 → float64.
+          float32 → float64, float64 → float64.
         This mirrors Fortran CaMa-Flood's JPRD (double-precision) for
         storage variables (P2RIVSTO, P2FLDSTO, etc.).
         """
         if not self.mixed_precision:
             return self.precision
         _hp_map = {
-            torch.bfloat16: torch.float32,
             torch.float32: torch.float64,
             torch.float64: torch.float64,
         }

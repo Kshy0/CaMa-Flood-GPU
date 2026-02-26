@@ -7,7 +7,7 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import typed_sqrt
+from cmfgpu.phys.triton.utils import typed_sqrt, to_compute_dtype
 
 
 # -----------------------------------------------------------------------------
@@ -16,18 +16,18 @@ from cmfgpu.phys.triton.utils import typed_sqrt
 @triton.jit
 def compute_flood_stage_kernel(
     # Storage update pointers
-    river_inflow_ptr,            # *f32: River inflow (in/out, return to zero)
-    flood_inflow_ptr,            # *f32: Flood inflow  (in/out, return to zero)
+    river_inflow_ptr,            # *f64: River inflow (in/out, return to zero)
+    flood_inflow_ptr,            # *f64: Flood inflow  (in/out, return to zero)
     river_outflow_ptr,           # *f32: River outflow
     flood_outflow_ptr,           # *f32: Flood outflow
-    global_bifurcation_outflow_ptr, # *f32: Global bifurcation outflow
+    global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
     time_step,                   # f32: Time step
     # Storage and output pointers
-    outgoing_storage_ptr,           # *f32: outgoing storage (out, return to zero)
-    river_storage_ptr,           # *f32: River storage (in/out)
-    flood_storage_ptr,           # *f32: Flood storage (in/out)
-    protected_storage_ptr,       # *f32: Protected storage (in/out)
+    outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
+    river_storage_ptr,           # *f64: River storage (in/out)
+    flood_storage_ptr,           # *f64: Flood storage (in/out)
+    protected_storage_ptr,       # *f64: Protected storage (in/out)
     river_depth_ptr,             # *f32: River depth (out)
     flood_depth_ptr,             # *f32: Flood depth (out)
     protected_depth_ptr,         # *f32: Protected depth (out)
@@ -59,6 +59,11 @@ def compute_flood_stage_kernel(
     global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
 
+    # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
+    river_inflow = to_compute_dtype(river_inflow, river_outflow)
+    flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
+    global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+
     river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
     flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - global_bifurcation_outflow) * time_step
     river_storage_updated = tl.maximum(river_storage_updated, 0.0)
@@ -69,6 +74,9 @@ def compute_flood_stage_kernel(
     )
     flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+
+    # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
+    total_storage = to_compute_dtype(total_storage, river_outflow)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
     river_height        = tl.load(river_height_ptr        + offs, mask=mask)
@@ -163,18 +171,18 @@ def compute_flood_stage_kernel(
 @triton.jit
 def compute_flood_stage_log_kernel(
     # Storage update pointers
-    river_inflow_ptr,            # *f32: River inflow (in/out, return to zero)
-    flood_inflow_ptr,            # *f32: Flood inflow  (in/out, return to zero)
+    river_inflow_ptr,            # *f64: River inflow (in/out, return to zero)
+    flood_inflow_ptr,            # *f64: Flood inflow  (in/out, return to zero)
     river_outflow_ptr,           # *f32: River outflow
     flood_outflow_ptr,           # *f32: Flood outflow
-    global_bifurcation_outflow_ptr,  # *f32: Global bifurcation outflow
+    global_bifurcation_outflow_ptr,  # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
     time_step,                   # f32: Time step
     # Storage and output pointers
-    outgoing_storage_ptr,           # *f32: outgoing storage (out, return to zero)
-    river_storage_ptr,           # *f32: River storage (in/out)
-    flood_storage_ptr,           # *f32: Flood storage (in/out)
-    protected_storage_ptr,       # *f32: Protected storage (in/out)
+    outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
+    river_storage_ptr,           # *f64: River storage (in/out)
+    flood_storage_ptr,           # *f64: Flood storage (in/out)
+    protected_storage_ptr,       # *f64: Protected storage (in/out)
     river_depth_ptr,             # *f32: River depth (in/out)
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
@@ -225,6 +233,12 @@ def compute_flood_stage_log_kernel(
     global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     total_stage_pre = river_storage + flood_storage + protected_storage
     tl.atomic_add(total_storage_pre_sum_ptr + current_step, tl.sum(total_stage_pre) * 1e-9)
+
+    # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
+    river_inflow = to_compute_dtype(river_inflow, river_outflow)
+    flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
+    global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+
     river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
     flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - global_bifurcation_outflow) * time_step
     river_storage_updated = tl.maximum(river_storage_updated, 0.0)
@@ -242,6 +256,8 @@ def compute_flood_stage_log_kernel(
     tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
     tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff - river_outflow - flood_outflow - global_bifurcation_outflow) * time_step, 0)) * 1e-9)
 
+    # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
+    total_storage = to_compute_dtype(total_storage, river_outflow)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
     river_height        = tl.load(river_height_ptr        + offs, mask=mask)
@@ -343,18 +359,18 @@ def compute_flood_stage_log_kernel(
 @triton.jit
 def compute_flood_stage_batched_kernel(
     # Storage update pointers
-    river_inflow_ptr,            # *f32: River inflow (in/out, return to zero)
-    flood_inflow_ptr,            # *f32: Flood inflow  (in/out, return to zero)
+    river_inflow_ptr,            # *f64: River inflow (in/out, return to zero)
+    flood_inflow_ptr,            # *f64: Flood inflow  (in/out, return to zero)
     river_outflow_ptr,           # *f32: River outflow
     flood_outflow_ptr,           # *f32: Flood outflow
-    global_bifurcation_outflow_ptr, # *f32: Global bifurcation outflow
+    global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
     time_step,                   # f32: Time step
     # Storage and output pointers
-    outgoing_storage_ptr,           # *f32: outgoing storage (out, return to zero)
-    river_storage_ptr,           # *f32: River storage (in/out)
-    flood_storage_ptr,           # *f32: Flood storage (in/out)
-    protected_storage_ptr,       # *f32: Protected storage (in/out)
+    outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
+    river_storage_ptr,           # *f64: River storage (in/out)
+    flood_storage_ptr,           # *f64: Flood storage (in/out)
+    protected_storage_ptr,       # *f64: Protected storage (in/out)
     river_depth_ptr,             # *f32: River depth (in/out)
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
@@ -400,6 +416,11 @@ def compute_flood_stage_batched_kernel(
     
     runoff = tl.load(runoff_ptr + (idx if batched_runoff else catchment_idx), mask=mask, other=0.0)
 
+    # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
+    river_inflow = to_compute_dtype(river_inflow, river_outflow)
+    flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
+    global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+
     river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
     flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - global_bifurcation_outflow) * time_step
     river_storage_updated = tl.maximum(river_storage_updated, 0.0)
@@ -410,6 +431,9 @@ def compute_flood_stage_batched_kernel(
     )
     flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+
+    # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
+    total_storage = to_compute_dtype(total_storage, river_outflow)
 
     # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
     river_height        = tl.load(river_height_ptr        + (idx if batched_river_height else catchment_idx), mask=mask)
