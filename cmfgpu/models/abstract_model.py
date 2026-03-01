@@ -77,7 +77,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         description="Base precision of the model",
     )
     mixed_precision: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Enable mixed precision for hpfloat (storage) tensors.\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
@@ -473,7 +473,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             calendar=self.calendar,
             in_memory_mode=self.in_memory_output,
             result_device=self.result_device,
-            save_precision=self.dtype,
+            save_precision=torch.float32,
         )
 
         registered_vars = set()

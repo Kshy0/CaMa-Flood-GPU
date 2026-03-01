@@ -82,6 +82,7 @@ def computed_tensor_field(
     dim_coords: Optional[str] = None,
     category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
+    depends_on: Optional[str] = None,
     **kwargs
 ):
     """
@@ -101,6 +102,9 @@ def computed_tensor_field(
                   - 'shared_state': Computed state variable (NEVER batched)
                   - 'virtual': Computed on-demand during analysis/output (not stored in memory)
         expr: Expression string for virtual variables
+        depends_on: Module name that must be in ``opened_modules`` for this field
+                    to be created. When the dependency is absent, the cached_property
+                    should return ``None`` and the framework will skip validation.
         **kwargs: Additional computed_field parameters
     """
     if expr is not None and category != "virtual":
@@ -121,7 +125,8 @@ def computed_tensor_field(
             "save_coord": save_coord,
             "dim_coords": dim_coords,
             "category": category,
-            "expr": expr
+            "expr": expr,
+            "depends_on": depends_on,
         },
         **kwargs
     )
@@ -176,7 +181,7 @@ class AbstractModule(BaseModel, ABC):
         description="Data type for tensors",
     )
     mixed_precision: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Enable mixed precision for hpfloat tensors (storage variables).\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
@@ -445,6 +450,11 @@ class AbstractModule(BaseModel, ABC):
             # Need to skip virtual fields
             category = json_schema_extra.get('category', 'derived_param')
             if category == 'virtual':
+                continue
+
+            # Skip fields whose dependency module is not opened
+            depends_on = json_schema_extra.get('depends_on')
+            if depends_on is not None and depends_on not in self.opened_modules:
                 continue
 
             tensor = getattr(self, field_name)

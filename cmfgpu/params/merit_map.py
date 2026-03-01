@@ -85,6 +85,16 @@ class MERITMap(BaseModel):
         default=False,
         description="If True, merge levee data into map parameters."
     )
+
+    reservoir_flag: bool = Field(
+        default=False,
+        description="If True, merge reservoir data into map parameters."
+    )
+
+    dam_file: Optional[FilePath] = Field(
+        default=None,
+        description="Path to dam/reservoir parameter CSV file (Fortran CaMa-Flood format)."
+    )
     
     gauge_file: Optional[FilePath] = Field(
         default=None,
@@ -183,6 +193,15 @@ class MERITMap(BaseModel):
         "levee_fraction",
         "levee_crown_height",
         "levee_basin_id",
+        "reservoir_id",
+        "reservoir_catchment_id",
+        "reservoir_basin_id",
+        "reservoir_capacity",
+        "conservation_volume",
+        "emergency_volume",
+        "normal_outflow",
+        "flood_control_outflow",
+        "reservoir_area",
         "gauge_catchment_id",
         "longitude",
         "latitude",
@@ -251,6 +270,9 @@ class MERITMap(BaseModel):
         # Default: save all catchments (will be updated in filter_to_poi_basins if only_save_pois)
         self.catchment_save_id = catchment_id.copy()
         self.catchment_save_basin_id = None  # Will be set after basin_id is computed
+        self.num_reservoirs = 0
+        self.reservoir_catchment_id = np.array([], dtype=np.int64)
+        self.reservoir_basin_id = np.array([], dtype=np.int64)
         
 
         print(f"Loaded {len(catchment_id)} catchments")
@@ -742,8 +764,133 @@ class MERITMap(BaseModel):
             self.levee_fraction = levee_fraction[levee_mask]
             self.levee_basin_id = self.catchment_basin_id[levee_mask]
 
+        if self.reservoir_flag:
+            self._load_reservoir_parameters()
+
         data = read_map(self.map_dir / "fldhgt.bin", (self.nx, self.ny, self.num_flood_levels), precision=self.map_precision)
         self.flood_depth_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
+
+    def _load_reservoir_parameters(self) -> None:
+        """
+        Load dam/reservoir parameters from a CSV file (Fortran CaMa-Flood format).
+
+        CSV format (following ``cmf_ctrl_damout_mod.F90``):
+            Line 1:  NDAM (number of dams)
+            Line 2:  header (skipped)
+            Line 3+: DamID, DamName, DamLat, DamLon, upreal,
+                      DamIX, DamIY, FldVol_mcm, ConVol_mcm, TotVol_mcm,
+                      Qn, Qf
+
+        DamIX/DamIY are 1-based Fortran indices, converted to 0-based here.
+        Only dams that fall within the current catchment domain are retained.
+        """
+        if self.dam_file is None:
+            print("reservoir_flag is True but dam_file not specified; skipping reservoir loading")
+            return
+
+        dam_path = Path(self.dam_file) if not isinstance(self.dam_file, Path) else self.dam_file
+        print(f"Loading dam parameters from {dam_path}")
+
+        with open(dam_path, "r") as f:
+            ndam = int(f.readline().strip().split()[0])
+            f.readline()  # skip header
+
+            dam_ids = []
+            dam_ix = []
+            dam_iy = []
+            fld_vol_mcm = []
+            con_vol_mcm = []
+            tot_vol_mcm = []
+            qn_list = []
+            qf_list = []
+            upreal_list = []
+
+            for _ in range(ndam):
+                parts = f.readline().strip().split()
+                if len(parts) < 12:
+                    continue
+                dam_ids.append(int(parts[0]))
+                # parts[1] = DamName, parts[2] = DamLat, parts[3] = DamLon
+                upreal_list.append(float(parts[4]))
+                dam_ix.append(int(parts[5]))    # 1-based
+                dam_iy.append(int(parts[6]))    # 1-based
+                fld_vol_mcm.append(float(parts[7]))
+                con_vol_mcm.append(float(parts[8]))
+                tot_vol_mcm.append(float(parts[9]))
+                qn_list.append(float(parts[10]))
+                qf_list.append(float(parts[11]))
+
+        dam_ids = np.array(dam_ids, dtype=np.int64)
+        dam_ix = np.array(dam_ix, dtype=np.int64) - 1   # Fortran 1-based → 0-based
+        dam_iy = np.array(dam_iy, dtype=np.int64) - 1
+        fld_vol_mcm = np.array(fld_vol_mcm, dtype=self.numpy_precision)
+        con_vol_mcm = np.array(con_vol_mcm, dtype=self.numpy_precision)
+        tot_vol_mcm = np.array(tot_vol_mcm, dtype=self.numpy_precision)
+        qn = np.array(qn_list, dtype=self.numpy_precision)
+        qf = np.array(qf_list, dtype=self.numpy_precision)
+
+        # Filter to dams within grid bounds
+        valid = (dam_ix >= 0) & (dam_ix < self.nx) & (dam_iy >= 0) & (dam_iy < self.ny)
+        if not valid.all():
+            n_out = int((~valid).sum())
+            print(f"  Warning: {n_out} dams outside grid bounds, skipped")
+
+        # Map (IX, IY) to catchment_id via ravel_multi_index
+        dam_cids = np.full(len(dam_ix), -1, dtype=np.int64)
+        dam_cids[valid] = np.ravel_multi_index(
+            (dam_ix[valid], dam_iy[valid]), self.map_shape
+        )
+
+        # Keep only dams whose grid cell is a valid catchment
+        in_domain = np.isin(dam_cids, self.catchment_id)
+        keep = valid & in_domain
+        n_kept = int(keep.sum())
+        n_skipped = int(valid.sum()) - n_kept
+        if n_skipped > 0:
+            print(f"  Warning: {n_skipped} dams on non-catchment grid cells, skipped")
+
+        if n_kept == 0:
+            print("  No dams allocated in the current domain")
+            return
+
+        # Apply filter
+        dam_cids = dam_cids[keep]
+        dam_ids = dam_ids[keep]
+        fld_vol_mcm = fld_vol_mcm[keep]
+        con_vol_mcm = con_vol_mcm[keep]
+        tot_vol_mcm = tot_vol_mcm[keep]
+        qn = qn[keep]
+        qf = qf[keep]
+
+        # Compute storage volumes (MCM → m³)
+        fld_vol = fld_vol_mcm * 1.0e6      # flood control storage
+        con_vol = con_vol_mcm * 1.0e6       # conservation storage
+        tot_vol = tot_vol_mcm * 1.0e6       # total capacity
+        eme_vol = con_vol + fld_vol * 0.95  # emergency threshold (Fortran: EmeVol)
+
+        # Reservoir area: not available from CSV; set to 0 (can be overridden later)
+        res_area = np.zeros(n_kept, dtype=self.numpy_precision)
+
+        # Map dam catchment IDs to basin IDs
+        # find_indices_in gives the position of each dam_cid in self.catchment_id
+        dam_catchment_idx = find_indices_in(dam_cids, self.catchment_id)
+        dam_basin_id = self.catchment_basin_id[dam_catchment_idx]
+
+        # Store results (reservoir-indexed arrays)
+        self.num_reservoirs = n_kept
+        self.reservoir_id = np.arange(n_kept, dtype=np.int64)
+        self.reservoir_catchment_id = dam_cids
+        self.reservoir_basin_id = dam_basin_id
+
+        # Physical parameters (saved to NetCDF, loaded by ReservoirModule)
+        self.reservoir_capacity = tot_vol
+        self.conservation_volume = con_vol
+        self.emergency_volume = eme_vol
+        self.normal_outflow = qn
+        self.flood_control_outflow = qf
+        self.reservoir_area = res_area
+
+        print(f"  Allocated {n_kept} reservoirs out of {ndam} dams")
 
     def check_flow_direction(self) -> None:
         """Validate flow direction consistency."""
@@ -789,6 +936,9 @@ class MERITMap(BaseModel):
             if self.levee_flag:
                 ds.createDimension("levee", self.num_levees)
 
+            if self.reservoir_flag and self.num_reservoirs > 0:
+                ds.createDimension("reservoir", self.num_reservoirs)
+
             if self.num_gauges > 0:
                 ds.createDimension("gauge", self.num_gauges)
             
@@ -810,6 +960,8 @@ class MERITMap(BaseModel):
                         return ("bifurcation_path",)
                     if self.levee_flag and shape[0] == self.num_levees:
                         return ("levee",)
+                    if self.reservoir_flag and self.num_reservoirs > 0 and shape[0] == self.num_reservoirs:
+                        return ("reservoir",)
                     if self.num_gauges > 0 and shape[0] == self.num_gauges:
                         return ("gauge",)
                     if num_saved_catchments > 0 and shape[0] == num_saved_catchments:
@@ -984,6 +1136,7 @@ class MERITMap(BaseModel):
         print(f"Grid dimensions          : {self.nx} x {self.ny}")
         print(f"Number of basins         : {self.num_basins}")
         print(f"Number of catchments     : {self.num_catchments}")
+        print(f"Number of reservoirs     : {getattr(self, 'num_reservoirs', 0)}")
         print(f"Number of levees         : {getattr(self, 'num_levees', 0)}")
         print(f"Number of bifurcation paths : {self.num_bifurcation_paths}")
         print(f"Number of gauges         : {self.num_gauges}")

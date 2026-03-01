@@ -110,7 +110,7 @@ def main():
         output_start_time=start_date,
         calendar=dataset0.calendar,
     )
-    model.set_total_steps(len(dataset0))
+    model.set_total_steps(dataset0.total_steps)
 
     # assume both datasets have the same formatting and mapping
     local_runoff_matrix = dataset0.build_local_runoff_matrix(

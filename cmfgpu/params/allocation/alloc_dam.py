@@ -24,6 +24,14 @@ if TYPE_CHECKING:
     from cmfgpu.params.allocation.hires_map import HiResMap
 
 
+def _find_col(header_lower: list[str], aliases: list[str]) -> int | None:
+    """Return the column index matching any alias, or *None*."""
+    for alias in aliases:
+        if alias in header_lower:
+            return header_lower.index(alias)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Numba kernel
 # ---------------------------------------------------------------------------
@@ -175,7 +183,9 @@ class DamAllocMixin:
 
             ID  Lat  Lon  Uparea(km²)  DamName  RivName  Cap_MCM  Year
 
-        Only the first four numeric columns are used for allocation.
+        The first four numeric columns (ID, Lat, Lon, Uparea) are always
+        read by position.  ``cap_mcm`` and ``year`` are detected by header
+        name if present.
         """
         dam_list_path = Path(dam_list_path)
         ids: List[int] = []
@@ -183,27 +193,64 @@ class DamAllocMixin:
         lons: List[float] = []
         areas: List[float] = []
         names: List[str] = []
+        cap_mcm_list: List[float] = []
+        year_list: List[int] = []
 
-        with open(dam_list_path) as f:
-            header = f.readline()  # skip header
+        with open(dam_list_path, encoding="utf-8-sig") as f:
+            header = f.readline()
             sep = "," if "," in header else None
+            header_lower = [h.strip().lower() for h in header.split(sep)]
+
+            # Detect optional columns by header name
+            cap_col = _find_col(header_lower, ["cap_mcm"])
+            year_col = _find_col(header_lower, ["year"])
+
             for line in f:
                 parts = line.strip().split(sep)
                 if len(parts) < 4:
                     continue
-                ids.append(int(parts[0]))
-                lats.append(float(parts[1]))
-                lons.append(float(parts[2]))
-                areas.append(float(parts[3]))
+                try:
+                    ids.append(int(parts[0]))
+                    lats.append(float(parts[1]))
+                    lons.append(float(parts[2]))
+                    areas.append(float(parts[3]))
+                except (ValueError, IndexError):
+                    continue
                 names.append(parts[4].strip() if len(parts) > 4 else "")
+
+                if cap_col is not None and len(parts) > cap_col:
+                    try:
+                        cap_mcm_list.append(float(parts[cap_col]))
+                    except ValueError:
+                        cap_mcm_list.append(-999.0)
+                else:
+                    cap_mcm_list.append(-999.0)
+
+                if year_col is not None and len(parts) > year_col:
+                    try:
+                        year_list.append(int(parts[year_col]))
+                    except ValueError:
+                        year_list.append(-99)
+                else:
+                    year_list.append(-99)
 
         self.dam_ids = np.array(ids, dtype=np.int64)
         self.dam_lats = np.array(lats, dtype=np.float64)
         self.dam_lons = np.array(lons, dtype=np.float64)
         self.dam_areas = np.array(areas, dtype=np.float64)
         self.dam_names = names
+        self.dam_cap_mcm = np.array(cap_mcm_list, dtype=np.float64)
+        self.dam_years = np.array(year_list, dtype=np.int64)
 
-        print(f"Loaded {len(ids)} dams from {dam_list_path}")
+        extras = []
+        if cap_col is not None:
+            extras.append(f"cap_mcm (col {cap_col})")
+        if year_col is not None:
+            extras.append(f"year (col {year_col})")
+        msg = f"Loaded {len(ids)} dams from {dam_list_path}"
+        if extras:
+            msg += f" [{', '.join(extras)}]"
+        print(msg)
 
     def allocate_dams(self: HiResMap) -> None:
         """Run dam allocation (numba-accelerated core).
@@ -266,6 +313,8 @@ class DamAllocMixin:
         area_cama               : CaMa upstream area (km²); -888 = sub-grid, -999 = error
         error                   : relative error; -8 for sub-grid
         snum                    : 0 = outlet, 1 = upstream grid
+        cap_mcm                 : total capacity (MCM), -999 if unavailable
+        year                    : construction year, -99 if unavailable
         """
         N = len(self.dam_ids)
         dtype = np.dtype([
@@ -279,6 +328,8 @@ class DamAllocMixin:
             ("area_cama", np.float64),
             ("error", np.float64),
             ("snum", np.int32),
+            ("cap_mcm", np.float64),
+            ("year", np.int64),
         ])
         arr = np.empty(N, dtype=dtype)
         arr["id"] = self.dam_ids
@@ -290,6 +341,10 @@ class DamAllocMixin:
         arr["area_cama"] = self.dam_area_cmf
         arr["error"] = self.dam_err_rel
         arr["snum"] = self.dam_snum
+        arr["cap_mcm"] = getattr(self, "dam_cap_mcm",
+                                  np.full(N, -999.0, dtype=np.float64))
+        arr["year"] = getattr(self, "dam_years",
+                               np.full(N, -99, dtype=np.int64))
 
         cid = np.full(N, -1, dtype=np.int64)
         ok = (self.dam_staX >= 0) & (self.dam_staY >= 0)

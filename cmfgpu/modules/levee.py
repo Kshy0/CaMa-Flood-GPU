@@ -27,8 +27,6 @@ def LeveeField(
     shape: Tuple[str, ...] = ("base.num_levees",),
     dtype: Literal["float", "int", "bool"] = "float",
     group_by: Optional[str] = "levee_basin_id",
-    save_idx: Optional[str] = "levee_save_idx",
-    save_coord: Optional[str] = "levee_save_id",
     dim_coords: Optional[str] = "base.levee_catchment_id",
     category: Literal["topology", "param", "init_state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
@@ -39,8 +37,8 @@ def LeveeField(
         shape=shape,
         dtype=dtype,
         group_by=group_by,
-        save_idx=save_idx,
-        save_coord=save_coord,
+        save_idx=None,
+        save_coord=None,
         dim_coords=dim_coords,
         category=category,
         mode=mode,
@@ -52,8 +50,6 @@ def computed_levee_field(
     description: str,
     shape: Tuple[str, ...] = ("base.num_levees",),
     dtype: Literal["float", "int", "bool"] = "float",
-    save_idx: Optional[str] = "levee_save_idx",
-    save_coord: Optional[str] = "levee_save_id",
     dim_coords: Optional[str] = "base.levee_catchment_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
@@ -63,8 +59,8 @@ def computed_levee_field(
         description=description,
         shape=shape,
         dtype=dtype,
-        save_idx=save_idx,
-        save_coord=save_coord,
+        save_idx=None,
+        save_coord=None,
         dim_coords=dim_coords,
         category=category,
         expr=expr,
@@ -89,14 +85,6 @@ class LeveeModule(AbstractModule):
     # Levee metadata and topology
     # ------------------------------------------------------------------ #
 
-
-    levee_save_mask: Optional[torch.Tensor] = LeveeField(
-        description="Mask of levees whose diagnostics should be saved",
-        dtype="bool",
-        default=None,
-        category="topology",
-    )
-
     levee_id: torch.Tensor = LeveeField(
         description="Unique ID for each levee",
         dtype="int",
@@ -116,18 +104,6 @@ class LeveeModule(AbstractModule):
         description="Relative distance between river and levee (0 close to channel, 1 far end)",
         category="param",
     )
-
-    # ------------------------------------------------------------------ #
-    # Computed scalar metadata
-    # ------------------------------------------------------------------ #
-
-    @computed_field(description="Number of levees whose outputs are persisted")
-    @cached_property
-    def num_saved_levees(self) -> int:
-        if self.levee_save_mask is None:
-            return self.base.num_levees
-        active = torch.count_nonzero(self.levee_save_mask)
-        return int(active.item())
 
     # ------------------------------------------------------------------ #
     # Computed tensors (levee-aligned)
@@ -326,34 +302,6 @@ class LeveeModule(AbstractModule):
         upper_val = S_table.gather(-1, upper_idx_table.unsqueeze(-1)).squeeze(-1)
         
         return (lower_val + frac * (upper_val - lower_val))
-
-    # ------------------------------------------------------------------ #
-    # Save/selection helpers
-    # ------------------------------------------------------------------ #
-    @computed_levee_field(
-        description="Indices of levees whose outputs are saved",
-        dtype="idx",
-        shape=("num_saved_levees",),
-        category="topology",
-    )
-    @cached_property
-    def levee_save_idx(self) -> Optional[torch.Tensor]:
-        if self.levee_save_mask is None:
-            return torch.arange(self.base.num_levees, dtype=torch.int32, device=self.device)
-        idx = torch.nonzero(self.levee_save_mask, as_tuple=False).squeeze(-1).to(torch.int32)
-        return idx if idx.numel() > 0 else None
-
-    @computed_levee_field(
-        description="Levee IDs that correspond to saved outputs",
-        dtype="int",
-        shape=("num_saved_levees",),
-        category="topology",
-    )
-    @cached_property
-    def levee_save_id(self) -> Optional[torch.Tensor]:
-        if self.levee_save_idx is None:
-            return None
-        return self.base.levee_catchment_id[self.levee_save_idx]
 
     # ------------------------------------------------------------------ #
     # Validators

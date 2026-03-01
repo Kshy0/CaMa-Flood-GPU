@@ -9,6 +9,7 @@ from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
 from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
+from cmfgpu.modules.reservoir import ReservoirModule
 
 __all__ = [
     "AdaptiveTimeModule",
@@ -16,4 +17,5 @@ __all__ = [
     "LeveeModule",
     "LogModule",
     "BaseModule",
+    "ReservoirModule",
 ]

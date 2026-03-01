@@ -104,11 +104,18 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Bifurcation topology
     # ------------------------------------------------------------------ #
-    bifurcation_save_mask: Optional[torch.Tensor] = BifurcationField(
-        description="Mask of bifurcation paths to save in output",
-        dtype="bool",
+    bifurcation_path_save_id: Optional[torch.Tensor] = BifurcationField(
+        description="Bifurcation path IDs to save in output. "
+                    "None means save all paths.",
+        dtype="int",
+        group_by=None,
+        save_idx=None,
+        save_coord=None,
+        dim_coords=None,
+        shape=("num_saved_bifurcation_paths",),
         default=None,
         category="topology",
+        mode="cpu",
     )
 
     bifurcation_catchment_id: torch.Tensor = BifurcationField(
@@ -197,22 +204,10 @@ class BifurcationModule(AbstractModule):
         category="topology",
     )
     @cached_property
-    def bifurcation_path_save_idx(self) -> torch.Tensor:
-        if self.bifurcation_save_mask is None:
-            return torch.arange(self.num_bifurcation_paths, dtype=torch.int32, device=self.device)
-        return torch.nonzero(self.bifurcation_save_mask, as_tuple=False).squeeze(-1).to(torch.int32)
-    
-    @computed_bifurcation_field(
-        description="Indices of bifurcation paths to save in output",
-        shape=("num_saved_bifurcation_paths",),
-        dtype="int",
-        category="topology",
-    )
-    @cached_property
-    def bifurcation_path_save_id(self) -> torch.Tensor:
-        if self.bifurcation_path_save_idx is None:
-            return self.bifurcation_path_id
-        return self.bifurcation_path_id[self.bifurcation_path_save_idx]
+    def bifurcation_path_save_idx(self) -> Optional[torch.Tensor]:
+        if self.bifurcation_path_save_id is None:
+            return None
+        return find_indices_in_torch(self.bifurcation_path_save_id, self.bifurcation_path_id)
 
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
@@ -222,7 +217,9 @@ class BifurcationModule(AbstractModule):
     )
     @cached_property
     def num_saved_bifurcation_paths(self) -> int:
-        return len(self.bifurcation_path_save_idx)
+        if self.bifurcation_path_save_id is None:
+            return self.num_bifurcation_paths
+        return self.bifurcation_path_save_id.shape[0]
 
     @computed_field(
         description="Total number of bifurcation paths."
@@ -250,11 +247,12 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
     def validate_bifurcation_path_save_idx(self) -> Self:
-        if not torch.all(
-            (self.bifurcation_path_save_idx >= 0)
-            & (self.bifurcation_path_save_idx < self.num_bifurcation_paths)
-        ):
-            raise ValueError("bifurcation_path_save_idx contains invalid indices")
+        if self.bifurcation_path_save_idx is not None:
+            if not torch.all(
+                (self.bifurcation_path_save_idx >= 0)
+                & (self.bifurcation_path_save_idx < self.num_bifurcation_paths)
+            ):
+                raise ValueError("bifurcation_path_save_id contains entries absent from bifurcation_path_id")
         return self
 
     @model_validator(mode="after")

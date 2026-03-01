@@ -11,7 +11,8 @@ This module converts:
     1. parameters.nc  →  nextxy.bin, ctmare.bin, elevtn.bin, nxtdst.bin,
                           rivlen.bin, fldhgt.bin, rivwth_gwdlr.bin, rivhgt.bin,
                           rivman.bin, lonlat.bin, width.bin,
-                          levhgt.bin, levfrc.bin, bifprm.txt, mapdim.txt
+                          levhgt.bin, levfrc.bin, bifprm.txt, dam_params.csv,
+                          mapdim.txt
     2. runoff_mapping.npz  →  inpmat*.bin, diminfo*.txt
 
 Both full-grid and cropped (POI-filtered) parameters are supported.
@@ -352,6 +353,140 @@ def _write_bifprm(
 
 
 # ---------------------------------------------------------------------------
+# dam_params.csv writer
+# ---------------------------------------------------------------------------
+
+def _write_dam_params_csv(
+    path: Path,
+    reservoir_catchment_id: np.ndarray,
+    reservoir_capacity: np.ndarray,
+    conservation_volume: np.ndarray,
+    emergency_volume: np.ndarray,
+    normal_outflow: np.ndarray,
+    flood_control_outflow: np.ndarray,
+    catchment_id: np.ndarray,
+    full_ny: int,
+    x_min: int = 0,
+    y_min: int = 0,
+    out_nx: int = 0,
+    out_ny: int = 0,
+    longitude: Optional[np.ndarray] = None,
+    latitude: Optional[np.ndarray] = None,
+    upstream_area: Optional[np.ndarray] = None,
+) -> None:
+    """Write ``dam_params.csv`` in the format expected by CaMa-Flood Fortran.
+
+    The CSV has the same layout as ``cmf_ctrl_damout_mod.F90``::
+
+        Line 1  :  NDAM
+        Line 2  :  header (skipped by Fortran)
+        Line 3+ :  DamID  DamName  DamLat  DamLon  upreal
+                    DamIX  DamIY  FldVol_mcm  ConVol_mcm  TotVol_mcm  Qn  Qf
+
+    Only dams whose grid cell falls within the output grid ``[0, out_nx) ×
+    [0, out_ny)`` are retained (relevant when ``crop_to_bbox=True``).
+
+    Parameters
+    ----------
+    reservoir_catchment_id : 1-D int64
+        Ravel-index of each dam in the **full** (uncropped) grid.
+    reservoir_capacity, conservation_volume, emergency_volume : 1-D float
+        Storage parameters in m³.  ``emergency_volume = ConVol + FldVol*0.95``.
+    normal_outflow, flood_control_outflow : 1-D float
+        Outflow parameters in m³ s⁻¹ (**raw**, before Yamazaki–Funato
+        modification; Fortran re-derives effective values at runtime).
+    catchment_id : 1-D int64
+        Catchment IDs of the domain (already filtered to current NC).
+    full_ny : int
+        Column count of the **full** (uncropped) grid, used to unravel
+        ``reservoir_catchment_id``.
+    x_min, y_min : int
+        Crop offset (0 when not cropping).
+    out_nx, out_ny : int
+        Output grid dimensions.
+    longitude, latitude : 1-D float, optional
+        Catchment-indexed lon/lat (same order as *catchment_id*).
+    upstream_area : 1-D float, optional
+        Catchment-indexed upstream drainage area in m² (same order as
+        *catchment_id*).
+    """
+    n_total = len(reservoir_catchment_id)
+    if n_total == 0:
+        return
+
+    # ---- Unravel reservoir_catchment_id → (full_x, full_y) ----
+    full_x = reservoir_catchment_id // full_ny
+    full_y = reservoir_catchment_id % full_ny
+
+    # ---- Offset to output-grid coordinates ----
+    dam_cx = full_x - x_min
+    dam_cy = full_y - y_min
+
+    # ---- Filter to dams inside the output grid ----
+    inside = (
+        (dam_cx >= 0) & (dam_cx < out_nx) &
+        (dam_cy >= 0) & (dam_cy < out_ny)
+    )
+    idx_keep = np.nonzero(inside)[0]
+    n_kept = len(idx_keep)
+    if n_kept == 0:
+        print("  No dams inside the output grid — skipping dam_params.csv")
+        return
+
+    # ---- Build catchment_id → array-index lookup ----
+    cid_to_idx = {int(cid): i for i, cid in enumerate(catchment_id)}
+
+    # ---- Reverse-engineer FldVol from emergency_volume and conservation_volume ----
+    #      EmeVol = ConVol + FldVol * 0.95  →  FldVol = (EmeVol - ConVol) / 0.95
+    flood_volume = (emergency_volume - conservation_volume) / 0.95
+
+    # ---- Write CSV ----
+    with open(path, "w") as f:
+        f.write(f"{n_kept}\n")
+        f.write("DamID DamName DamLat DamLon upreal "
+                "DamIX DamIY FldVol_mcm ConVol_mcm TotVol_mcm Qn Qf\n")
+
+        for rank, i in enumerate(idx_keep):
+            dam_id = rank + 1                        # sequential 1-based ID
+            dam_name = f"DAM_{dam_id}"
+
+            ix_out = int(dam_cx[i]) + 1              # 1-based Fortran index
+            iy_out = int(dam_cy[i]) + 1
+
+            fld_mcm = float(flood_volume[i]) / 1.0e6
+            con_mcm = float(conservation_volume[i]) / 1.0e6
+            tot_mcm = float(reservoir_capacity[i]) / 1.0e6
+            qn_val = float(normal_outflow[i])
+            qf_val = float(flood_control_outflow[i])
+
+            # Lat / Lon / upstream area from catchment arrays
+            cid_int = int(reservoir_catchment_id[i])
+            catch_idx = cid_to_idx.get(cid_int, None)
+            if catch_idx is not None and latitude is not None:
+                lat_val = float(latitude[catch_idx])
+                lon_val = float(longitude[catch_idx])
+            else:
+                lat_val = 0.0
+                lon_val = 0.0
+
+            if catch_idx is not None and upstream_area is not None:
+                upreal_km2 = float(upstream_area[catch_idx]) / 1.0e6  # m² → km²
+            else:
+                upreal_km2 = 0.0
+
+            f.write(
+                f"{dam_id} {dam_name} {lat_val:.4f} {lon_val:.4f} "
+                f"{upreal_km2:.2f} {ix_out} {iy_out} "
+                f"{fld_mcm:.4f} {con_mcm:.4f} {tot_mcm:.4f} "
+                f"{qn_val:.4f} {qf_val:.4f}\n"
+            )
+
+    print(f"  Wrote dam_params.csv  ({n_kept} dams"
+          + (f", {n_total - n_kept} outside crop" if n_kept < n_total else "")
+          + ")")
+
+
+# ---------------------------------------------------------------------------
 # mapdim / diminfo writers
 # ---------------------------------------------------------------------------
 
@@ -465,6 +600,7 @@ def export_map_params(
     * ``levhgt.bin``  – levee crown height [m]  (if ``levee_crown_height`` present)
     * ``levfrc.bin``  – unprotected fraction [0–1]  (if ``levee_fraction`` present)
     * ``bifprm.txt``  – bifurcation channel table (if bifurcations present)
+    * ``dam_params.csv`` – reservoir/dam parameter table (if reservoirs present)
     * ``mapdim.txt``  – grid dimensions
 
     Notes
@@ -650,6 +786,47 @@ def export_map_params(
                     if "catchment_elevation" in ds.variables else None
                 ),
                 missing_int=missing_int,
+            )
+
+        # ---- dam_params.csv (reservoir parameters) ----
+        if "reservoir_catchment_id" in ds.variables:
+            res_cid = ds.variables["reservoir_catchment_id"][:].astype(np.int64)
+            res_cap = ds.variables["reservoir_capacity"][:].astype("<f4")
+            res_con = ds.variables["conservation_volume"][:].astype("<f4")
+            res_eme = ds.variables["emergency_volume"][:].astype("<f4")
+            res_qn = ds.variables["normal_outflow"][:].astype("<f4")
+            res_qf = ds.variables["flood_control_outflow"][:].astype("<f4")
+
+            up_area = (
+                ds.variables["upstream_area"][:].astype("<f4")
+                if "upstream_area" in ds.variables else None
+            )
+            lon_1d = (
+                ds.variables["longitude"][:].astype("<f4")
+                if "longitude" in ds.variables else None
+            )
+            lat_1d = (
+                ds.variables["latitude"][:].astype("<f4")
+                if "latitude" in ds.variables else None
+            )
+
+            _write_dam_params_csv(
+                out_dir / "dam_params.csv",
+                reservoir_catchment_id=res_cid,
+                reservoir_capacity=res_cap,
+                conservation_volume=res_con,
+                emergency_volume=res_eme,
+                normal_outflow=res_qn,
+                flood_control_outflow=res_qf,
+                catchment_id=catchment_id,
+                full_ny=full_ny,
+                x_min=x_min,
+                y_min=y_min,
+                out_nx=out_nx,
+                out_ny=out_ny,
+                longitude=lon_1d,
+                latitude=lat_1d,
+                upstream_area=up_area,
             )
 
         # ---- mapdim.txt ----

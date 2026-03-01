@@ -49,7 +49,11 @@ def compute_outflow_kernel(
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
     time_step,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
-    BLOCK_SIZE: tl.constexpr                # block size
+    BLOCK_SIZE: tl.constexpr,               # block size
+    HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    is_dam_upstream_ptr=None,               # *bool  upstream-of-dam mask (catchment-indexed)
+    HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
+    MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -195,6 +199,31 @@ def compute_outflow_kernel(
     updated_flood_outflow = tl.where(is_negative_flow, updated_flood_outflow * limit_rate, updated_flood_outflow)
 
     #----------------------------------------------------------------------
+    # (9b) Kinematic wave override for upstream-of-dam cells (Fortran I1DAM=10)
+    #      Uses bed slope (catchment elevation gradient) instead of water-surface slope.
+    #----------------------------------------------------------------------
+    if HAS_RESERVOIR:
+        is_dam_up = tl.load(is_dam_upstream_ptr + offs, mask=mask, other=0).to(tl.int1)
+        # Bed slope
+        bed_slope = (catchment_elevation - tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0)) / downstream_distance
+        bed_slope = tl.maximum(bed_slope, MIN_KINEMATIC_SLOPE)
+        # River kinematic: Q = W * n^{-1} * S^{0.5} * d^{5/3}
+        kin_riv_vel = (1.0 / river_manning) * typed_sqrt(bed_slope) * typed_pow(river_depth, 2.0 / 3.0)
+        kin_riv = river_width * river_depth * kin_riv_vel
+        kin_riv = tl.minimum(kin_riv, river_storage / time_step)
+        kin_riv = tl.maximum(kin_riv, 0.0)
+        # Flood kinematic: slope clamped to 0.005
+        bed_slope_f = tl.minimum(bed_slope, 0.005)
+        kin_fld_vel = (1.0 / flood_manning) * typed_sqrt(bed_slope_f) * typed_pow(flood_depth, 2.0 / 3.0)
+        kin_fld_area = tl.maximum(flood_storage / river_length - flood_depth * river_width, 0.0)
+        kin_fld = kin_fld_area * kin_fld_vel
+        kin_fld = tl.minimum(kin_fld, flood_storage / time_step)
+        kin_fld = tl.maximum(kin_fld, 0.0)
+        # Override
+        updated_river_outflow = tl.where(is_dam_up, kin_riv, updated_river_outflow)
+        updated_flood_outflow = tl.where(is_dam_up, kin_fld, updated_flood_outflow)
+
+    #----------------------------------------------------------------------
     # (10) Store results - in-place update
     #----------------------------------------------------------------------
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
@@ -208,7 +237,8 @@ def compute_outflow_kernel(
     
     tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
-    tl.store(global_bifurcation_outflow_ptr + offs, 0.0, mask=mask)
+    if HAS_BIFURCATION:
+        tl.store(global_bifurcation_outflow_ptr + offs, 0.0, mask=mask)
 
     #----------------------------------------------------------------------
     # (11) Fused outgoing storage computation (was compute_outgoing_storage_kernel)
@@ -237,7 +267,10 @@ def compute_inflow_kernel(
     river_inflow_ptr,              # *f64: River inflow (output, atomic add)
     flood_inflow_ptr,              # *f64: Flood inflow (output, atomic add)
     limit_rate_ptr,                # *f32: Limit rate (reference)
+    reservoir_total_inflow_ptr,    # *f64: Reservoir total inflow (catchment-sized, atomic add)
+    is_reservoir_ptr,              # *i1:  Boolean mask for reservoir catchments
     num_catchments: tl.constexpr,  # Total number of units
+    HAS_RESERVOIR: tl.constexpr,   # Whether reservoir module is active
     BLOCK_SIZE: tl.constexpr       # Block size
 ):
     pid = tl.program_id(0)
@@ -278,8 +311,15 @@ def compute_inflow_kernel(
 
     # -------- Accumulate inflows --------
     is_river_mouth = downstream_idx == offs
-    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=mask&(~is_river_mouth))
-    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=mask&(~is_river_mouth))
+    not_mouth = mask & (~is_river_mouth)
+    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=not_mouth)
+    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=not_mouth)
+
+    # -------- Accumulate reservoir inflow --------
+    if HAS_RESERVOIR:
+        is_downstream_res = tl.load(is_reservoir_ptr + downstream_idx, mask=not_mouth, other=0) != 0
+        total_outflow = updated_river_outflow + updated_flood_outflow
+        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx, total_outflow, mask=not_mouth & is_downstream_res)
 
 
 @triton.jit
@@ -330,7 +370,8 @@ def compute_outflow_batched_kernel(
     batched_river_width: tl.constexpr,
     batched_river_length: tl.constexpr,
     batched_river_height: tl.constexpr,
-    batched_catchment_elevation: tl.constexpr
+    batched_catchment_elevation: tl.constexpr,
+    HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
 ):
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -496,7 +537,8 @@ def compute_outflow_batched_kernel(
     
     tl.store(river_inflow_ptr + idx, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + idx, 0.0, mask=mask)
-    tl.store(global_bifurcation_outflow_ptr + idx, 0.0, mask=mask)
+    if HAS_BIFURCATION:
+        tl.store(global_bifurcation_outflow_ptr + idx, 0.0, mask=mask)
 
     #----------------------------------------------------------------------
     # (11) Fused outgoing storage computation (was compute_outgoing_storage_kernel)
@@ -524,8 +566,11 @@ def compute_inflow_batched_kernel(
     river_inflow_ptr,              # *f64: River inflow (output, atomic add)
     flood_inflow_ptr,              # *f64: Flood inflow (output, atomic add)
     limit_rate_ptr,                # *f32: Limit rate (reference)
+    reservoir_total_inflow_ptr,    # *f64: Reservoir total inflow (catchment-sized, atomic add)
+    is_reservoir_ptr,              # *i1:  Boolean mask for reservoir catchments
     num_catchments: tl.constexpr,  # Total number of units
     num_trials: tl.constexpr,
+    HAS_RESERVOIR: tl.constexpr,   # Whether reservoir module is active
     BLOCK_SIZE: tl.constexpr       # Block size
 ):
     pid_x = tl.program_id(0)
@@ -574,5 +619,12 @@ def compute_inflow_batched_kernel(
 
     # -------- Accumulate inflows --------
     is_river_mouth = downstream_idx == catchment_idx
-    tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=mask&(~is_river_mouth))
-    tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=mask&(~is_river_mouth))
+    not_mouth = mask & (~is_river_mouth)
+    tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=not_mouth)
+    tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=not_mouth)
+
+    # -------- Accumulate reservoir inflow --------
+    if HAS_RESERVOIR:
+        is_downstream_res = tl.load(is_reservoir_ptr + downstream_idx, mask=not_mouth, other=0) != 0
+        total_outflow = updated_river_outflow + updated_flood_outflow
+        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx_global, total_outflow, mask=not_mouth & is_downstream_res)

@@ -28,7 +28,7 @@ class ExportedDataset(NetCDFDataset):
     File convention (by default): f"{var_name}_rank{rank}.nc"
     Variables expected:
       - time: numeric with units/calendar
-      - save_coord: (saved_points,) linear catchment ids
+      - catchment_id: (saved_points,) linear catchment ids
       - {var_name}: (time, saved_points) values
 
     Key differences from grid-based datasets:

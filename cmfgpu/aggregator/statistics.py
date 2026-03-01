@@ -177,6 +177,7 @@ class StatisticsMixin:
             save_idx = json_schema_extra.get('save_idx')
             description = getattr(field_info, 'description', f"Variable {var_name}")
             save_coord = json_schema_extra.get('save_coord')
+            dim_coords = json_schema_extra.get('dim_coords')
 
             if not save_idx:
                 raise ValueError(f"Variable '{var_name}' must have save_idx in json_schema_extra")
@@ -370,6 +371,7 @@ class StatisticsMixin:
                     'actual_shape': actual_shape,
                     'actual_ndim': actual_ndim,
                     'save_coord': save_coord,
+                    'nc_coord_name': dim_coords.split('.')[-1] if dim_coords else None,
                     'description': f"{description} ({op})",
                     'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
                     'k': effective_k,

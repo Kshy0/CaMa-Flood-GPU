@@ -27,6 +27,7 @@ from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
 from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
+from cmfgpu.modules.reservoir import ReservoirModule
 from cmfgpu.phys.adaptive_time import (
     compute_adaptive_time_step_batched_kernel,
     compute_adaptive_time_step_kernel)
@@ -47,6 +48,7 @@ from cmfgpu.phys.outflow import (compute_inflow_batched_kernel,
 from cmfgpu.phys.storage import (compute_flood_stage_batched_kernel,
                                  compute_flood_stage_kernel,
                                  compute_flood_stage_log_kernel)
+from cmfgpu.phys.reservoir import compute_reservoir_outflow_kernel
 
 
 class CaMaFlood(AbstractModel):
@@ -59,6 +61,7 @@ class CaMaFlood(AbstractModel):
         "log": LogModule,
         "adaptive_time": AdaptiveTimeModule,
         "levee": LeveeModule,
+        "reservoir": ReservoirModule,
     }
     group_by: ClassVar[str] = "catchment_basin_id"
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
@@ -84,6 +87,10 @@ class CaMaFlood(AbstractModel):
     @cached_property
     def adaptive_time(self) -> Optional[AdaptiveTimeModule]:
         return self.get_module("adaptive_time")
+
+    @cached_property
+    def reservoir(self) -> Optional[ReservoirModule]:
+        return self.get_module("reservoir")
     
     @computed_field
     @cached_property
@@ -94,11 +101,73 @@ class CaMaFlood(AbstractModel):
     @cached_property
     def levee_flag(self) -> bool:
         return self.levee is not None
+
+    @computed_field
+    @cached_property
+    def reservoir_flag(self) -> bool:
+        return self.reservoir is not None
     
     @model_validator(mode="after")
     def validate_log_compatibility(self) -> Self:
         if self.num_trials is not None and self.num_trials > 1 and "log" in self.opened_modules:
             raise ValueError("The 'log' module cannot be used when num_trials > 1.")
+        return self
+
+    @model_validator(mode="after")
+    def init_dam_cell_storage(self) -> Self:
+        """
+        At cold start, bump river_storage at dam cells to conservation_volume,
+        following Fortran CMF_DAMOUT_INIT:
+          P2DAMSTO(ISEQ) = MAX(P2RIVSTO(ISEQ)+P2FLDSTO(ISEQ), DamVol_cons)
+          P2RIVSTO(ISEQ) = P2DAMSTO(ISEQ)
+          P2FLDSTO(ISEQ) = 0
+        """
+        if not self.reservoir_flag:
+            return self
+        res_idx = self.reservoir.reservoir_catchment_idx   # (num_reservoirs,)
+        con_vol = self.reservoir.conservation_volume        # (num_reservoirs,)
+        current = self.base.river_storage[res_idx]          # (num_reservoirs,)
+        need_fix = current < con_vol.to(current.dtype)
+        if need_fix.any():
+            n_fixed = int(need_fix.sum().item())
+            self.base.river_storage[res_idx] = torch.where(
+                need_fix,
+                con_vol.to(self.base.river_storage.dtype),
+                current,
+            )
+            # Also zero out flood_storage at fixed dam cells (Fortran: P2FLDSTO=0)
+            flood_current = self.base.flood_storage[res_idx]
+            self.base.flood_storage[res_idx] = torch.where(
+                need_fix,
+                torch.zeros_like(flood_current),
+                flood_current,
+            )
+            print(f"  [init_dam_cell_storage] Clamped {n_fixed}/{len(con_vol)} dam-cell "
+                  f"river_storage to conservation_volume")
+        return self
+
+    @model_validator(mode="after")
+    def mask_bifurcation_at_dam_cells(self) -> Self:
+        """
+        Disable bifurcation at dam and upstream-of-dam cells by setting
+        bifurcation elevation to 1E20, following Fortran CMF_DAMOUT_INIT:
+          IF( I1DAM(ISEQP)>0 .or. I1DAM(JSEQP)>0 ) PTH_ELV(IPTH,:)=1.E20
+        """
+        if not self.reservoir_flag or not self.bifurcation_flag:
+            return self
+        is_dam = self.base.is_dam_related
+        if is_dam is None:
+            return self
+        # Check each bifurcation path: if upstream or downstream touches a dam-related cell
+        up_idx = self.bifurcation.bifurcation_catchment_idx
+        dn_idx = self.bifurcation.bifurcation_downstream_idx
+        up_is_dam = is_dam[up_idx]
+        dn_is_dam = is_dam[dn_idx]
+        mask_paths = up_is_dam | dn_is_dam  # (num_paths,)
+        if mask_paths.any():
+            n_masked = int(mask_paths.sum().item())
+            self.bifurcation.bifurcation_elevation[mask_paths] = 1.0e20
+            print(f"  Masked {n_masked} bifurcation paths at dam-related cells (elevation → 1E20)")
         return self
 
     @cached_property
@@ -116,6 +185,14 @@ class CaMaFlood(AbstractModel):
         if not self.levee_flag:
             return None
         return lambda META: (_cdiv(self.base.num_levees * (self.num_trials or 1), META["BLOCK_SIZE"]),)
+
+    @cached_property
+    def reservoir_grid(self) -> Callable:
+        if not self.reservoir_flag:
+            return None
+        return lambda META: (_cdiv(self.base.num_reservoirs, META["BLOCK_SIZE"]),)
+
+
 
     @torch.inference_mode()
     def step_advance(
@@ -163,6 +240,7 @@ class CaMaFlood(AbstractModel):
                 compute_adaptive_time_step_batched_kernel[self.base_grid](
                     river_depth_ptr=self.base.river_depth,
                     downstream_distance_ptr=self.base.downstream_distance,
+                    is_dam_related_ptr=self.base.is_dam_related,
                     max_sub_steps_ptr=self.adaptive_time.max_sub_steps,
                     time_step=time_step,
                     adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
@@ -171,17 +249,20 @@ class CaMaFlood(AbstractModel):
                     num_trials=self.num_trials,
                     BLOCK_SIZE=self.BLOCK_SIZE,
                     batched_downstream_distance=False,
+                    HAS_RESERVOIR=self.reservoir_flag,
                 )
             else:
                 compute_adaptive_time_step_kernel[self.base_grid](
                     river_depth_ptr=self.base.river_depth,
                     downstream_distance_ptr=self.base.downstream_distance,
+                    is_dam_related_ptr=self.base.is_dam_related,
                     max_sub_steps_ptr=self.adaptive_time.max_sub_steps,
                     time_step=time_step,
                     adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
                     gravity=self.base.gravity,
                     num_catchments=self.base.num_catchments,
-                    BLOCK_SIZE=self.BLOCK_SIZE
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                    HAS_RESERVOIR=self.reservoir_flag,
                 )
             if self.world_size > 1:
                 dist.all_reduce(self.adaptive_time.max_sub_steps, op=dist.ReduceOp.MAX)
@@ -304,6 +385,7 @@ class CaMaFlood(AbstractModel):
                 batched_river_length=self.base.batched_river_length,
                 batched_river_height=self.base.batched_river_height,
                 batched_catchment_elevation=self.base.batched_catchment_elevation,
+                HAS_BIFURCATION=self.bifurcation_flag,
             )
         else:
             compute_outflow_kernel[self.base_grid](
@@ -336,9 +418,37 @@ class CaMaFlood(AbstractModel):
                 gravity=self.base.gravity,
                 time_step=time_sub_step,
                 num_catchments=self.base.num_catchments,
-                BLOCK_SIZE=self.BLOCK_SIZE
+                BLOCK_SIZE=self.BLOCK_SIZE,
+                HAS_BIFURCATION=self.bifurcation_flag,
+                is_dam_upstream_ptr=self.base.is_dam_upstream,
+                HAS_RESERVOIR=self.reservoir_flag,
+                MIN_KINEMATIC_SLOPE=self.base.min_kinematic_slope,
             )
-        
+
+        # Reservoir outflow computation (overwrites main kernel's result for reservoir catchments)
+        if self.reservoir_flag:
+            compute_reservoir_outflow_kernel[self.reservoir_grid](
+                reservoir_catchment_idx_ptr=self.reservoir.reservoir_catchment_idx,
+                downstream_idx_ptr=self.base.downstream_idx,
+                reservoir_total_inflow_ptr=self.base.reservoir_total_inflow,
+                river_outflow_ptr=self.base.river_outflow,
+                flood_outflow_ptr=self.base.flood_outflow,
+                river_storage_ptr=self.base.river_storage,
+                flood_storage_ptr=self.base.flood_storage,
+                conservation_volume_ptr=self.reservoir.conservation_volume,
+                emergency_volume_ptr=self.reservoir.emergency_volume,
+                adjustment_volume_ptr=self.reservoir.adjustment_volume,
+                normal_outflow_ptr=self.reservoir.effective_normal_outflow,
+                adjustment_outflow_ptr=self.reservoir.adjustment_outflow,
+                flood_control_outflow_ptr=self.reservoir.flood_control_outflow,
+                runoff_ptr=runoff,
+                total_storage_ptr=self.base.total_storage,
+                outgoing_storage_ptr=self.base.outgoing_storage,
+                time_step=time_sub_step,
+                num_reservoirs=self.base.num_reservoirs,
+                BLOCK_SIZE=self.BLOCK_SIZE,
+            )
+
         # Bifurcation outflow computation
         if self.bifurcation_flag:
             if self.levee_flag:
@@ -447,8 +557,11 @@ class CaMaFlood(AbstractModel):
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
                 limit_rate_ptr=self.base.limit_rate,
+                reservoir_total_inflow_ptr=self.base.reservoir_total_inflow,
+                is_reservoir_ptr=self.base.is_reservoir,
                 num_catchments=self.base.num_catchments,
                 num_trials=self.num_trials,
+                HAS_RESERVOIR=self.reservoir_flag,
                 BLOCK_SIZE=self.BLOCK_SIZE,
             )
         else:
@@ -462,7 +575,10 @@ class CaMaFlood(AbstractModel):
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
                 limit_rate_ptr=self.base.limit_rate,
+                reservoir_total_inflow_ptr=self.base.reservoir_total_inflow,
+                is_reservoir_ptr=self.base.is_reservoir,
                 num_catchments=self.base.num_catchments,
+                HAS_RESERVOIR=self.reservoir_flag,
                 BLOCK_SIZE=self.BLOCK_SIZE
             )
         
@@ -526,6 +642,7 @@ class CaMaFlood(AbstractModel):
                 batched_catchment_area=self.base.batched_catchment_area,
                 batched_river_width=self.base.batched_river_width,
                 batched_river_length=self.base.batched_river_length,
+                HAS_BIFURCATION=self.bifurcation_flag,
             )
         elif self.log is not None and output_enabled and compute_flood_stage_log_kernel is not None:
             compute_flood_stage_log_kernel[self.base_grid](
@@ -565,7 +682,8 @@ class CaMaFlood(AbstractModel):
                 num_catchments=self.base.num_catchments,
                 num_flood_levels=self.base.num_flood_levels,
                 log_buffer_size=self.log.log_buffer_size,
-                BLOCK_SIZE=self.BLOCK_SIZE
+                BLOCK_SIZE=self.BLOCK_SIZE,
+                HAS_BIFURCATION=self.bifurcation_flag,
             )
         else:
             compute_flood_stage_kernel[self.base_grid](
@@ -591,7 +709,8 @@ class CaMaFlood(AbstractModel):
                 river_length_ptr=self.base.river_length,
                 num_catchments=self.base.num_catchments,
                 num_flood_levels=self.base.num_flood_levels,
-                BLOCK_SIZE=self.BLOCK_SIZE
+                BLOCK_SIZE=self.BLOCK_SIZE,
+                HAS_BIFURCATION=self.bifurcation_flag,
             )
 
         # Levee stage computation (if enabled)

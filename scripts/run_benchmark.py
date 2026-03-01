@@ -80,7 +80,7 @@ def benchmark_block_sizes():
         prefix=prefix,
         suffix=suffix,
     )
-    model.set_total_steps(len(dataset))
+    model.set_total_steps(dataset.total_steps)
 
     local_runoff_matrix = dataset.build_local_runoff_matrix(
         runoff_mapping_file=runoff_mapping_file,
@@ -103,6 +103,7 @@ def benchmark_block_sizes():
 
     for block_size in BLOCK_SIZE_LIST:
         model.BLOCK_SIZE = block_size
+        model.set_total_steps(dataset.total_steps)
         current_time = start_date
         last_valid_time = start_date
         if rank == 0:

@@ -5,6 +5,11 @@
 #
 
 from cmfgpu.params.allocation.hires_map import HiResMap
+from cmfgpu.params.estimate_dam_params import (
+    compute_dam_discharge_from_timeseries,
+    estimate_dam_params,
+    estimate_flood_discharge,
+)
 from cmfgpu.params.estimate_river_geometry import (
     accumulate_discharge,
     estimate_river_geometry,
@@ -22,6 +27,9 @@ __all__ = [
     "InputProxy",
     "MERITMap",
     "accumulate_discharge",
+    "compute_dam_discharge_from_timeseries",
+    "estimate_dam_params",
+    "estimate_flood_discharge",
     "estimate_river_geometry",
     "export_inpmat",
     "export_map_params",

@@ -14,16 +14,23 @@ from cmfgpu.phys.triton.utils import typed_sqrt
 def compute_adaptive_time_step_kernel(
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
+    is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
     max_sub_steps_ptr,                      # *i64 max sub steps
     time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
-    BLOCK_SIZE: tl.constexpr                # block size
+    BLOCK_SIZE: tl.constexpr,               # block size
+    HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
+
+    # Skip dam-related cells from CFL calculation (Fortran: I2MASK==0 only)
+    if HAS_RESERVOIR:
+        is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
+        mask = mask & (~is_dam)
 
     #----------------------------------------------------------------------
     # (1) Load input variables
@@ -31,12 +38,6 @@ def compute_adaptive_time_step_kernel(
     downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=float('inf'))
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
-
-    # Upcast to fp32 for intermediate computation:
-    # time_step (86400) exceeds fp16 max (65504), so fp16 would overflow.
-    downstream_distance = downstream_distance.to(tl.float32)
-    river_depth = river_depth.to(tl.float32)
-
     depth = tl.maximum(river_depth, 0.01)
     dt = adaptive_time_factor * downstream_distance / typed_sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
@@ -55,6 +56,7 @@ def compute_adaptive_time_step_kernel(
 def compute_adaptive_time_step_batched_kernel(
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
+    is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
     max_sub_steps_ptr,                      # *i64 (size num_trials)
     time_step,
     adaptive_time_factor: tl.constexpr ,
@@ -63,7 +65,8 @@ def compute_adaptive_time_step_batched_kernel(
     num_trials: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                # block size
     # Batch flags
-    batched_downstream_distance: tl.constexpr
+    batched_downstream_distance: tl.constexpr,
+    HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
 ):
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -74,6 +77,11 @@ def compute_adaptive_time_step_batched_kernel(
     
     mask = idx < (num_catchments * num_trials)
     
+    # Skip dam-related cells from CFL calculation (Fortran: I2MASK==0 only)
+    if HAS_RESERVOIR:
+        is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
+        mask = mask & (~is_dam)
+
     trial_offset = trial_idx * num_catchments
 
     #----------------------------------------------------------------------

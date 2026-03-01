@@ -56,6 +56,7 @@ def computed_base_field(
     dim_coords: Optional[str] = "catchment_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
+    depends_on: Optional[str] = None,
     **kwargs
 ):
 
@@ -68,6 +69,7 @@ def computed_base_field(
         dim_coords=dim_coords,
         category=category,
         expr=expr,
+        depends_on=depends_on,
         **kwargs
     )
 
@@ -87,6 +89,11 @@ class BaseModule(AbstractModule):
     gravity: float = Field(
         default=9.8,
         description="Gravitational acceleration constant (m/s²)",
+        gt=0.0,
+    )
+    min_kinematic_slope: float = Field(
+        default=1.0e-5,
+        description="Minimum bed slope for kinematic wave (Fortran PMINSLP)",
         gt=0.0,
     )
 
@@ -130,6 +137,17 @@ class BaseModule(AbstractModule):
         description="Bankfull depth of river channel (m)",
         category="param",
         shape=("num_catchments",),
+    )
+
+    reservoir_catchment_id: Optional[torch.Tensor] = BaseField(
+        description="Catchment ID for each reservoir",
+        dtype="int",
+        group_by="reservoir_basin_id",
+        dim_coords=None,
+        shape=("num_reservoirs",),
+        default=None,
+        category="topology",
+        mode="cpu",
     )
 
     # --------------------------------------------------------------------- #
@@ -324,11 +342,71 @@ class BaseModule(AbstractModule):
         Returns the indices (into catchment_id) of catchments to save.
         """
         return find_indices_in_torch(self.catchment_save_id, self.catchment_id)
+
+    @computed_field(description="Total number of reservoirs")
+    @cached_property
+    def num_reservoirs(self) -> int:
+        if self.reservoir_catchment_id is None:
+            return 0
+        return self.reservoir_catchment_id.shape[0]
+
+    @computed_base_field(
+        description="Boolean mask for reservoir catchments",
+        dtype="bool",
+        category="topology",
+        depends_on="reservoir",
+    )
+    @cached_property
+    def is_reservoir(self) -> Optional[torch.Tensor]:
+        if "reservoir" not in self.opened_modules or self.reservoir_catchment_id is None:
+            return None
+
+        indices = find_indices_in_torch(self.reservoir_catchment_id, self.catchment_id)
+        valid_mask = indices >= 0
+        valid_indices = indices[valid_mask]
+
+        mask = torch.zeros(self.num_catchments, dtype=torch.bool, device=self.device)
+        mask[valid_indices] = True
+        return mask
+
+    @computed_base_field(
+        description="Mask for dam-related cells: dam itself OR upstream of dam "
+                    "(Fortran I2MASK > 0).  Used to skip adaptive time step and "
+                    "bifurcation for these cells.",
+        dtype="bool",
+        category="topology",
+        depends_on="reservoir",
+    )
+    @cached_property
+    def is_dam_related(self) -> Optional[torch.Tensor]:
+        if self.is_reservoir is None:
+            return None
+        is_res = self.is_reservoir
+        # Upstream-of-dam: a non-dam, non-mouth cell whose downstream is a dam
+        downstream_is_dam = is_res[self.downstream_idx]
+        idx_range = torch.arange(self.num_catchments, device=self.device)
+        not_mouth = self.downstream_idx != idx_range
+        is_upstream = (~is_res) & not_mouth & downstream_is_dam
+        return is_res | is_upstream
+
+    @computed_base_field(
+        description="Mask for upstream-of-dam cells only (Fortran I1DAM=10). "
+                    "These cells use kinematic wave instead of local-inertial.",
+        dtype="bool",
+        category="topology",
+        depends_on="reservoir",
+    )
+    @cached_property
+    def is_dam_upstream(self) -> Optional[torch.Tensor]:
+        if self.is_dam_related is None:
+            return None
+        return self.is_dam_related & ~self.is_reservoir
     
     @computed_base_field(
         description="Boolean mask for catchments governed by levee physics",
         dtype="bool",
         category="topology",
+        depends_on="levee",
     )
     @cached_property
     def is_levee(self) -> torch.Tensor:
@@ -357,17 +435,23 @@ class BaseModule(AbstractModule):
         description="Total outflow via all bifurcation paths (m³ s⁻¹)",
         category="state",
         dtype="hpfloat",
+        depends_on="bifurcation",
     )
     @cached_property
-    def global_bifurcation_outflow(self) -> torch.Tensor:
+    def global_bifurcation_outflow(self) -> Optional[torch.Tensor]:
+        if "bifurcation" not in self.opened_modules:
+            return None
         return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(
         description="Levee surface elevation (m a.s.l.)",
         category="state",
+        depends_on="levee",
     )
     @cached_property
-    def global_levee_surface_elevation(self) -> torch.Tensor:
+    def global_levee_surface_elevation(self) -> Optional[torch.Tensor]:
+        if "levee" not in self.opened_modules:
+            return None
         return torch.zeros_like(self.river_outflow)
     
     @computed_base_field(
@@ -438,6 +522,22 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def flood_inflow(self) -> torch.Tensor:
+        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
+
+    @computed_base_field(
+        description="Accumulated reservoir total inflow from upstream (m³ s⁻¹). "
+                    "Written by compute_inflow_kernel during downstream scatter, "
+                    "read and zeroed by compute_reservoir_outflow_kernel.",
+        save_idx=None,
+        save_coord=None,
+        dtype="hpfloat",
+        category="state",
+        depends_on="reservoir",
+    )
+    @cached_property
+    def reservoir_total_inflow(self) -> Optional[torch.Tensor]:
+        if "reservoir" not in self.opened_modules:
+            return None
         return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(

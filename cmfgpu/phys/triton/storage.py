@@ -42,6 +42,7 @@ def compute_flood_stage_kernel(
     num_catchments: tl.constexpr,
     num_flood_levels: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
 ):
     # --- Block and lane indexing ---
     pid = tl.program_id(0)
@@ -56,16 +57,18 @@ def compute_flood_stage_kernel(
     flood_inflow = tl.load(flood_inflow_ptr + offs, mask=mask, other=0.0)
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
     flood_outflow = tl.load(flood_outflow_ptr + offs, mask=mask, other=0.0)
-    global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
+    if HAS_BIFURCATION:
+        global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
 
     # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
     river_inflow = to_compute_dtype(river_inflow, river_outflow)
     flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
-    global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+    if HAS_BIFURCATION:
+        global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
 
     river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
-    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - global_bifurcation_outflow) * time_step
+    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step
     river_storage_updated = tl.maximum(river_storage_updated, 0.0)
     river_storage_updated = tl.where(
         flood_storage_updated < 0.0,
@@ -212,6 +215,7 @@ def compute_flood_stage_log_kernel(
     num_flood_levels: tl.constexpr,
     log_buffer_size: tl.constexpr = 1000,
     BLOCK_SIZE: tl.constexpr = 128,
+    HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
 ):
     # --- Block and lane indexing ---
     pid = tl.program_id(0)
@@ -230,17 +234,19 @@ def compute_flood_stage_log_kernel(
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
     flood_outflow = tl.load(flood_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
-    global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
+    if HAS_BIFURCATION:
+        global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     total_stage_pre = river_storage + flood_storage + protected_storage
     tl.atomic_add(total_storage_pre_sum_ptr + current_step, tl.sum(total_stage_pre) * 1e-9)
 
     # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
     river_inflow = to_compute_dtype(river_inflow, river_outflow)
     flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
-    global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+    if HAS_BIFURCATION:
+        global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
 
     river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
-    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - global_bifurcation_outflow) * time_step
+    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step
     river_storage_updated = tl.maximum(river_storage_updated, 0.0)
     river_storage_updated = tl.where(
         flood_storage_updated < 0.0,
@@ -254,7 +260,7 @@ def compute_flood_stage_log_kernel(
     tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_storage, 0)) * 1e-9)
     tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_inflow + flood_inflow) * time_step, 0)) * 1e-9)
     tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
-    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff - river_outflow - flood_outflow - global_bifurcation_outflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff - river_outflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step, 0)) * 1e-9)
 
     # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
     total_storage = to_compute_dtype(total_storage, river_outflow)
@@ -392,7 +398,8 @@ def compute_flood_stage_batched_kernel(
     batched_flood_depth_table: tl.constexpr,
     batched_catchment_area: tl.constexpr,
     batched_river_width: tl.constexpr,
-    batched_river_length: tl.constexpr
+    batched_river_length: tl.constexpr,
+    HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
 ):
     # --- Block and lane indexing ---
     pid_x = tl.program_id(0)
@@ -412,17 +419,19 @@ def compute_flood_stage_batched_kernel(
     flood_inflow = tl.load(flood_inflow_ptr + idx, mask=mask, other=0.0)
     river_outflow = tl.load(river_outflow_ptr + idx, mask=mask, other=0.0)
     flood_outflow = tl.load(flood_outflow_ptr + idx, mask=mask, other=0.0)
-    global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + idx, mask=mask, other=0.0)
+    if HAS_BIFURCATION:
+        global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + idx, mask=mask, other=0.0)
     
     runoff = tl.load(runoff_ptr + (idx if batched_runoff else catchment_idx), mask=mask, other=0.0)
 
     # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
     river_inflow = to_compute_dtype(river_inflow, river_outflow)
     flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
-    global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+    if HAS_BIFURCATION:
+        global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
 
     river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
-    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - global_bifurcation_outflow) * time_step
+    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step
     river_storage_updated = tl.maximum(river_storage_updated, 0.0)
     river_storage_updated = tl.where(
         flood_storage_updated < 0.0,

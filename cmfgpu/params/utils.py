@@ -322,6 +322,7 @@ def plot_basins_common(
     removed_bifurcations: Optional[Dict[str, np.ndarray]] = None,
     pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None, # Points of interest markers
     river_mouths_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None, # River mouths markers
+    dams_xyc: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None, # (x, y, capacity_mcm)
     # Configuration
     longitude: Optional[np.ndarray] = None,
     latitude: Optional[np.ndarray] = None,
@@ -484,6 +485,21 @@ def plot_basins_common(
         m = within_extent(rmx, rmy)
         if np.any(m):
              plt.scatter(rmx[m], rmy[m], edgecolors='cyan', facecolors='none', s=1.0, marker='s', linewidths=0.2, label='River Mouth', zorder=7)
+
+    if dams_xyc is not None:
+        dx, dy, dcap = dams_xyc
+        if use_lonlat: dx, dy = idx_to_lon(dx), idx_to_lat(dy)
+        m = within_extent(dx, dy)
+        if np.any(m):
+            cap_m = dcap[m]
+            # Map capacity (MCM) to marker size via log scale
+            cap_pos = np.maximum(cap_m, 1.0)
+            sizes = np.clip(np.log10(cap_pos) * 3.0, 1.0, 30.0)
+            plt.scatter(
+                dx[m], dy[m], s=sizes, c='#FF6600', marker='^',
+                edgecolors='#993300', linewidths=0.3, alpha=0.8,
+                label='Dams', zorder=8,
+            )
 
     def plot_bifs(bifs, color, linestyle, label):
         if not bifs: return
@@ -650,6 +666,7 @@ def visualize_nc_basins(
     visualize_gauges: bool = True,
     visualize_bifurcations: bool = True,
     visualize_levees: bool = True,
+    visualize_dams: bool = True,
     visualize_river_mouths: bool = False,
     interactive: bool = False,
     pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None,
@@ -706,6 +723,22 @@ def visualize_nc_basins(
         if 'upstream_area' in ds.variables:
             upstream_area = ds['upstream_area'][:]
 
+        dams_xyc = None
+        if visualize_dams and 'reservoir_catchment_id' in ds.variables and 'catchment_id' in ds.variables:
+            res_cids = np.asarray(ds['reservoir_catchment_id'][:]).astype(np.int64)
+            all_cids = np.asarray(ds['catchment_id'][:]).astype(np.int64)
+            res_idx = find_indices_in(res_cids, all_cids)
+            valid = res_idx >= 0
+            if np.any(valid):
+                rx = catchment_x[res_idx[valid]]
+                ry = catchment_y[res_idx[valid]]
+                if 'reservoir_capacity' in ds.variables:
+                    cap_m3 = np.asarray(ds['reservoir_capacity'][:])[valid]
+                    cap_mcm = cap_m3 / 1.0e6
+                else:
+                    cap_mcm = np.ones(int(valid.sum()), dtype=np.float64)
+                dams_xyc = (rx, ry, cap_mcm)
+
         river_mouths_xy = None
         if visualize_river_mouths:
             # User requested identification by catchment_id == downstream_id
@@ -746,6 +779,7 @@ def visualize_nc_basins(
             interactive=interactive,
             pois_xy=pois_xy,
             river_mouths_xy=river_mouths_xy,
+            dams_xyc=dams_xyc,
             upstream_area=upstream_area,
             catchment_id=catchment_id,
             downstream_id=downstream_id,

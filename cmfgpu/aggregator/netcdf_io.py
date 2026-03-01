@@ -37,11 +37,17 @@ def _write_time_step_netcdf_process(args: Tuple[Any, ...]) -> Tuple[str, int]:
         elif safe in ncfile.variables:
             target_var = safe
         else:
-            # Find first variable that is not dimension/coord related
+            # Find first variable that is not dimension/coord related.
+            _skip = {'time', 'trial', 'saved_points', 'levels'}
             for v in ncfile.variables:
-                if v not in ('time', 'trial', 'saved_points', 'levels', 'catchment_id'):
-                    target_var = v
-                    break
+                vobj = ncfile.variables[v]
+                if v in _skip:
+                    continue
+                # Skip coordinate variables (1-D integer arrays on saved_points)
+                if vobj.dimensions == ('saved_points',) and vobj.dtype.kind in ('i', 'u'):
+                    continue
+                target_var = v
+                break
         
         if target_var is None:
             raise KeyError(f"Could not find variable for '{var_name}' (safe: '{safe}') in {output_path}")
@@ -93,7 +99,8 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
 
     actual_shape = metadata.get('actual_shape', ())  # Spatial shape
     tensor_shape = metadata.get('tensor_shape', ())  # Logical grid shape
-    coord_name = metadata.get('save_coord', None)
+    # nc_coord_name is derived from dim_coords (e.g. "catchment_id").
+    coord_name = metadata.get('nc_coord_name')
     dtype = metadata.get('dtype', 'f8')
     k_val = metadata.get('k', 1)
     

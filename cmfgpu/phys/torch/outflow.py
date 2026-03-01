@@ -52,6 +52,9 @@ def _compute_outflow_body(
     gravity: float,
     time_step: float,
     num_catchments: int,
+    is_dam_upstream=None,
+    HAS_RESERVOIR: bool = False,
+    MIN_KINEMATIC_SLOPE: float = 1e-5,
 ) -> torch.Tensor:
     """Compilable body – all computation *except* ``scatter_add_``.
 
@@ -133,6 +136,27 @@ def _compute_outflow_body(
     upd_riv_out = torch.where(is_neg, upd_riv_out * limit_rate, upd_riv_out)
     upd_fld_out = torch.where(is_neg, upd_fld_out * limit_rate, upd_fld_out)
 
+    # (9b) Kinematic wave override for upstream-of-dam cells (Fortran I1DAM=10)
+    if HAS_RESERVOIR:
+        is_dam_up = is_dam_upstream.bool()
+        bed_slope = (catchment_elevation - elev_ds) / downstream_distance
+        bed_slope = torch.clamp(bed_slope, min=MIN_KINEMATIC_SLOPE)
+        # River kinematic: Q = W * d * v,  v = n^{-1} * S^{0.5} * d^{2/3}
+        kin_riv_vel = (1.0 / river_manning) * torch.sqrt(bed_slope) * torch.pow(river_depth, 2.0 / 3.0)
+        kin_riv = river_width * river_depth * kin_riv_vel
+        kin_riv = torch.clamp(kin_riv, min=0.0)
+        kin_riv = torch.minimum(kin_riv, river_storage / time_step)
+        # Flood kinematic (slope clamped to 0.005)
+        bed_slope_f = torch.clamp(bed_slope, max=0.005)
+        kin_fld_vel = (1.0 / flood_manning) * torch.sqrt(bed_slope_f) * torch.pow(flood_depth, 2.0 / 3.0)
+        kin_fld_area = torch.clamp(flood_storage / river_length - flood_depth * river_width, min=0.0)
+        kin_fld = kin_fld_area * kin_fld_vel
+        kin_fld = torch.clamp(kin_fld, min=0.0)
+        kin_fld = torch.minimum(kin_fld, flood_storage / time_step)
+        # Override diffusion wave with kinematic wave for dam-upstream cells
+        upd_riv_out = torch.where(is_dam_up, kin_riv, upd_riv_out)
+        upd_fld_out = torch.where(is_dam_up, kin_fld, upd_fld_out)
+
     # (10) Store results (in-place ops – fine for torch.compile)
     river_outflow.copy_(upd_riv_out)
     flood_outflow.copy_(upd_fld_out)
@@ -190,6 +214,9 @@ def compute_outflow_kernel(
     gravity: float,
     time_step: float,
     num_catchments: int,
+    is_dam_upstream=None,
+    HAS_RESERVOIR: bool = False,
+    MIN_KINEMATIC_SLOPE: float = 1e-5,
     BLOCK_SIZE: int = 128,
 ) -> None:
     """Outflow kernel: compiled body + eager scatter."""
@@ -223,6 +250,9 @@ def compute_outflow_kernel(
         gravity=gravity,
         time_step=time_step,
         num_catchments=num_catchments,
+        is_dam_upstream=is_dam_upstream,
+        HAS_RESERVOIR=HAS_RESERVOIR,
+        MIN_KINEMATIC_SLOPE=MIN_KINEMATIC_SLOPE,
     )
     # Scatter downstream negative outflow (eager – not compiled)
     ds = downstream_idx
@@ -244,7 +274,10 @@ def _compute_inflow_body(
     flood_inflow: torch.Tensor,
     limit_rate: torch.Tensor,
     num_catchments: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    reservoir_total_inflow=None,
+    is_reservoir=None,
+    HAS_RESERVOIR: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compilable body – returns values to scatter into inflows.
 
     Instead of boolean-indexing ``ds[non_mouth]`` (which creates
@@ -280,7 +313,17 @@ def _compute_inflow_body(
     # array is equivalent to the original masked scatter.
     scatter_riv = torch.where(is_river_mouth, 0.0, upd_riv)
     scatter_fld = torch.where(is_river_mouth, 0.0, upd_fld)
-    return scatter_riv, scatter_fld
+
+    # Accumulate reservoir inflow
+    if HAS_RESERVOIR:
+        total_outflow = upd_riv + upd_fld
+        is_downstream_res = is_reservoir[ds].bool()
+        scatter_res = torch.where(
+            is_river_mouth | ~is_downstream_res, 0.0, total_outflow
+        )
+    else:
+        scatter_res = torch.zeros_like(scatter_riv)
+    return scatter_riv, scatter_fld, scatter_res
 
 
 _compute_inflow_compiled = _torch_compile(_compute_inflow_body)
@@ -297,10 +340,13 @@ def compute_inflow_kernel(
     flood_inflow: torch.Tensor,
     limit_rate: torch.Tensor,
     num_catchments: int,
+    reservoir_total_inflow=None,
+    is_reservoir=None,
+    HAS_RESERVOIR: bool = False,
     BLOCK_SIZE: int = 128,
 ) -> None:
     """Inflow kernel: compiled body + eager scatter."""
-    scatter_riv, scatter_fld = _compute_inflow_compiled(
+    scatter_riv, scatter_fld, scatter_res = _compute_inflow_compiled(
         downstream_idx=downstream_idx,
         river_outflow=river_outflow,
         flood_outflow=flood_outflow,
@@ -311,11 +357,17 @@ def compute_inflow_kernel(
         flood_inflow=flood_inflow,
         limit_rate=limit_rate,
         num_catchments=num_catchments,
+        reservoir_total_inflow=reservoir_total_inflow,
+        is_reservoir=is_reservoir,
+        HAS_RESERVOIR=HAS_RESERVOIR,
     )
     # Accumulate inflows via scatter_add_ (eager – not compiled)
     ds = downstream_idx
     river_inflow.scatter_add_(0, ds, scatter_riv)
     flood_inflow.scatter_add_(0, ds, scatter_fld)
+    # Accumulate reservoir total inflow
+    if HAS_RESERVOIR:
+        reservoir_total_inflow.scatter_add_(0, ds, scatter_res)
 
 
 # Batched variants not implemented for MPS / torch backend
