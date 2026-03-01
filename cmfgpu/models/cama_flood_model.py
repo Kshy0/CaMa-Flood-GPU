@@ -16,6 +16,7 @@ import torch
 from pydantic import PrivateAttr, computed_field, model_validator
 from torch import distributed as dist
 
+
 def _cdiv(n: int, d: int) -> int:
     """Ceiling division, equivalent to triton.cdiv."""
     return (n + d - 1) // d
@@ -45,10 +46,10 @@ from cmfgpu.phys.outflow import (compute_inflow_batched_kernel,
                                  compute_inflow_kernel,
                                  compute_outflow_batched_kernel,
                                  compute_outflow_kernel)
+from cmfgpu.phys.reservoir import compute_reservoir_outflow_kernel
 from cmfgpu.phys.storage import (compute_flood_stage_batched_kernel,
                                  compute_flood_stage_kernel,
                                  compute_flood_stage_log_kernel)
-from cmfgpu.phys.reservoir import compute_reservoir_outflow_kernel
 
 
 class CaMaFlood(AbstractModel):

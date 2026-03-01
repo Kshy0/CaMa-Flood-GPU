@@ -22,12 +22,12 @@ from pydantic.fields import FieldInfo
 def TensorField(
     description: str,
     shape: Tuple[str, ...],
-    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     group_by: Optional[str] = None,
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
-    category: Literal["topology", "param", "init_state"] = "param",
+    category: Literal["topology", "param", "init_state", "state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
 ):
@@ -37,7 +37,7 @@ def TensorField(
     Args:
         description: Human-readable description of the variable
         shape: Tuple of dimension names (scalar variable names)
-        dtype: Data type ('float', 'int', 'bool')
+        dtype: Data type ('float', 'int', 'idx', 'bool', 'hpfloat')
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
         dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
@@ -76,7 +76,7 @@ def TensorField(
 def computed_tensor_field(
     description: str,
     shape: Tuple[str, ...],
-    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     save_idx: Optional[str] = None,
     save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
@@ -91,7 +91,7 @@ def computed_tensor_field(
     Args:
         description: Human-readable description of the variable
         shape: Tuple of dimension names (scalar variable names)
-        dtype: Data type ('float', 'int', 'bool')
+        dtype: Data type ('float', 'int', 'idx', 'bool', 'hpfloat')
         group_by: Name of the variable that indicates basin membership for this tensor.
                        If None, the full data will be loaded without distribution.
         dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
@@ -192,6 +192,8 @@ class AbstractModule(BaseModel, ABC):
         default=None,
         description="Number of parallel simulations (ensemble members)",
     )
+    
+    _expanded_params: set = PrivateAttr(default_factory=set)
 
     @property
     def high_precision(self) -> torch.dtype:
@@ -212,8 +214,6 @@ class AbstractModule(BaseModel, ABC):
             torch.float64: torch.float64,
         }
         return _hp_map.get(self.precision, self.precision)
-    
-    _expanded_params: set = PrivateAttr(default_factory=set)
 
     @field_validator('num_trials')
     @classmethod
@@ -367,7 +367,7 @@ class AbstractModule(BaseModel, ABC):
         - Validates shapes (fails on mismatch)
         - Ensures device consistency (moves to self.device if needed)
         - Ensures precision consistency for floating-point tensors
-        - Ensures int tensors are int64
+        - Ensures int tensors are int64, idx tensors are int32
         """
         auto_fix_log = {}
 

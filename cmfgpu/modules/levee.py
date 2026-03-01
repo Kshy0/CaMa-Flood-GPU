@@ -25,7 +25,7 @@ from cmfgpu.utils import find_indices_in_torch
 def LeveeField(
     description: str,
     shape: Tuple[str, ...] = ("base.num_levees",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool"] = "float",
     group_by: Optional[str] = "levee_basin_id",
     dim_coords: Optional[str] = "base.levee_catchment_id",
     category: Literal["topology", "param", "init_state"] = "param",
@@ -49,7 +49,7 @@ def LeveeField(
 def computed_levee_field(
     description: str,
     shape: Tuple[str, ...] = ("base.num_levees",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool"] = "float",
     dim_coords: Optional[str] = "base.levee_catchment_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,

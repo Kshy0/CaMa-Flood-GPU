@@ -25,7 +25,7 @@ from cmfgpu.utils import find_indices_in_torch
 def BifurcationField(
     description: str,
     shape: Tuple[str, ...] = ("num_bifurcation_paths",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool"] = "float",
     group_by: Optional[str] = "bifurcation_basin_id",
     save_idx: Optional[str] = "bifurcation_path_save_idx",
     save_coord: Optional[str] = "bifurcation_path_save_id",
@@ -50,7 +50,7 @@ def BifurcationField(
 def computed_bifurcation_field(
     description: str,
     shape: Tuple[str, ...] = ("num_bifurcation_paths",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool"] = "float",
     save_idx: Optional[str] = "bifurcation_path_save_idx",
     save_coord: Optional[str] = "bifurcation_path_save_id",
     dim_coords: Optional[str] = "bifurcation_path_id",

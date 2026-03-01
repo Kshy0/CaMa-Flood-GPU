@@ -14,14 +14,13 @@ from cmfgpu.phys._backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "torch":
     from cmfgpu.phys._backend import adapt_torch_kernel
-    from cmfgpu.phys.torch.reservoir import (
-        compute_reservoir_outflow_kernel as _compute_reservoir_outflow_kernel,
-    )
+    from cmfgpu.phys.torch.reservoir import \
+        compute_reservoir_outflow_kernel as _compute_reservoir_outflow_kernel
+
     # compile=False: kernel uses scatter_add_ which breaks torch.compile graph
     compute_reservoir_outflow_kernel = adapt_torch_kernel(
         _compute_reservoir_outflow_kernel, compile=False
     )
 else:
-    from cmfgpu.phys.triton.reservoir import (  # noqa: F401
-        compute_reservoir_outflow_kernel,
-    )
+    from cmfgpu.phys.triton.reservoir import \
+        compute_reservoir_outflow_kernel  # noqa: F401

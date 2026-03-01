@@ -23,8 +23,8 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
 
 from cmfgpu.aggregator import StatisticsAggregator
 from cmfgpu.models.utils import (ActivePlan, ParameterPlanMixin, PlanItem,
-                                  ProgressMixin, ProgressTracker,
-                                  compute_group_to_rank)
+                                 ProgressMixin, ProgressTracker,
+                                 compute_group_to_rank)
 from cmfgpu.modules.abstract_module import AbstractModule
 from cmfgpu.params.input_proxy import InputProxy
 

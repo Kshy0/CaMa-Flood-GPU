@@ -7,7 +7,7 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import typed_pow, typed_sqrt, to_compute_dtype
+from cmfgpu.phys.triton.utils import to_compute_dtype, typed_pow, typed_sqrt
 
 
 @triton.jit

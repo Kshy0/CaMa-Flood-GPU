@@ -706,70 +706,6 @@ class MERITMap(BaseModel):
             self.gauge_id = self.gauge_catchment_id
             self.num_gauges = len(self.gauge_id)
 
-    def load_parameters(self) -> None:
-
-        def _read_2d_map(filename: str) -> np.ndarray:
-            """Read a 2D map variable and extract catchment values."""
-            file_path = self.map_dir / filename
-            data = read_map(file_path, (self.nx, self.ny), precision=self.map_precision)
-            return data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y]
-        self.river_length = _read_2d_map("rivlen.bin")
-
-        # River height (optional — will be estimated by update_river_params if missing)
-        rivhgt_path = self.map_dir / "rivhgt.bin"
-        if rivhgt_path.exists():
-            self.river_height = _read_2d_map("rivhgt.bin")
-            print(f"Loaded river_height from rivhgt.bin")
-
-        # River width (optional — will be estimated by update_river_params if missing)
-        rivwth_path = self.map_dir / "rivwth_gwdlr.bin"
-        if rivwth_path.exists():
-            self.river_width = _read_2d_map("rivwth_gwdlr.bin")
-            print(f"Loaded river_width from rivwth_gwdlr.bin")
-
-        # Satellite-derived width (optional, stored for estimate_river_geometry)
-        if self.satellite_width_file is not None:
-            sat_path = self.map_dir / self.satellite_width_file
-            if sat_path.exists():
-                self.satellite_width = _read_2d_map(self.satellite_width_file)
-                n_sat = int(np.count_nonzero(self.satellite_width > 0))
-                print(f"Loaded satellite_width ({n_sat}/{self.num_catchments} valid cells)")
-        self.catchment_elevation = _read_2d_map("elevtn.bin")
-        self.catchment_area = _read_2d_map("ctmare.bin")
-        self.upstream_area = _read_2d_map("uparea.bin")
-        self.downstream_distance = _read_2d_map("nxtdst.bin")
-        self.downstream_distance[self.is_river_mouth] = self.river_mouth_distance
-
-        lonlat_path = self.map_dir / "lonlat.bin"
-        if lonlat_path.exists():
-            print(f"Loading lon/lat from {lonlat_path}")
-            lonlat_data = binread(
-                lonlat_path,
-                (self.nx, self.ny, 2),
-                dtype_str=self.map_precision
-            )
-            self.longitude = lonlat_data[self.catchment_x, self.catchment_y, 0].astype(self.numpy_precision)
-            self.latitude = lonlat_data[self.catchment_x, self.catchment_y, 1].astype(self.numpy_precision)
-
-        if self.levee_flag:
-            levee_crown_height = _read_2d_map("levhgt.bin")
-            levee_fraction = _read_2d_map("levfrc.bin")
-            levee_mask = (levee_fraction >= 0) & (levee_fraction < 1.0) & (levee_crown_height > 0)
-            self.num_levees = int(np.sum(levee_mask))
-            self.levee_id = np.arange(self.num_levees, dtype=np.int64)
-            self.levee_catchment_id = self.catchment_id[levee_mask]
-            self.levee_catchment_x = self.catchment_x[levee_mask]
-            self.levee_catchment_y = self.catchment_y[levee_mask]
-            self.levee_crown_height = levee_crown_height[levee_mask]
-            self.levee_fraction = levee_fraction[levee_mask]
-            self.levee_basin_id = self.catchment_basin_id[levee_mask]
-
-        if self.reservoir_flag:
-            self._load_reservoir_parameters()
-
-        data = read_map(self.map_dir / "fldhgt.bin", (self.nx, self.ny, self.num_flood_levels), precision=self.map_precision)
-        self.flood_depth_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
-
     def _load_reservoir_parameters(self) -> None:
         """
         Load dam/reservoir parameters from a CSV file (Fortran CaMa-Flood format).
@@ -891,6 +827,70 @@ class MERITMap(BaseModel):
         self.reservoir_area = res_area
 
         print(f"  Allocated {n_kept} reservoirs out of {ndam} dams")
+
+    def load_parameters(self) -> None:
+
+        def _read_2d_map(filename: str) -> np.ndarray:
+            """Read a 2D map variable and extract catchment values."""
+            file_path = self.map_dir / filename
+            data = read_map(file_path, (self.nx, self.ny), precision=self.map_precision)
+            return data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y]
+        self.river_length = _read_2d_map("rivlen.bin")
+
+        # River height (optional — will be estimated by update_river_params if missing)
+        rivhgt_path = self.map_dir / "rivhgt.bin"
+        if rivhgt_path.exists():
+            self.river_height = _read_2d_map("rivhgt.bin")
+            print(f"Loaded river_height from rivhgt.bin")
+
+        # River width (optional — will be estimated by update_river_params if missing)
+        rivwth_path = self.map_dir / "rivwth_gwdlr.bin"
+        if rivwth_path.exists():
+            self.river_width = _read_2d_map("rivwth_gwdlr.bin")
+            print(f"Loaded river_width from rivwth_gwdlr.bin")
+
+        # Satellite-derived width (optional, stored for estimate_river_geometry)
+        if self.satellite_width_file is not None:
+            sat_path = self.map_dir / self.satellite_width_file
+            if sat_path.exists():
+                self.satellite_width = _read_2d_map(self.satellite_width_file)
+                n_sat = int(np.count_nonzero(self.satellite_width > 0))
+                print(f"Loaded satellite_width ({n_sat}/{self.num_catchments} valid cells)")
+        self.catchment_elevation = _read_2d_map("elevtn.bin")
+        self.catchment_area = _read_2d_map("ctmare.bin")
+        self.upstream_area = _read_2d_map("uparea.bin")
+        self.downstream_distance = _read_2d_map("nxtdst.bin")
+        self.downstream_distance[self.is_river_mouth] = self.river_mouth_distance
+
+        lonlat_path = self.map_dir / "lonlat.bin"
+        if lonlat_path.exists():
+            print(f"Loading lon/lat from {lonlat_path}")
+            lonlat_data = binread(
+                lonlat_path,
+                (self.nx, self.ny, 2),
+                dtype_str=self.map_precision
+            )
+            self.longitude = lonlat_data[self.catchment_x, self.catchment_y, 0].astype(self.numpy_precision)
+            self.latitude = lonlat_data[self.catchment_x, self.catchment_y, 1].astype(self.numpy_precision)
+
+        if self.levee_flag:
+            levee_crown_height = _read_2d_map("levhgt.bin")
+            levee_fraction = _read_2d_map("levfrc.bin")
+            levee_mask = (levee_fraction >= 0) & (levee_fraction < 1.0) & (levee_crown_height > 0)
+            self.num_levees = int(np.sum(levee_mask))
+            self.levee_id = np.arange(self.num_levees, dtype=np.int64)
+            self.levee_catchment_id = self.catchment_id[levee_mask]
+            self.levee_catchment_x = self.catchment_x[levee_mask]
+            self.levee_catchment_y = self.catchment_y[levee_mask]
+            self.levee_crown_height = levee_crown_height[levee_mask]
+            self.levee_fraction = levee_fraction[levee_mask]
+            self.levee_basin_id = self.catchment_basin_id[levee_mask]
+
+        if self.reservoir_flag:
+            self._load_reservoir_parameters()
+
+        data = read_map(self.map_dir / "fldhgt.bin", (self.nx, self.ny, self.num_flood_levels), precision=self.map_precision)
+        self.flood_depth_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
 
     def check_flow_direction(self) -> None:
         """Validate flow direction consistency."""

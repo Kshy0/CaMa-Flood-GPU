@@ -24,7 +24,7 @@ from cmfgpu.utils import find_indices_in_torch
 def ReservoirField(
     description: str,
     shape: Tuple[str, ...] = ("base.num_reservoirs",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool"] = "float",
     group_by: Optional[str] = "reservoir_basin_id",
     dim_coords: Optional[str] = "base.reservoir_catchment_id",
     category: Literal["topology", "param"] = "param",
@@ -47,7 +47,7 @@ def ReservoirField(
 def computed_reservoir_field(
     description: str,
     shape: Tuple[str, ...] = ("base.num_reservoirs",),
-    dtype: Literal["float", "int", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool"] = "float",
     dim_coords: Optional[str] = "base.reservoir_catchment_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,

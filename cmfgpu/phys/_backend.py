@@ -52,6 +52,20 @@ KERNEL_BACKEND: str = _resolve_backend()
 os.environ.setdefault("CMFGPU_BACKEND", KERNEL_BACKEND)
 
 
+def _torch_compile(fn: Callable) -> Callable:
+    """Apply torch.compile with inference-optimized settings.
+
+    Uses ``reduce-overhead`` (CUDA-graph replay) on CUDA for minimal
+    kernel-launch overhead.  On non-CUDA devices (MPS, CPU) we still
+    use ``fullgraph=True`` so that compilation errors surface at the
+    first call rather than lazily on a rare code-path hours later.
+    """
+    import torch
+    if torch.cuda.is_available():
+        return torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+    return torch.compile(fn, fullgraph=True)
+
+
 class TorchAdapter:
     """Wrap a pure-PyTorch kernel so it can be called with Triton syntax.
 
@@ -137,14 +151,6 @@ class TorchAdapter:
         exec(code, ns)  # noqa: S102 – generated code is fully controlled
         return ns["_fast"]
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def __getitem__(self, grid):
-        """Accept ``kernel[grid]`` syntax; grid is unused."""
-        return self
-
     def __call__(self, **kwargs: Any):
         key = tuple(kwargs.keys())  # dict ordering is guaranteed (Python 3.7+)
         if key != self._cached_key:
@@ -152,19 +158,13 @@ class TorchAdapter:
             self._cached_key = key
         return self._fast_caller(kwargs)  # type: ignore[misc]
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-def _torch_compile(fn: Callable) -> Callable:
-    """Apply torch.compile with inference-optimized settings.
-
-    Uses ``reduce-overhead`` (CUDA-graph replay) on CUDA for minimal
-    kernel-launch overhead.  On non-CUDA devices (MPS, CPU) we still
-    use ``fullgraph=True`` so that compilation errors surface at the
-    first call rather than lazily on a rare code-path hours later.
-    """
-    import torch
-    if torch.cuda.is_available():
-        return torch.compile(fn, mode="reduce-overhead", fullgraph=True)
-    return torch.compile(fn, fullgraph=True)
+    def __getitem__(self, grid):
+        """Accept ``kernel[grid]`` syntax; grid is unused."""
+        return self
 
 
 def adapt_torch_kernel(kernel_func: Callable, *, compile: bool = True) -> TorchAdapter:

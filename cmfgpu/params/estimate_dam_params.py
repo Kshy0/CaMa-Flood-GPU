@@ -61,7 +61,6 @@ from netCDF4 import Dataset
 
 from cmfgpu.utils import find_indices_in
 
-
 # ---------------------------------------------------------------------------
 # Numba-accelerated kernels
 # ---------------------------------------------------------------------------
@@ -213,24 +212,6 @@ def _extract_dam_stats(
     return annual_max_all, qn
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _load_dam_list(dam_list_path: Path) -> dict:
-    """Parse a ``GRanD_allocated.csv`` (or similar) dam-list CSV.
-
-    Column matching is case-insensitive via :data:`_CSV_COL_MAP`.
-
-    Returns
-    -------
-    dict
-        Keys: ``ids``, ``lats``, ``lons``, ``upareas``, ``names``,
-        ``cap_mcm``, ``years``.
-    """
-    return _load_dam_list_csv(dam_list_path)
-
-
 # Column-name aliases (lower-cased) for GRanD dam-list CSV
 _CSV_COL_MAP: dict[str, list[str]] = {
     "ids": ["id", "grand_id", "dam_id"],
@@ -307,6 +288,24 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
         "cap_mcm": np.array(cap_mcm_list, dtype=np.float64),
         "years": np.array(years_list, dtype=np.int64),
     }
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _load_dam_list(dam_list_path: Path) -> dict:
+    """Parse a ``GRanD_allocated.csv`` (or similar) dam-list CSV.
+
+    Column matching is case-insensitive via :data:`_CSV_COL_MAP`.
+
+    Returns
+    -------
+    dict
+        Keys: ``ids``, ``lats``, ``lons``, ``upareas``, ``names``,
+        ``cap_mcm``, ``years``.
+    """
+    return _load_dam_list_csv(dam_list_path)
 
 
 def _read_alloc_file(path: Path) -> np.ndarray:

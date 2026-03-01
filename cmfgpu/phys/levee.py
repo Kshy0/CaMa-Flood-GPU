@@ -15,11 +15,13 @@ from cmfgpu.phys._backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "torch":
     from cmfgpu.phys._backend import adapt_torch_kernel
-    from cmfgpu.phys.torch.levee import (
-        compute_levee_stage_kernel as _compute_levee_stage_kernel,
-        compute_levee_stage_log_kernel as _compute_levee_stage_log_kernel,
-        compute_levee_bifurcation_outflow_kernel as _compute_levee_bifurcation_outflow_kernel,
-    )
+    from cmfgpu.phys.torch.levee import \
+        compute_levee_bifurcation_outflow_kernel as \
+        _compute_levee_bifurcation_outflow_kernel
+    from cmfgpu.phys.torch.levee import \
+        compute_levee_stage_kernel as _compute_levee_stage_kernel
+    from cmfgpu.phys.torch.levee import \
+        compute_levee_stage_log_kernel as _compute_levee_stage_log_kernel
     compute_levee_stage_kernel = adapt_torch_kernel(_compute_levee_stage_kernel)
     compute_levee_stage_log_kernel = adapt_torch_kernel(_compute_levee_stage_log_kernel)
     # compile=False: this kernel splits its compilable body from
@@ -29,9 +31,7 @@ if KERNEL_BACKEND == "torch":
     compute_levee_bifurcation_outflow_batched_kernel = None
 else:
     from cmfgpu.phys.triton.levee import (  # noqa: F401
-        compute_levee_stage_kernel,
-        compute_levee_stage_log_kernel,
+        compute_levee_bifurcation_outflow_batched_kernel,
         compute_levee_bifurcation_outflow_kernel,
-        compute_levee_stage_batched_kernel,
-        compute_levee_bifurcation_outflow_batched_kernel
-    )
+        compute_levee_stage_batched_kernel, compute_levee_stage_kernel,
+        compute_levee_stage_log_kernel)

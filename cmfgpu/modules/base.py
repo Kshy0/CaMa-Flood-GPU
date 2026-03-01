@@ -24,7 +24,7 @@ from cmfgpu.utils import find_indices_in_torch
 def BaseField(
     description: str,
     shape: Tuple[str, ...] = ("num_catchments",),
-    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     group_by: Optional[str] = "catchment_basin_id",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
@@ -50,7 +50,7 @@ def BaseField(
 def computed_base_field(
     description: str,
     shape: Tuple[str, ...] = ("num_catchments",),
-    dtype: Literal["float", "int", "bool", "hpfloat"] = "float",
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     save_idx: Optional[str] = "catchment_save_idx",
     save_coord: Optional[str] = "catchment_save_id",
     dim_coords: Optional[str] = "catchment_id",
