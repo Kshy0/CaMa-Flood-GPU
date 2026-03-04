@@ -3,7 +3,7 @@ Script to generate runoff mapping tables for input datasets.
 """
 from datetime import datetime
 
-from cmfgpu.datasets.daily_bin_dataset import DailyBinDataset
+from hydroforge.datasets import DailyBinDataset
 
 print("\n=== Generating Runoff Mapping Table ===")
 
@@ -26,7 +26,7 @@ dataset = DailyBinDataset(
     end_date=end_date,
 )
 
-dataset.generate_runoff_mapping_table(
+dataset.generate_mapping_table(
     map_dir=map_dir,
     out_dir=out_dir,
     npz_file="runoff_mapping_bin.npz",
@@ -42,7 +42,7 @@ dataset.generate_runoff_mapping_table(
 #     var_name="Runoff",
 #     chunk_len=24,
 # )
-# dataset.generate_runoff_mapping_table(
+# dataset.generate_mapping_table(
 #     map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
 #     hires_map_tag="1min",
 #     out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}",

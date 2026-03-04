@@ -13,7 +13,7 @@ operations run eagerly.
 
 import torch
 
-from cmfgpu.phys._backend import _torch_compile
+from hydroforge.compute.backend import _torch_compile
 
 # ======================================================================
 # Bifurcation outflow

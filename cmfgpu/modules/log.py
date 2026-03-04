@@ -21,8 +21,7 @@ import torch
 import torch.distributed as dist
 from pydantic import Field, PrivateAttr
 
-from cmfgpu.modules.abstract_module import (AbstractModule,
-                                            computed_tensor_field)
+from hydroforge.core.module import AbstractModule, computed_tensor_field
 
 
 def computed_log_field(

@@ -9,7 +9,7 @@ __pycache__/
 *.so
 .DS_Store
 tests/
-scripts_hpc/
+scripts_*/
 temp/
 inp/
 etc/

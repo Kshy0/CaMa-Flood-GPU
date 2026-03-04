@@ -11,14 +11,14 @@ Imports kernel functions from either the Triton or Torch backend
 based on the CMFGPU_BACKEND environment variable (default: triton).
 """
 
-from cmfgpu.phys._backend import KERNEL_BACKEND
+from hydroforge.compute.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "torch":
-    from cmfgpu.phys._backend import adapt_torch_kernel
     from cmfgpu.phys.torch.storage import \
         compute_flood_stage_kernel as _compute_flood_stage_kernel
     from cmfgpu.phys.torch.storage import \
         compute_flood_stage_log_kernel as _compute_flood_stage_log_kernel
+    from hydroforge.compute.backend import adapt_torch_kernel
     compute_flood_stage_kernel = adapt_torch_kernel(_compute_flood_stage_kernel)
     compute_flood_stage_log_kernel = adapt_torch_kernel(_compute_flood_stage_log_kernel)
     compute_flood_stage_batched_kernel = None

@@ -15,10 +15,10 @@ from typing import ClassVar, Literal, Optional, Self, Tuple
 import torch
 from pydantic import Field, model_validator
 
-from cmfgpu.modules.abstract_module import (AbstractModule, TensorField,
-                                            computed_tensor_field)
 from cmfgpu.modules.base import BaseModule
-from cmfgpu.utils import find_indices_in_torch
+from hydroforge.core.distributed import find_indices_in_torch
+from hydroforge.core.module import (AbstractModule, TensorField,
+                                    computed_tensor_field)
 
 
 def ReservoirField(

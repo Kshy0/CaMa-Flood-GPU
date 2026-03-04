@@ -10,7 +10,7 @@ Example: estimate river width / height from ELSE_GPCC daily climatology.
 1. Build a ``DailyBinDataset`` with a constant ``time_to_key`` (single
    binary file containing 365 daily frames) and construct the local-runoff
    mapping matrix via the Dataset API.
-2. Call ``export_runoff_climatology`` to produce a catchment-level
+2. Call ``export_climatology`` to produce a catchment-level
    mean-runoff NetCDF (analogous to ``calc_outclm.F90``).
 3. Call ``estimate_river_geometry`` to compute river width, height,
    depth, storage, and update bifurcation elevation
@@ -22,7 +22,7 @@ from datetime import datetime
 import numpy as np
 from netCDF4 import Dataset
 
-from cmfgpu.datasets.daily_bin_dataset import DailyBinDataset
+from hydroforge.datasets import DailyBinDataset
 from cmfgpu.params import estimate_river_geometry
 
 
@@ -65,8 +65,8 @@ def main():
         time_to_key=None,              # single file mode
     )
 
-    local_runoff_matrix = dataset.build_local_runoff_matrix(
-        runoff_mapping_file=runoff_mapping_file,
+    local_mapping = dataset.build_local_mapping(
+        mapping_file=runoff_mapping_file,
         desired_catchment_ids=catchment_ids,
         device="cpu",
     )
@@ -74,9 +74,10 @@ def main():
     # ------------------------------------------------------------------
     # 3. Export runoff climatology
     # ------------------------------------------------------------------
-    dataset.export_runoff_climatology(
+    dataset.export_climatology(
         out_path=climatology_nc,
-        local_runoff_matrix=local_runoff_matrix,
+        local_mapping=local_mapping,
+        var_name="runoff_clm",
         device="cpu",
     )
 

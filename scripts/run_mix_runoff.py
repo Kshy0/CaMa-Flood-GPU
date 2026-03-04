@@ -11,10 +11,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from cmfgpu.datasets import NetCDFDataset
+from hydroforge.datasets import NetCDFDataset
 from cmfgpu.models import CaMaFlood
 from cmfgpu.params import InputProxy
-from cmfgpu.utils import setup_distributed
+from hydroforge.core.distributed import setup_distributed
 
 
 def main():
@@ -113,8 +113,8 @@ def main():
     model.set_total_steps(dataset0.total_steps)
 
     # assume both datasets have the same formatting and mapping
-    local_runoff_matrix = dataset0.build_local_runoff_matrix(
-        runoff_mapping_file=runoff_mapping_file,
+    local_mapping = dataset0.build_local_mapping(
+        mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         device=device,
     )
@@ -140,7 +140,7 @@ def main():
     last_valid_time = start_date
     for batch_runoff0, batch_runoff1 in zip(loader0, loader1):
         with stream_ctx:
-            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_runoff_matrix, world_size)
+            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_mapping, world_size)
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:

@@ -11,14 +11,14 @@ Imports kernel functions from either the Triton or Torch backend
 based on the CMFGPU_BACKEND environment variable (default: triton).
 """
 
-from cmfgpu.phys._backend import KERNEL_BACKEND
+from hydroforge.compute.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "torch":
-    from cmfgpu.phys._backend import adapt_torch_kernel
     from cmfgpu.phys.torch.outflow import \
         compute_inflow_kernel as _compute_inflow_kernel
     from cmfgpu.phys.torch.outflow import \
         compute_outflow_kernel as _compute_outflow_kernel
+    from hydroforge.compute.backend import adapt_torch_kernel
 
     # compile=False: these kernels split their compilable body from
     # scatter_add_ and handle torch.compile internally.

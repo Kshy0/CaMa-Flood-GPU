@@ -22,7 +22,6 @@ def _cdiv(n: int, d: int) -> int:
     return (n + d - 1) // d
 
 
-from cmfgpu.models.abstract_model import AbstractModel
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
@@ -50,6 +49,7 @@ from cmfgpu.phys.reservoir import compute_reservoir_outflow_kernel
 from cmfgpu.phys.storage import (compute_flood_stage_batched_kernel,
                                  compute_flood_stage_kernel,
                                  compute_flood_stage_log_kernel)
+from hydroforge.core.model import AbstractModel
 
 
 class CaMaFlood(AbstractModel):
@@ -112,6 +112,23 @@ class CaMaFlood(AbstractModel):
     def validate_log_compatibility(self) -> Self:
         if self.num_trials is not None and self.num_trials > 1 and "log" in self.opened_modules:
             raise ValueError("The 'log' module cannot be used when num_trials > 1.")
+        return self
+
+    @model_validator(mode='after')
+    def validate_backend_precision(self) -> Self:
+        """Non-triton backends only support float32, no mixed precision."""
+        from hydroforge.compute.backend import KERNEL_BACKEND
+        if KERNEL_BACKEND != "triton":
+            if self.precision != "float32":
+                raise ValueError(
+                    f"Backend '{KERNEL_BACKEND}' only supports float32 precision, "
+                    f"got '{self.precision}'. Use the triton (CUDA) backend for float64."
+                )
+            if self.mixed_precision:
+                raise ValueError(
+                    f"Backend '{KERNEL_BACKEND}' does not support mixed precision. "
+                    f"Set mixed_precision=False or use the triton backend."
+                )
         return self
 
     @model_validator(mode="after")

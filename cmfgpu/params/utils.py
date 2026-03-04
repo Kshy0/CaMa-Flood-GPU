@@ -13,7 +13,7 @@ import numpy as np
 from netCDF4 import Dataset
 from numba import njit
 
-from cmfgpu.utils import find_indices_in
+from hydroforge.core.distributed import find_indices_in
 
 
 @njit

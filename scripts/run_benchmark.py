@@ -12,10 +12,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from cmfgpu.datasets import DailyBinDataset
+from hydroforge.datasets import DailyBinDataset
 from cmfgpu.models import CaMaFlood
 from cmfgpu.params import InputProxy
-from cmfgpu.utils import setup_distributed
+from hydroforge.core.distributed import setup_distributed
 
 BLOCK_SIZE_LIST = [64, 128, 256, 512, 1024]
 
@@ -82,8 +82,8 @@ def benchmark_block_sizes():
     )
     model.set_total_steps(dataset.total_steps)
 
-    local_runoff_matrix = dataset.build_local_runoff_matrix(
-        runoff_mapping_file=runoff_mapping_file,
+    local_mapping = dataset.build_local_mapping(
+        mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
         device=device,
     )
@@ -117,7 +117,7 @@ def benchmark_block_sizes():
 
         for batch_runoff in loader:
             with stream_ctx:
-                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_runoff_matrix, world_size)
+                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_mapping, world_size)
                 for runoff in batch_runoff:
                     if current_time > end_date:
                         continue

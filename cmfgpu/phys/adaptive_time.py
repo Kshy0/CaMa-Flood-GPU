@@ -11,12 +11,12 @@ Imports kernel functions from either the Triton or Torch backend
 based on the CMFGPU_BACKEND environment variable (default: triton).
 """
 
-from cmfgpu.phys._backend import KERNEL_BACKEND
+from hydroforge.compute.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "torch":
-    from cmfgpu.phys._backend import adapt_torch_kernel
     from cmfgpu.phys.torch.adaptive_time import \
         compute_adaptive_time_step_kernel as _compute_adaptive_time_step_kernel
+    from hydroforge.compute.backend import adapt_torch_kernel
     compute_adaptive_time_step_kernel = adapt_torch_kernel(_compute_adaptive_time_step_kernel)
     compute_adaptive_time_step_batched_kernel = None
 else:

@@ -10,8 +10,7 @@ from typing import ClassVar
 import torch
 from pydantic import Field
 
-from cmfgpu.modules.abstract_module import (AbstractModule,
-                                            computed_tensor_field)
+from hydroforge.core.module import AbstractModule, computed_tensor_field
 
 
 class AdaptiveTimeModule(AbstractModule):

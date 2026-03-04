@@ -22,7 +22,7 @@ from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
                                  reorder_by_basin_size,
                                  resolve_target_cids_from_poi,
                                  topological_sort, trace_outlets_dict)
-from cmfgpu.utils import binread, find_indices_in, read_map
+from hydroforge.core.distributed import binread, find_indices_in, read_map
 
 
 class MERITMap(BaseModel):

@@ -10,15 +10,17 @@ authors = [
     {name = "Shengyu Kang", email = "kshy0204@whu.edu.cn"}
 ]
 dependencies = [
+    "hydroforge>=0.1.0",
     "netCDF4",
     "scipy",
     "numba",
     "pydantic",
-    "tqdm"
+    "tqdm",
 ]
 
-[tool.setuptools]
-packages = ["cmfgpu"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cmfgpu*"]
 
 [project.optional-dependencies]
 dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "meson", "ninja"]

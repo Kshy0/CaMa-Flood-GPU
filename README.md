@@ -6,21 +6,20 @@
 
 **Development Environment:** This project is currently developed under WSL2 (Windows Subsystem for Linux 2), and requires that `torch` and `triton` can be installed successfully.
 
-**Target Audience:** This project is intended for advanced users who are already familiar with the original CaMa-Flood model. Users are strongly advised to run the original [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) first to understand the data structure, input specifications, and general workflow before attempting to use this GPU-accelerated version.
+**Target Audience**: This project is intended for advanced users who are already familiar with the original CaMa-Flood model. Users are strongly advised to run the original [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) first to understand the data structure, input specifications, and general workflow before attempting to use this GPU-accelerated version.
 
 ---
 
 ## Prerequisites
 
 - Python == 3.14.*  
-- PyTorch (with CUDA support) == 2.10.0+cu130
-- Triton == 3.6.0
+- PyTorch (with CUDA support) == 2.10.0+cu130 — `triton` ships automatically with PyTorch on supported systems
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4
   - and other utility packages as needed
 
-The installable version of torch depends on your system. This project will always rely on the official latest releases of torch and triton for the newest features and optimal performance. Tests have confirmed that the project can also run with torch 2.6.0 and CUDA 12.4.
+The installable version of torch depends on your system. This project will always rely on the official latest releases of torch (and the triton version it bundles) for the newest features and optimal performance. Tests have confirmed that the project can also run with torch 2.6.0 and CUDA 12.4.
 
 In theory, the codebase should also run on AMD GPUs, but I haven’t had the chance to test that setup yet.
 
@@ -51,17 +50,38 @@ For CUDA 13.0, you may use:
 pip install torch --index-url https://download.pytorch.org/whl/cu130
 ```
 
-> **Note:** By default, `triton` will be installed automatically when you install PyTorch. You don't need to install packages `torchvision` or `torchaudio` as stated in the official manual.
+> **Note:** `triton` ships automatically with PyTorch on supported CUDA systems — no separate installation needed. You also don't need to install `torchvision` or `torchaudio` as stated in the official manual.
 >
 > Sometimes, the above command may not be compatible with your system. For example, on some clusters running older systems, you can use `pip index versions torch` to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
-### 3. Install other dependencies
+### 3. Install Hydroforge
+
+[Hydroforge](https://github.com/Kshy0/hydroforge) is the underlying abstract framework used by this project. Install it with:
+
+```shell
+pip install git+https://github.com/Kshy0/hydroforge.git
+```
+
+### 4. Install other dependencies
 
 ```shell
 pip install -e .
 ```
 
 This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, and others.
+
+---
+
+## Updating
+
+When pulling the latest version of this repository, **remember to also update `Hydroforge`**, as the two packages are developed in tandem and API changes in one may require a matching update in the other:
+
+```shell
+git pull
+pip uninstall hydroforge -y
+pip install --upgrade git+https://github.com/Kshy0/hydroforge.git
+pip install -e .
+```
 
 ---
 

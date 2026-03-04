@@ -16,9 +16,9 @@ from typing import ClassVar, List, Literal, Optional, Self, Tuple
 import torch
 from pydantic import Field, computed_field, model_validator
 
-from cmfgpu.modules.abstract_module import (AbstractModule, TensorField,
-                                            computed_tensor_field)
-from cmfgpu.utils import find_indices_in_torch
+from hydroforge.core.distributed import find_indices_in_torch
+from hydroforge.core.module import (AbstractModule, TensorField,
+                                    computed_tensor_field)
 
 
 def BaseField(

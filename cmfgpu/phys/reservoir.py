@@ -10,12 +10,12 @@ Backend dispatcher for cmfgpu.phys.reservoir.
 Imports reservoir outflow kernel functions from the Triton backend.
 """
 
-from cmfgpu.phys._backend import KERNEL_BACKEND
+from hydroforge.compute.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "torch":
-    from cmfgpu.phys._backend import adapt_torch_kernel
     from cmfgpu.phys.torch.reservoir import \
         compute_reservoir_outflow_kernel as _compute_reservoir_outflow_kernel
+    from hydroforge.compute.backend import adapt_torch_kernel
 
     # compile=False: kernel uses scatter_add_ which breaks torch.compile graph
     compute_reservoir_outflow_kernel = adapt_torch_kernel(
