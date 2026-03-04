@@ -19,3 +19,4 @@ fortran/
 cmfgpu/phys/cutile/
 grad*
 downscale*
+.specstory/

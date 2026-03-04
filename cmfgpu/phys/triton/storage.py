@@ -7,7 +7,7 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import to_compute_dtype, typed_sqrt
+from cmfgpu.phys.triton.utils import to_compute_dtype
 
 
 # -----------------------------------------------------------------------------
@@ -130,7 +130,7 @@ def compute_flood_stage_kernel(
         (next_flood_depth - prev_flood_depth) / width_increment
     )
 
-    diff_width = typed_sqrt(
+    diff_width = tl.sqrt(
         prev_total_width * prev_total_width +
         2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
     ) - prev_total_width
@@ -314,7 +314,7 @@ def compute_flood_stage_log_kernel(
         (next_flood_depth - prev_flood_depth) / width_increment
     )
     
-    diff_width = typed_sqrt(
+    diff_width = tl.sqrt(
         prev_total_width * prev_total_width +
         2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
     ) - prev_total_width
@@ -401,142 +401,167 @@ def compute_flood_stage_batched_kernel(
     batched_river_length: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
 ):
-    # --- Block and lane indexing ---
-    pid_x = tl.program_id(0)
-    idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = idx < num_catchments * num_trials
-    
-    catchment_idx = idx % num_catchments
-    
-    # Calculate trial offset for batched table lookup if needed
-    trial_offset = (idx // num_catchments) * num_catchments
+    # --- Loop-based batched kernel ---
+    # Grid = cdiv(num_catchments, BLOCK_SIZE), each block loops over trials.
+    # Shared (non-trial) parameters are loaded once and reused across trials,
+    # reducing memory traffic and register pressure.
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_catchments
 
-    # ---- 1. Storage update (from update_storage_kernel) ----
-    river_storage = tl.load(river_storage_ptr + idx, mask=mask, other=0.0)
-    flood_storage = tl.load(flood_storage_ptr + idx, mask=mask, other=0.0)
-    protected_storage = tl.load(protected_storage_ptr + idx, mask=mask, other=0.0)
-    river_inflow = tl.load(river_inflow_ptr + idx, mask=mask, other=0.0)
-    flood_inflow = tl.load(flood_inflow_ptr + idx, mask=mask, other=0.0)
-    river_outflow = tl.load(river_outflow_ptr + idx, mask=mask, other=0.0)
-    flood_outflow = tl.load(flood_outflow_ptr + idx, mask=mask, other=0.0)
-    if HAS_BIFURCATION:
-        global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + idx, mask=mask, other=0.0)
-    
-    runoff = tl.load(runoff_ptr + (idx if batched_runoff else catchment_idx), mask=mask, other=0.0)
+    # ---- Load shared (non-trial) parameters once ----
+    if not batched_river_height:
+        river_height_shared = tl.load(river_height_ptr + offs, mask=mask)
+    if not batched_catchment_area:
+        catchment_area_shared = tl.load(catchment_area_ptr + offs, mask=mask)
+    if not batched_river_width:
+        river_width_shared = tl.load(river_width_ptr + offs, mask=mask)
+    if not batched_river_length:
+        river_length_shared = tl.load(river_length_ptr + offs, mask=mask)
+    if not batched_runoff:
+        runoff_shared = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
 
-    # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
-    river_inflow = to_compute_dtype(river_inflow, river_outflow)
-    flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
-    if HAS_BIFURCATION:
-        global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
+    # Pre-compute derived constants that don't change across trials
+    if not batched_river_height and not batched_river_width and not batched_river_length:
+        river_max_storage_shared = river_length_shared * river_width_shared * river_height_shared
+    if not batched_catchment_area and not batched_river_length:
+        catchment_width_shared = catchment_area_shared / river_length_shared
+        width_increment_shared = catchment_width_shared / num_flood_levels
 
-    river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
-    flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step
-    river_storage_updated = tl.maximum(river_storage_updated, 0.0)
-    river_storage_updated = tl.where(
-        flood_storage_updated < 0.0,
-        tl.maximum(river_storage_updated + flood_storage_updated, 0.0),
-        river_storage_updated
-    )
-    flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
-    total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+    # ---- Loop over trials ----
+    for t in tl.static_range(num_trials):
+        trial_offset = t * num_catchments
+        idx = trial_offset + offs
 
-    # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
-    total_storage = to_compute_dtype(total_storage, river_outflow)
+        # ---- 1. Storage update ----
+        river_storage = tl.load(river_storage_ptr + idx, mask=mask, other=0.0)
+        flood_storage = tl.load(flood_storage_ptr + idx, mask=mask, other=0.0)
+        protected_storage = tl.load(protected_storage_ptr + idx, mask=mask, other=0.0)
+        river_inflow = tl.load(river_inflow_ptr + idx, mask=mask, other=0.0)
+        flood_inflow = tl.load(flood_inflow_ptr + idx, mask=mask, other=0.0)
+        river_outflow = tl.load(river_outflow_ptr + idx, mask=mask, other=0.0)
+        flood_outflow = tl.load(flood_outflow_ptr + idx, mask=mask, other=0.0)
+        if HAS_BIFURCATION:
+            global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + idx, mask=mask, other=0.0)
 
-    # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
-    river_height        = tl.load(river_height_ptr        + (idx if batched_river_height else catchment_idx), mask=mask)
-    catchment_area      = tl.load(catchment_area_ptr      + (idx if batched_catchment_area else catchment_idx), mask=mask)
-    river_width         = tl.load(river_width_ptr         + (idx if batched_river_width else catchment_idx), mask=mask)
-    river_length        = tl.load(river_length_ptr        + (idx if batched_river_length else catchment_idx), mask=mask)
-    
-    river_max_storage = river_length * river_width * river_height
-    catchment_width = catchment_area / river_length
-    width_increment = catchment_width / num_flood_levels
+        runoff = tl.load(runoff_ptr + idx, mask=mask, other=0.0) if batched_runoff else runoff_shared
 
-    # Determine flood level by scanning the storage table
-    level = tl.where(total_storage > river_max_storage, 0, -1).to(tl.int32)
-    
-    S_accum = river_max_storage
-    prev_H = 0.0
-    prev_W = river_width
-    
-    prev_total_storage = river_max_storage
-    prev_flood_depth = 0.0
-    next_flood_depth = 0.0
-    
-    # Table offset
-    # Table is (num_catchments, num_flood_levels) or (num_trials, num_catchments, num_flood_levels)
-    # If batched: trial_idx * num_catchments * num_flood_levels + catchment_idx * num_flood_levels + i
-    # trial_idx * num_catchments = trial_offset
-    # So: trial_offset * num_flood_levels + catchment_idx * num_flood_levels
-    
-    table_base_offset = (trial_offset * num_flood_levels) if batched_flood_depth_table else 0
-    
-    for i in tl.static_range(num_flood_levels):
-        H_curr = tl.load(flood_depth_table_ptr + table_base_offset + catchment_idx * num_flood_levels + i, mask=mask)
-        W_curr = river_width + (i + 1) * width_increment
-        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
-        S_curr = S_accum + dS
-        
-        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
-        
-        is_above = total_storage > S_curr
-        level += tl.where(is_above, 1, 0)
-        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
-        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+        # Downcast hpfloat
+        river_inflow = to_compute_dtype(river_inflow, river_outflow)
+        flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
+        if HAS_BIFURCATION:
+            global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
 
-        S_accum = S_curr
-        prev_H = H_curr
-        prev_W = W_curr
+        river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
+        flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step
+        river_storage_updated = tl.maximum(river_storage_updated, 0.0)
+        river_storage_updated = tl.where(
+            flood_storage_updated < 0.0,
+            tl.maximum(river_storage_updated + flood_storage_updated, 0.0),
+            river_storage_updated
+        )
+        flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
+        total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+        total_storage = to_compute_dtype(total_storage, river_outflow)
 
-    no_flood_cond = level < 0
-    level = tl.maximum(level, 0)
-    
-    prev_total_width = river_width + level * width_increment
+        # ---- 2. Flood stage computation ----
+        # Use pre-loaded shared values or load per-trial batched values
+        river_height = tl.load(river_height_ptr + idx, mask=mask) if batched_river_height else river_height_shared
+        catchment_area = tl.load(catchment_area_ptr + idx, mask=mask) if batched_catchment_area else catchment_area_shared
+        river_width = tl.load(river_width_ptr + idx, mask=mask) if batched_river_width else river_width_shared
+        river_length = tl.load(river_length_ptr + idx, mask=mask) if batched_river_length else river_length_shared
 
-    flood_grad = tl.where(
-        level == num_flood_levels,
-        0.0,
-        (next_flood_depth - prev_flood_depth) / width_increment
-    )
+        # Use pre-computed derived constants when possible
+        if batched_river_height or batched_river_width or batched_river_length:
+            river_max_storage = river_length * river_width * river_height
+        else:
+            river_max_storage = river_max_storage_shared
+        if batched_catchment_area or batched_river_length:
+            catchment_width = catchment_area / river_length
+            width_increment = catchment_width / num_flood_levels
+        else:
+            width_increment = width_increment_shared
 
-    diff_width = typed_sqrt(
-        prev_total_width * prev_total_width +
-        2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
-    ) - prev_total_width
-    flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
-    flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
+        level = tl.where(total_storage > river_max_storage, 0, -1).to(tl.int32)
 
-    flood_depth = tl.where(
-        no_flood_cond, 0.0,
-        tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
-    )
+        S_accum = river_max_storage
+        prev_H = 0.0
+        prev_W = river_width
 
-    river_storage_final = tl.where(
-        no_flood_cond,
-        total_storage,
-        tl.minimum(river_max_storage + river_length * river_width * flood_depth, total_storage)
-    )
-    river_depth = river_storage_final / (river_length * river_width)
+        prev_total_storage = river_max_storage
+        prev_flood_depth = 0.0
+        next_flood_depth = 0.0
 
+        # Table offset: when not batched, table_base_offset is 0 and addresses
+        # don't depend on trial → Triton compiler can hoist these loads.
+        if batched_flood_depth_table:
+            table_base_offset = trial_offset * num_flood_levels
+        else:
+            table_base_offset = 0
 
-    flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
-    flood_fraction = tl.where(
-        no_flood_cond, 0.0,
-        tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
-    )
+        for i in tl.static_range(num_flood_levels):
+            H_curr = tl.load(flood_depth_table_ptr + table_base_offset + offs * num_flood_levels + i, mask=mask)
+            W_curr = river_width + (i + 1) * width_increment
+            dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+            S_curr = S_accum + dS
 
-    flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
+            next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
 
-    # Return to zero
-    tl.store(outgoing_storage_ptr + idx, 0.0, mask=mask)
+            is_above = total_storage > S_curr
+            level += tl.where(is_above, 1, 0)
+            prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+            prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
 
-    # Store outputs (in-place update)
-    tl.store(river_storage_ptr    + idx, river_storage_final, mask=mask)
-    tl.store(flood_storage_ptr    + idx, flood_storage_final, mask=mask)
-    tl.store(protected_storage_ptr + idx, 0.0, mask=mask)
-    tl.store(river_depth_ptr      + idx, river_depth, mask=mask)
-    tl.store(flood_depth_ptr      + idx, flood_depth, mask=mask)
-    tl.store(protected_depth_ptr  + idx, flood_depth, mask=mask)
-    tl.store(flood_fraction_ptr   + idx, flood_fraction, mask=mask)
+            S_accum = S_curr
+            prev_H = H_curr
+            prev_W = W_curr
+
+        no_flood_cond = level < 0
+        level = tl.maximum(level, 0)
+
+        prev_total_width = river_width + level * width_increment
+
+        flood_grad = tl.where(
+            level == num_flood_levels,
+            0.0,
+            (next_flood_depth - prev_flood_depth) / width_increment
+        )
+
+        diff_width = tl.sqrt(
+            prev_total_width * prev_total_width +
+            2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
+        ) - prev_total_width
+        flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
+        flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
+
+        flood_depth = tl.where(
+            no_flood_cond, 0.0,
+            tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
+        )
+
+        river_storage_final = tl.where(
+            no_flood_cond,
+            total_storage,
+            tl.minimum(river_max_storage + river_length * river_width * flood_depth, total_storage)
+        )
+        river_depth = river_storage_final / (river_length * river_width)
+
+        flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
+        flood_fraction = tl.where(
+            no_flood_cond, 0.0,
+            tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
+        )
+
+        flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
+
+        # Return to zero
+        tl.store(outgoing_storage_ptr + idx, 0.0, mask=mask)
+
+        # Store outputs
+        tl.store(river_storage_ptr    + idx, river_storage_final, mask=mask)
+        tl.store(flood_storage_ptr    + idx, flood_storage_final, mask=mask)
+        tl.store(protected_storage_ptr + idx, 0.0, mask=mask)
+        tl.store(river_depth_ptr      + idx, river_depth, mask=mask)
+        tl.store(flood_depth_ptr      + idx, flood_depth, mask=mask)
+        tl.store(protected_depth_ptr  + idx, flood_depth, mask=mask)
+        tl.store(flood_fraction_ptr   + idx, flood_fraction, mask=mask)

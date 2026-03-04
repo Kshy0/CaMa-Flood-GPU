@@ -6,8 +6,9 @@
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
-from cmfgpu.phys.triton.utils import to_compute_dtype, typed_pow, typed_sqrt
+from cmfgpu.phys.triton.utils import to_compute_dtype
 
 
 @triton.jit
@@ -124,7 +125,7 @@ def compute_outflow_kernel(
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
     updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
-    river_semi_implicit_flow_depth = tl.maximum(typed_sqrt(
+    river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
         updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
@@ -133,7 +134,7 @@ def compute_outflow_kernel(
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(
-        typed_sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
+        tl.sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
         1e-6
     )
 
@@ -144,7 +145,7 @@ def compute_outflow_kernel(
         flood_storage / river_length - flood_depth * river_width,
         0.0
     )
-    flood_implicit_area = tl.maximum(typed_sqrt(
+    flood_implicit_area = tl.maximum(tl.sqrt(
         updated_flood_cross_section_area * tl.maximum(flood_cross_section_area, 1e-6)
     ), 1e-6)
 
@@ -162,9 +163,9 @@ def compute_outflow_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use typed_pow() for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * typed_pow(river_semi_implicit_flow_depth, -7.0/3.0)
+                      * libdevice.pow(river_semi_implicit_flow_depth, -7.0/3.0)
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -176,9 +177,9 @@ def compute_outflow_kernel(
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     
-    # Use typed_pow() for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * typed_pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
+                      * libdevice.pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
@@ -208,13 +209,13 @@ def compute_outflow_kernel(
         bed_slope = (catchment_elevation - tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0)) / downstream_distance
         bed_slope = tl.maximum(bed_slope, MIN_KINEMATIC_SLOPE)
         # River kinematic: Q = W * n^{-1} * S^{0.5} * d^{5/3}
-        kin_riv_vel = (1.0 / river_manning) * typed_sqrt(bed_slope) * typed_pow(river_depth, 2.0 / 3.0)
+        kin_riv_vel = (1.0 / river_manning) * tl.sqrt(bed_slope) * libdevice.pow(river_depth, 2.0 / 3.0)
         kin_riv = river_width * river_depth * kin_riv_vel
         kin_riv = tl.minimum(kin_riv, river_storage / time_step)
         kin_riv = tl.maximum(kin_riv, 0.0)
         # Flood kinematic: slope clamped to 0.005
         bed_slope_f = tl.minimum(bed_slope, 0.005)
-        kin_fld_vel = (1.0 / flood_manning) * typed_sqrt(bed_slope_f) * typed_pow(flood_depth, 2.0 / 3.0)
+        kin_fld_vel = (1.0 / flood_manning) * tl.sqrt(bed_slope_f) * libdevice.pow(flood_depth, 2.0 / 3.0)
         kin_fld_area = tl.maximum(flood_storage / river_length - flood_depth * river_width, 0.0)
         kin_fld = kin_fld_area * kin_fld_vel
         kin_fld = tl.minimum(kin_fld, flood_storage / time_step)
@@ -449,7 +450,7 @@ def compute_outflow_batched_kernel(
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
     updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
-    river_semi_implicit_flow_depth = tl.maximum(typed_sqrt(
+    river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
         updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
@@ -458,7 +459,7 @@ def compute_outflow_batched_kernel(
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(
-        typed_sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
+        tl.sqrt(updated_flood_cross_section_depth * flood_cross_section_depth), 
         1e-6
     )
 
@@ -469,7 +470,7 @@ def compute_outflow_batched_kernel(
         flood_storage / river_length - flood_depth * river_width,
         0.0
     )
-    flood_implicit_area = tl.maximum(typed_sqrt(
+    flood_implicit_area = tl.maximum(tl.sqrt(
         updated_flood_cross_section_area * tl.maximum(flood_cross_section_area, 1e-6)
     ), 1e-6)
 
@@ -487,9 +488,9 @@ def compute_outflow_batched_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use typed_pow() for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * typed_pow(river_semi_implicit_flow_depth, -7.0/3.0)
+                      * libdevice.pow(river_semi_implicit_flow_depth, -7.0/3.0)
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -501,9 +502,9 @@ def compute_outflow_batched_kernel(
 
     numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
     
-    # Use typed_pow() for power calculation
+    # Use libdevice.pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * typed_pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
+                      * libdevice.pow(flood_semi_implicit_flow_depth, -4.0/3.0) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)

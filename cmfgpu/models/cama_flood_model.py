@@ -176,6 +176,11 @@ class CaMaFlood(AbstractModel):
         return lambda META: (_cdiv(self.base.num_catchments * (self.num_trials or 1), META["BLOCK_SIZE"]),)
 
     @cached_property
+    def base_grid_loop(self) -> Callable:
+        """Grid for loop-based batched kernels: cdiv(N, BS) instead of cdiv(N*T, BS)."""
+        return lambda META: (_cdiv(self.base.num_catchments, META["BLOCK_SIZE"]),)
+
+    @cached_property
     def bifurcation_grid(self) -> Callable:
         if not self.bifurcation_flag:
             return None
@@ -186,6 +191,13 @@ class CaMaFlood(AbstractModel):
         if not self.levee_flag:
             return None
         return lambda META: (_cdiv(self.base.num_levees * (self.num_trials or 1), META["BLOCK_SIZE"]),)
+
+    @cached_property
+    def levee_grid_loop(self) -> Callable:
+        """Grid for loop-based batched levee kernels: cdiv(num_levees, BS)."""
+        if not self.levee_flag:
+            return None
+        return lambda META: (_cdiv(self.base.num_levees, META["BLOCK_SIZE"]),)
 
     @cached_property
     def reservoir_grid(self) -> Callable:
@@ -612,7 +624,7 @@ class CaMaFlood(AbstractModel):
 
         # Flood stage computation for non-levee catchments
         if self.num_trials is not None:
-            compute_flood_stage_batched_kernel[self.base_grid](
+            compute_flood_stage_batched_kernel[self.base_grid_loop](
                 river_inflow_ptr=self.base.river_inflow,
                 flood_inflow_ptr=self.base.flood_inflow,
                 river_outflow_ptr=self.base.river_outflow,
@@ -717,7 +729,7 @@ class CaMaFlood(AbstractModel):
         # Levee stage computation (if enabled)
         if self.levee_flag:
             if self.num_trials is not None:
-                compute_levee_stage_batched_kernel[self.levee_grid](
+                compute_levee_stage_batched_kernel[self.levee_grid_loop](
                     levee_catchment_idx_ptr=self.levee.levee_catchment_idx,
                     river_storage_ptr=self.base.river_storage,
                     flood_storage_ptr=self.base.flood_storage,

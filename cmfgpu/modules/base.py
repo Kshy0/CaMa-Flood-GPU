@@ -400,6 +400,7 @@ class BaseModule(AbstractModule):
     def is_dam_upstream(self) -> Optional[torch.Tensor]:
         if self.is_dam_related is None:
             return None
+        assert self.is_reservoir is not None
         return self.is_dam_related & ~self.is_reservoir
     
     @computed_base_field(
@@ -504,7 +505,7 @@ class BaseModule(AbstractModule):
         expr="flood_fraction * catchment_area"
     )
     @cached_property
-    def flood_area(self) -> torch.Tensor:
+    def flood_area(self) -> Optional[torch.Tensor]:
         return None
 
     @computed_base_field(
@@ -546,7 +547,7 @@ class BaseModule(AbstractModule):
         expr="river_outflow + flood_outflow",
     )
     @cached_property
-    def total_outflow(self) -> torch.Tensor:
+    def total_outflow(self) -> Optional[torch.Tensor]:
         return None
 
     # ------------------------------------------------------------------ #

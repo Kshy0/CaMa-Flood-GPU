@@ -62,7 +62,7 @@ def TensorField(
         description=description,
         **kwargs,
         json_schema_extra={
-            "tensor_shape": shape,
+            "tensor_shape": list(shape),
             "tensor_dtype": dtype,
             "group_by": group_by,
             "save_idx": save_idx,
@@ -119,7 +119,7 @@ def computed_tensor_field(
     return computed_field(
         description=description,
         json_schema_extra={
-            "tensor_shape": shape,
+            "tensor_shape": list(shape),
             "tensor_dtype": dtype,
             "save_idx": save_idx,
             "save_coord": save_coord,
@@ -237,7 +237,7 @@ class AbstractModule(BaseModel, ABC):
         return cls.model_fields
     
     @classmethod
-    def get_model_computed_fields(cls) -> Dict[str, FieldInfo]:
+    def get_model_computed_fields(cls) -> Dict[str, Any]:
         return cls.model_computed_fields
 
     
@@ -251,7 +251,7 @@ class AbstractModule(BaseModel, ABC):
         for name, field_info in self.get_model_fields().items():
             # Check if it is a TensorField by looking for tensor_shape in json_schema_extra
             json_schema_extra = getattr(field_info, 'json_schema_extra', None)
-            if json_schema_extra is None or 'tensor_shape' not in json_schema_extra:
+            if not isinstance(json_schema_extra, dict) or 'tensor_shape' not in json_schema_extra:
                 continue
 
             if name in self.model_fields_set:
@@ -259,8 +259,10 @@ class AbstractModule(BaseModel, ABC):
             value = getattr(self, name, None)
             # shape
             expected_shape = self.get_expected_shape(name)
+            if expected_shape is None:
+                continue
             # dtype
-            tensor_dtype = field_info.json_schema_extra.get('tensor_dtype', 'float')
+            tensor_dtype = str(json_schema_extra.get('tensor_dtype', 'float'))
             dtype_map = {
                 'float': self.precision,
                 'hpfloat': self.high_precision,
@@ -279,7 +281,7 @@ class AbstractModule(BaseModel, ABC):
 
             setattr(self, name, tensor_value)
 
-    def get_expected_shape(self, field_name: str) -> Tuple[int, ...]:
+    def get_expected_shape(self, field_name: str) -> Optional[Tuple[int, ...]]:
         """
         Get the expected shape for a tensor field based on current scalar values.
         
@@ -287,13 +289,13 @@ class AbstractModule(BaseModel, ABC):
             field_name: Name of the tensor field
             
         Returns:
-            Tuple of integer dimensions
+            Tuple of integer dimensions, or None if no shape is defined
         """
         model_fields = self.get_model_fields() | self.get_model_computed_fields()
         if field_name not in model_fields:
             raise ValueError(f"Field {field_name} is not a tensor field")
         json_schema_extra = getattr(model_fields[field_name], 'json_schema_extra', None)
-        if json_schema_extra is None:
+        if not isinstance(json_schema_extra, dict):
             json_schema_extra = {}
         shape_spec = json_schema_extra.get('tensor_shape', None)
         if shape_spec is None:
@@ -346,9 +348,9 @@ class AbstractModule(BaseModel, ABC):
         if field_name not in model_fields:
             raise ValueError(f"Field {field_name} is not a tensor field")
         json_schema_extra = getattr(model_fields[field_name], 'json_schema_extra', None)
-        if json_schema_extra is None:
+        if not isinstance(json_schema_extra, dict):
             json_schema_extra = {}
-        dtype_str = json_schema_extra.get('tensor_dtype', 'float')
+        dtype_str = str(json_schema_extra.get('tensor_dtype', 'float'))
         
         dtype_map = {
             'float': self.precision,
@@ -374,7 +376,7 @@ class AbstractModule(BaseModel, ABC):
         for field_name, field_info in self.get_model_fields().items():
             # Check if it is a TensorField by looking for tensor_shape in json_schema_extra
             json_schema_extra = getattr(field_info, 'json_schema_extra', None)
-            if json_schema_extra is None or 'tensor_shape' not in json_schema_extra:
+            if not isinstance(json_schema_extra, dict) or 'tensor_shape' not in json_schema_extra:
                 continue
 
             tensor = getattr(self, field_name, None)
@@ -384,6 +386,8 @@ class AbstractModule(BaseModel, ABC):
                 
             # 1. Shape validation (fail fast)
             expected_shape = self.get_expected_shape(field_name)
+            if expected_shape is None:
+                continue
             if tensor.shape != expected_shape:
                 # Try to expand if it's a state/init_state variable and shape matches without batch dim
                 category = json_schema_extra.get('category', 'param')
@@ -444,7 +448,7 @@ class AbstractModule(BaseModel, ABC):
         auto_fix_log = {}
         for field_name, field_info in self.get_model_computed_fields().items():
             json_schema_extra = getattr(field_info, 'json_schema_extra', None)
-            if json_schema_extra is None:
+            if not isinstance(json_schema_extra, dict):
                 continue
 
             # Need to skip virtual fields
@@ -475,6 +479,8 @@ class AbstractModule(BaseModel, ABC):
                 setattr(self, field_name, tensor)
             
             expected_shape = self.get_expected_shape(field_name)
+            if expected_shape is None:
+                continue
             if tensor.shape != expected_shape:
                 # Check if it is batched (num_trials > 1)
                 if self.num_trials is not None and tensor.shape == (self.num_trials,) + expected_shape:

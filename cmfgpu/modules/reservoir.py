@@ -126,6 +126,7 @@ class ReservoirModule(AbstractModule):
     )
     @cached_property
     def reservoir_catchment_idx(self) -> torch.Tensor:
+        assert self.base is not None
         return find_indices_in_torch(self.base.reservoir_catchment_id, self.base.catchment_id)
 
     # ------------------------------------------------------------------ #

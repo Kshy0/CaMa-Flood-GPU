@@ -7,8 +7,6 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import typed_sqrt
-
 
 @triton.jit
 def compute_adaptive_time_step_kernel(
@@ -39,7 +37,7 @@ def compute_adaptive_time_step_kernel(
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
     depth = tl.maximum(river_depth, 0.01)
-    dt = adaptive_time_factor * downstream_distance / typed_sqrt(gravity * depth)
+    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
     
     min_dt = tl.min(dt_clamped)
@@ -97,7 +95,7 @@ def compute_adaptive_time_step_batched_kernel(
     river_depth = river_depth.to(tl.float32)
 
     depth = tl.maximum(river_depth, 0.01)
-    dt = adaptive_time_factor * downstream_distance / typed_sqrt(gravity * depth)
+    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, time_step)
     
     min_dt = tl.min(dt_clamped)

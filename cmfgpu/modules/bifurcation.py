@@ -186,6 +186,7 @@ class BifurcationModule(AbstractModule):
     )
     @cached_property
     def bifurcation_catchment_idx(self) -> torch.Tensor:
+        assert self.base is not None
         return find_indices_in_torch(self.bifurcation_catchment_id, self.base.catchment_id)
 
     @computed_bifurcation_field(
@@ -195,6 +196,7 @@ class BifurcationModule(AbstractModule):
     )
     @cached_property
     def bifurcation_downstream_idx(self) -> torch.Tensor:
+        assert self.base is not None
         return find_indices_in_torch(self.bifurcation_downstream_id, self.base.catchment_id)
 
     @computed_bifurcation_field(
@@ -240,6 +242,7 @@ class BifurcationModule(AbstractModule):
     )
     @cached_property
     def num_catchments(self) -> int:
+        assert self.base is not None
         return self.base.catchment_id.shape[0]
 
     # ------------------------------------------------------------------ #

@@ -111,9 +111,11 @@ class LeveeModule(AbstractModule):
     @computed_levee_field(description="Indices of catchments hosting each levee", dtype="idx", category="topology")
     @cached_property
     def levee_catchment_idx(self) -> torch.Tensor:
+        assert self.base is not None
         return find_indices_in_torch(self.base.levee_catchment_id, self.base.catchment_id)
 
     def _interp_lookup(self, table: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+        assert self.base is not None
         # table: (N, M) or (T, N, M)
         # position: (L,) or (T, L)
         
@@ -175,11 +177,13 @@ class LeveeModule(AbstractModule):
     @computed_levee_field(description="Levee base height above river bed (m)", category="derived_param")
     @cached_property
     def levee_base_height(self) -> torch.Tensor:
+        assert self.base is not None
         return self._interp_lookup(self.base.flood_depth_table, self.levee_fraction * self.base.num_flood_levels)
     
     @computed_levee_field(description="Storage when water first touches levee base (m³)", category="derived_param")
     @cached_property
     def levee_base_storage(self) -> torch.Tensor:
+        assert self.base is not None
         # Gather parameters for levee catchments
         idx = self.levee_catchment_idx
         river_length = self.gather_tensor(self.base.river_length, idx)

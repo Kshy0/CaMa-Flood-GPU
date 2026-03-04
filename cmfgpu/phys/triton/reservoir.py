@@ -11,7 +11,7 @@ Reservoir outflow Triton kernels.
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import to_compute_dtype, typed_sqrt
+from cmfgpu.phys.triton.utils import to_compute_dtype
 
 
 @triton.jit
@@ -106,7 +106,7 @@ def compute_reservoir_outflow_kernel(
     cond1 = total_storage <= conservation_volume
     reservoir_outflow = tl.where(
         cond1,
-        normal_outflow * typed_sqrt(total_storage / conservation_volume),
+        normal_outflow * tl.sqrt(total_storage / conservation_volume),
         reservoir_outflow,
     )
 
