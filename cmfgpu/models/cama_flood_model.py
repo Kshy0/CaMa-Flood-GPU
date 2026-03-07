@@ -124,7 +124,8 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
     @model_validator(mode='after')
     def validate_cuda_backend_limitations(self) -> Self:
-        """CUDA C++ / Metal backends do not support batched (num_trials>1) or log modules."""
+        """CUDA C++ / Metal backends do not support batched (num_trials>1);
+        CUDA C++ additionally lacks the log module kernels."""
         from hydroforge.runtime.backend import KERNEL_BACKEND
         if KERNEL_BACKEND not in ("cuda", "metal"):
             return self
@@ -133,7 +134,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 f"'{KERNEL_BACKEND}' backend does not support batched execution "
                 f"(num_trials={self.num_trials}). Use the triton backend instead."
             )
-        if "log" in self.opened_modules:
+        if KERNEL_BACKEND == "cuda" and "log" in self.opened_modules:
             raise ValueError(
                 f"'{KERNEL_BACKEND}' backend does not implement the 'log' module kernels "
                 "(compute_flood_stage_log, compute_levee_stage_log). "
@@ -397,17 +398,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             river_width_ptr=self.base.river_width,
             river_length_ptr=self.base.river_length,
             is_levee_ptr=self.base.is_levee,
-            total_storage_pre_sum_ptr=self.log.total_storage_pre_sum,
-            total_storage_next_sum_ptr=self.log.total_storage_next_sum,
-            total_storage_new_sum_ptr=self.log.total_storage_new_sum,
-            total_inflow_sum_ptr=self.log.total_inflow_sum,
-            total_outflow_sum_ptr=self.log.total_outflow_sum,
-            total_storage_stage_sum_ptr=self.log.total_storage_stage_sum,
-            river_storage_sum_ptr=self.log.river_storage_sum,
-            flood_storage_sum_ptr=self.log.flood_storage_sum,
-            total_inflow_error_sum_ptr=self.log.total_inflow_error_sum,
-            total_stage_error_sum_ptr=self.log.total_stage_error_sum,
-            flood_area_sum_ptr=self.log.flood_area_sum,
+            log_sums_ptr=self.log.log_sums,
             num_catchments=self.base.num_catchments,
             time_step_ptr=self.base.time_step,
             current_step_ptr=self.base.current_step,
@@ -470,14 +461,11 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             levee_crown_height_ptr=self.levee.levee_crown_height,
             levee_fraction_ptr=self.levee.levee_fraction,
             flood_fraction_ptr=self.base.flood_fraction,
-            total_storage_stage_sum_ptr=self.log.total_storage_stage_sum,
-            river_storage_sum_ptr=self.log.river_storage_sum,
-            flood_storage_sum_ptr=self.log.flood_storage_sum,
-            flood_area_sum_ptr=self.log.flood_area_sum,
-            total_stage_error_sum_ptr=self.log.total_stage_error_sum,
+            log_sums_ptr=self.log.log_sums,
             num_levees=self.base.num_levees,
             current_step_ptr=self.base.current_step,
             num_flood_levels=self.base.num_flood_levels,
+            log_buffer_size=self.log.log_buffer_size,
             BLOCK_SIZE=self.BLOCK_SIZE,
         )
 

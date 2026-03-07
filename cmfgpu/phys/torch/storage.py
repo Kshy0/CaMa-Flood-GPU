@@ -152,17 +152,10 @@ def compute_flood_stage_log_kernel(
     river_width: torch.Tensor,
     river_length: torch.Tensor,
     is_levee: torch.Tensor,
-    total_storage_pre_sum: torch.Tensor,
-    total_storage_next_sum: torch.Tensor,
-    total_storage_new_sum: torch.Tensor,
-    total_inflow_sum: torch.Tensor,
-    total_outflow_sum: torch.Tensor,
-    total_storage_stage_sum: torch.Tensor,
-    river_storage_sum: torch.Tensor,
-    flood_storage_sum: torch.Tensor,
-    flood_area_sum: torch.Tensor,
-    total_inflow_error_sum: torch.Tensor,
-    total_stage_error_sum: torch.Tensor,
+    # Packed log sums: (NUM_LOG_VARS, log_buffer_size) contiguous tensor
+    # row 0=pre, 1=next, 2=new, 3=inflow_err, 4=inflow, 5=outflow,
+    #     6=stage, 7=stage_err, 8=riv_sto, 9=fld_sto, 10=fld_area
+    log_sums: torch.Tensor,
     current_step: int,
     num_catchments: int,
     num_flood_levels: int,
@@ -175,7 +168,7 @@ def compute_flood_stage_log_kernel(
 
     # Pre-logging (all tensor ops, no .item() – keeps the graph intact)
     total_pre = river_storage + flood_storage + protected_storage
-    total_storage_pre_sum[current_step] += total_pre.sum() * 1e-9
+    log_sums[0, current_step] += total_pre.sum() * 1e-9
 
     riv_in = river_inflow.clone()
     fld_in = flood_inflow.clone()
@@ -217,18 +210,18 @@ def compute_flood_stage_log_kernel(
     fld_sto = flood_storage
     ff = flood_fraction
     total_next = riv_sto + fld_sto
-    total_inflow_sum[current_step] += torch.where(non_levee, (riv_in + fld_in) * time_step, 0.0).sum() * 1e-9
-    total_outflow_sum[current_step] += torch.where(non_levee, (riv_out + fld_out) * time_step, 0.0).sum() * 1e-9
-    total_storage_next_sum[current_step] += torch.where(non_levee, total_next, 0.0).sum() * 1e-9
-    total_storage_new_sum[current_step] += torch.where(non_levee, total_next, 0.0).sum() * 1e-9
-    total_storage_stage_sum[current_step] += total_next.sum() * 1e-9
-    river_storage_sum[current_step] += torch.where(non_levee, riv_sto, 0.0).sum() * 1e-9
-    flood_storage_sum[current_step] += torch.where(non_levee, fld_sto, 0.0).sum() * 1e-9
+    log_sums[4, current_step] += torch.where(non_levee, (riv_in + fld_in) * time_step, 0.0).sum() * 1e-9
+    log_sums[5, current_step] += torch.where(non_levee, (riv_out + fld_out) * time_step, 0.0).sum() * 1e-9
+    log_sums[1, current_step] += torch.where(non_levee, total_next, 0.0).sum() * 1e-9
+    log_sums[2, current_step] += torch.where(non_levee, total_next, 0.0).sum() * 1e-9
+    log_sums[6, current_step] += total_next.sum() * 1e-9
+    log_sums[8, current_step] += torch.where(non_levee, riv_sto, 0.0).sum() * 1e-9
+    log_sums[9, current_step] += torch.where(non_levee, fld_sto, 0.0).sum() * 1e-9
     flood_area = ff * ca
-    flood_area_sum[current_step] += torch.where(non_levee, flood_area, 0.0).sum() * 1e-9
-    total_inflow_error_sum[current_step] += torch.where(non_levee,
+    log_sums[10, current_step] += torch.where(non_levee, flood_area, 0.0).sum() * 1e-9
+    log_sums[3, current_step] += torch.where(non_levee,
         total_pre - total_next + (riv_in + fld_in + ro - riv_out - fld_out - bif_out) * time_step, 0.0).sum() * 1e-9
-    total_stage_error_sum[current_step] += torch.where(non_levee,
+    log_sums[7, current_step] += torch.where(non_levee,
         (total_next - (riv_sto + fld_sto)) * 1e-9, 0.0).sum()
 
 

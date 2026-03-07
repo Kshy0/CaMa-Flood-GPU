@@ -262,15 +262,14 @@ def compute_levee_stage_log_kernel(
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
-    total_storage_stage_sum_ptr,
-    river_storage_sum_ptr,
-    flood_storage_sum_ptr,
-    flood_area_sum_ptr,
-    total_stage_error_sum_ptr,
+    # Packed log sums: (NUM_LOG_VARS, log_buffer_size) contiguous tensor
+    # row 6=stage, 7=stage_err, 8=riv_sto, 9=fld_sto, 10=fld_area
+    log_sums_ptr,
     current_step_ptr,
     num_levees: tl.constexpr,
     num_flood_levels: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    log_buffer_size: tl.constexpr = 1000,
+    BLOCK_SIZE: tl.constexpr = 128,
 ):
     pid = tl.program_id(0)
     levee_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -474,11 +473,11 @@ def compute_levee_stage_log_kernel(
 
     # Log variables
     total_storage_stage_new = r_sto + f_sto + p_sto
-    tl.atomic_add(total_storage_stage_sum_ptr + current_step, tl.sum(total_storage_stage_new) * 1e-9)
-    tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(r_sto) * 1e-9)
-    tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(f_sto) * 1e-9)
-    tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(f_frc * catchment_area) * 1e-9)
-    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(total_storage_stage_new - total_storage) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 6 * log_buffer_size + current_step, tl.sum(total_storage_stage_new) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 8 * log_buffer_size + current_step, tl.sum(r_sto) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 9 * log_buffer_size + current_step, tl.sum(f_sto) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 10 * log_buffer_size + current_step, tl.sum(f_frc * catchment_area) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 7 * log_buffer_size + current_step, tl.sum(total_storage_stage_new - total_storage) * 1e-9)
 
     # Store results
     tl.store(river_storage_ptr + levee_catchment_idx, r_sto, mask=mask)

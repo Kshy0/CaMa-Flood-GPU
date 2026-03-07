@@ -38,7 +38,7 @@ compute_outflow_kernel = make_metal_dispatcher(
         "flood_cross_section_area_ptr", "global_bifurcation_outflow_ptr",
         "total_storage_ptr", "outgoing_storage_ptr",
         "water_surface_elevation_ptr", "protected_water_surface_elevation_ptr",
-        "gravity", "time_step", "num_catchments", "HAS_BIFURCATION",
+        "gravity", "time_step_ptr", "num_catchments", "HAS_BIFURCATION",
     ),
     arg_defaults={"HAS_BIFURCATION": True},
 )
@@ -69,13 +69,29 @@ compute_flood_stage_kernel = make_metal_dispatcher(
         "protected_storage_ptr", "river_depth_ptr", "flood_depth_ptr",
         "protected_depth_ptr", "flood_fraction_ptr", "river_height_ptr",
         "flood_depth_table_ptr", "catchment_area_ptr", "river_width_ptr",
-        "river_length_ptr", "time_step", "num_catchments", "HAS_BIFURCATION",
+        "river_length_ptr", "time_step_ptr", "num_catchments", "HAS_BIFURCATION",
     ),
     template_vars={"__NUM_FLOOD_LEVELS__": "num_flood_levels"},
     arg_defaults={"HAS_BIFURCATION": True},
 )
 
-compute_flood_stage_log_kernel = None
+compute_flood_stage_log_kernel = make_metal_dispatcher(
+    _DIR / "storage.metal", "compute_flood_stage_log",
+    args=(
+        "river_inflow_ptr", "flood_inflow_ptr", "river_outflow_ptr",
+        "flood_outflow_ptr", "global_bifurcation_outflow_ptr", "runoff_ptr",
+        "outgoing_storage_ptr", "river_storage_ptr", "flood_storage_ptr",
+        "protected_storage_ptr", "river_depth_ptr", "flood_depth_ptr",
+        "protected_depth_ptr", "flood_fraction_ptr", "river_height_ptr",
+        "flood_depth_table_ptr", "catchment_area_ptr", "river_width_ptr",
+        "river_length_ptr", "is_levee_ptr",
+        "log_sums_ptr",
+        "time_step_ptr", "num_catchments", "HAS_BIFURCATION",
+        "current_step_ptr", "log_buffer_size",
+    ),
+    template_vars={"__NUM_FLOOD_LEVELS__": "num_flood_levels"},
+    arg_defaults={"HAS_BIFURCATION": True},
+)
 compute_flood_stage_batched_kernel = None
 
 # ── Adaptive time step ────────────────────────────────────────────────────
@@ -95,14 +111,14 @@ compute_adaptive_time_step_batched_kernel = None
 # ── Bifurcation ───────────────────────────────────────────────────────────
 
 compute_bifurcation_outflow_kernel = make_metal_dispatcher(
-    _DIR / "bifurcation_outflow.metal", "compute_bifurcation_outflow",
+    _DIR / "bifurcation.metal", "compute_bifurcation_outflow",
     args=(
         "bifurcation_catchment_idx_ptr", "bifurcation_downstream_idx_ptr",
         "bifurcation_manning_ptr", "bifurcation_outflow_ptr",
         "bifurcation_width_ptr", "bifurcation_length_ptr",
         "bifurcation_elevation_ptr", "bifurcation_cross_section_depth_ptr",
         "water_surface_elevation_ptr", "total_storage_ptr",
-        "outgoing_storage_ptr", "gravity", "time_step",
+        "outgoing_storage_ptr", "gravity", "time_step_ptr",
         "num_bifurcation_paths",
     ),
     size_key="num_bifurcation_paths",
@@ -110,7 +126,7 @@ compute_bifurcation_outflow_kernel = make_metal_dispatcher(
 )
 
 compute_bifurcation_inflow_kernel = make_metal_dispatcher(
-    _DIR / "bifurcation_inflow.metal", "compute_bifurcation_inflow",
+    _DIR / "bifurcation.metal", "compute_bifurcation_inflow",
     args=(
         "bifurcation_catchment_idx_ptr", "bifurcation_downstream_idx_ptr",
         "limit_rate_ptr", "bifurcation_outflow_ptr",
@@ -135,7 +151,7 @@ compute_reservoir_outflow_kernel = make_metal_dispatcher(
         "adjustment_volume_ptr", "normal_outflow_ptr",
         "adjustment_outflow_ptr", "flood_control_outflow_ptr",
         "runoff_ptr", "total_storage_ptr", "outgoing_storage_ptr",
-        "time_step", "num_reservoirs",
+        "time_step_ptr", "num_reservoirs",
     ),
     size_key="num_reservoirs",
 )
@@ -143,7 +159,7 @@ compute_reservoir_outflow_kernel = make_metal_dispatcher(
 # ── Levee ──────────────────────────────────────────────────────────────────
 
 compute_levee_stage_kernel = make_metal_dispatcher(
-    _DIR / "levee_stage.metal", "compute_levee_stage",
+    _DIR / "levee.metal", "compute_levee_stage",
     args=(
         "levee_catchment_idx_ptr", "river_storage_ptr", "flood_storage_ptr",
         "protected_storage_ptr", "river_depth_ptr", "flood_depth_ptr",
@@ -156,7 +172,21 @@ compute_levee_stage_kernel = make_metal_dispatcher(
     template_vars={"__NUM_FLOOD_LEVELS__": "num_flood_levels"},
 )
 
-compute_levee_stage_log_kernel = None
+compute_levee_stage_log_kernel = make_metal_dispatcher(
+    _DIR / "levee.metal", "compute_levee_stage_log",
+    args=(
+        "levee_catchment_idx_ptr", "river_storage_ptr", "flood_storage_ptr",
+        "protected_storage_ptr", "river_depth_ptr", "flood_depth_ptr",
+        "protected_depth_ptr", "river_height_ptr", "flood_depth_table_ptr",
+        "catchment_area_ptr", "river_width_ptr", "river_length_ptr",
+        "levee_base_height_ptr", "levee_crown_height_ptr",
+        "levee_fraction_ptr", "flood_fraction_ptr",
+        "log_sums_ptr",
+        "num_levees", "current_step_ptr", "log_buffer_size",
+    ),
+    size_key="num_levees",
+    template_vars={"__NUM_FLOOD_LEVELS__": "num_flood_levels"},
+)
 
 compute_levee_bifurcation_outflow_kernel = make_metal_dispatcher(
     _DIR / "levee_bifurcation_outflow.metal", "compute_levee_bifurcation_outflow",
@@ -167,7 +197,7 @@ compute_levee_bifurcation_outflow_kernel = make_metal_dispatcher(
         "bifurcation_elevation_ptr", "bifurcation_cross_section_depth_ptr",
         "water_surface_elevation_ptr", "protected_water_surface_elevation_ptr",
         "total_storage_ptr", "outgoing_storage_ptr",
-        "gravity", "time_step", "num_bifurcation_paths",
+        "gravity", "time_step_ptr", "num_bifurcation_paths",
     ),
     size_key="num_bifurcation_paths",
     template_vars={"__NUM_BIF_LEVELS__": "num_bifurcation_levels"},

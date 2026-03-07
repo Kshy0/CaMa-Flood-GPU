@@ -230,11 +230,9 @@ def compute_levee_stage_log_kernel(
     levee_crown_height: torch.Tensor,
     levee_fraction: torch.Tensor,
     flood_fraction: torch.Tensor,
-    total_storage_stage_sum: torch.Tensor,
-    river_storage_sum: torch.Tensor,
-    flood_storage_sum: torch.Tensor,
-    flood_area_sum: torch.Tensor,
-    total_stage_error_sum: torch.Tensor,
+    # Packed log sums: (NUM_LOG_VARS, log_buffer_size) contiguous tensor
+    # row 6=stage, 7=stage_err, 8=riv_sto, 9=fld_sto, 10=fld_area
+    log_sums: torch.Tensor,
     current_step: int,
     num_levees: int,
     num_flood_levels: int,
@@ -274,11 +272,11 @@ def compute_levee_stage_log_kernel(
     ff = flood_fraction[lci]
 
     total_new = r_sto + f_sto + p_sto
-    total_storage_stage_sum[current_step] += total_new.sum() * 1e-9
-    river_storage_sum[current_step] += r_sto.sum() * 1e-9
-    flood_storage_sum[current_step] += f_sto.sum() * 1e-9
-    flood_area_sum[current_step] += (ff * ca).sum() * 1e-9
-    total_stage_error_sum[current_step] += (total_new - total_pre).sum() * 1e-9
+    log_sums[6, current_step] += total_new.sum() * 1e-9
+    log_sums[8, current_step] += r_sto.sum() * 1e-9
+    log_sums[9, current_step] += f_sto.sum() * 1e-9
+    log_sums[10, current_step] += (ff * ca).sum() * 1e-9
+    log_sums[7, current_step] += (total_new - total_pre).sum() * 1e-9
 
 
 def _levee_bifurcation_outflow_body(
