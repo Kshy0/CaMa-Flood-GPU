@@ -41,13 +41,14 @@ def compute_reservoir_outflow_kernel(
     total_storage_ptr,                      # *f64  total storage (catchment-indexed, in/out)
     outgoing_storage_ptr,                   # *f64  outgoing storage (catchment-indexed, in/out)
 
-    time_step,                              # f32   scalar time step
+    time_step_ptr,                              # f32   scalar time step
     num_reservoirs,                         # i32   total number of reservoirs
     BLOCK_SIZE: tl.constexpr,               # block size
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_reservoirs
+    time_step = tl.load(time_step_ptr)
 
     # ---------- Index mapping ----------
     catchment_idx = tl.load(reservoir_catchment_idx_ptr + offs, mask=mask, other=0)

@@ -22,7 +22,7 @@ def compute_flood_stage_kernel(
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
-    time_step,                   # f32: Time step
+    time_step_ptr,                   # f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
     river_storage_ptr,           # *f64: River storage (in/out)
@@ -48,6 +48,7 @@ def compute_flood_stage_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
+    time_step = tl.load(time_step_ptr)
 
     # ---- 1. Storage update (from update_storage_kernel) ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
@@ -180,7 +181,7 @@ def compute_flood_stage_log_kernel(
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr,  # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
-    time_step,                   # f32: Time step
+    time_step_ptr,                   # f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
     river_storage_ptr,           # *f64: River storage (in/out)
@@ -210,7 +211,7 @@ def compute_flood_stage_log_kernel(
     total_inflow_error_sum_ptr, # *f32
     total_stage_error_sum_ptr, # *f32
     # Constants
-    current_step,
+    current_step_ptr,
     num_catchments: tl.constexpr,
     num_flood_levels: tl.constexpr,
     log_buffer_size: tl.constexpr = 1000,
@@ -221,6 +222,8 @@ def compute_flood_stage_log_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
+    time_step = tl.load(time_step_ptr)
+    current_step = tl.load(current_step_ptr)
 
     is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=True)
     non_levee = ~is_levee
@@ -371,7 +374,7 @@ def compute_flood_stage_batched_kernel(
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
-    time_step,                   # f32: Time step
+    time_step_ptr,                   # f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
     river_storage_ptr,           # *f64: River storage (in/out)
@@ -408,6 +411,7 @@ def compute_flood_stage_batched_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
+    time_step = tl.load(time_step_ptr)
 
     # ---- Load shared (non-trial) parameters once ----
     if not batched_river_height:

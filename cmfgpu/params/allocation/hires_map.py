@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
 
 import numpy as np
+from hydroforge.modeling.distributed import binread, read_map
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
 
@@ -40,7 +41,6 @@ from cmfgpu.params.allocation.alloc_flow_gauge import FlowGaugeMixin
 from cmfgpu.params.allocation.alloc_level_gauge import LevelGaugeAllocMixin
 from cmfgpu.params.allocation.hires_kernels import (build_upstream_table,
                                                     calc_outlet_pixels)
-from hydroforge.core.distributed import binread, read_map
 
 # ---------------------------------------------------------------------------
 # Pydantic data class

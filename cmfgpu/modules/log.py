@@ -19,9 +19,8 @@ import cftime
 import numpy as np
 import torch
 import torch.distributed as dist
+from hydroforge.modeling.module import AbstractModule, computed_tensor_field
 from pydantic import Field, PrivateAttr
-
-from hydroforge.core.module import AbstractModule, computed_tensor_field
 
 
 def computed_log_field(
@@ -51,8 +50,8 @@ class LogModule(AbstractModule):
     dependencies: ClassVar[list] = ["base"]
 
     log_buffer_size: int = Field(
-        default=4000,
-        description="Size of the log buffer",
+        default=20000,
+        description="Size of the log buffer (fixed constant for CUDA Graph compatibility)",
         ge=0,
     )
 
@@ -94,13 +93,10 @@ class LogModule(AbstractModule):
             self._current_time + timedelta(seconds=time_step * i) for i in range(num_steps)
         ]
         if num_steps > self.log_buffer_size:
-            old_size = self.log_buffer_size
-            self.log_buffer_size = num_steps + 1000
-            for field in self.log_vars:
-                tensor = getattr(self, field)
-                tensor.resize_(self.log_buffer_size)
-                # Zero-fill the newly allocated portion to avoid garbage data
-                tensor[old_size:].zero_()
+            raise ValueError(
+                f"num_steps ({num_steps}) exceeds log_buffer_size ({self.log_buffer_size}). "
+                f"Increase log_buffer_size in the log module configuration."
+            )
     
     def gather_results(self) -> None:
         """

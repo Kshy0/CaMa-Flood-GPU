@@ -3,7 +3,7 @@ Script to generate runoff mapping tables for input datasets.
 """
 from datetime import datetime
 
-from hydroforge.datasets import DailyBinDataset
+from hydroforge.io.datasets import DailyBinDataset
 
 print("\n=== Generating Runoff Mapping Table ===")
 

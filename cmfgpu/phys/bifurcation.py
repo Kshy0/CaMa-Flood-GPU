@@ -4,32 +4,51 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""
-Backend dispatcher for cmfgpu.phys.bifurcation.
+"""Unified bifurcation outflow / inflow interface — backend-agnostic."""
 
-Imports kernel functions from either the Triton or Torch backend
-based on the CMFGPU_BACKEND environment variable (default: triton).
-"""
+from hydroforge.runtime.backend import KERNEL_BACKEND
 
-from hydroforge.compute.backend import KERNEL_BACKEND
-
-if KERNEL_BACKEND == "torch":
-    from cmfgpu.phys.torch.bifurcation import \
-        compute_bifurcation_inflow_kernel as _compute_bifurcation_inflow_kernel
-    from cmfgpu.phys.torch.bifurcation import \
+if KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import \
+        compute_bifurcation_inflow_kernel as compute_bifurcation_inflow
+    from cmfgpu.phys.cuda import \
         compute_bifurcation_outflow_kernel as \
-        _compute_bifurcation_outflow_kernel
-    from hydroforge.compute.backend import adapt_torch_kernel
+        compute_bifurcation_outflow  # noqa: F401
 
-    # compile=False: these kernels split their compilable body from
-    # scatter_add_ and handle torch.compile internally.
-    compute_bifurcation_outflow_kernel = adapt_torch_kernel(_compute_bifurcation_outflow_kernel, compile=False)
-    compute_bifurcation_inflow_kernel = adapt_torch_kernel(_compute_bifurcation_inflow_kernel, compile=False)
-    compute_bifurcation_outflow_batched_kernel = None
-    compute_bifurcation_inflow_batched_kernel = None
-else:
-    from cmfgpu.phys.triton.bifurcation import (  # noqa: F401
+elif KERNEL_BACKEND == "metal":
+    from cmfgpu.phys.metal import \
+        compute_bifurcation_inflow_kernel as compute_bifurcation_inflow
+    from cmfgpu.phys.metal import \
+        compute_bifurcation_outflow_kernel as \
+        compute_bifurcation_outflow  # noqa: F401
+
+elif KERNEL_BACKEND == "torch":
+    from hydroforge.runtime.backend import adapt_kernel
+
+    from cmfgpu.phys.torch.bifurcation import \
+        compute_bifurcation_inflow_kernel as _raw_bif_in
+    from cmfgpu.phys.torch.bifurcation import \
+        compute_bifurcation_outflow_kernel as _raw_bif_out
+    compute_bifurcation_outflow = adapt_kernel(_raw_bif_out, compile=False)
+    compute_bifurcation_inflow = adapt_kernel(_raw_bif_in, compile=False)
+
+else:  # triton
+    from hydroforge.runtime.backend import make_triton_dispatcher
+
+    from cmfgpu.phys.triton.bifurcation import (
         compute_bifurcation_inflow_batched_kernel,
         compute_bifurcation_inflow_kernel,
         compute_bifurcation_outflow_batched_kernel,
         compute_bifurcation_outflow_kernel)
+    compute_bifurcation_outflow = make_triton_dispatcher(
+        compute_bifurcation_outflow_kernel,
+        batched_kernel=compute_bifurcation_outflow_batched_kernel,
+        size_key="num_bifurcation_paths",
+        non_batched_drop=("num_catchments",),
+    )
+    compute_bifurcation_inflow = make_triton_dispatcher(
+        compute_bifurcation_inflow_kernel,
+        batched_kernel=compute_bifurcation_inflow_batched_kernel,
+        size_key="num_bifurcation_paths",
+        non_batched_drop=("num_catchments",),
+    )

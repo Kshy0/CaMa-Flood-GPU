@@ -9,12 +9,12 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
+from hydroforge.io.datasets import NetCDFDataset
+from hydroforge.modeling.distributed import setup_distributed
 from torch.utils.data import DataLoader
 
-from hydroforge.datasets import NetCDFDataset
 from cmfgpu.models import CaMaFlood
 from cmfgpu.params import InputProxy
-from hydroforge.core.distributed import setup_distributed
 
 
 def main():

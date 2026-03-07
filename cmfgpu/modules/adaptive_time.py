@@ -8,9 +8,8 @@ from functools import cached_property
 from typing import ClassVar
 
 import torch
+from hydroforge.modeling.module import AbstractModule, computed_tensor_field
 from pydantic import Field
-
-from hydroforge.core.module import AbstractModule, computed_tensor_field
 
 
 class AdaptiveTimeModule(AbstractModule):

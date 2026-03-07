@@ -14,8 +14,7 @@ the scatter runs eagerly without triggering recompilation storms.
 """
 
 import torch
-
-from hydroforge.compute.backend import _torch_compile
+from hydroforge.runtime.backend import _torch_compile
 
 # ======================================================================
 # Outflow kernel

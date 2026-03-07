@@ -6,7 +6,7 @@
 
 **Development Environment:** This project is currently developed under WSL2 (Windows Subsystem for Linux 2), and requires that `torch` and `triton` can be installed successfully.
 
-**Target Audience**: This project is intended for advanced users who are already familiar with the original CaMa-Flood model. Users are strongly advised to run the original [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) first to understand the data structure, input specifications, and general workflow before attempting to use this GPU-accelerated version.
+**Target Audience:** This project is intended for advanced users who are already familiar with the original CaMa-Flood model. Users are strongly advised to run the original [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) first to understand the data structure, input specifications, and general workflow before attempting to use this GPU-accelerated version.
 
 ---
 

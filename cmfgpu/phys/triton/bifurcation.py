@@ -26,7 +26,7 @@ def compute_bifurcation_outflow_kernel(
     total_storage_ptr,                          # *f64: Total storage (in/out)
     outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
-    time_step,                                  # f32: Time step
+    time_step_ptr,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     BLOCK_SIZE: tl.constexpr                    # Block size
@@ -34,6 +34,7 @@ def compute_bifurcation_outflow_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_bifurcation_paths
+    time_step = tl.load(time_step_ptr)
     
     # Load indices
     bifurcation_catchment_idx = tl.load(bifurcation_catchment_idx_ptr + offs, mask=mask, other=0)
@@ -151,7 +152,7 @@ def compute_bifurcation_outflow_batched_kernel(
     total_storage_ptr,                          # *f64: Total storage (in/out)
     outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
-    time_step,                                  # f32: Time step
+    time_step_ptr,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     num_trials: tl.constexpr,
@@ -171,6 +172,7 @@ def compute_bifurcation_outflow_batched_kernel(
     offs = idx % num_bifurcation_paths
     
     mask = idx < (num_bifurcation_paths * num_trials)
+    time_step = tl.load(time_step_ptr)
     
     trial_offset_paths = trial_idx * num_bifurcation_paths
     trial_offset_catchments = trial_idx * num_catchments

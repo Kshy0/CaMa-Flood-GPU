@@ -57,9 +57,8 @@ from typing import Optional, Union
 
 import numba
 import numpy as np
+from hydroforge.modeling.distributed import find_indices_in
 from netCDF4 import Dataset
-
-from hydroforge.core.distributed import find_indices_in
 
 # ---------------------------------------------------------------------------
 # Numba-accelerated kernels

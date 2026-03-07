@@ -4,34 +4,59 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""
-Backend dispatcher for cmfgpu.phys.levee.
+"""Unified levee interface — backend-agnostic."""
 
-Imports kernel functions from either the Triton or Torch backend
-based on the CMFGPU_BACKEND environment variable (default: triton).
-"""
+from hydroforge.runtime.backend import KERNEL_BACKEND
 
-from hydroforge.compute.backend import KERNEL_BACKEND
-
-if KERNEL_BACKEND == "torch":
-    from cmfgpu.phys.torch.levee import \
+if KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import \
         compute_levee_bifurcation_outflow_kernel as \
-        _compute_levee_bifurcation_outflow_kernel
+        compute_levee_bifurcation_outflow
+    from cmfgpu.phys.cuda import \
+        compute_levee_stage_kernel as compute_levee_stage  # noqa: F401
+    from cmfgpu.phys.cuda import \
+        compute_levee_stage_log_kernel as compute_levee_stage_log
+
+elif KERNEL_BACKEND == "metal":
+    from cmfgpu.phys.metal import \
+        compute_levee_bifurcation_outflow_kernel as \
+        compute_levee_bifurcation_outflow
+    from cmfgpu.phys.metal import \
+        compute_levee_stage_kernel as compute_levee_stage  # noqa: F401
+    from cmfgpu.phys.metal import \
+        compute_levee_stage_log_kernel as compute_levee_stage_log
+
+elif KERNEL_BACKEND == "torch":
+    from hydroforge.runtime.backend import adapt_kernel
+
     from cmfgpu.phys.torch.levee import \
-        compute_levee_stage_kernel as _compute_levee_stage_kernel
+        compute_levee_bifurcation_outflow_kernel as _raw_levee_bif
     from cmfgpu.phys.torch.levee import \
-        compute_levee_stage_log_kernel as _compute_levee_stage_log_kernel
-    from hydroforge.compute.backend import adapt_torch_kernel
-    compute_levee_stage_kernel = adapt_torch_kernel(_compute_levee_stage_kernel)
-    compute_levee_stage_log_kernel = adapt_torch_kernel(_compute_levee_stage_log_kernel)
-    # compile=False: this kernel splits its compilable body from
-    # scatter_add_ and handles torch.compile internally.
-    compute_levee_bifurcation_outflow_kernel = adapt_torch_kernel(_compute_levee_bifurcation_outflow_kernel, compile=False)
-    compute_levee_stage_batched_kernel = None
-    compute_levee_bifurcation_outflow_batched_kernel = None
-else:
-    from cmfgpu.phys.triton.levee import (  # noqa: F401
+        compute_levee_stage_kernel as _raw_levee_stage
+    from cmfgpu.phys.torch.levee import \
+        compute_levee_stage_log_kernel as _raw_levee_stage_log
+    compute_levee_stage = adapt_kernel(_raw_levee_stage)
+    compute_levee_stage_log = adapt_kernel(_raw_levee_stage_log)
+    compute_levee_bifurcation_outflow = adapt_kernel(_raw_levee_bif, compile=False)
+
+else:  # triton
+    from hydroforge.runtime.backend import make_triton_dispatcher
+
+    from cmfgpu.phys.triton.levee import (
         compute_levee_bifurcation_outflow_batched_kernel,
         compute_levee_bifurcation_outflow_kernel,
         compute_levee_stage_batched_kernel, compute_levee_stage_kernel,
         compute_levee_stage_log_kernel)
+    compute_levee_stage = make_triton_dispatcher(
+        compute_levee_stage_kernel, batched_kernel=compute_levee_stage_batched_kernel,
+        size_key="num_levees", batched_grid="loop",
+        non_batched_drop=("num_catchments",),
+    )
+    compute_levee_stage_log = make_triton_dispatcher(
+        compute_levee_stage_log_kernel, size_key="num_levees")
+    compute_levee_bifurcation_outflow = make_triton_dispatcher(
+        compute_levee_bifurcation_outflow_kernel,
+        batched_kernel=compute_levee_bifurcation_outflow_batched_kernel,
+        size_key="num_bifurcation_paths",
+        non_batched_drop=("num_catchments",),
+    )

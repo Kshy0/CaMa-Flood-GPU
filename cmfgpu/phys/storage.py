@@ -4,25 +4,40 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""
-Backend dispatcher for cmfgpu.phys.storage.
+"""Unified flood-stage interface — backend-agnostic."""
 
-Imports kernel functions from either the Triton or Torch backend
-based on the CMFGPU_BACKEND environment variable (default: triton).
-"""
+from hydroforge.runtime.backend import KERNEL_BACKEND
 
-from hydroforge.compute.backend import KERNEL_BACKEND
+if KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import \
+        compute_flood_stage_kernel as compute_flood_stage  # noqa: F401
+    from cmfgpu.phys.cuda import \
+        compute_flood_stage_log_kernel as compute_flood_stage_log
 
-if KERNEL_BACKEND == "torch":
+elif KERNEL_BACKEND == "metal":
+    from cmfgpu.phys.metal import \
+        compute_flood_stage_kernel as compute_flood_stage  # noqa: F401
+    from cmfgpu.phys.metal import \
+        compute_flood_stage_log_kernel as compute_flood_stage_log
+
+elif KERNEL_BACKEND == "torch":
+    from hydroforge.runtime.backend import adapt_kernel
+
     from cmfgpu.phys.torch.storage import \
-        compute_flood_stage_kernel as _compute_flood_stage_kernel
+        compute_flood_stage_kernel as _raw_stage
     from cmfgpu.phys.torch.storage import \
-        compute_flood_stage_log_kernel as _compute_flood_stage_log_kernel
-    from hydroforge.compute.backend import adapt_torch_kernel
-    compute_flood_stage_kernel = adapt_torch_kernel(_compute_flood_stage_kernel)
-    compute_flood_stage_log_kernel = adapt_torch_kernel(_compute_flood_stage_log_kernel)
-    compute_flood_stage_batched_kernel = None
-else:
-    from cmfgpu.phys.triton.storage import (  # noqa: F401
-        compute_flood_stage_batched_kernel, compute_flood_stage_kernel,
-        compute_flood_stage_log_kernel)
+        compute_flood_stage_log_kernel as _raw_stage_log
+    compute_flood_stage = adapt_kernel(_raw_stage)
+    compute_flood_stage_log = adapt_kernel(_raw_stage_log)
+
+else:  # triton
+    from hydroforge.runtime.backend import make_triton_dispatcher
+
+    from cmfgpu.phys.triton.storage import (compute_flood_stage_batched_kernel,
+                                            compute_flood_stage_kernel,
+                                            compute_flood_stage_log_kernel)
+    compute_flood_stage = make_triton_dispatcher(
+        compute_flood_stage_kernel, batched_kernel=compute_flood_stage_batched_kernel,
+        batched_grid="loop",
+    )
+    compute_flood_stage_log = make_triton_dispatcher(compute_flood_stage_log_kernel)

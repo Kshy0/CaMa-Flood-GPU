@@ -13,12 +13,12 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
+from hydroforge.modeling.distributed import find_indices_in_torch
+from hydroforge.modeling.module import (AbstractModule, TensorField,
+                                        computed_tensor_field)
 from pydantic import Field, model_validator
 
 from cmfgpu.modules.base import BaseModule
-from hydroforge.core.distributed import find_indices_in_torch
-from hydroforge.core.module import (AbstractModule, TensorField,
-                                    computed_tensor_field)
 
 
 def ReservoirField(

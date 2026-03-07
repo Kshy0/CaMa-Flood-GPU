@@ -9,12 +9,12 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
+from hydroforge.io.datasets import DailyBinDataset
+from hydroforge.modeling.distributed import setup_distributed
 from torch.utils.data import DataLoader
 
-from hydroforge.datasets import DailyBinDataset
 from cmfgpu.models import CaMaFlood
 from cmfgpu.params import InputProxy
-from hydroforge.core.distributed import setup_distributed
 
 
 def main():
@@ -90,7 +90,7 @@ def main():
         output_workers=output_workers,
         output_complevel=output_complevel,
         BLOCK_SIZE=BLOCK_SIZE,
-        output_split_by_year=output_split_by_year
+        output_split_by_year=output_split_by_year,
     )
     model.set_total_steps(dataset.total_steps)
 

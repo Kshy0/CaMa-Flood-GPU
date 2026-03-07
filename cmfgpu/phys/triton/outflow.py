@@ -48,7 +48,7 @@ def compute_outflow_kernel(
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
-    time_step,                              # f32 scalar time step
+    time_step_ptr,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     BLOCK_SIZE: tl.constexpr,               # block size
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
@@ -59,6 +59,7 @@ def compute_outflow_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
+    time_step = tl.load(time_step_ptr)
 
     #----------------------------------------------------------------------
     # (1) Load previous time step input variables
@@ -360,7 +361,7 @@ def compute_outflow_batched_kernel(
     water_surface_elevation_ptr,            # *f32 water surface elevation
     protected_water_surface_elevation_ptr,  # *f32 protected water surface elevation
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
-    time_step,                              # f32 scalar time step
+    time_step_ptr,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     num_trials: tl.constexpr,                             # number of trials
     BLOCK_SIZE: tl.constexpr,                # block size
@@ -377,6 +378,7 @@ def compute_outflow_batched_kernel(
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = idx < num_catchments * num_trials
+    time_step = tl.load(time_step_ptr)
     
     catchment_idx = idx % num_catchments
     

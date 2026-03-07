@@ -14,11 +14,10 @@ from functools import cached_property
 from typing import ClassVar, List, Literal, Optional, Self, Tuple
 
 import torch
+from hydroforge.modeling.distributed import find_indices_in_torch
+from hydroforge.modeling.module import (AbstractModule, TensorField,
+                                        computed_tensor_field)
 from pydantic import Field, computed_field, model_validator
-
-from hydroforge.core.distributed import find_indices_in_torch
-from hydroforge.core.module import (AbstractModule, TensorField,
-                                    computed_tensor_field)
 
 
 def BaseField(
@@ -549,6 +548,36 @@ class BaseModule(AbstractModule):
     @cached_property
     def total_outflow(self) -> Optional[torch.Tensor]:
         return None
+
+    # ------------------------------------------------------------------ #
+    # Mutable scalar buffers (1-element device tensors for CUDA Graph)
+    # ------------------------------------------------------------------ #
+    @computed_base_field(
+        description="Current sub-step time step (seconds). "
+                    "Updated via .fill_() before each sub-step loop.",
+        shape=("one",),
+        save_idx=None,
+        category="state",
+    )
+    @cached_property
+    def time_step(self) -> torch.Tensor:
+        return torch.zeros(1, dtype=self.precision, device=self.device)
+
+    @computed_base_field(
+        description="Current sub-step index within the time step. "
+                    "Updated via .fill_() before each sub-step for log kernels.",
+        shape=("one",),
+        save_idx=None,
+        category="state",
+        dtype="idx",
+    )
+    @cached_property
+    def current_step(self) -> torch.Tensor:
+        return torch.zeros(1, dtype=torch.int32, device=self.device)
+
+    @cached_property
+    def one(self) -> int:
+        return 1
 
     # ------------------------------------------------------------------ #
     # Post-init validation

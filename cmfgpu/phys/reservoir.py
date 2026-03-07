@@ -4,23 +4,30 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""
-Backend dispatcher for cmfgpu.phys.reservoir.
+"""Unified reservoir-outflow interface — backend-agnostic."""
 
-Imports reservoir outflow kernel functions from the Triton backend.
-"""
+from hydroforge.runtime.backend import KERNEL_BACKEND
 
-from hydroforge.compute.backend import KERNEL_BACKEND
+if KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import \
+        compute_reservoir_outflow_kernel as \
+        compute_reservoir_outflow  # noqa: F401
 
-if KERNEL_BACKEND == "torch":
+elif KERNEL_BACKEND == "metal":
+    from cmfgpu.phys.metal import \
+        compute_reservoir_outflow_kernel as \
+        compute_reservoir_outflow  # noqa: F401
+
+elif KERNEL_BACKEND == "torch":
+    from hydroforge.runtime.backend import adapt_kernel
+
     from cmfgpu.phys.torch.reservoir import \
-        compute_reservoir_outflow_kernel as _compute_reservoir_outflow_kernel
-    from hydroforge.compute.backend import adapt_torch_kernel
+        compute_reservoir_outflow_kernel as _raw_reservoir
+    compute_reservoir_outflow = adapt_kernel(_raw_reservoir, compile=False)
 
-    # compile=False: kernel uses scatter_add_ which breaks torch.compile graph
-    compute_reservoir_outflow_kernel = adapt_torch_kernel(
-        _compute_reservoir_outflow_kernel, compile=False
-    )
-else:
-    from cmfgpu.phys.triton.reservoir import \
-        compute_reservoir_outflow_kernel  # noqa: F401
+else:  # triton
+    from hydroforge.runtime.backend import make_triton_dispatcher
+
+    from cmfgpu.phys.triton.reservoir import compute_reservoir_outflow_kernel
+    compute_reservoir_outflow = make_triton_dispatcher(
+        compute_reservoir_outflow_kernel, size_key="num_reservoirs")
