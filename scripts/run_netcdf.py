@@ -11,10 +11,10 @@ import torch
 import torch.distributed as dist
 from hydroforge.io.datasets import NetCDFDataset
 from hydroforge.modeling.distributed import setup_distributed
+from hydroforge.modeling.input_proxy import InputProxy
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
-from cmfgpu.params import InputProxy
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
     experiment_name = f"{resolution}_nc"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
-    opened_modules = ["base", "adaptive_time","log", "bifurcation"]
+    opened_modules = ["base", "adaptive_time", "bifurcation"]
     variables_to_save = {"mean": ["total_outflow"], "last": ["river_depth"]}
     time_step = 86400.0
     default_num_sub_steps = 360

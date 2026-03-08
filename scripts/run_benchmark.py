@@ -12,10 +12,10 @@ import torch
 import torch.distributed as dist
 from hydroforge.io.datasets import DailyBinDataset
 from hydroforge.modeling.distributed import setup_distributed
+from hydroforge.modeling.input_proxy import InputProxy
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
-from cmfgpu.params import InputProxy
 
 BLOCK_SIZE_LIST = [64, 128, 256, 512, 1024]
 

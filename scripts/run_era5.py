@@ -11,10 +11,10 @@ import torch
 import torch.distributed as dist
 from hydroforge.io.datasets import ERA5LandAccumDataset
 from hydroforge.modeling.distributed import setup_distributed
+from hydroforge.modeling.input_proxy import InputProxy
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
-from cmfgpu.params import InputProxy
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
-    variables_to_save = {"mean": ["river_outflow", "total_outflow"]}
+    variables_to_save = {"mean": ["total_outflow"], "last": ["river_depth"]}
     runoff_time_interval_hour = 24
     time_step = runoff_time_interval_hour * 3600
     default_num_sub_steps = 360

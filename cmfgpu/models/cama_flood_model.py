@@ -663,13 +663,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         if num_sub_steps > 1:
             if use_stats_cg:
                 # === FAST PATH ===
-                # Both physics and stats graphs are now captured (sub-step 0
-                # ensured that).  Bypass cuda_graph_replay / _stats_graph_replay
-                # to eliminate per-iteration overhead:
-                #   - no **kwargs dict allocation
-                #   - no redundant runoff.copy_() (runoff unchanged between sub-steps)
-                #   - only fill the 1 scalar that actually changes (sub_step)
-                #     (the other 6 constants were set in sub-step 0)
                 phys_graph = self.__dict__["_cg_cache"][0][0]
                 stats_graph = self._stats_cg
                 states = agg._kernel_states
@@ -734,6 +727,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             else:
                 msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
             print(f"\r\033[K{msg}", end="", flush=True)
+            
     def do_one_sub_step(self, runoff: torch.Tensor, output_enabled: bool = True) -> None:
         """Execute one sub time step calculation."""
         self._call_outflow()

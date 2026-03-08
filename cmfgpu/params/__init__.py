@@ -4,8 +4,6 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from hydroforge.modeling.input_proxy import InputProxy
-
 from cmfgpu.params.allocation.hires_map import HiResMap
 from cmfgpu.params.estimate_dam_params import (
     compute_dam_discharge_from_timeseries, estimate_dam_params,
@@ -18,7 +16,6 @@ from cmfgpu.params.merit_map import MERITMap
 
 __all__ = [
     "HiResMap",
-    "InputProxy",
     "MERITMap",
     "accumulate_discharge",
     "compute_dam_discharge_from_timeseries",
