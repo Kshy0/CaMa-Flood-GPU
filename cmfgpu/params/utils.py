@@ -97,22 +97,26 @@ def compute_init_river_depth(catchment_elevation, river_height, downstream_idx):
     return river_depth
 
 def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
-    """Reorder by basin size."""
-    groups = defaultdict(list)
-    for idx in topo_idx:
-        groups[basin_id[idx]].append(idx)
+    """Reorder by basin size (vectorized to avoid Python-object memory overhead)."""
+    topo_basin = basin_id[topo_idx]
 
-    ordered_basins = sorted(groups.keys(),
-                            key=lambda b: len(groups[b]),
-                            reverse=True)
+    # Compute basin sizes via bincount
+    unique_basins, inverse = np.unique(topo_basin, return_inverse=True)
+    counts = np.bincount(inverse).astype(np.int64)
 
-    new_order = []
-    basin_sizes = np.empty(len(ordered_basins), dtype=np.int64)
-    for k, b in enumerate(ordered_basins):
-        new_order.extend(groups[b])
-        basin_sizes[k] = len(groups[b])
+    # Sort basins by descending size
+    size_order = np.argsort(-counts)
+    basin_sizes = counts[size_order]
 
-    return (np.asarray(new_order, dtype=np.int64), basin_sizes)
+    # Build a mapping: old basin label → new rank (0 = largest)
+    rank = np.empty_like(size_order)
+    rank[size_order] = np.arange(len(size_order))
+    topo_rank = rank[inverse]
+
+    # Stable sort topo_idx by basin rank (preserves topological order within basin)
+    new_order = topo_idx[np.argsort(topo_rank, kind='stable')]
+
+    return (new_order.astype(np.int64), basin_sizes)
 
 def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_to_keep: int):
     """

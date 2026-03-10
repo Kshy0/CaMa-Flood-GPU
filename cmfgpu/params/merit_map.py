@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 
 import numpy as np
-from hydroforge.modeling.distributed import binread, find_indices_in, read_map
 from netCDF4 import Dataset
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
@@ -23,6 +22,7 @@ from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
                                  reorder_by_basin_size,
                                  resolve_target_cids_from_poi,
                                  topological_sort, trace_outlets_dict)
+from hydroforge.modeling.distributed import find_indices_in
 
 
 class MERITMap(BaseModel):
@@ -228,17 +228,21 @@ class MERITMap(BaseModel):
 
         print(f"Loaded map dimensions: nx={self.nx}, ny={self.ny}, num_flood_levels={self.num_flood_levels}")
 
+    @staticmethod
+    def _open_memmap(path, dtype, shape):
+        """Memory-map a Fortran-ordered binary file (read-only)."""
+        return np.memmap(str(path), dtype=dtype, mode='r',
+                         shape=shape, order='F')
+
     def load_catchment_id(self) -> None:
         """Load catchment IDs and connectivity from nextxy.bin."""
         nextxy_path = self.map_dir / "nextxy.bin"
 
-        nextxy_data = binread(
-            nextxy_path,
-            (self.nx, self.ny, 2),
-            dtype_str=self.idx_precision
+        nextxy_data = self._open_memmap(
+            nextxy_path, self.idx_precision, (self.nx, self.ny, 2)
         )
 
-        self.map_shape = nextxy_data.shape[:2]
+        self.map_shape = (self.nx, self.ny)
 
         # Find valid catchments
         catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != self.missing_value)
@@ -255,6 +259,8 @@ class MERITMap(BaseModel):
             (next_catchment_x[valid_next], next_catchment_y[valid_next]),
             self.map_shape
         )
+
+        del nextxy_data  # release memory map
 
         # Trace to river mouths
         river_mouth_id = trace_outlets_dict(catchment_id, downstream_id)
@@ -393,14 +399,12 @@ class MERITMap(BaseModel):
             self._finalize_connectivity(root_mouth=self.root_mouth)
             return
 
-        # Read maps needed by bifurcation parsing
-        rivhgt_path = self.map_dir / "rivhgt.bin"
-        if rivhgt_path.exists():
-            rivhgt_2d = read_map(rivhgt_path, (self.nx, self.ny), precision=self.map_precision)
-        else:
-            rivhgt_2d = None
-            print("Warning: rivhgt.bin not found; bifurcation depth clamping disabled")
+        # Read maps needed by bifurcation parsing (memory-mapped)
+        rivhgt_2d = self._open_memmap(
+            self.map_dir / "rivhgt.bin", self.map_precision, (self.nx, self.ny)
+        )
         pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifori(self.bifori_file, rivhgt_2d, self.bif_levels_to_keep)
+        del rivhgt_2d
 
         # Initialize arrays
         self.num_bifurcation_paths = len(pth_upst)
@@ -422,8 +426,8 @@ class MERITMap(BaseModel):
         n_before = int(self.num_bifurcation_paths)
         if self.basin_use_file:
             basin_file = self.map_dir / "basin.bin"
-            # Read basin.bin
-            basin_data = read_map(basin_file, (self.nx, self.ny), precision=self.idx_precision)
+            # Read basin.bin (memory-mapped)
+            basin_data = self._open_memmap(basin_file, self.idx_precision, (self.nx, self.ny))
             # Get basin IDs for bifurcation endpoints
             bifurcation_up_basin = basin_data[self.bifurcation_catchment_x, self.bifurcation_catchment_y]
             bifurcation_down_basin = basin_data[self.bifurcation_downstream_x, self.bifurcation_downstream_y]
@@ -836,10 +840,13 @@ class MERITMap(BaseModel):
     def load_parameters(self) -> None:
 
         def _read_2d_map(filename: str) -> np.ndarray:
-            """Read a 2D map variable and extract catchment values."""
+            """Read a 2D map variable and extract catchment values via memory mapping."""
             file_path = self.map_dir / filename
-            data = read_map(file_path, (self.nx, self.ny), precision=self.map_precision)
-            return data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y]
+            data = self._open_memmap(file_path, self.map_precision, (self.nx, self.ny))
+            result = np.array(data[self.catchment_x, self.catchment_y],
+                              dtype=self.numpy_precision)
+            del data
+            return result
         self.river_length = _read_2d_map("rivlen.bin")
 
         # River height (optional — will be estimated by update_river_params if missing)
@@ -870,13 +877,18 @@ class MERITMap(BaseModel):
         lonlat_path = self.map_dir / "lonlat.bin"
         if lonlat_path.exists():
             print(f"Loading lon/lat from {lonlat_path}")
-            lonlat_data = binread(
-                lonlat_path,
-                (self.nx, self.ny, 2),
-                dtype_str=self.map_precision
+            lonlat_data = self._open_memmap(
+                lonlat_path, self.map_precision, (self.nx, self.ny, 2)
             )
-            self.longitude = lonlat_data[self.catchment_x, self.catchment_y, 0].astype(self.numpy_precision)
-            self.latitude = lonlat_data[self.catchment_x, self.catchment_y, 1].astype(self.numpy_precision)
+            self.longitude = np.array(
+                lonlat_data[self.catchment_x, self.catchment_y, 0],
+                dtype=self.numpy_precision,
+            )
+            self.latitude = np.array(
+                lonlat_data[self.catchment_x, self.catchment_y, 1],
+                dtype=self.numpy_precision,
+            )
+            del lonlat_data
 
         if self.levee_flag:
             levee_crown_height = _read_2d_map("levhgt.bin")
@@ -894,8 +906,15 @@ class MERITMap(BaseModel):
         if self.reservoir_flag:
             self._load_reservoir_parameters()
 
-        data = read_map(self.map_dir / "fldhgt.bin", (self.nx, self.ny, self.num_flood_levels), precision=self.map_precision)
-        self.flood_depth_table = data.astype(self.numpy_precision)[self.catchment_x, self.catchment_y, :]
+        data = self._open_memmap(
+            self.map_dir / "fldhgt.bin", self.map_precision,
+            (self.nx, self.ny, self.num_flood_levels),
+        )
+        self.flood_depth_table = np.array(
+            data[self.catchment_x, self.catchment_y, :],
+            dtype=self.numpy_precision,
+        )
+        del data
 
     def check_flow_direction(self) -> None:
         """Validate flow direction consistency."""
