@@ -117,7 +117,7 @@ def benchmark_block_sizes():
 
         for batch_runoff in loader:
             with stream_ctx:
-                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_mapping, world_size)
+                batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_mapping)
                 for runoff in batch_runoff:
                     if current_time > end_date:
                         continue

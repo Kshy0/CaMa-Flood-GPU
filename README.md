@@ -78,6 +78,7 @@ When pulling the latest version of this repository, **remember to also update `H
 
 ```shell
 git pull
+conda activate CMF
 pip uninstall hydroforge -y
 pip install --upgrade git+https://github.com/Kshy0/hydroforge.git
 pip install -e .

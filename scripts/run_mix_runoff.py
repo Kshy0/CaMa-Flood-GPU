@@ -140,7 +140,7 @@ def main():
     last_valid_time = start_date
     for batch_runoff0, batch_runoff1 in zip(loader0, loader1):
         with stream_ctx:
-            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_mapping, world_size)
+            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_mapping)
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:
