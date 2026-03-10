@@ -114,11 +114,12 @@ def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
 
     return (np.asarray(new_order, dtype=np.int64), basin_sizes)
 
-def read_bifori(bifori_file: Path, rivhgt_2d: np.ndarray, bif_levels_to_keep: int):
+def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_to_keep: int):
     """
     Vectorized reader for bifori.txt replicating the core logic of Fortran set_bifparam:
       - Keep only paths where any width>0 within the first keepN levels
       - Compute dph from wth(1) with an empirical formula and clamp to [0.5, max(rivhgt(up), rivhgt(dn))]
+        (rivhgt clamping is skipped when rivhgt_2d is None)
       - Keep widths only for the first keepN levels
       - Elevation table: level 0 -> pelv - dph (if width>0); other levels -> pelv + ilev - 1 (if width>0); else 1e20
     Returns:
@@ -176,8 +177,11 @@ def read_bifori(bifori_file: Path, rivhgt_2d: np.ndarray, bif_levels_to_keep: in
     if np.any(pos):
         dph_pos = np.log10(w1[pos]) * 2.5 - 4.0
         dph_pos = np.maximum(dph_pos, 0.5)
-        dph0 = np.maximum(rivhgt_2d[ix[pos], iy[pos]], rivhgt_2d[jx[pos], jy[pos]])
-        dph[pos] = np.minimum(dph_pos, dph0)
+        if rivhgt_2d is not None:
+            dph0 = np.maximum(rivhgt_2d[ix[pos], iy[pos]], rivhgt_2d[jx[pos], jy[pos]])
+            dph[pos] = np.minimum(dph_pos, dph0)
+        else:
+            dph[pos] = dph_pos
 
     # 3) Truncate widths to keepN; force wth(1)=0 when w1<=0
     wth_keep = wth_all[:, :keepN].copy()

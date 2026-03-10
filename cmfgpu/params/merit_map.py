@@ -394,7 +394,12 @@ class MERITMap(BaseModel):
             return
 
         # Read maps needed by bifurcation parsing
-        rivhgt_2d = read_map(self.map_dir / "rivhgt.bin", (self.nx, self.ny), precision=self.map_precision)
+        rivhgt_path = self.map_dir / "rivhgt.bin"
+        if rivhgt_path.exists():
+            rivhgt_2d = read_map(rivhgt_path, (self.nx, self.ny), precision=self.map_precision)
+        else:
+            rivhgt_2d = None
+            print("Warning: rivhgt.bin not found; bifurcation depth clamping disabled")
         pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifori(self.bifori_file, rivhgt_2d, self.bif_levels_to_keep)
 
         # Initialize arrays
