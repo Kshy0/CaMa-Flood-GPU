@@ -621,7 +621,15 @@ class BaseModule(AbstractModule):
         if self.num_flood_levels > 1:
             diffs = torch.diff(self.flood_depth_table, dim=1)
             if not torch.all(diffs >= 0):
-                raise ValueError("flood_depth_table must be monotonically increasing along the columns (flood levels)")
+                # Check if violations are within fixable tolerance
+                min_diff = diffs.min().item()
+                if min_diff < -0.1:
+                    raise ValueError(
+                        f"flood_depth_table has non-monotonic entries with diff={min_diff:.6f}, "
+                        "exceeding the fixable tolerance of 0.1"
+                    )
+                # Fix tiny floating-point regressions via cumulative max
+                self.flood_depth_table = torch.cummax(self.flood_depth_table, dim=1).values
         return self
 
     @model_validator(mode="after")

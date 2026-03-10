@@ -26,6 +26,8 @@ end_date = datetime(2000, 12, 31)
 # --- Configuration End ---
 
 dataset = DailyBinDataset(
+    prefix="Roff____",
+    suffix=".one",
     base_dir=runoff_base_dir,
     shape=runoff_shape,
     start_date=start_date,
