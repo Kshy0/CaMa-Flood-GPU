@@ -614,7 +614,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         agg = self._statistics_aggregator
         use_stats_cg = (self.cuda_graph_enabled
                         and KERNEL_BACKEND != "torch"
-                        and not stat_is_outer_first and not stat_is_outer_last
                         and output_enabled and agg is not None and agg._aggregator_generated)
 
         self.base.time_step.fill_(time_sub_step)
@@ -631,12 +630,19 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
         if output_enabled:
             if use_stats_cg:
-                is_inner_last_0 = bool(flags & 2) and (num_sub_steps == 1)
-                if is_inner_last_0:
-                    for out_name, is_outer in agg._output_is_outer.items():
-                        if not is_outer:
-                            agg._dirty_outputs.add(out_name)
-                    agg._current_macro_step_count += 1.0
+                if num_sub_steps == 1:
+                    is_inner_last_0 = bool(flags & 2)
+                    is_outer_first_0 = bool(flags & 4) and is_inner_last_0
+                    is_outer_last_0 = bool(flags & 8) and is_inner_last_0
+                    if is_outer_first_0:
+                        agg._macro_step_index = 0
+                        agg._current_macro_step_count = 0.0
+                    if is_inner_last_0 or is_outer_last_0:
+                        for out_name, out_is_outer in agg._output_is_outer.items():
+                            if (not out_is_outer and is_inner_last_0) or (out_is_outer and is_outer_last_0):
+                                agg._dirty_outputs.add(out_name)
+                    if is_inner_last_0:
+                        agg._current_macro_step_count += 1.0
                 self._stats_graph_replay(
                     sub_step=0,
                     num_sub_steps=num_sub_steps,
@@ -670,17 +676,24 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 current_step_t = self.base.current_step
                 last_sub = num_sub_steps - 1
                 is_stat_last = bool(flags & 2)
+                is_stat_outer_first = bool(flags & 4) and is_stat_last
+                is_stat_outer_last = bool(flags & 8) and is_stat_last
 
                 for sub_step in range(1, num_sub_steps):
                     current_step_t.fill_(sub_step)
                     phys_graph.replay()
                     sub_step_t.fill_(sub_step)
-                    if sub_step == last_sub and is_stat_last:
-                        for out_name, is_outer in agg._output_is_outer.items():
-                            if not is_outer:
-                                agg._dirty_outputs.add(out_name)
-                        agg._current_macro_step_count += 1.0
-                        states['__num_macro_steps'].fill_(agg._current_macro_step_count)
+                    if sub_step == last_sub:
+                        if is_stat_outer_first:
+                            agg._macro_step_index = 0
+                            agg._current_macro_step_count = 0.0
+                        if is_stat_last or is_stat_outer_last:
+                            for out_name, out_is_outer in agg._output_is_outer.items():
+                                if (not out_is_outer and is_stat_last) or (out_is_outer and is_stat_outer_last):
+                                    agg._dirty_outputs.add(out_name)
+                        if is_stat_last:
+                            agg._current_macro_step_count += 1.0
+                            states['__num_macro_steps'].fill_(agg._current_macro_step_count)
                     stats_graph.replay()
 
                 self._stats_elapsed_time += (num_sub_steps - 1) * time_sub_step
