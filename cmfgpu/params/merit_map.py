@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 
 import numpy as np
+from hydroforge.modeling.distributed import find_indices_in
 from netCDF4 import Dataset
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
@@ -22,7 +23,6 @@ from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
                                  reorder_by_basin_size,
                                  resolve_target_cids_from_poi,
                                  topological_sort, trace_outlets_dict)
-from hydroforge.modeling.distributed import find_indices_in
 
 
 class MERITMap(BaseModel):

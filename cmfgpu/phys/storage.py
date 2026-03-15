@@ -8,19 +8,7 @@
 
 from hydroforge.runtime.backend import KERNEL_BACKEND
 
-if KERNEL_BACKEND == "cuda":
-    from cmfgpu.phys.cuda import \
-        compute_flood_stage_kernel as compute_flood_stage  # noqa: F401
-    from cmfgpu.phys.cuda import \
-        compute_flood_stage_log_kernel as compute_flood_stage_log
-
-elif KERNEL_BACKEND == "hip":
-    from cmfgpu.phys.hip import \
-        compute_flood_stage_kernel as compute_flood_stage  # noqa: F401
-    from cmfgpu.phys.hip import \
-        compute_flood_stage_log_kernel as compute_flood_stage_log
-
-elif KERNEL_BACKEND == "metal":
+if KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
         compute_flood_stage_kernel as compute_flood_stage  # noqa: F401
     from cmfgpu.phys.metal import \

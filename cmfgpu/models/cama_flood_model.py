@@ -49,12 +49,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         "reservoir": ReservoirModule,
     }
     group_by: ClassVar[str] = "catchment_basin_id"
-    compile_only: bool = Field(
-        default=False,
-        description="If True, only compile CUDA kernels without loading tensor data. "
-                    "Scalars are correctly computed from NetCDF variable shapes via InputProxy. "
-                    "After compilation the model instance should be discarded.",
-    )
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
     _stats_start_time: Optional[Union[datetime, cftime.datetime]] = PrivateAttr(default=None)
     _stats_macro_step: int = PrivateAttr(default=0)
@@ -62,73 +56,10 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
     def model_post_init(self, __context: Any) -> None:
         super().model_post_init(__context)
-        if self.compile_only:
-            # Discard all tensor data — we only needed shapes for scalar computation
-            for mod in self._modules.values():
-                for name in list(mod.__class__.model_fields):
-                    val = getattr(mod, name, None)
-                    if isinstance(val, torch.Tensor):
-                        setattr(mod, name, None)
-            return
-        # Auto-enable CUDA graphs for backends that support it
+        # Auto-enable CUDA graphs for the triton backend
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND in ("triton", "cuda", "hip") and torch.cuda.is_available():
+        if KERNEL_BACKEND == "triton" and torch.cuda.is_available():
             self.enable_cuda_graph()
-
-    def shard_param(self) -> Dict[str, Any]:
-        if not self.compile_only:
-            return super().shard_param()
-        return self._shard_param_compile_only()
-
-    def _shard_param_compile_only(self) -> Dict[str, Any]:
-        """Create minimal dummy tensors with correct shapes for compile-only mode.
-
-        Only NetCDF variable shapes are read (via ``InputProxy.get_var_shape``);
-        no actual array data is loaded from disk.  Scalar NetCDF variables
-        (gravity, min_kinematic_slope, …) **are** read so that compile-time
-        constants are accurate.
-        """
-        hp_dtype = (
-            torch.float64
-            if self.mixed_precision and self.dtype == torch.float32
-            else self.dtype
-        )
-        dtype_map = {
-            "float": self.dtype,
-            "hpfloat": hp_dtype,
-            "int": torch.int64,
-            "idx": torch.int32,
-            "bool": torch.bool,
-        }
-
-        module_data: Dict[str, Any] = {}
-        for _, _, field_name, field_info in self._iter_all_fields(include_computed=False):
-            if field_name in module_data:
-                continue
-            if field_name not in self.input_proxy:
-                continue
-
-            shape = self.input_proxy.get_var_shape(field_name)
-
-            # Scalar NetCDF variables — load actual value (cheap)
-            if len(shape) == 0:
-                val = self.input_proxy[field_name]
-                module_data[field_name] = val.item() if hasattr(val, "item") else val
-                continue
-
-            jse = getattr(field_info, "json_schema_extra", {}) or {}
-            tensor_dtype = jse.get("tensor_dtype", "float")
-            torch_dtype = dtype_map.get(tensor_dtype, self.dtype)
-
-            # Fields with uniqueness validators need non-duplicate values
-            if field_name in ("catchment_id", "catchment_save_id"):
-                module_data[field_name] = torch.arange(shape[0], dtype=torch_dtype)
-            else:
-                module_data[field_name] = torch.zeros(shape, dtype=torch_dtype)
-
-        print(f"[compile_only] Created dummy tensors from NetCDF shapes — "
-              f"no array data loaded.")
-        return module_data
 
     @cached_property
     def base(self) -> BaseModule:
@@ -177,13 +108,13 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
     @model_validator(mode='after')
     def validate_backend_precision(self) -> Self:
-        """Non-triton/cuda backends only support float32, no mixed precision."""
+        """Metal backend only supports float32, no mixed precision."""
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND not in ("triton", "cuda", "hip"):
+        if KERNEL_BACKEND not in ("triton", "torch"):
             if self.precision != "float32":
                 raise ValueError(
                     f"Backend '{KERNEL_BACKEND}' only supports float32 precision, "
-                    f"got '{self.precision}'. Use the triton (CUDA) backend for float64."
+                    f"got '{self.precision}'. Use the triton backend for float64."
                 )
             if self.mixed_precision:
                 raise ValueError(
@@ -193,75 +124,16 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         return self
 
     @model_validator(mode='after')
-    def validate_cuda_backend_limitations(self) -> Self:
-        """CUDA C++ / Metal backends do not support batched (num_trials>1);
-        CUDA C++ additionally lacks the log module kernels."""
+    def validate_metal_backend_limitations(self) -> Self:
+        """Metal backend does not support batched (num_trials>1)."""
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND not in ("cuda", "hip", "metal"):
+        if KERNEL_BACKEND != "metal":
             return self
         if self.num_trials is not None and self.num_trials > 1:
             raise ValueError(
                 f"'{KERNEL_BACKEND}' backend does not support batched execution "
                 f"(num_trials={self.num_trials}). Use the triton backend instead."
             )
-        if KERNEL_BACKEND in ("cuda", "hip") and "log" in self.opened_modules:
-            raise ValueError(
-                f"'{KERNEL_BACKEND}' backend does not implement the 'log' module kernels "
-                "(compute_flood_stage_log, compute_levee_stage_log). "
-                "Use the triton or torch backend instead."
-            )
-        # Auto-configure CUDA storage precision to match the model's setting.
-        # mixed_precision=False → all float32 → compile CUDA with -DCMF_STORAGE_FLOAT
-        if KERNEL_BACKEND == "cuda" and not self.mixed_precision:
-            from cmfgpu.phys.cuda import configure_storage_precision
-            configure_storage_precision(use_float32=True)
-        # Auto-configure CUDA compile-time constants from loaded modules.
-        if KERNEL_BACKEND == "cuda":
-            from cmfgpu.phys.cuda import configure as configure_cuda
-            build_dir = str(Path(self.output_full_dir) / "cuda_build") if self.output_full_dir else None
-            configure_cuda(
-                num_flood_levels=self.base.num_flood_levels,
-                num_bif_levels=(
-                    self.bifurcation.num_bifurcation_levels
-                    if self.bifurcation is not None else 1
-                ),
-                has_bifurcation=self.bifurcation_flag,
-                has_reservoir=self.reservoir_flag,
-                gravity=self.base.gravity,
-                min_kinematic_slope=self.base.min_kinematic_slope,
-                build_directory=build_dir,
-            )
-            # In compile_only mode, eagerly trigger compilation now
-            if self.compile_only:
-                from cmfgpu.phys.cuda import _get_module
-                _get_module()
-            # MPI barrier: ensure all ranks finish compilation before proceeding
-            if dist.is_initialized():
-                dist.barrier()
-        # Auto-configure HIP storage precision and compile-time constants.
-        if KERNEL_BACKEND == "hip" and not self.mixed_precision:
-            from cmfgpu.phys.hip import configure_storage_precision as hip_configure_storage_precision
-            hip_configure_storage_precision(use_float32=True)
-        if KERNEL_BACKEND == "hip":
-            from cmfgpu.phys.hip import configure as configure_hip
-            build_dir = str(Path(self.output_full_dir) / "hip_build") if self.output_full_dir else None
-            configure_hip(
-                num_flood_levels=self.base.num_flood_levels,
-                num_bif_levels=(
-                    self.bifurcation.num_bifurcation_levels
-                    if self.bifurcation is not None else 1
-                ),
-                has_bifurcation=self.bifurcation_flag,
-                has_reservoir=self.reservoir_flag,
-                gravity=self.base.gravity,
-                min_kinematic_slope=self.base.min_kinematic_slope,
-                build_directory=build_dir,
-            )
-            if self.compile_only:
-                from cmfgpu.phys.hip import _get_module as _get_hip_module
-                _get_hip_module()
-            if dist.is_initialized():
-                dist.barrier()
         return self
 
     @model_validator(mode="after")
@@ -273,7 +145,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
           P2RIVSTO(ISEQ) = P2DAMSTO(ISEQ)
           P2FLDSTO(ISEQ) = 0
         """
-        if self.compile_only or not self.reservoir_flag:
+        if not self.reservoir_flag:
             return self
         res_idx = self.reservoir.reservoir_catchment_idx   # (num_reservoirs,)
         con_vol = self.reservoir.conservation_volume        # (num_reservoirs,)
@@ -304,7 +176,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         bifurcation elevation to 1E20, following Fortran CMF_DAMOUT_INIT:
           IF( I1DAM(ISEQP)>0 .or. I1DAM(JSEQP)>0 ) PTH_ELV(IPTH,:)=1.E20
         """
-        if self.compile_only or not self.reservoir_flag or not self.bifurcation_flag:
+        if not self.reservoir_flag or not self.bifurcation_flag:
             return self
         is_dam = self.base.is_dam_related
         if is_dam is None:

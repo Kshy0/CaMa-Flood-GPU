@@ -8,17 +8,7 @@
 
 from hydroforge.runtime.backend import KERNEL_BACKEND
 
-if KERNEL_BACKEND == "cuda":
-    from cmfgpu.phys.cuda import \
-        compute_adaptive_time_step_kernel as \
-        compute_adaptive_time_step  # noqa: F401
-
-elif KERNEL_BACKEND == "hip":
-    from cmfgpu.phys.hip import \
-        compute_adaptive_time_step_kernel as \
-        compute_adaptive_time_step  # noqa: F401
-
-elif KERNEL_BACKEND == "metal":
+if KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
         compute_adaptive_time_step_kernel as \
         compute_adaptive_time_step  # noqa: F401
