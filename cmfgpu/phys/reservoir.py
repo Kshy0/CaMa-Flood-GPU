@@ -13,6 +13,11 @@ if KERNEL_BACKEND == "cuda":
         compute_reservoir_outflow_kernel as \
         compute_reservoir_outflow  # noqa: F401
 
+elif KERNEL_BACKEND == "hip":
+    from cmfgpu.phys.hip import \
+        compute_reservoir_outflow_kernel as \
+        compute_reservoir_outflow  # noqa: F401
+
 elif KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
         compute_reservoir_outflow_kernel as \

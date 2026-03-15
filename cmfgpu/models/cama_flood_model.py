@@ -72,7 +72,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             return
         # Auto-enable CUDA graphs for backends that support it
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND in ("triton", "cuda") and torch.cuda.is_available():
+        if KERNEL_BACKEND in ("triton", "cuda", "hip") and torch.cuda.is_available():
             self.enable_cuda_graph()
 
     def shard_param(self) -> Dict[str, Any]:
@@ -179,7 +179,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     def validate_backend_precision(self) -> Self:
         """Non-triton/cuda backends only support float32, no mixed precision."""
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND not in ("triton", "cuda"):
+        if KERNEL_BACKEND not in ("triton", "cuda", "hip"):
             if self.precision != "float32":
                 raise ValueError(
                     f"Backend '{KERNEL_BACKEND}' only supports float32 precision, "
@@ -197,14 +197,14 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         """CUDA C++ / Metal backends do not support batched (num_trials>1);
         CUDA C++ additionally lacks the log module kernels."""
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND not in ("cuda", "metal"):
+        if KERNEL_BACKEND not in ("cuda", "hip", "metal"):
             return self
         if self.num_trials is not None and self.num_trials > 1:
             raise ValueError(
                 f"'{KERNEL_BACKEND}' backend does not support batched execution "
                 f"(num_trials={self.num_trials}). Use the triton backend instead."
             )
-        if KERNEL_BACKEND == "cuda" and "log" in self.opened_modules:
+        if KERNEL_BACKEND in ("cuda", "hip") and "log" in self.opened_modules:
             raise ValueError(
                 f"'{KERNEL_BACKEND}' backend does not implement the 'log' module kernels "
                 "(compute_flood_stage_log, compute_levee_stage_log). "
@@ -236,6 +236,30 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 from cmfgpu.phys.cuda import _get_module
                 _get_module()
             # MPI barrier: ensure all ranks finish compilation before proceeding
+            if dist.is_initialized():
+                dist.barrier()
+        # Auto-configure HIP storage precision and compile-time constants.
+        if KERNEL_BACKEND == "hip" and not self.mixed_precision:
+            from cmfgpu.phys.hip import configure_storage_precision as hip_configure_storage_precision
+            hip_configure_storage_precision(use_float32=True)
+        if KERNEL_BACKEND == "hip":
+            from cmfgpu.phys.hip import configure as configure_hip
+            build_dir = str(Path(self.output_full_dir) / "hip_build") if self.output_full_dir else None
+            configure_hip(
+                num_flood_levels=self.base.num_flood_levels,
+                num_bif_levels=(
+                    self.bifurcation.num_bifurcation_levels
+                    if self.bifurcation is not None else 1
+                ),
+                has_bifurcation=self.bifurcation_flag,
+                has_reservoir=self.reservoir_flag,
+                gravity=self.base.gravity,
+                min_kinematic_slope=self.base.min_kinematic_slope,
+                build_directory=build_dir,
+            )
+            if self.compile_only:
+                from cmfgpu.phys.hip import _get_module as _get_hip_module
+                _get_hip_module()
             if dist.is_initialized():
                 dist.barrier()
         return self

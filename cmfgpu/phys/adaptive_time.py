@@ -13,6 +13,11 @@ if KERNEL_BACKEND == "cuda":
         compute_adaptive_time_step_kernel as \
         compute_adaptive_time_step  # noqa: F401
 
+elif KERNEL_BACKEND == "hip":
+    from cmfgpu.phys.hip import \
+        compute_adaptive_time_step_kernel as \
+        compute_adaptive_time_step  # noqa: F401
+
 elif KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
         compute_adaptive_time_step_kernel as \

@@ -15,6 +15,13 @@ if KERNEL_BACKEND == "cuda":
         compute_bifurcation_outflow_kernel as \
         compute_bifurcation_outflow  # noqa: F401
 
+elif KERNEL_BACKEND == "hip":
+    from cmfgpu.phys.hip import \
+        compute_bifurcation_inflow_kernel as compute_bifurcation_inflow
+    from cmfgpu.phys.hip import \
+        compute_bifurcation_outflow_kernel as \
+        compute_bifurcation_outflow  # noqa: F401
+
 elif KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
         compute_bifurcation_inflow_kernel as compute_bifurcation_inflow
