@@ -8,14 +8,15 @@
 
 // =========================================================================
 // Kernel: compute_adaptive_time_step  (no storage_t — uses float only)
+//   CMF_GRAVITY, HAS_RESERVOIR_CONST are compile-time constants.
 // =========================================================================
 __global__ void compute_adaptive_time_step_kernel(
     const float*  __restrict__ river_depth,
     const float*  __restrict__ downstream_distance,
     const bool*   __restrict__ is_dam_related,
     int*          __restrict__ max_sub_steps,
-    float time_step, float adaptive_time_factor, float gravity,
-    int num_catchments, bool has_reservoir
+    float time_step, float adaptive_time_factor,
+    int num_catchments
 ) {
     extern __shared__ float sdata[];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -23,11 +24,15 @@ __global__ void compute_adaptive_time_step_kernel(
 
     float dt = time_step;
     if (i < num_catchments) {
-        bool skip = has_reservoir && is_dam_related != nullptr && is_dam_related[i];
+#if HAS_RESERVOIR_CONST
+        bool skip = is_dam_related != nullptr && is_dam_related[i];
+#else
+        bool skip = false;
+#endif
         if (!skip) {
             float d = fmaxf(river_depth[i], 0.01f);
             float dd = downstream_distance[i];
-            dt = fminf(adaptive_time_factor * dd / sqrtf(gravity * d), time_step);
+            dt = fminf(adaptive_time_factor * dd / sqrtf(CMF_GRAVITY * d), time_step);
         }
     }
     sdata[tid] = dt;
@@ -49,14 +54,14 @@ __global__ void compute_adaptive_time_step_kernel(
 void launch_adaptive_time_step(
     torch::Tensor river_depth, torch::Tensor downstream_distance,
     torch::Tensor is_dam_related, torch::Tensor max_sub_steps,
-    float time_step, float adaptive_time_factor, float gravity,
-    int num_catchments, bool has_reservoir
+    float time_step, float adaptive_time_factor,
+    int num_catchments
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_catchments, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_adaptive_time_step_kernel<<<grid, bs, bs * sizeof(float), stream>>>(
         river_depth.data_ptr<float>(), downstream_distance.data_ptr<float>(),
         is_dam_related.data_ptr<bool>(), max_sub_steps.data_ptr<int>(),
-        time_step, adaptive_time_factor, gravity, num_catchments, has_reservoir);
+        time_step, adaptive_time_factor, num_catchments);
 }

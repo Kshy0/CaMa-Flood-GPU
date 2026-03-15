@@ -115,7 +115,7 @@ void launch_reservoir_outflow(
     torch::Tensor total_storage, torch::Tensor outgoing_storage,
     torch::Tensor time_step_tensor, int num_reservoirs
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_reservoirs, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_reservoir_outflow_kernel<<<grid, bs, 0, stream>>>(

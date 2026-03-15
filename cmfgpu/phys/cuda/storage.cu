@@ -8,6 +8,7 @@
 
 // =========================================================================
 // Kernel: compute_flood_stage
+//   NUM_FLOOD_LEVELS, HAS_BIFURCATION_CONST are compile-time constants.
 // =========================================================================
 __global__ void compute_flood_stage_kernel(
     storage_t*       __restrict__ river_inflow,
@@ -30,7 +31,7 @@ __global__ void compute_flood_stage_kernel(
     const float*     __restrict__ catchment_area,
     const float*     __restrict__ river_width,
     const float*     __restrict__ river_length,
-    int num_catchments, int num_flood_levels, bool has_bifurcation
+    int num_catchments
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_catchments) return;
@@ -40,7 +41,11 @@ __global__ void compute_flood_stage_kernel(
     float f_inflow = (float)flood_inflow[i];
     float r_out = river_outflow[i];
     float f_out = flood_outflow[i];
-    float bif_out = has_bifurcation ? (float)global_bifurcation_outflow[i] : 0.0f;
+#if HAS_BIFURCATION_CONST
+    float bif_out = (float)global_bifurcation_outflow[i];
+#else
+    float bif_out = 0.0f;
+#endif
     float roff = runoff[i];
 
     storage_t r_sto = river_storage[i] + STO_CAST((r_inflow - r_out) * time_step);
@@ -61,7 +66,8 @@ __global__ void compute_flood_stage_kernel(
 
     float r_max_sto = r_l * r_w * r_h;
     float cw = area / r_l;
-    float w_inc = cw / num_flood_levels;
+    constexpr float inv_nfl = 1.0f / NUM_FLOOD_LEVELS;
+    float w_inc = cw * inv_nfl;
 
     int level = (total_sto > r_max_sto) ? 0 : -1;
     float S_accum = r_max_sto;
@@ -70,8 +76,9 @@ __global__ void compute_flood_stage_kernel(
     float prev_flood_depth = 0.0f;
     float next_flood_depth = 0.0f;
 
-    for (int fl = 0; fl < num_flood_levels; fl++) {
-        float H_curr = flood_depth_table[i * num_flood_levels + fl];
+    #pragma unroll
+    for (int fl = 0; fl < NUM_FLOOD_LEVELS; fl++) {
+        float H_curr = flood_depth_table[i * NUM_FLOOD_LEVELS + fl];
         float W_curr = r_w + (fl + 1) * w_inc;
         float dS = r_l * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
         float S_curr = S_accum + dS;
@@ -92,14 +99,14 @@ __global__ void compute_flood_stage_kernel(
     if (level < 0) level = 0;
 
     float prev_total_w = r_w + level * w_inc;
-    float flood_grad = (level == num_flood_levels) ? 0.0f :
+    float flood_grad = (level == NUM_FLOOD_LEVELS) ? 0.0f :
         (next_flood_depth - prev_flood_depth) / w_inc;
 
     float fld_depth, fld_frac;
     if (no_flood) {
         fld_depth = 0.0f;
         fld_frac = 0.0f;
-    } else if (level == num_flood_levels) {
+    } else if (level == NUM_FLOOD_LEVELS) {
         fld_depth = prev_flood_depth + (total_sto - prev_total_sto) / (prev_total_w * r_l);
         fld_frac = 1.0f;
     } else {
@@ -140,9 +147,9 @@ void launch_flood_stage(
     torch::Tensor river_height, torch::Tensor flood_depth_table,
     torch::Tensor catchment_area, torch::Tensor river_width,
     torch::Tensor river_length,
-    int num_catchments, int num_flood_levels, bool has_bifurcation
+    int num_catchments
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_catchments, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_flood_stage_kernel<<<grid, bs, 0, stream>>>(
@@ -158,5 +165,5 @@ void launch_flood_stage(
         river_height.data_ptr<float>(), flood_depth_table.data_ptr<float>(),
         catchment_area.data_ptr<float>(), river_width.data_ptr<float>(),
         river_length.data_ptr<float>(),
-        num_catchments, num_flood_levels, has_bifurcation);
+        num_catchments);
 }

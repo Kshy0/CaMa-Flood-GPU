@@ -11,16 +11,23 @@ JIT-compiles .cu / .cpp / .cuh sources in the ``cuda/`` subdirectory via
 hydroforge's ``load_cu_module()`` on first use, then exposes each launcher
 as a ``LazyCudaKernel`` compatible with the Triton calling convention.
 
-Compile with ``CMF_STORAGE_FLOAT=1`` (env var) to use float32 storage
-instead of the default float64.
+Compile-time constants (NUM_FLOOD_LEVELS, NUM_BIF_LEVELS, HAS_BIFURCATION_CONST,
+HAS_RESERVOIR_CONST, CMF_GRAVITY, CMF_MIN_KINEMATIC_SLOPE) must be set via
+:func:`configure` before any kernel is called.
 """
 
 import os
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import torch
-from hydroforge.runtime.cuda_kernel import (CudaKernel, LazyCudaKernel,
-                                            load_cu_module)
+from hydroforge.runtime.cuda_kernel import (
+    CudaKernel,
+    LazyCudaKernel,
+    check_build_manifest,
+    load_cu_module,
+    update_build_manifest,
+)
 
 # ── Precision configuration ───────────────────────────────────────────────
 
@@ -46,6 +53,42 @@ def configure_storage_precision(use_float32: bool) -> None:
         STORAGE_DTYPE = torch.float64
 
 
+# ── Compile-time constants ────────────────────────────────────────────────
+
+_compile_config: Dict[str, Any] = {}
+_build_dir: Optional[str] = None
+
+
+def configure(
+    *,
+    num_flood_levels: int,
+    num_bif_levels: int,
+    has_bifurcation: bool,
+    has_reservoir: bool,
+    gravity: float = 9.80665,
+    min_kinematic_slope: float = 1e-5,
+    build_directory: Optional[str] = None,
+) -> None:
+    """Set compile-time constants before CUDA kernels are compiled.
+
+    Must be called before the first kernel invocation.  Invalidates any
+    previously compiled module so that the next call to ``_get_module()``
+    recompiles with the new constants.
+    """
+    global _compile_config, _build_dir, _module
+    _compile_config = {
+        "NUM_FLOOD_LEVELS": num_flood_levels,
+        "NUM_BIF_LEVELS": num_bif_levels,
+        "HAS_BIFURCATION_CONST": int(has_bifurcation),
+        "HAS_RESERVOIR_CONST": int(has_reservoir),
+        "CMF_GRAVITY": f"{gravity}f",
+        "CMF_MIN_KINEMATIC_SLOPE": f"{min_kinematic_slope}f",
+    }
+    if build_directory is not None:
+        _build_dir = str(build_directory)
+    _module = None  # invalidate cached module
+
+
 # ── Module loading ────────────────────────────────────────────────────────
 
 _CU_DIR = Path(__file__).parent
@@ -68,14 +111,42 @@ def _get_module():
     global _module
     if _module is not None:
         return _module
+    if not _compile_config:
+        raise RuntimeError(
+            "CUDA compile-time constants not configured. "
+            "Call cmfgpu.phys.cuda.configure(...) before using CUDA kernels."
+        )
+    # Build module name encoding all compile-time constants
+    cc = _compile_config
+    name = (
+        f"cmfgpu_cuda_fl{cc['NUM_FLOOD_LEVELS']}"
+        f"_bl{cc['NUM_BIF_LEVELS']}"
+        f"_bif{cc['HAS_BIFURCATION_CONST']}"
+        f"_res{cc['HAS_RESERVOIR_CONST']}"
+    )
+    if STORAGE_FLOAT:
+        name += "_f32"
+    # Validate precompiled cache before (potentially slow) compilation
+    if _build_dir is not None:
+        check_build_manifest(_build_dir, "physics", name)
     flags = ["-O3", "--use_fast_math", f"-I{_CU_DIR}"]
+    for key, val in cc.items():
+        flags.append(f"-D{key}={val}")
     if STORAGE_FLOAT:
         flags.append("-DCMF_STORAGE_FLOAT")
     _module = load_cu_module(
-        "cmfgpu_cuda_kernels" if not STORAGE_FLOAT else "cmfgpu_cuda_kernels_f32",
+        name,
         _CU_FILES,
         extra_cuda_cflags=flags,
+        build_directory=_build_dir,
     )
+    # Record in manifest for future validation
+    if _build_dir is not None:
+        update_build_manifest(_build_dir, "physics", {
+            "module_name": name,
+            "config": {k: v for k, v in cc.items()},
+            "STORAGE_FLOAT": STORAGE_FLOAT,
+        })
     return _module
 
 
@@ -104,11 +175,8 @@ def _make_outflow():
         "outgoing_storage_ptr", "water_surface_elevation_ptr",
         "protected_water_surface_elevation_ptr",
         "is_dam_upstream_ptr",
-        ("gravity", float), "time_step_ptr",
-        ("MIN_KINEMATIC_SLOPE", float, 1e-5),
+        "time_step_ptr",
         ("num_catchments", int),
-        ("HAS_BIFURCATION", bool, True),
-        ("HAS_RESERVOIR", bool, False),
     ], nullable={"is_dam_upstream_ptr": "torch.bool"})
 
 
@@ -123,7 +191,6 @@ def _make_inflow():
         "limit_rate_ptr",
         "reservoir_total_inflow_ptr", "is_reservoir_ptr",
         ("num_catchments", int),
-        ("HAS_RESERVOIR", bool, False),
     ], nullable={
         "reservoir_total_inflow_ptr": sto_dtype,
         "is_reservoir_ptr": "torch.bool",
@@ -149,8 +216,7 @@ def _make_flood_stage():
         "protected_depth_ptr", "flood_fraction_ptr",
         "river_height_ptr", "flood_depth_table_ptr",
         "catchment_area_ptr", "river_width_ptr", "river_length_ptr",
-        ("num_catchments", int), ("num_flood_levels", int),
-        ("HAS_BIFURCATION", bool, True),
+        ("num_catchments", int),
     ])
 
 
@@ -165,8 +231,7 @@ def _make_adaptive_time_step():
         "river_depth_ptr", "downstream_distance_ptr",
         "is_dam_related_ptr", "max_sub_steps_ptr",
         ("time_step", float), ("adaptive_time_factor", float),
-        ("gravity", float), ("num_catchments", int),
-        ("HAS_RESERVOIR", bool, False),
+        ("num_catchments", int),
     ], nullable={"is_dam_related_ptr": "torch.bool"})
 
 
@@ -183,8 +248,8 @@ def _make_bifurcation_outflow():
         "bifurcation_elevation_ptr", "bifurcation_cross_section_depth_ptr",
         "water_surface_elevation_ptr",
         "total_storage_ptr", "outgoing_storage_ptr",
-        ("gravity", float), "time_step_ptr",
-        ("num_bifurcation_paths", int), ("num_bifurcation_levels", int),
+        "time_step_ptr",
+        ("num_bifurcation_paths", int),
     ])
 
 
@@ -193,7 +258,7 @@ def _make_bifurcation_inflow():
         "bifurcation_catchment_idx_ptr", "bifurcation_downstream_idx_ptr",
         "limit_rate_ptr", "bifurcation_outflow_ptr",
         "global_bifurcation_outflow_ptr",
-        ("num_bifurcation_paths", int), ("num_bifurcation_levels", int),
+        ("num_bifurcation_paths", int),
     ])
 
 
@@ -232,7 +297,7 @@ def _make_levee_stage():
         "catchment_area_ptr", "river_width_ptr", "river_length_ptr",
         "levee_base_height_ptr", "levee_crown_height_ptr",
         "levee_fraction_ptr", "flood_fraction_ptr",
-        ("num_levees", int), ("num_flood_levels", int),
+        ("num_levees", int),
     ])
 
 
@@ -244,8 +309,8 @@ def _make_levee_bifurcation_outflow():
         "bifurcation_elevation_ptr", "bifurcation_cross_section_depth_ptr",
         "water_surface_elevation_ptr", "protected_water_surface_elevation_ptr",
         "total_storage_ptr", "outgoing_storage_ptr",
-        ("gravity", float), "time_step_ptr",
-        ("num_bifurcation_paths", int), ("num_bifurcation_levels", int),
+        "time_step_ptr",
+        ("num_bifurcation_paths", int),
     ])
 
 

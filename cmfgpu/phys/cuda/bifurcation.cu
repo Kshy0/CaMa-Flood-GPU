@@ -8,6 +8,7 @@
 
 // =========================================================================
 // Kernel: compute_bifurcation_outflow
+//   NUM_BIF_LEVELS, CMF_GRAVITY are compile-time constants.
 // =========================================================================
 __global__ void compute_bifurcation_outflow_kernel(
     const int*       __restrict__ bif_catchment_idx,
@@ -21,8 +22,8 @@ __global__ void compute_bifurcation_outflow_kernel(
     const float*     __restrict__ water_surface_elevation,
     const storage_t* __restrict__ total_storage,
     storage_t*       __restrict__ outgoing_storage,
-    float gravity, const float* __restrict__ time_step_ptr,
-    int num_paths, int num_levels
+    const float* __restrict__ time_step_ptr,
+    int num_paths
 ) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= num_paths) return;
@@ -40,8 +41,9 @@ __global__ void compute_bifurcation_outflow_kernel(
     float sto_d = (float)total_storage[d_idx];
 
     float sum_out = 0.0f;
-    for (int lv = 0; lv < num_levels; lv++) {
-        int li = p * num_levels + lv;
+    #pragma unroll
+    for (int lv = 0; lv < NUM_BIF_LEVELS; lv++) {
+        int li = p * NUM_BIF_LEVELS + lv;
         float manning = bif_manning[li];
         float cs_d = bif_cs_depth[li];
         float elev = bif_elevation[li];
@@ -50,8 +52,8 @@ __global__ void compute_bifurcation_outflow_kernel(
         float width = bif_width[li];
         float outf = bif_outflow[li];
         float unit_out = outf / width;
-        float num = width * (unit_out + gravity * time_step * semi * b_slope);
-        float den = 1.0f + gravity * time_step * (manning * manning)
+        float num = width * (unit_out + CMF_GRAVITY * time_step * semi * b_slope);
+        float den = 1.0f + CMF_GRAVITY * time_step * (manning * manning)
                     * fabsf(unit_out) * powf(semi, -7.0f / 3.0f);
         float upd = (semi > 1e-5f) ? (num / den) : 0.0f;
         sum_out += upd;
@@ -62,8 +64,9 @@ __global__ void compute_bifurcation_outflow_kernel(
     float lr = fminf(0.05f * fminf(sto_c, sto_d)
                       / (fabsf(sum_out) * time_step), 1.0f);
     sum_out *= lr;
-    for (int lv = 0; lv < num_levels; lv++) {
-        bif_outflow[p * num_levels + lv] *= lr;
+    #pragma unroll
+    for (int lv = 0; lv < NUM_BIF_LEVELS; lv++) {
+        bif_outflow[p * NUM_BIF_LEVELS + lv] *= lr;
     }
 
     float pos = fmaxf(sum_out, 0.0f);
@@ -82,9 +85,9 @@ void launch_bifurcation_outflow(
     torch::Tensor bif_elevation, torch::Tensor bif_cs_depth,
     torch::Tensor wse, torch::Tensor total_storage,
     torch::Tensor outgoing_storage,
-    float gravity, torch::Tensor time_step_tensor, int num_paths, int num_levels
+    torch::Tensor time_step_tensor, int num_paths
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_paths, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_bifurcation_outflow_kernel<<<grid, bs, 0, stream>>>(
@@ -94,11 +97,12 @@ void launch_bifurcation_outflow(
         bif_elevation.data_ptr<float>(), bif_cs_depth.data_ptr<float>(),
         wse.data_ptr<float>(), total_storage.data_ptr<storage_t>(),
         outgoing_storage.data_ptr<storage_t>(),
-        gravity, time_step_tensor.data_ptr<float>(), num_paths, num_levels);
+        time_step_tensor.data_ptr<float>(), num_paths);
 }
 
 // =========================================================================
 // Kernel: compute_bifurcation_inflow
+//   NUM_BIF_LEVELS is a compile-time constant.
 // =========================================================================
 __global__ void compute_bifurcation_inflow_kernel(
     const int*   __restrict__ bif_catchment_idx,
@@ -106,7 +110,7 @@ __global__ void compute_bifurcation_inflow_kernel(
     const float* __restrict__ limit_rate,
     float*       __restrict__ bif_outflow,
     storage_t*   __restrict__ global_bif_outflow,
-    int num_paths, int num_levels
+    int num_paths
 ) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= num_paths) return;
@@ -117,8 +121,9 @@ __global__ void compute_bifurcation_inflow_kernel(
     float lr_d = limit_rate[d_idx];
 
     float sum = 0.0f;
-    for (int lv = 0; lv < num_levels; lv++) {
-        int li = p * num_levels + lv;
+    #pragma unroll
+    for (int lv = 0; lv < NUM_BIF_LEVELS; lv++) {
+        int li = p * NUM_BIF_LEVELS + lv;
         float out = bif_outflow[li];
         float upd = (out >= 0.0f) ? out * lr_c : out * lr_d;
         sum += upd;
@@ -136,14 +141,14 @@ void launch_bifurcation_inflow(
     torch::Tensor bif_catchment_idx, torch::Tensor bif_downstream_idx,
     torch::Tensor limit_rate, torch::Tensor bif_outflow,
     torch::Tensor global_bif_outflow,
-    int num_paths, int num_levels
+    int num_paths
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_paths, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_bifurcation_inflow_kernel<<<grid, bs, 0, stream>>>(
         bif_catchment_idx.data_ptr<int>(), bif_downstream_idx.data_ptr<int>(),
         limit_rate.data_ptr<float>(), bif_outflow.data_ptr<float>(),
         global_bif_outflow.data_ptr<storage_t>(),
-        num_paths, num_levels);
+        num_paths);
 }

@@ -8,6 +8,8 @@
 
 // =========================================================================
 // Kernel: compute_outflow
+//   HAS_BIFURCATION_CONST, HAS_RESERVOIR_CONST, CMF_GRAVITY,
+//   CMF_MIN_KINEMATIC_SLOPE are compile-time constants.
 // =========================================================================
 template <bool HAS_BIFURCATION, bool HAS_RESERVOIR>
 __global__ void compute_outflow_kernel(
@@ -38,7 +40,7 @@ __global__ void compute_outflow_kernel(
     float*           __restrict__ water_surface_elevation_out,
     float*           __restrict__ protected_wse_out,
     const bool*      __restrict__ is_dam_upstream,
-    float gravity, const float* __restrict__ time_step_ptr, float min_kinematic_slope,
+    const float* __restrict__ time_step_ptr,
     int   num_catchments
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -97,13 +99,13 @@ __global__ void compute_outflow_kernel(
     float r_cross = upd_r_cs * r_width;
     bool r_cond = (r_semi > 1e-5f) && (r_cross > 1e-5f);
     float unit_r = r_outflow / r_width;
-    float num_r = r_width * (unit_r + gravity * time_step * r_semi * r_slope);
-    float den_r = 1.0f + gravity * time_step * (r_manning * r_manning) * fabsf(unit_r) * powf(r_semi, -7.0f/3.0f);
+    float num_r = r_width * (unit_r + CMF_GRAVITY * time_step * r_semi * r_slope);
+    float den_r = 1.0f + CMF_GRAVITY * time_step * (r_manning * r_manning) * fabsf(unit_r) * powf(r_semi, -7.0f/3.0f);
     float upd_r_outflow = r_cond ? (num_r / den_r) : 0.0f;
 
     bool f_cond = (f_semi > 1e-5f) && (upd_f_area > 1e-5f);
-    float num_f = f_outflow + gravity * time_step * f_impl_area * f_slope;
-    float den_f = 1.0f + gravity * time_step * (f_manning * f_manning) * fabsf(f_outflow) * powf(f_semi, -4.0f/3.0f) / f_impl_area;
+    float num_f = f_outflow + CMF_GRAVITY * time_step * f_impl_area * f_slope;
+    float den_f = 1.0f + CMF_GRAVITY * time_step * (f_manning * f_manning) * fabsf(f_outflow) * powf(f_semi, -4.0f/3.0f) / f_impl_area;
     float upd_f_outflow = f_cond ? (num_f / den_f) : 0.0f;
 
     if (upd_r_outflow * upd_f_outflow < 0.0f)
@@ -117,7 +119,7 @@ __global__ void compute_outflow_kernel(
     }
 
     if (HAS_RESERVOIR && is_dam_upstream != nullptr && is_dam_upstream[i]) {
-        float bed_slope = fmaxf((elev - elev_ds) / ds_dist, min_kinematic_slope);
+        float bed_slope = fmaxf((elev - elev_ds) / ds_dist, CMF_MIN_KINEMATIC_SLOPE);
         float kin_r_vel = (1.0f / r_manning) * sqrtf(bed_slope) * powf(r_depth, 2.0f/3.0f);
         float kin_r = fmaxf(fminf(r_width * r_depth * kin_r_vel, r_storage / time_step), 0.0f);
         float bed_slope_f = fminf(bed_slope, 0.005f);
@@ -152,7 +154,7 @@ __global__ void compute_outflow_kernel(
 }
 
 // =========================================================================
-// Launcher
+// Launcher — single template instantiation via compile-time macros
 // =========================================================================
 void launch_outflow(
     torch::Tensor downstream_idx,
@@ -171,40 +173,33 @@ void launch_outflow(
     torch::Tensor outgoing_storage, torch::Tensor wse_out,
     torch::Tensor p_wse_out,
     torch::Tensor is_dam_upstream,
-    float gravity, torch::Tensor time_step_tensor, float min_kinematic_slope,
-    int num_catchments,
-    bool has_bifurcation, bool has_reservoir
+    torch::Tensor time_step_tensor,
+    int num_catchments
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_catchments, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     const bool* dam_ptr = (is_dam_upstream.defined() && is_dam_upstream.numel() > 0)
         ? is_dam_upstream.data_ptr<bool>() : nullptr;
 
-    #define LAUNCH(BIF, RES) \
-        compute_outflow_kernel<BIF, RES><<<grid, bs, 0, stream>>>( \
-            downstream_idx.data_ptr<int>(), \
-            river_inflow.data_ptr<storage_t>(), river_outflow.data_ptr<float>(), \
-            river_manning.data_ptr<float>(), river_depth.data_ptr<float>(), \
-            river_width.data_ptr<float>(), river_length.data_ptr<float>(), \
-            river_height.data_ptr<float>(), river_storage.data_ptr<storage_t>(), \
-            flood_inflow.data_ptr<storage_t>(), flood_outflow.data_ptr<float>(), \
-            flood_manning.data_ptr<float>(), flood_depth.data_ptr<float>(), \
-            protected_depth.data_ptr<float>(), catchment_elevation.data_ptr<float>(), \
-            downstream_distance.data_ptr<float>(), flood_storage.data_ptr<storage_t>(), \
-            protected_storage.data_ptr<storage_t>(), \
-            river_cs_depth.data_ptr<float>(), flood_cs_depth.data_ptr<float>(), \
-            flood_cs_area.data_ptr<float>(), \
-            global_bif_outflow.data_ptr<storage_t>(), total_storage.data_ptr<storage_t>(), \
-            outgoing_storage.data_ptr<storage_t>(), wse_out.data_ptr<float>(), \
-            p_wse_out.data_ptr<float>(), \
-            dam_ptr, \
-            gravity, time_step_tensor.data_ptr<float>(), min_kinematic_slope, num_catchments \
-        )
-
-    if (has_bifurcation && has_reservoir) { LAUNCH(true, true); }
-    else if (has_bifurcation)             { LAUNCH(true, false); }
-    else if (has_reservoir)               { LAUNCH(false, true); }
-    else                                  { LAUNCH(false, false); }
-    #undef LAUNCH
+    compute_outflow_kernel<(bool)HAS_BIFURCATION_CONST, (bool)HAS_RESERVOIR_CONST>
+        <<<grid, bs, 0, stream>>>(
+            downstream_idx.data_ptr<int>(),
+            river_inflow.data_ptr<storage_t>(), river_outflow.data_ptr<float>(),
+            river_manning.data_ptr<float>(), river_depth.data_ptr<float>(),
+            river_width.data_ptr<float>(), river_length.data_ptr<float>(),
+            river_height.data_ptr<float>(), river_storage.data_ptr<storage_t>(),
+            flood_inflow.data_ptr<storage_t>(), flood_outflow.data_ptr<float>(),
+            flood_manning.data_ptr<float>(), flood_depth.data_ptr<float>(),
+            protected_depth.data_ptr<float>(), catchment_elevation.data_ptr<float>(),
+            downstream_distance.data_ptr<float>(), flood_storage.data_ptr<storage_t>(),
+            protected_storage.data_ptr<storage_t>(),
+            river_cs_depth.data_ptr<float>(), flood_cs_depth.data_ptr<float>(),
+            flood_cs_area.data_ptr<float>(),
+            global_bif_outflow.data_ptr<storage_t>(), total_storage.data_ptr<storage_t>(),
+            outgoing_storage.data_ptr<storage_t>(), wse_out.data_ptr<float>(),
+            p_wse_out.data_ptr<float>(),
+            dam_ptr,
+            time_step_tensor.data_ptr<float>(), num_catchments
+        );
 }

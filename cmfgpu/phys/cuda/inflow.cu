@@ -8,6 +8,7 @@
 
 // =========================================================================
 // Kernel: compute_inflow
+//   HAS_RESERVOIR_CONST is a compile-time constant.
 // =========================================================================
 template <bool HAS_RESERVOIR>
 __global__ void compute_inflow_kernel(
@@ -57,7 +58,7 @@ __global__ void compute_inflow_kernel(
 }
 
 // =========================================================================
-// Launcher
+// Launcher — single template via HAS_RESERVOIR_CONST macro
 // =========================================================================
 void launch_inflow(
     torch::Tensor downstream_idx,
@@ -68,31 +69,25 @@ void launch_inflow(
     torch::Tensor limit_rate,
     torch::Tensor reservoir_total_inflow,
     torch::Tensor is_reservoir,
-    int num_catchments,
-    bool has_reservoir
+    int num_catchments
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_catchments, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
-    if (has_reservoir) {
-        compute_inflow_kernel<true><<<grid, bs, 0, stream>>>(
-            downstream_idx.data_ptr<int>(),
-            river_outflow.data_ptr<float>(), flood_outflow.data_ptr<float>(),
-            river_storage.data_ptr<storage_t>(), flood_storage.data_ptr<storage_t>(),
-            outgoing_storage.data_ptr<storage_t>(),
-            river_inflow.data_ptr<storage_t>(), flood_inflow.data_ptr<storage_t>(),
-            limit_rate.data_ptr<float>(),
-            reservoir_total_inflow.data_ptr<storage_t>(),
-            is_reservoir.data_ptr<bool>(),
-            num_catchments);
-    } else {
-        compute_inflow_kernel<false><<<grid, bs, 0, stream>>>(
-            downstream_idx.data_ptr<int>(),
-            river_outflow.data_ptr<float>(), flood_outflow.data_ptr<float>(),
-            river_storage.data_ptr<storage_t>(), flood_storage.data_ptr<storage_t>(),
-            outgoing_storage.data_ptr<storage_t>(),
-            river_inflow.data_ptr<storage_t>(), flood_inflow.data_ptr<storage_t>(),
-            limit_rate.data_ptr<float>(),
-            nullptr, nullptr, num_catchments);
-    }
+
+    storage_t* res_ptr = (HAS_RESERVOIR_CONST && reservoir_total_inflow.defined()
+                          && reservoir_total_inflow.numel() > 0)
+        ? reservoir_total_inflow.data_ptr<storage_t>() : nullptr;
+    const bool* res_flag_ptr = (HAS_RESERVOIR_CONST && is_reservoir.defined()
+                                && is_reservoir.numel() > 0)
+        ? is_reservoir.data_ptr<bool>() : nullptr;
+
+    compute_inflow_kernel<(bool)HAS_RESERVOIR_CONST><<<grid, bs, 0, stream>>>(
+        downstream_idx.data_ptr<int>(),
+        river_outflow.data_ptr<float>(), flood_outflow.data_ptr<float>(),
+        river_storage.data_ptr<storage_t>(), flood_storage.data_ptr<storage_t>(),
+        outgoing_storage.data_ptr<storage_t>(),
+        river_inflow.data_ptr<storage_t>(), flood_inflow.data_ptr<storage_t>(),
+        limit_rate.data_ptr<float>(),
+        res_ptr, res_flag_ptr, num_catchments);
 }

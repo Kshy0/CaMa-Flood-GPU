@@ -19,12 +19,12 @@ from cmfgpu.models import CaMaFlood
 
 def main():
     ### Configuration Start ###
-    resolution = "glb_15min"
+    resolution = "glb_06min"
     experiment_name = f"{resolution}_bin"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out/"
     opened_modules = ["base", "adaptive_time","bifurcation"]
-    variables_to_save = {"mean": ["total_outflow"], "last": ["river_depth"]}
+    variables_to_save = {}
     time_step = 86400.0
     default_num_sub_steps = 360
     

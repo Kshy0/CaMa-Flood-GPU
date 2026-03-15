@@ -8,10 +8,7 @@
 
 // =========================================================================
 // Kernel: compute_levee_stage
-//
-// Re-distributes river/flood/protected storage for levee-protected
-// catchments.  Four cases depending on how total_storage compares with
-// levee_base_storage, s_top, and levee_fill_storage.
+//   NUM_FLOOD_LEVELS is a compile-time constant.
 // =========================================================================
 __global__ void compute_levee_stage_kernel(
     const int*       __restrict__ levee_catchment_idx,
@@ -30,14 +27,13 @@ __global__ void compute_levee_stage_kernel(
     const float*     __restrict__ levee_crown_height,
     const float*     __restrict__ levee_fraction,
     float*           __restrict__ flood_fraction,
-    int num_levees, int num_flood_levels
+    int num_levees
 ) {
     int lid = blockIdx.x * blockDim.x + threadIdx.x;
     if (lid >= num_levees) return;
 
     int ci = levee_catchment_idx[lid];
 
-    // Load parameters
     float r_l   = river_length[ci];
     float r_w   = river_width[ci];
     float r_h   = river_height[ci];
@@ -46,18 +42,16 @@ __global__ void compute_levee_stage_kernel(
     float l_crown_h = levee_crown_height[lid];
     float l_frac    = levee_fraction[lid];
 
-    // Downcast storage from storage_t to float for computation
     float r_sto_curr = (float)river_storage[ci];
     float f_sto_curr = (float)flood_storage[ci];
     float f_dph_curr = flood_depth[ci];
     float total_sto  = r_sto_curr + f_sto_curr;
 
-    // Derived
     float r_max_sto   = r_l * r_w * r_h;
-    float dwth_inc    = (area / r_l) / num_flood_levels;
+    constexpr float inv_nfl = 1.0f / NUM_FLOOD_LEVELS;
+    float dwth_inc    = (area / r_l) * inv_nfl;
     float l_distance  = l_frac * (area / r_l);
 
-    // Iterate flood levels to find base/fill storage + Case 3 search B
     float s_curr    = r_max_sto;
     float dhgt_pre  = 0.0f;
     float dwth_pre  = r_w;
@@ -67,7 +61,7 @@ __global__ void compute_levee_stage_kernel(
     bool found_base = false;
     bool found_fill = false;
 
-    int ilev = (int)(l_frac * num_flood_levels);
+    int ilev = (int)(l_frac * NUM_FLOOD_LEVELS);
 
     float dsto_fil_B = 0.0f;
     float dwth_fil_B = 0.0f;
@@ -75,15 +69,15 @@ __global__ void compute_levee_stage_kernel(
     float gradient_B = 0.0f;
     bool  found_B    = false;
 
-    for (int i = 0; i < num_flood_levels; i++) {
-        float depth_val = flood_depth_table[ci * num_flood_levels + i];
+    #pragma unroll
+    for (int i = 0; i < NUM_FLOOD_LEVELS; i++) {
+        float depth_val = flood_depth_table[ci * NUM_FLOOD_LEVELS + i];
         float dhgt_seg  = fmaxf(depth_val - dhgt_pre, 1e-6f);
         float dwth_mid  = dwth_pre + 0.5f * dwth_inc;
         float dsto_seg  = r_l * dwth_mid * dhgt_seg;
         float s_next    = s_curr + dsto_seg;
         float gradient  = dhgt_seg / dwth_inc;
 
-        // Check Base
         if (!found_base && l_base_h > dhgt_pre && l_base_h <= depth_val) {
             float ratio = (l_base_h - dhgt_pre) / dhgt_seg;
             l_base_sto = s_curr + r_l * (dwth_pre + 0.5f * ratio * dwth_inc)
@@ -91,7 +85,6 @@ __global__ void compute_levee_stage_kernel(
             found_base = true;
         }
 
-        // Check Fill
         if (!found_fill && l_crown_h > dhgt_pre && l_crown_h <= depth_val) {
             float ratio = (l_crown_h - dhgt_pre) / dhgt_seg;
             l_fill_sto = s_curr + r_l * (dwth_pre + 0.5f * ratio * dwth_inc)
@@ -99,7 +92,6 @@ __global__ void compute_levee_stage_kernel(
             found_fill = true;
         }
 
-        // Case 3 Search B
         if (i >= ilev && !found_B) {
             float dhgt_dif_loop = l_crown_h - l_base_h;
             float s_top_loop = l_base_sto
@@ -126,7 +118,6 @@ __global__ void compute_levee_stage_kernel(
         dwth_pre += dwth_inc;
     }
 
-    // Handle out-of-range
     if (!found_base) {
         l_base_sto = (l_base_h > dhgt_pre)
             ? s_curr + r_l * dwth_pre * (l_base_h - dhgt_pre)
@@ -141,16 +132,13 @@ __global__ void compute_levee_stage_kernel(
     float dhgt_dif = l_crown_h - l_base_h;
     float s_top = l_base_sto + (l_distance + r_w) * dhgt_dif * r_l;
 
-    // Determine case
     bool is_case4 = (total_sto >= l_fill_sto);
     bool is_case3 = !is_case4 && (total_sto >= s_top);
     bool is_case2 = !is_case4 && !is_case3 && (total_sto >= l_base_sto);
-    // Case 1 (default): water below levee base — keep current values
 
     float r_sto, f_sto, p_sto, r_dph, f_dph, p_dph, f_frc;
 
     if (is_case2) {
-        // Water between levee base and crown, only inside levee distance
         float dsto_add = total_sto - l_base_sto;
         float dwth_add = l_distance + r_w;
         f_dph = l_base_h + dsto_add / dwth_add / r_l;
@@ -161,19 +149,17 @@ __global__ void compute_levee_stage_kernel(
         p_dph = 0.0f;
         f_frc = l_frac;
     } else if (is_case3) {
-        // Water overtopping levee, expanding beyond
         float dsto_add = total_sto - dsto_fil_B;
         float term = dwth_fil_B * dwth_fil_B
             + 2.0f * dsto_add / r_l / (gradient_B + 1e-9f);
         float dwth_add = -dwth_fil_B + sqrtf(fmaxf(term, 0.0f));
         float ddph_add = dwth_add * gradient_B;
         if (!found_B) {
-            // Extrapolate
             ddph_add = dsto_add / (dwth_fil_B * r_l + 1e-9f);
         }
         p_dph = l_base_h + ddph_fil_B + ddph_add;
         f_frc = found_B
-            ? fminf(fmaxf((dwth_fil_B + l_distance) / (dwth_inc * num_flood_levels), 0.0f), 1.0f)
+            ? fminf(fmaxf((dwth_fil_B + l_distance) / (dwth_inc * NUM_FLOOD_LEVELS), 0.0f), 1.0f)
             : 1.0f;
 
         f_dph = l_crown_h;
@@ -182,17 +168,15 @@ __global__ void compute_levee_stage_kernel(
         f_sto = fmaxf(s_top - r_sto, 0.0f);
         p_sto = fmaxf(total_sto - r_sto - f_sto, 0.0f);
     } else if (is_case4) {
-        // Water fully above levee — use existing flood depth
         f_dph = f_dph_curr;
         r_sto = r_sto_curr;
         float dsto_add_c4 = (f_dph - l_crown_h) * (l_distance + r_w) * r_l;
         f_sto = fmaxf(s_top + dsto_add_c4 - r_sto, 0.0f);
         p_sto = fmaxf(total_sto - r_sto - f_sto, 0.0f);
-        r_dph = river_depth[ci];   // keep current
+        r_dph = river_depth[ci];
         p_dph = f_dph;
-        f_frc = flood_fraction[ci]; // keep current
+        f_frc = flood_fraction[ci];
     } else {
-        // Case 1: no change
         r_sto = r_sto_curr;
         f_sto = f_sto_curr;
         p_sto = 0.0f;
@@ -202,7 +186,6 @@ __global__ void compute_levee_stage_kernel(
         f_frc = flood_fraction[ci];
     }
 
-    // Store results
     river_storage[ci]     = STO_CAST(r_sto);
     flood_storage[ci]     = STO_CAST(f_sto);
     protected_storage[ci] = STO_CAST(p_sto);
@@ -226,9 +209,9 @@ void launch_levee_stage(
     torch::Tensor river_length,
     torch::Tensor levee_base_height, torch::Tensor levee_crown_height,
     torch::Tensor levee_fraction, torch::Tensor flood_fraction,
-    int num_levees, int num_flood_levels
+    int num_levees
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_levees, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_levee_stage_kernel<<<grid, bs, 0, stream>>>(
@@ -245,14 +228,12 @@ void launch_levee_stage(
         levee_crown_height.data_ptr<float>(),
         levee_fraction.data_ptr<float>(),
         flood_fraction.data_ptr<float>(),
-        num_levees, num_flood_levels);
+        num_levees);
 }
 
 // =========================================================================
 // Kernel: compute_levee_bifurcation_outflow
-//
-// Like regular bifurcation outflow but level 0 uses river WSE while
-// levels > 0 use protected WSE (behind levee).
+//   NUM_BIF_LEVELS, CMF_GRAVITY are compile-time constants.
 // =========================================================================
 __global__ void compute_levee_bifurcation_outflow_kernel(
     const int*       __restrict__ bif_catchment_idx,
@@ -267,8 +248,8 @@ __global__ void compute_levee_bifurcation_outflow_kernel(
     const float*     __restrict__ protected_wse,
     const storage_t* __restrict__ total_storage,
     storage_t*       __restrict__ outgoing_storage,
-    float gravity, const float* __restrict__ time_step_ptr,
-    int num_paths, int num_levels
+    const float* __restrict__ time_step_ptr,
+    int num_paths
 ) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= num_paths) return;
@@ -291,19 +272,18 @@ __global__ void compute_levee_bifurcation_outflow_kernel(
     float sto_d = (float)total_storage[d_idx];
 
     float sum_out = 0.0f;
-    for (int lv = 0; lv < num_levels; lv++) {
-        int li = p * num_levels + lv;
+    #pragma unroll
+    for (int lv = 0; lv < NUM_BIF_LEVELS; lv++) {
+        int li = p * NUM_BIF_LEVELS + lv;
         float manning = bif_manning[li];
         float cs_d    = bif_cs_depth[li];
         float elev    = bif_elevation[li];
         float width   = bif_width[li];
         float outf    = bif_outflow[li];
 
-        // Level 0: river WSE; Level > 0: protected WSE
         float current_max_wse = (lv == 0) ? max_wse : max_pwse;
         float upd_cs = fmaxf(current_max_wse - elev, 0.0f);
 
-        // Level 0: semi-implicit; Level > 0: explicit
         float semi;
         if (lv == 0) {
             semi = fmaxf(sqrtf(upd_cs * cs_d), sqrtf(upd_cs * 0.01f));
@@ -312,8 +292,8 @@ __global__ void compute_levee_bifurcation_outflow_kernel(
         }
 
         float unit_out = outf / width;
-        float num = width * (unit_out + gravity * time_step * semi * b_slope);
-        float den = 1.0f + gravity * time_step * (manning * manning)
+        float num = width * (unit_out + CMF_GRAVITY * time_step * semi * b_slope);
+        float den = 1.0f + CMF_GRAVITY * time_step * (manning * manning)
                     * fabsf(unit_out) * powf(semi, -7.0f / 3.0f);
         float upd = (semi > 1e-5f) ? (num / den) : 0.0f;
         sum_out += upd;
@@ -324,8 +304,9 @@ __global__ void compute_levee_bifurcation_outflow_kernel(
     float lr = fminf(0.05f * fminf(sto_c, sto_d)
                       / (fabsf(sum_out) * time_step), 1.0f);
     sum_out *= lr;
-    for (int lv = 0; lv < num_levels; lv++) {
-        bif_outflow[p * num_levels + lv] *= lr;
+    #pragma unroll
+    for (int lv = 0; lv < NUM_BIF_LEVELS; lv++) {
+        bif_outflow[p * NUM_BIF_LEVELS + lv] *= lr;
     }
 
     float pos = fmaxf(sum_out, 0.0f);
@@ -344,9 +325,9 @@ void launch_levee_bifurcation_outflow(
     torch::Tensor bif_elevation, torch::Tensor bif_cs_depth,
     torch::Tensor wse, torch::Tensor protected_wse,
     torch::Tensor total_storage, torch::Tensor outgoing_storage,
-    float gravity, torch::Tensor time_step_tensor, int num_paths, int num_levels
+    torch::Tensor time_step_tensor, int num_paths
 ) {
-    const int bs = 256;
+    const int bs = CMF_BLOCK_SIZE;
     const int grid = cdiv(num_paths, bs);
     const auto stream = at::cuda::getCurrentCUDAStream();
     compute_levee_bifurcation_outflow_kernel<<<grid, bs, 0, stream>>>(
@@ -357,5 +338,5 @@ void launch_levee_bifurcation_outflow(
         wse.data_ptr<float>(), protected_wse.data_ptr<float>(),
         total_storage.data_ptr<storage_t>(),
         outgoing_storage.data_ptr<storage_t>(),
-        gravity, time_step_tensor.data_ptr<float>(), num_paths, num_levels);
+        time_step_tensor.data_ptr<float>(), num_paths);
 }

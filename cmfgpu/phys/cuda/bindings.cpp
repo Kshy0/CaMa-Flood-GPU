@@ -13,13 +13,13 @@ void launch_outflow(
     torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor,
-    float, torch::Tensor, float, int, bool, bool);
+    torch::Tensor, int);
 
 void launch_inflow(
     torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, torch::Tensor, int, bool);
+    torch::Tensor, torch::Tensor, int);
 
 void launch_flood_stage(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -27,21 +27,21 @@ void launch_flood_stage(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    int, int, bool);
+    int);
 
 void launch_adaptive_time_step(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    float, float, float, int, bool);
+    float, float, int);
 
 void launch_bifurcation_outflow(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor,
-    float, torch::Tensor, int, int);
+    torch::Tensor, int);
 
 void launch_bifurcation_inflow(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, int, int);
+    torch::Tensor, int);
 
 void launch_reservoir_outflow(
     torch::Tensor, torch::Tensor, torch::Tensor,
@@ -55,13 +55,13 @@ void launch_levee_stage(
     torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, int, int);
+    torch::Tensor, int);
 
 void launch_levee_bifurcation_outflow(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    float, torch::Tensor, int, int);
+    torch::Tensor, int);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("launch_outflow", &launch_outflow);
