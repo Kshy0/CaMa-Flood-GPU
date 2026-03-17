@@ -312,19 +312,25 @@ class MERITMap(BaseModel):
             if self.skip_secondary_gauges and (ix2 >= 0 and iy2 >= 0):
                 continue
 
+            nx, ny = self.map_shape
             catchment_ids = []
 
             # Primary catchment
             if ix1 >= 0 and iy1 >= 0:
+                if ix1 >= nx or iy1 >= ny:
+                    continue  # skip gauge outside regional domain
                 catchment1 = np.ravel_multi_index((ix1, iy1), self.map_shape)
                 catchment_ids.append(catchment1)
                 gauge_id_set.add(catchment1)
 
             # Secondary catchment for type 2 gauges
             if type_num == 2 and ix2 >= 0 and iy2 >= 0:
-                catchment2 = np.ravel_multi_index((ix2, iy2), self.map_shape)
-                catchment_ids.append(catchment2)
-                gauge_id_set.add(catchment2)
+                if ix2 >= nx or iy2 >= ny:
+                    pass  # skip out-of-range secondary, keep primary if valid
+                else:
+                    catchment2 = np.ravel_multi_index((ix2, iy2), self.map_shape)
+                    catchment_ids.append(catchment2)
+                    gauge_id_set.add(catchment2)
 
             if catchment_ids:
                 self.gauge_info[gauge_name] = {

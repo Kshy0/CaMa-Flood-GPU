@@ -40,7 +40,7 @@ dataset.generate_mapping_table(
     npz_file="runoff_mapping_bin.npz",
 )
 
-# from cmfgpu.datasets.daily_bin_dataset import NetCDFDataset
+# from hydroforge.io.datasets import NetCDFDataset
 # dataset = NetCDFDataset(
 #     base_dir="/home/eat/cmf_v420_pkg/inp/test_15min_nc",
 #     start_date=datetime(2000, 1, 1),
@@ -52,7 +52,6 @@ dataset.generate_mapping_table(
 # )
 # dataset.generate_mapping_table(
 #     map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
-#     hires_map_tag="1min",
 #     out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}",
 #     npz_file="runoff_mapping_nc.npz",
 # )

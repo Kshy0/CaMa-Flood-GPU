@@ -25,7 +25,7 @@ def main():
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
     variables_to_save = {"mean": ["total_outflow"], "last": ["river_depth"]}
-    runoff_time_interval_hour = 24
+    runoff_time_interval_hour = 1
     time_step = runoff_time_interval_hour * 3600
     default_num_sub_steps = 360
 
@@ -37,7 +37,7 @@ def main():
     BLOCK_SIZE = 128
     save_state = False
     start_date = datetime(2000, 1, 1, 0, 0, 0)
-    end_date = datetime(2000, 12, 31, 0, 0, 0)
+    end_date = datetime(2000, 12, 31, 23, 0, 0)
     runoff_dir = "/home/eat/ERA5_Runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_era5.npz"
     prefix = "runoff_"
@@ -48,7 +48,7 @@ def main():
     # Spin-up configuration
     do_spin_up = False
     spin_up_start_date = datetime(2000, 1, 1, 0, 0, 0)
-    spin_up_end_date = datetime(2000, 12, 31, 0, 0, 0)
+    spin_up_end_date = datetime(2000, 12, 31, 23, 0, 0)
     spin_up_cycles = 1
     ### Configuration End ###
 

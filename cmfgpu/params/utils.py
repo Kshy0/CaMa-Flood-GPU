@@ -881,7 +881,7 @@ def crop_parameters_nc(
             if rootX != rootY:
                 parent_map[rootX] = rootY
 
-        if 'bifurcation_catchment_id' in src.variables:
+        if 'bifurcation_catchment_id' in src.variables and 'bifurcation_downstream_id' in src.variables:
              for b in kept_basin_ids:
                  for neighbor in basin_adj[b]:
                      if neighbor in parent_map:
@@ -1020,6 +1020,9 @@ def crop_parameters_nc(
                     dst[name][:] = new_data
 
                 else:
+                     # Skip variables whose dimensions were not created in dst
+                     if any(d not in dst.dimensions for d in dims):
+                         continue
                      dst.createVariable(name, var.dtype, dims, zlib=True)
                      dst[name][:] = data
             
