@@ -18,6 +18,7 @@ Example: estimate river width / height from ELSE_GPCC daily climatology.
 """
 
 from datetime import datetime
+import os
 
 import numpy as np
 from hydroforge.io.datasets import DailyBinDataset
@@ -29,6 +30,7 @@ from cmfgpu.params import estimate_river_geometry
 def main():
     ### Configuration Start ###
     resolution = "glb_15min"
+    map_dir = f"/home/eat/cmf_v420_pkg/map/{resolution}"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
 
     # Pre-computed 365-day runoff climatology (360×180, float32, mm/day)
@@ -36,7 +38,7 @@ def main():
     runoff_clm_dir = "/home/eat/cmf_v420_pkg/map/data"
     runoff_clm_prefix = "ELSE_GPCC_dayclm-1981-2010"
     runoff_clm_suffix = ".one"
-    runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
+    runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_clm.npz"
     runoff_shape = [180, 360]       # (ny, nx)
     unit_factor = 86400000          # mm/day → m/s
 
@@ -64,6 +66,17 @@ def main():
         suffix=runoff_clm_suffix,
         time_to_key=None,              # single file mode
     )
+
+    if not os.path.exists(runoff_mapping_file):
+        mapping_out_dir = os.path.dirname(runoff_mapping_file)
+        mapping_npz_file = os.path.basename(runoff_mapping_file)
+        os.makedirs(mapping_out_dir, exist_ok=True)
+        print(f"runoff mapping not found, generating: {runoff_mapping_file}")
+        dataset.generate_mapping_table(
+            map_dir=map_dir,
+            out_dir=mapping_out_dir,
+            npz_file=mapping_npz_file,
+        )
 
     local_mapping = dataset.build_local_mapping(
         mapping_file=runoff_mapping_file,
