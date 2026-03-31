@@ -149,6 +149,17 @@ class BaseModule(AbstractModule):
         mode="cpu",
     )
 
+    inflow_catchment_id: Optional[torch.Tensor] = BaseField(
+        description="Catchment ID for each inflow injection gauge",
+        dtype="int",
+        group_by="inflow_basin_id",
+        dim_coords=None,
+        shape=("num_inflow_gauges",),
+        default=None,
+        category="topology",
+        mode="cpu",
+    )
+
     # --------------------------------------------------------------------- #
     # Catchment properties
     # --------------------------------------------------------------------- #
@@ -348,6 +359,25 @@ class BaseModule(AbstractModule):
         if self.reservoir_catchment_id is None:
             return 0
         return self.reservoir_catchment_id.shape[0]
+
+    @computed_field(description="Total number of inflow injection gauges")
+    @cached_property
+    def num_inflow_gauges(self) -> int:
+        if self.inflow_catchment_id is None:
+            return 0
+        return self.inflow_catchment_id.shape[0]
+
+    @computed_base_field(
+        description="Indices (into catchment_id) for inflow injection gauges",
+        shape=("num_inflow_gauges",),
+        dtype="idx",
+        category="topology",
+    )
+    @cached_property
+    def inflow_catchment_idx(self) -> Optional[torch.Tensor]:
+        if self.inflow_catchment_id is None or self.inflow_catchment_id.numel() == 0:
+            return None
+        return find_indices_in_torch(self.inflow_catchment_id, self.catchment_id)
 
     @computed_base_field(
         description="Boolean mask for reservoir catchments",
@@ -642,6 +672,19 @@ class BaseModule(AbstractModule):
     def validate_catchment_save_idx(self) -> Self:
         if torch.any(self.catchment_save_idx < 0):
             raise ValueError("catchment_save_idx contains invalid indices (< 0). Check that catchment_save_id matches catchment_id.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_inflow_catchment_id(self) -> Self:
+        if self.inflow_catchment_id is not None and self.inflow_catchment_id.numel() > 0:
+            idx = find_indices_in_torch(self.inflow_catchment_id, self.catchment_id)
+            if torch.any(idx < 0):
+                bad = self.inflow_catchment_id[idx < 0].tolist()
+                raise ValueError(
+                    f"inflow_catchment_id contains entries absent from catchment_id: {bad}"
+                )
+            if torch.unique(self.inflow_catchment_id).numel() != self.inflow_catchment_id.numel():
+                raise ValueError("inflow_catchment_id must be unique")
         return self
 
     # ------------------------------------------------------------------ #

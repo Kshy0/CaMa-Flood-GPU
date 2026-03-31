@@ -96,6 +96,79 @@ def compute_init_river_depth(catchment_elevation, river_height, downstream_idx):
 
     return river_depth
 
+
+@njit(cache=True)
+def build_upstream_csr(catchment_id, downstream_id):
+    """Build CSR upstream adjacency in index space.
+
+    Returns (indptr, indices) where for node at index *i*,
+    its upstream neighbours are indices[indptr[i]:indptr[i+1]].
+    """
+    n = len(catchment_id)
+    id_to_idx = dict()
+    for i in range(n):
+        id_to_idx[catchment_id[i]] = i
+
+    # Pass 1: count upstream neighbours per node
+    count = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        did = downstream_id[i]
+        if did >= 0 and did != catchment_id[i] and did in id_to_idx:
+            count[id_to_idx[did]] += 1
+
+    # Pass 2: build indptr
+    indptr = np.zeros(n + 1, dtype=np.int32)
+    for i in range(n):
+        indptr[i + 1] = indptr[i] + count[i]
+
+    # Pass 3: fill indices
+    indices = np.empty(indptr[n], dtype=np.int32)
+    offset = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        did = downstream_id[i]
+        if did >= 0 and did != catchment_id[i] and did in id_to_idx:
+            d_idx = id_to_idx[did]
+            indices[indptr[d_idx] + offset[d_idx]] = i
+            offset[d_idx] += 1
+
+    return indptr, indices
+
+
+@njit(cache=True)
+def trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask):
+    """BFS upstream from *start_idx* over a CSR adjacency.
+
+    *stop_mask*: boolean array of length *n*.  Nodes where stop_mask is True
+    are **included** in the result but their upstream neighbours are **not**
+    expanded (except when they are the *start_idx* itself).
+
+    Returns a boolean visited array of length *n*.
+    """
+    visited = np.zeros(n, dtype=np.bool_)
+    queue = np.empty(n, dtype=np.int32)
+    front = 0
+    back = 0
+
+    queue[back] = start_idx
+    back += 1
+    visited[start_idx] = True
+
+    while front < back:
+        curr = queue[front]
+        front += 1
+        # Stop nodes are included but not expanded (except start)
+        if stop_mask[curr] and curr != start_idx:
+            continue
+        for j in range(indptr[curr], indptr[curr + 1]):
+            nb = indices[j]
+            if not visited[nb]:
+                visited[nb] = True
+                queue[back] = nb
+                back += 1
+
+    return visited
+
+
 def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
     """Reorder by basin size (vectorized to avoid Python-object memory overhead)."""
     topo_basin = basin_id[topo_idx]
@@ -252,15 +325,14 @@ def resolve_target_cids_from_poi(
                                    target_cids.extend(info.get("upstream_id", []))
                                    matched = True
                          if not matched:
-                              print(f"Warning: No gauges matched pattern '{pattern}'.")
+                              raise ValueError(f"No gauges matched pattern '{pattern}'.")
                     else:
                         if pattern in gauge_info:
                             target_cids.extend(gauge_info[pattern].get("upstream_id", []))
                         else:
-                            print(f"Warning: Gauge {pattern} not found in loaded gauge info.")
+                            raise ValueError(f"Gauge '{pattern}' not found in loaded gauge info.")
         else:
-             # Fallback or warning if gauge_info not provided (e.g. from NC without gauge vars)
-             print("Warning: 'gauges' POI requested but gauge_info not provided or available.")
+             raise ValueError("'gauges' POI requested but gauge_info not provided or available.")
 
     # 2) Coordinates
     coords_cids: List[int] = []
@@ -276,7 +348,8 @@ def resolve_target_cids_from_poi(
                        coords_cids.append(cid)
                        target_cids.append(cid)
                   else:
-                       print(f"Warning: No catchment found at coords ({x}, {y})")
+                       raise ValueError(f"No catchment found at coords ({x}, {y}). "
+                                        f"Use interactive mode to find valid coordinates.")
 
     # 3) Explicit Catchment IDs
     catches_val = poi.get("catchments")
@@ -315,6 +388,22 @@ def get_kept_basin_ids(
     
     kept_basin_ids = np.unique(catchment_basin_id[target_idx[valid_mask]])
     return kept_basin_ids
+
+
+def _build_upstream_adj(catchment_id, downstream_id):
+    """Build upstream adjacency (CSR + mapping).
+
+    Returns ``(indptr, indices, id_to_idx, cid_arr)`` where *indptr* / *indices*
+    are the CSR arrays in index-space, *id_to_idx* maps CID→index, and *cid_arr*
+    is the catchment_id array (int64).
+    """
+    cid_arr = np.asarray(catchment_id, dtype=np.int64)
+    did_arr = np.asarray(downstream_id, dtype=np.int64)
+    indptr, indices = build_upstream_csr(cid_arr, did_arr)
+    id_to_idx = {}
+    for i in range(len(cid_arr)):
+        id_to_idx[int(cid_arr[i])] = i
+    return indptr, indices, id_to_idx, cid_arr
 
 def plot_basins_common(
     map_shape: Tuple[int, int],
@@ -415,7 +504,7 @@ def plot_basins_common(
     default_cmap.set_bad(alpha=0.0)
 
     # Plot
-    display_dpi = 150 if interactive else 600
+    display_dpi = 150
     plt.figure(figsize=(12, 10), dpi=display_dpi)
     
     if color_by_upstream_area and uparea_map is not None:
@@ -491,7 +580,7 @@ def plot_basins_common(
         if use_lonlat: rmx, rmy = idx_to_lon(rmx), idx_to_lat(rmy)
         m = within_extent(rmx, rmy)
         if np.any(m):
-             plt.scatter(rmx[m], rmy[m], edgecolors='cyan', facecolors='none', s=1.0, marker='s', linewidths=0.2, label='River Mouth', zorder=7)
+             plt.scatter(rmx[m], rmy[m], c='red', edgecolors='black', s=20.0, marker='*', linewidths=0.3, label='River Mouth', zorder=7)
 
     if dams_xyc is not None:
         dx, dy, dcap = dams_xyc
@@ -553,7 +642,8 @@ def plot_basins_common(
 
         highlight_im = None
         cid_map = None
-        upstream_adj = None
+        _csr_indptr = None
+        _csr_indices = None
         cid_to_idx = None
         upstream_cache = {}
         # Mutable state for current selection (xi, yi in index space)
@@ -565,13 +655,9 @@ def plot_basins_common(
 
              cid_map = np.full(map_shape, fill_value=-1, dtype=np.int64)
              cid_map[catchment_x, catchment_y] = catchment_id
-             
-             upstream_adj = defaultdict(list)
-             for u, d in zip(catchment_id, downstream_id):
-                 if d >= 0 and d != u:
-                     upstream_adj[d].append(u)
-             
-             cid_to_idx = {cid: i for i, cid in enumerate(catchment_id)}
+
+             _adj = _build_upstream_adj(catchment_id, downstream_id)
+             _csr_indptr, _csr_indices, cid_to_idx, _ = _adj
 
         def _select_point(xi, yi):
             """Core selection logic shared by click, text input, and arrow keys."""
@@ -631,22 +717,15 @@ def plot_basins_common(
                       if clicked_cid in upstream_cache:
                           current_set = upstream_cache[clicked_cid]
                       else:
-                          current_set = set()
-                          q = [clicked_cid]
-                          visited = {clicked_cid}
-                          while q:
-                              curr = q.pop(0)
-                              if curr in upstream_cache:
-                                  current_set.update(upstream_cache[curr])
-                                  continue
-                              if curr in cid_to_idx:
-                                   idx = cid_to_idx[curr]
-                                   cx, cy = catchment_x[idx], catchment_y[idx]
-                                   current_set.add((cx, cy))
-                              for neighbor in upstream_adj[curr]:
-                                   if neighbor not in visited:
-                                       visited.add(neighbor)
-                                       q.append(neighbor)
+                          _n = len(catchment_id)
+                          _stop = np.zeros(_n, dtype=np.bool_)
+                          _vis = trace_upstream_bfs_csr(
+                              cid_to_idx[clicked_cid], _csr_indptr, _csr_indices, _n, _stop
+                          )
+                          current_set = set(
+                              (int(catchment_x[i]), int(catchment_y[i]))
+                              for i in range(_n) if _vis[i]
+                          )
                           upstream_cache[clicked_cid] = current_set
 
                       for cx, cy in current_set:
@@ -729,6 +808,9 @@ def plot_basins_common(
     if save_path:
         plt.savefig(save_path, dpi=600, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
+    else:
+        plt.show()
+        return
     plt.close()
 
 def visualize_nc_basins(
@@ -857,6 +939,42 @@ def visualize_nc_basins(
             color_by_upstream_area=color_by_upstream_area
         )
 
+
+def _trace_upstream_bfs(start_cid, upstream_adj, stop_at=None):
+    """BFS upstream from *start_cid*.  Returns a **set of CIDs**.
+
+    *upstream_adj* must be the tuple returned by ``_build_upstream_adj``.
+    If *stop_at* is a set of CIDs, those nodes are included but not expanded.
+    """
+    indptr, indices, id_to_idx, cid_arr = upstream_adj
+    n = len(cid_arr)
+    start_idx = id_to_idx[int(start_cid)]
+    stop_mask = np.zeros(n, dtype=np.bool_)
+    if stop_at is not None:
+        for s in stop_at:
+            si = int(s)
+            if si in id_to_idx:
+                stop_mask[id_to_idx[si]] = True
+    visited = trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
+    return set(int(cid_arr[i]) for i in range(n) if visited[i])
+
+
+def _check_poi_overlap(target_cids, poi_upstream):
+    """Raise ValueError if any POI is in the upstream set of another."""
+    target_set = set(int(c) for c in target_cids)
+    overlapping = []
+    for cid_a in target_set:
+        for cid_b in target_set:
+            if cid_a != cid_b and cid_a in poi_upstream[cid_b]:
+                overlapping.append((cid_a, cid_b))
+    if overlapping:
+        pairs_str = "; ".join(f"POI {a} is upstream of POI {b}" for a, b in overlapping)
+        raise ValueError(
+            f"Overlapping POIs detected (one is upstream of another): {pairs_str}. "
+            f"Please remove redundant POIs so that no POI is in the upstream set of another."
+        )
+
+
 def crop_parameters_nc(
     input_nc: Union[str, Path],
     output_nc: Union[str, Path],
@@ -865,6 +983,7 @@ def crop_parameters_nc(
     only_save_pois: bool = False,
     crop_upstream: bool = False,
     crop_downstream: bool = False,
+    crop_interval: bool = False,
     # Visualization options (forwarded to visualize_nc_basins)
     visualize_gauges: bool = True,
     visualize_bifurcations: bool = True,
@@ -887,13 +1006,19 @@ def crop_parameters_nc(
     unchanged so they route normally downstream. This is useful for removing upstream
     tributaries and injecting prescribed inflow at the POI locations.
     
-    crop_upstream and crop_downstream are mutually exclusive.
-    Overlapping POIs (one upstream of another) are not allowed and will raise a ValueError.
+    If crop_interval=True, each POI acts as a gauge defining an interval sub-basin. The
+    upstream BFS from each POI stops when it encounters another POI (included but not
+    traversed further). Each POI's downstream_id is set to self (river mouth), creating
+    independent interval basins. Catchments not reachable from any POI are removed.
+    POIs on the same flow path are allowed (this is the primary use case).
+    
+    crop_upstream, crop_downstream, and crop_interval are mutually exclusive.
+    For crop_upstream and crop_downstream, overlapping POIs are not allowed.
     """
     input_nc = Path(input_nc)
     output_nc = Path(output_nc)
-    if crop_upstream and crop_downstream:
-        raise ValueError("crop_upstream and crop_downstream cannot both be True.")
+    if sum([crop_upstream, crop_downstream, crop_interval]) > 1:
+        raise ValueError("Only one of crop_upstream, crop_downstream, crop_interval can be True.")
     if interactive:
         visualize = True
 
@@ -916,15 +1041,13 @@ def crop_parameters_nc(
             )
             
             if len(target_cids) == 0:
-                print("No valid target catchments found to crop to. Aborting.")
-                return
+                raise ValueError("No valid target catchments found from points_of_interest.")
 
             # Find basins containing these catchments
             kept_basin_ids = get_kept_basin_ids(target_cids, catchment_id, catchment_basin_id)
             
             if len(kept_basin_ids) == 0:
-                 print("Target catchments not found in map. Aborting.")
-                 return
+                 raise ValueError("Target catchments not found in map — basin lookup failed.")
         else:
             print("No points_of_interest provided or empty. Keeping all basins.")
             target_cids = np.array([], dtype=np.int64)
@@ -940,46 +1063,16 @@ def crop_parameters_nc(
                 print("Error: crop_upstream requires 'downstream_id' in the input NC. Aborting.")
                 return
 
-            # Build upstream adjacency (main-stem only): downstream_cid -> [upstream_cid, ...]
-            upstream_adj = defaultdict(list)
-            cid_to_idx = {int(cid): i for i, cid in enumerate(catchment_id)}
-            for i, (cid, did) in enumerate(zip(catchment_id, downstream_id)):
-                if did >= 0 and did != cid:
-                    upstream_adj[int(did)].append(int(cid))
+            upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
+            cid_to_idx = upstream_adj[2]
 
-            # For each POI, trace all upstream catchments (BFS)
-            def trace_upstream(start_cid):
-                visited = set()
-                queue = [int(start_cid)]
-                while queue:
-                    curr = queue.pop(0)
-                    if curr in visited:
-                        continue
-                    visited.add(curr)
-                    for u in upstream_adj[curr]:
-                        if u not in visited:
-                            queue.append(u)
-                return visited
-
-            poi_upstream = {}  # poi_cid -> set of all upstream cids (including self)
+            poi_upstream = {}
             for cid in target_cids:
-                poi_upstream[int(cid)] = trace_upstream(int(cid))
+                poi_upstream[int(cid)] = _trace_upstream_bfs(int(cid), upstream_adj)
 
-            # Check for overlapping POIs: error if any POI is upstream of another
-            target_set = set(int(c) for c in target_cids)
-            overlapping = []
-            for cid_a in target_set:
-                for cid_b in target_set:
-                    if cid_a != cid_b and cid_a in poi_upstream[cid_b]:
-                        overlapping.append((cid_a, cid_b))
-            if overlapping:
-                pairs_str = "; ".join(f"POI {a} is upstream of POI {b}" for a, b in overlapping)
-                raise ValueError(
-                    f"Overlapping POIs detected (one is upstream of another): {pairs_str}. "
-                    f"Please remove redundant POIs so that no POI is in the upstream set of another."
-                )
+            _check_poi_overlap(target_cids, poi_upstream)
 
-            effective_outlets = sorted(target_set)
+            effective_outlets = sorted(int(c) for c in target_cids)
             print(f"crop_upstream: Effective outlet POIs: {effective_outlets}")
 
             # Collect all upstream catchments of effective outlets
@@ -1022,43 +1115,13 @@ def crop_parameters_nc(
                 print("Error: crop_downstream requires 'downstream_id' in the input NC. Aborting.")
                 return
 
-            # Build upstream adjacency (main-stem only): downstream_cid -> [upstream_cid, ...]
-            upstream_adj = defaultdict(list)
-            for i, (cid, did) in enumerate(zip(catchment_id, downstream_id)):
-                if did >= 0 and did != cid:
-                    upstream_adj[int(did)].append(int(cid))
-
-            # For each POI, trace all upstream catchments (BFS)
-            def trace_upstream_dn(start_cid):
-                visited = set()
-                queue = [int(start_cid)]
-                while queue:
-                    curr = queue.pop(0)
-                    if curr in visited:
-                        continue
-                    visited.add(curr)
-                    for u in upstream_adj[curr]:
-                        if u not in visited:
-                            queue.append(u)
-                return visited
+            upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
 
             poi_upstream = {}
             for cid in target_cids:
-                poi_upstream[int(cid)] = trace_upstream_dn(int(cid))
+                poi_upstream[int(cid)] = _trace_upstream_bfs(int(cid), upstream_adj)
 
-            # Check for overlapping POIs: error if any POI is upstream of another
-            target_set = set(int(c) for c in target_cids)
-            overlapping = []
-            for cid_a in target_set:
-                for cid_b in target_set:
-                    if cid_a != cid_b and cid_a in poi_upstream[cid_b]:
-                        overlapping.append((cid_a, cid_b))
-            if overlapping:
-                pairs_str = "; ".join(f"POI {a} is upstream of POI {b}" for a, b in overlapping)
-                raise ValueError(
-                    f"Overlapping POIs detected (one is upstream of another): {pairs_str}. "
-                    f"Please remove redundant POIs so that no POI is in the upstream set of another."
-                )
+            _check_poi_overlap(target_cids, poi_upstream)
 
             # Remove upstream of each POI (excluding the POI itself — it becomes a headwater)
             for cid in target_cids:
@@ -1073,7 +1136,57 @@ def crop_parameters_nc(
 
             print(f"crop_downstream: Removing {len(removed_cid_set_dn)} upstream catchments above {len(target_cids)} POIs")
 
-        if crop_upstream:
+        # ── crop_interval mode: split river network into interval sub-basins at POIs ──
+        if crop_interval and len(target_cids) > 0:
+            if downstream_id is None:
+                print("Error: crop_interval requires 'downstream_id' in the input NC. Aborting.")
+                return
+
+            upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
+            cid_to_idx = upstream_adj[2]
+            poi_set = set(int(c) for c in target_cids)
+
+            # Interval BFS: trace upstream from each POI, stop at other POIs
+            poi_intervals = {}
+            for cid in target_cids:
+                poi_intervals[int(cid)] = _trace_upstream_bfs(int(cid), upstream_adj, stop_at=poi_set)
+
+            # Assign each catchment to its own POI (priority: self > downstream POI)
+            # Since main-stem is a tree, a catchment appears in at most two intervals:
+            # its own (if it's a POI) and the downstream POI's. Assign to self.
+            cid_to_interval_poi = {}  # catchment_id -> assigned poi_cid
+            # First pass: assign all non-POI catchments
+            sorted_pois = sorted(poi_set)
+            for poi_cid in sorted_pois:
+                for member_cid in poi_intervals[poi_cid]:
+                    if member_cid not in poi_set:
+                        # Non-POI: should belong to exactly one interval
+                        cid_to_interval_poi[member_cid] = poi_cid
+            # Second pass: each POI belongs to its own interval
+            for poi_cid in sorted_pois:
+                cid_to_interval_poi[poi_cid] = poi_cid
+
+            # Kept catchments = all assigned catchments
+            kept_cid_set = set(cid_to_interval_poi.keys())
+
+            # Assign basin IDs: each POI gets basin 0..N-1
+            poi_to_basin = {int(cid): i for i, cid in enumerate(sorted_pois)}
+            new_basin_assignment = np.full(len(catchment_id), -1, dtype=np.int64)
+            for member_cid, assigned_poi in cid_to_interval_poi.items():
+                if member_cid in cid_to_idx:
+                    new_basin_assignment[cid_to_idx[member_cid]] = poi_to_basin[assigned_poi]
+
+            # Set up variables like crop_upstream
+            outlet_cids = np.array(sorted_pois, dtype=np.int64)
+            keep_mask = np.isin(catchment_id, np.array(sorted(kept_cid_set), dtype=np.int64))
+            catchment_basin_id = new_basin_assignment
+            kept_basin_ids = np.arange(len(sorted_pois), dtype=np.int64)
+            num_kept_catchments = int(np.sum(keep_mask))
+            target_cids = outlet_cids
+
+            print(f"crop_interval: {len(sorted_pois)} interval basins, {num_kept_catchments} catchments kept")
+
+        if crop_upstream or crop_interval:
             # In crop_upstream mode, basins are already reassigned above.
             # No bifurcation expansion or union-find needed — each outlet defines its own basin.
             num_merged_basins = len(kept_basin_ids)
@@ -1188,12 +1301,21 @@ def crop_parameters_nc(
             
             bif_mask = None
             if 'bifurcation_basin_id' in src.variables:
-                 if crop_upstream or crop_downstream:
+                 if crop_upstream or crop_downstream or crop_interval:
                      # Filter by both endpoints being in the kept catchment set
                      bif_up = src['bifurcation_catchment_id'][:]
                      bif_dn = src['bifurcation_downstream_id'][:]
                      kept_set = set(int(c) for c in kept_catchment_ids)
-                     bif_mask = np.array([int(u) in kept_set and int(d) in kept_set for u, d in zip(bif_up, bif_dn)])
+                     if crop_interval:
+                         # For interval mode, both endpoints must also be in the SAME basin
+                         cid_to_new_basin_iv = dict(zip(catchment_id[keep_mask], catchment_basin_id[keep_mask]))
+                         bif_mask = np.array([
+                             int(u) in kept_set and int(d) in kept_set
+                             and cid_to_new_basin_iv.get(int(u), -1) == cid_to_new_basin_iv.get(int(d), -2)
+                             for u, d in zip(bif_up, bif_dn)
+                         ])
+                     else:
+                         bif_mask = np.array([int(u) in kept_set and int(d) in kept_set for u, d in zip(bif_up, bif_dn)])
                  else:
                      bif_basin_id = src['bifurcation_basin_id'][:]
                      bif_mask = np.isin(bif_basin_id, kept_basin_ids)
@@ -1202,7 +1324,7 @@ def crop_parameters_nc(
             
             lev_mask = None
             if 'levee_basin_id' in src.variables:
-                 if crop_upstream or crop_downstream:
+                 if crop_upstream or crop_downstream or crop_interval:
                      lev_cids = src['levee_catchment_id'][:] if 'levee_catchment_id' in src.variables else None
                      if lev_cids is not None:
                          lev_mask = np.isin(lev_cids, kept_catchment_ids)
@@ -1242,7 +1364,7 @@ def crop_parameters_nc(
 
                 if primary_dim == 'catchment':
                      new_data = data[keep_mask]
-                     if crop_upstream:
+                     if crop_upstream or crop_interval:
                          if name == 'catchment_basin_id':
                              # Already reassigned in new_basin_assignment
                              new_data = catchment_basin_id[keep_mask].astype(new_data.dtype)
@@ -1266,8 +1388,8 @@ def crop_parameters_nc(
                 elif primary_dim == 'basin':
                      if name == 'basin_sizes':
                           new_data = new_basin_sizes.astype(data.dtype)
-                     elif crop_upstream:
-                          # In crop_upstream, basins are newly defined; skip old basin-dim vars
+                     elif crop_upstream or crop_interval:
+                          # In crop_upstream/interval, basins are newly defined; skip old basin-dim vars
                           # that don't have a meaningful mapping (e.g. basin_start_offsets).
                           continue
                      else:
@@ -1279,7 +1401,7 @@ def crop_parameters_nc(
                 elif primary_dim == 'bifurcation_path' and bif_mask is not None:
                      new_data = data[bif_mask]
                      if name == 'bifurcation_basin_id':
-                          if crop_upstream:
+                          if crop_upstream or crop_interval:
                               # Remap using catchment-to-new-basin lookup from upstream catchment
                               bif_up_filtered = src['bifurcation_catchment_id'][:][bif_mask]
                               cid_to_new_basin = dict(zip(catchment_id[keep_mask], catchment_basin_id[keep_mask]))
@@ -1293,7 +1415,7 @@ def crop_parameters_nc(
                 elif primary_dim == 'levee' and lev_mask is not None:
                      new_data = data[lev_mask]
                      if name == 'levee_basin_id':
-                          if crop_upstream:
+                          if crop_upstream or crop_interval:
                               lev_cids_filtered = src['levee_catchment_id'][:][lev_mask] if 'levee_catchment_id' in src.variables else None
                               if lev_cids_filtered is not None:
                                   cid_to_new_basin = dict(zip(catchment_id[keep_mask], catchment_basin_id[keep_mask]))

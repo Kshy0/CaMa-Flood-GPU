@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import netCDF4 as nc
 import numpy as np
 
+from cmfgpu.params.utils import build_upstream_csr
+
 
 class TopologyReader:
     """
@@ -64,11 +66,17 @@ class TopologyReader:
         self.rev_adj: Dict[int, List[int]] = {}
         
         if self.d_ids is not None:
-            for i, did in enumerate(self.d_ids):
-                if did != -9999: # Valid downstream
-                    if did not in self.rev_adj:
-                        self.rev_adj[did] = []
-                    self.rev_adj[did].append(self.c_ids[i])
+            
+            _indptr, _indices = build_upstream_csr(
+                np.asarray(self.c_ids, dtype=np.int64),
+                np.asarray(self.d_ids, dtype=np.int64),
+            )
+            for i in range(len(self.c_ids)):
+                s, e = _indptr[i], _indptr[i + 1]
+                if s < e:
+                    self.rev_adj[int(self.c_ids[i])] = [
+                        int(self.c_ids[_indices[j]]) for j in range(s, e)
+                    ]
                 
         print(f"Loaded {len(self.c_ids)} catchments.")
 

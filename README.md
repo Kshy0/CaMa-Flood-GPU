@@ -13,7 +13,7 @@
 ## Prerequisites
 
 - Python == 3.14.*  
-- PyTorch (with CUDA support) == 2.10.0+cu130 — `triton` ships automatically with PyTorch on supported systems
+- PyTorch (with CUDA support) == 2.11.0+cu130 — `triton` ships automatically with PyTorch on supported systems
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4
@@ -87,6 +87,12 @@ pip install -e .
 ---
 
 ## Quick Start
+
+> **Tip:** The `scripts/` folder is version-controlled and may be updated with each `git pull`. To avoid losing your local path edits, it is recommended to copy it to a personal working copy before making changes:
+> ```shell
+> cp -r scripts scripts_user
+> ```
+> Use `scripts_user/` for your day-to-day work. When you pull updates, check `scripts/` for any new or changed templates and merge them into your copy as needed.
 
 All scripts in this repository are designed for maximum flexibility. Before running any script (such as `scripts/make_map_params.py` for model parameters or `scripts/make_runoff_map.py` for runoff mapping), **you must manually set the correct file and directory paths** inside the script. This may include:
 

@@ -17,8 +17,8 @@ Example: estimate river width / height from ELSE_GPCC daily climatology.
    (analogous to ``calc_rivwth.F90``).
 """
 
-from datetime import datetime
 import os
+from datetime import datetime
 
 import numpy as np
 from hydroforge.io.datasets import DailyBinDataset

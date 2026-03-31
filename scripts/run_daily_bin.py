@@ -19,12 +19,12 @@ from cmfgpu.models import CaMaFlood
 
 def main():
     ### Configuration Start ###
-    resolution = "glb_06min"
+    resolution = "glb_15min"
     experiment_name = f"{resolution}_bin"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out/"
     opened_modules = ["base", "adaptive_time","bifurcation"]
-    variables_to_save = {}
+    variables_to_save = {"mean": ["total_outflow"], "last": ["river_depth"]}
     time_step = 86400.0
     default_num_sub_steps = 360
     
@@ -45,6 +45,8 @@ def main():
     bin_dtype = "float32"
     prefix = "Roff____"
     suffix = ".one"
+    lat_south_to_north = False
+    lon_0_to_360 = False
     
     # Spin-up configuration
     do_spin_up = False
@@ -76,6 +78,8 @@ def main():
         spin_up_cycles=spin_up_cycles if do_spin_up else 0,
         spin_up_start_date=spin_up_start_date,
         spin_up_end_date=spin_up_end_date,
+        lat_south_to_north=lat_south_to_north,
+        lon_0_to_360=lon_0_to_360,
     )
 
     model = CaMaFlood(
