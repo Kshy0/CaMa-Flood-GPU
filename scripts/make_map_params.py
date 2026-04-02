@@ -25,7 +25,6 @@ gauge_file = f"{map_dir}/GRDC_alloc.txt"
 # Settings
 target_gpus = 1
 visualized = True
-basin_use_file = False
 # --- Configuration End ---
 
 merit_map = MERITMap(
@@ -35,7 +34,6 @@ merit_map = MERITMap(
     gauge_file=gauge_file,   # Set to None if not available
     visualized=visualized,
     bif_levels_to_keep=5,
-    basin_use_file=basin_use_file,
     target_gpus=target_gpus,
     out_file="parameters.nc",
 )

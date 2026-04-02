@@ -10,7 +10,7 @@ MERIT-based map parameter generation using Pydantic v2.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Union
 
 import numpy as np
 from hydroforge.modeling.distributed import find_indices_in
@@ -19,10 +19,12 @@ from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
 
 from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
+                                 merge_basins_bifurcation_thresholds,
                                  plot_basins_common, read_bifori,
                                  reorder_by_basin_size,
                                  resolve_target_cids_from_poi,
-                                 topological_sort, trace_outlets_dict)
+                                 search_optimal_merge_rate,
+                                 topological_sort, trace_outlets)
 
 
 class MERITMap(BaseModel):
@@ -67,9 +69,13 @@ class MERITMap(BaseModel):
         description="Keep first N levels from bifori; filter out paths with all zero widths in [1..N]"
     )
     
-    basin_use_file: bool = Field(
-        default=False,
-        description="If True, use basin.bin file to cut bifurcations crossing basin boundaries."
+    basin_merge_rate: Optional[Union[float, str]] = Field(
+        default="auto",
+        description=(
+            "Basin merge strategy. 'auto': merge as aggressively as possible "
+            "while keeping basins >= target_gpus.  float: manual rate "
+            "(e.g. 0.06). None: merge ALL bifurcation-connected basins (no threshold)."
+        ),
     )
 
     satellite_width_file: Optional[str] = Field(
@@ -263,7 +269,7 @@ class MERITMap(BaseModel):
         del nextxy_data  # release memory map
 
         # Trace to river mouths
-        river_mouth_id = trace_outlets_dict(catchment_id, downstream_id)
+        river_mouth_id = trace_outlets(catchment_id, downstream_id)
 
         # Store results
         self.catchment_x = catchment_x
@@ -377,8 +383,9 @@ class MERITMap(BaseModel):
         # 3) Basin stats and ids
         self.basin_sizes = basin_sizes
         self.num_basins  = len(basin_sizes)
-        _, inverse_indices = np.unique(self.root_mouth, return_inverse=True)
-        self.catchment_basin_id = inverse_indices.astype(np.int64)
+        # Assign basin IDs from contiguous group boundaries (size-descending order)
+        changes = np.concatenate(([True], self.root_mouth[1:] != self.root_mouth[:-1]))
+        self.catchment_basin_id = (np.cumsum(changes) - 1).astype(np.int64)
 
         # 4) Downstream indices and mouth fix-up
         self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
@@ -428,20 +435,86 @@ class MERITMap(BaseModel):
         self.bifurcation_catchment_id = np.ravel_multi_index((self.bifurcation_catchment_x, self.bifurcation_catchment_y), self.map_shape)
         self.bifurcation_downstream_id = np.ravel_multi_index((self.bifurcation_downstream_x, self.bifurcation_downstream_y), self.map_shape)
 
-        # Handle basin-based pruning if basin_use_file is True
+        # --- Basin merging / pruning strategy ---
         n_before = int(self.num_bifurcation_paths)
-        if self.basin_use_file:
-            basin_file = self.map_dir / "basin.bin"
-            # Read basin.bin (memory-mapped)
-            basin_data = self._open_memmap(basin_file, self.idx_precision, (self.nx, self.ny))
-            # Get basin IDs for bifurcation endpoints
-            bifurcation_up_basin = basin_data[self.bifurcation_catchment_x, self.bifurcation_catchment_y]
-            bifurcation_down_basin = basin_data[self.bifurcation_downstream_x, self.bifurcation_downstream_y]
-            # Keep only intra-basin bifurcations
-            keep_mask = (bifurcation_up_basin == bifurcation_down_basin)
-            
-            # When using basin file, we respect original basins (no merging)
-            self.root_mouth = self.river_mouth_id.copy()
+
+        if self.basin_merge_rate is not None:
+            # ===== Threshold merge ('auto' or manual rate) =====
+            tmp_idx_up = find_indices_in(self.bifurcation_catchment_id, self.catchment_id)
+            tmp_idx_dn = find_indices_in(self.bifurcation_downstream_id, self.catchment_id)
+            valid_bif = (tmp_idx_up >= 0) & (tmp_idx_dn >= 0)
+
+            if np.any(valid_bif):
+                bif_up_mouth = self.river_mouth_id[tmp_idx_up[valid_bif]]
+                bif_dn_mouth = self.river_mouth_id[tmp_idx_dn[valid_bif]]
+
+                # Map unique mouth IDs to contiguous indices, sorted by
+                # DESCENDING initial size so that min(ib, jb) always picks
+                # the larger basin — matching Fortran set_bif_basin_mpi.F90.
+                unique_mouths_raw = np.unique(self.river_mouth_id)
+                raw_idx = np.searchsorted(unique_mouths_raw, self.river_mouth_id)
+                num_unique = len(unique_mouths_raw)
+                raw_sizes = np.bincount(raw_idx, minlength=num_unique).astype(np.int64)
+                size_order = np.argsort(-raw_sizes)            # [largest, ..., smallest]
+                unique_mouths = unique_mouths_raw[size_order]  # reordered mouth IDs
+                inv_order = np.empty_like(size_order)
+                inv_order[size_order] = np.arange(num_unique)  # old→new mapping
+                mouth_to_idx = inv_order[raw_idx]              # per-catchment new index
+
+                # Basin sizes in new (descending-size) order
+                basin_sizes_arr = raw_sizes[size_order]
+
+                # Map bif endpoints to basin indices (new order)
+                bif_up_bidx = inv_order[np.searchsorted(unique_mouths_raw, bif_up_mouth)]
+                bif_dn_bidx = inv_order[np.searchsorted(unique_mouths_raw, bif_dn_mouth)]
+
+                # River-channel flag: wth[0] > 0
+                if self.bifurcation_width.ndim > 1:
+                    bif_is_river = self.bifurcation_width[valid_bif, 0] > 0
+                else:
+                    bif_is_river = np.ones(int(np.sum(valid_bif)), dtype=np.bool_)
+
+                if isinstance(self.basin_merge_rate, str) and self.basin_merge_rate == "auto":
+                    # Max merge first (rate=1.0); fall back to binary search only if needed
+                    parent_arr, merged_sizes = merge_basins_bifurcation_thresholds(
+                        bif_up_bidx, bif_dn_bidx, bif_is_river,
+                        basin_sizes_arr, 1.0,
+                    )
+                    n_merged_basins = len(np.unique(parent_arr))
+                    best_rate = 1.0
+                    if n_merged_basins < self.target_gpus:
+                        # Too few basins for the requested GPUs → search for a smaller rate
+                        best_rate, parent_arr, merged_sizes, n_merged_basins = search_optimal_merge_rate(
+                            bif_up_bidx, bif_dn_bidx, bif_is_river,
+                            basin_sizes_arr, self.target_gpus,
+                        )
+                    print(f"Auto merge (target_gpus={self.target_gpus}): "
+                          f"rate={best_rate:.6f}, {num_unique} → {n_merged_basins} basins")
+                else:
+                    # Manual rate
+                    parent_arr, merged_sizes = merge_basins_bifurcation_thresholds(
+                        bif_up_bidx, bif_dn_bidx, bif_is_river,
+                        basin_sizes_arr, float(self.basin_merge_rate),
+                    )
+                    n_merged_basins = len(np.unique(parent_arr))
+                    print(f"Manual merge (rate={self.basin_merge_rate}): "
+                          f"{num_unique} → {n_merged_basins} basins")
+
+                # Map back to root_mouth for each catchment
+                root_basin_idx = parent_arr[mouth_to_idx]
+                self.root_mouth = unique_mouths[root_basin_idx]
+
+                # Determine which bif paths cross basin boundaries after merge
+                all_bif_up_root = parent_arr[bif_up_bidx]
+                all_bif_dn_root = parent_arr[bif_dn_bidx]
+                keep_valid = (all_bif_up_root == all_bif_dn_root)
+
+                # Build full keep_mask (valid_bif positions get keep_valid, invalid stay True)
+                keep_mask = np.ones(self.num_bifurcation_paths, dtype=bool)
+                keep_mask[valid_bif] = keep_valid
+            else:
+                self.root_mouth = self.river_mouth_id.copy()
+                keep_mask = np.ones(self.num_bifurcation_paths, dtype=bool)
 
             # Set removed for visualization
             removed_mask = ~keep_mask
@@ -449,42 +522,52 @@ class MERITMap(BaseModel):
             self.removed_bifurcation_catchment_y = self.bifurcation_catchment_y[removed_mask]
             self.removed_bifurcation_downstream_x = self.bifurcation_downstream_x[removed_mask]
             self.removed_bifurcation_downstream_y = self.bifurcation_downstream_y[removed_mask]
+
         else:
-            # Calculate river mouths for bifurcation endpoints to allow basin merging
+            # ===== Default: merge ALL bifurcation-connected basins (no threshold) =====
             tmp_idx_up = find_indices_in(self.bifurcation_catchment_id, self.catchment_id)
             tmp_idx_dn = find_indices_in(self.bifurcation_downstream_id, self.catchment_id)
-            
-            # Filter valid indices (though they should be valid if loaded correctly)
             valid_bif = (tmp_idx_up >= 0) & (tmp_idx_dn >= 0)
-            
+
             if np.any(valid_bif):
                 ori_river_mouth_id = self.river_mouth_id[tmp_idx_up[valid_bif]]
                 bif_river_mouth_id = self.river_mouth_id[tmp_idx_dn[valid_bif]]
-                
-                # Merge basins using Union-Find
-                parent = {m: m for m in np.unique(self.river_mouth_id)}
-                
+
+                # Union-Find with compact array via searchsorted
+                unique_mouths = np.unique(self.river_mouth_id)
+                n_um = len(unique_mouths)
+                parent = np.arange(n_um, dtype=np.int64)
+
                 def find(x):
-                    if parent[x] != x:
-                        parent[x] = find(parent[x])
-                    return parent[x]
-                
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]
+                        x = parent[x]
+                    return x
+
                 def union(x, y):
                     rootX = find(x)
                     rootY = find(y)
                     if rootX != rootY:
                         parent[rootX] = rootY
-                
-                for m1, m2 in zip(ori_river_mouth_id, bif_river_mouth_id):
-                    union(m1, m2)
-                
-                # Update root_mouth based on merged results
-                self.root_mouth = np.array([find(m) for m in self.river_mouth_id], dtype=np.int64)
+
+                # Map mouth values to compact indices
+                ori_compact = np.searchsorted(unique_mouths, ori_river_mouth_id)
+                bif_compact = np.searchsorted(unique_mouths, bif_river_mouth_id)
+
+                for c1, c2 in zip(ori_compact, bif_compact):
+                    union(c1, c2)
+
+                # Ensure full path compression
+                for i in range(n_um):
+                    find(i)
+
+                # Map all river_mouth_id to their root
+                all_compact = np.searchsorted(unique_mouths, self.river_mouth_id)
+                self.root_mouth = unique_mouths[parent[all_compact]]
             else:
                 self.root_mouth = self.river_mouth_id.copy()
 
             keep_mask = np.ones(self.num_bifurcation_paths, dtype=bool)
-            # No removed
             self.removed_bifurcation_catchment_x = np.array([], dtype=np.int64)
             self.removed_bifurcation_catchment_y = np.array([], dtype=np.int64)
             self.removed_bifurcation_downstream_x = np.array([], dtype=np.int64)
@@ -516,8 +599,6 @@ class MERITMap(BaseModel):
         self._finalize_connectivity(root_mouth=self.root_mouth)
 
         # Always compute and report load distribution (LPT over basins -> simulated GPU assignment).
-        # If `basin_use_file` was used earlier we already printed pruning info; regardless, always
-        # produce the per-rank loads and warn on imbalance (>10%).
         def _lpt_schedule(sizes, n_bins):
             bins = [0] * max(1, int(n_bins))
             for size in sorted(list(sizes), reverse=True):
@@ -543,55 +624,6 @@ class MERITMap(BaseModel):
                 f"Warning: Load imbalance detected across {self.target_gpus} ranks. "
                 f"Max deviation = {max_dev:.2%}, loads = {loads}, average = {avg_load:.2f}"
             )
-
-        # If basin_use_file is True, also compute and report the unpruned case
-        if self.basin_use_file:
-            # Compute unpruned basin sizes (allowing bifurcations to merge basins)
-            def compute_merged_basin_sizes(river_mouth_id, bifurcation_catchment_id, bifurcation_downstream_id, catchment_id):
-                from collections import defaultdict
-                parent = {}
-                def find(x):
-                    if x not in parent:
-                        parent[x] = x
-                    if parent[x] != x:
-                        parent[x] = find(parent[x])
-                    return parent[x]
-                def union(x, y):
-                    px = find(x)
-                    py = find(y)
-                    if px != py:
-                        parent[px] = py
-                catchment_to_basin = {cid: rid for cid, rid in zip(catchment_id, river_mouth_id)}
-                for up_cid, down_cid in zip(bifurcation_catchment_id, bifurcation_downstream_id):
-                    if up_cid in catchment_to_basin and down_cid in catchment_to_basin:
-                        union(catchment_to_basin[up_cid], catchment_to_basin[down_cid])
-                basin_to_size = defaultdict(int)
-                for cid in catchment_id:
-                    root = find(catchment_to_basin[cid])
-                    basin_to_size[root] += 1
-                return list(basin_to_size.values())
-
-            # Use original bifurcation arrays before pruning
-            orig_bif_catchment_id = np.ravel_multi_index((pth_upst[:, 0], pth_upst[:, 1]), self.map_shape)
-            orig_bif_downstream_id = np.ravel_multi_index((pth_down[:, 0], pth_down[:, 1]), self.map_shape)
-            unpruned_basin_sizes = compute_merged_basin_sizes(self.river_mouth_id, orig_bif_catchment_id, orig_bif_downstream_id, self.catchment_id)
-            unpruned_loads = _lpt_schedule(unpruned_basin_sizes, self.target_gpus)
-            print(f"Unpruned GPU loads (LPT over merged basins, ranks={self.target_gpus}): {unpruned_loads}")
-
-            # Check imbalance for unpruned
-            total_unpruned_load = sum(unpruned_loads)
-            if total_unpruned_load > 0:
-                avg_unpruned_load = total_unpruned_load / max(1, int(self.target_gpus))
-                max_unpruned_dev = max(abs(l - avg_unpruned_load) / avg_unpruned_load for l in unpruned_loads)
-            else:
-                avg_unpruned_load = 0.0
-                max_unpruned_dev = 0.0
-
-            if max_unpruned_dev > imbalance_threshold:
-                print(
-                    f"Warning: Load imbalance detected in unpruned case across {self.target_gpus} ranks. "
-                    f"Max deviation = {max_unpruned_dev:.2%}, loads = {unpruned_loads}, average = {avg_unpruned_load:.2f}"
-                )
 
     def filter_to_poi_basins(self) -> None:
         """
@@ -1079,8 +1111,10 @@ class MERITMap(BaseModel):
                 gauge_catchment_ids.extend(info["upstream_id"])
             gauge_catchment_ids = np.unique(gauge_catchment_ids)
             
-            catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
-            gauge_indices = [catchment_id_to_idx[cid] for cid in gauge_catchment_ids if cid in catchment_id_to_idx]
+            grid_to_idx = np.full(int(self.catchment_id.max()) + 1, -1, dtype=np.int64)
+            grid_to_idx[self.catchment_id] = np.arange(len(self.catchment_id), dtype=np.int64)
+            gauge_idx_vals = grid_to_idx[gauge_catchment_ids[gauge_catchment_ids < len(grid_to_idx)]]
+            gauge_indices = list(gauge_idx_vals[gauge_idx_vals >= 0])
             
             if gauge_indices:
                  gauges_xy = (self.catchment_x[gauge_indices], self.catchment_y[gauge_indices])
@@ -1118,13 +1152,14 @@ class MERITMap(BaseModel):
         if interactive_basin_picker:
             basin_extra_text = {}
             if getattr(self, "num_gauges", 0) > 0 and hasattr(self, "gauge_info"):
-                # Build lookup table
-                catchment_id_to_idx = {cid: idx for idx, cid in enumerate(self.catchment_id)}
+                # Build lookup table (flat array)
+                grid_to_idx2 = np.full(int(self.catchment_id.max()) + 1, -1, dtype=np.int64)
+                grid_to_idx2[self.catchment_id] = np.arange(len(self.catchment_id), dtype=np.int64)
                 basin_to_gauges: Dict[int, List[str]] = {}
                 
                 for gname, info in self.gauge_info.items():
                     for cid in info.get("upstream_id", []):
-                        idx = catchment_id_to_idx.get(cid, -1)
+                        idx = grid_to_idx2[int(cid)] if int(cid) < len(grid_to_idx2) else -1
                         if idx >= 0:
                             b = int(self.catchment_basin_id[idx])
                             basin_to_gauges.setdefault(b, []).append(str(gname))
@@ -1209,7 +1244,7 @@ if __name__ == "__main__":
         levee_flag=False,
         visualized=True,
         bif_levels_to_keep=5,
-        basin_use_file=False,
+        basin_merge_rate="auto",  # 'auto', float (e.g. 0.06), or None (merge all)
         target_gpus=1,
         out_file="parameters.nc",
     )

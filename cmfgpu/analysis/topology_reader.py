@@ -59,24 +59,22 @@ class TopologyReader:
         self.c_x = self.catchment_data.get('catchment_x')
         self.c_y = self.catchment_data.get('catchment_y')
 
-        # Build ID -> Index map
-        self.id_to_idx = {cid: i for i, cid in enumerate(self.c_ids)}
+        # Build ID -> Index map (flat array)
+        max_cid = int(self.c_ids.max())
+        self.grid_to_idx = np.full(max_cid + 1, -1, dtype=np.int64)
+        self.grid_to_idx[self.c_ids] = np.arange(len(self.c_ids), dtype=np.int64)
+        self._max_cid = max_cid
         
-        # Build Upstream Adjacency (Downstream ID -> List of Upstream IDs)
-        self.rev_adj: Dict[int, List[int]] = {}
+        # Build Upstream Adjacency via CSR
+        self._csr_indptr = None
+        self._csr_indices = None
         
         if self.d_ids is not None:
             
-            _indptr, _indices = build_upstream_csr(
+            self._csr_indptr, self._csr_indices = build_upstream_csr(
                 np.asarray(self.c_ids, dtype=np.int64),
                 np.asarray(self.d_ids, dtype=np.int64),
             )
-            for i in range(len(self.c_ids)):
-                s, e = _indptr[i], _indptr[i + 1]
-                if s < e:
-                    self.rev_adj[int(self.c_ids[i])] = [
-                        int(self.c_ids[_indices[j]]) for j in range(s, e)
-                    ]
                 
         print(f"Loaded {len(self.c_ids)} catchments.")
 
@@ -87,6 +85,26 @@ class TopologyReader:
             
         self.ds = None
         self._load_data()
+
+    def _has_cid(self, cid: int) -> bool:
+        """Check if catchment ID exists in the dataset."""
+        return 0 <= cid <= self._max_cid and self.grid_to_idx[cid] >= 0
+
+    def _idx_of(self, cid: int) -> int:
+        """Get array index for catchment ID. Returns -1 if not found."""
+        if 0 <= cid <= self._max_cid:
+            return int(self.grid_to_idx[cid])
+        return -1
+
+    def _get_upstream(self, cid: int) -> List[int]:
+        """Get upstream catchment IDs from CSR adjacency."""
+        if self._csr_indptr is None:
+            return []
+        idx = self._idx_of(cid)
+        if idx < 0:
+            return []
+        s, e = self._csr_indptr[idx], self._csr_indptr[idx + 1]
+        return [int(self.c_ids[self._csr_indices[j]]) for j in range(s, e)]
 
     def get_id_from_xy(self, x: int, y: int) -> Optional[int]:
         """Find catchment ID from (x, y) coordinates."""
@@ -107,14 +125,14 @@ class TopologyReader:
             if cid is None:
                 return None
         
-        if cid not in self.id_to_idx:
+        if not self._has_cid(cid):
             return None
             
-        idx = self.id_to_idx[cid]
+        idx = self._idx_of(cid)
         
         info = {
             "index": int(idx),
-            "upstream_ids": self.rev_adj.get(cid, [])
+            "upstream_ids": self._get_upstream(cid)
         }
         
         # Add all loaded catchment variables
@@ -262,7 +280,7 @@ class TopologyReader:
         visited_main = {mouth_id}
         curr = mouth_id
         while True:
-            ups = self.rev_adj.get(curr, [])
+            ups = self._get_upstream(curr)
             if not ups:
                 break
             # Choose up with max area
@@ -270,8 +288,8 @@ class TopologyReader:
             max_area = -1.0
             
             for up in ups:
-                if up in self.id_to_idx:
-                    u_idx = self.id_to_idx[up]
+                if self._has_cid(up):
+                    u_idx = self._idx_of(up)
                     # Check if in basin
                     if self.b_ids[u_idx] == basin_id:
                         area = self.catchment_data['upstream_area'][u_idx] if 'upstream_area' in self.catchment_data else 0
@@ -290,17 +308,18 @@ class TopologyReader:
         target_path = []
         visited_target = set()
         curr = target_cid
-        while curr in self.id_to_idx:
+        while self._has_cid(curr):
             if curr in visited_target:
                 print(f"Warning: Cycle detected at {curr}")
                 break
             visited_target.add(curr)
             target_path.append(curr)
-            idx = self.id_to_idx[curr]
+            idx = self._idx_of(curr)
             did = self.d_ids[idx]
             if did == -9999 or did == curr:
                 break
-            if did in self.id_to_idx and self.b_ids[self.id_to_idx[did]] == basin_id:
+            did_idx = self._idx_of(did)
+            if did_idx >= 0 and self.b_ids[did_idx] == basin_id:
                 curr = did
             else:
                 break
@@ -317,8 +336,8 @@ class TopologyReader:
             cid = self.c_ids[idx]
             did = self.d_ids[idx]
             
-            if did != -9999 and did in self.id_to_idx:
-                d_idx = self.id_to_idx[did]
+            if did != -9999 and self._has_cid(did):
+                d_idx = self._idx_of(did)
                 
                 # Coords
                 x1_c, y1_c = c_x_plot[idx], c_y_plot[idx]
@@ -353,8 +372,8 @@ class TopologyReader:
         ax.scatter(target_x, target_y, c='red', s=200, marker='*', label='Target', zorder=100, edgecolors='black')
         
         # Plot Outlet Point
-        if mouth_id in self.id_to_idx:
-            mouth_idx_global = self.id_to_idx[mouth_id]
+        if self._has_cid(mouth_id):
+            mouth_idx_global = self._idx_of(mouth_id)
             mouth_x = c_x_plot[mouth_idx_global]
             mouth_y = c_y_plot[mouth_idx_global]
             ax.scatter(mouth_x, mouth_y, c='cyan', s=150, marker='s', label='Outlet', zorder=100, edgecolors='black')
@@ -392,9 +411,9 @@ class TopologyReader:
         curr = target_cid
         visited = {curr}
         while True:
-            if curr not in self.id_to_idx:
+            if not self._has_cid(curr):
                 break
-            idx = self.id_to_idx[curr]
+            idx = self._idx_of(curr)
             did = self.d_ids[idx]
             
             if did == -9999:
@@ -412,7 +431,7 @@ class TopologyReader:
         visited_up = {curr}
         
         while True:
-            ups = self.rev_adj.get(curr, [])
+            ups = self._get_upstream(curr)
             if not ups:
                 break
             
@@ -421,8 +440,8 @@ class TopologyReader:
             max_area = -1.0
             
             for up in ups:
-                if up in self.id_to_idx:
-                    u_idx = self.id_to_idx[up]
+                if self._has_cid(up):
+                    u_idx = self._idx_of(up)
                     area = self.catchment_data['upstream_area'][u_idx] if 'upstream_area' in self.catchment_data else 0
                     if area > max_area:
                         max_area = area

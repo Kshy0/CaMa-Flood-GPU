@@ -161,9 +161,12 @@ def _rebuild_nextxy(
 
     is_mouth = downstream_id == catchment_id  # mouths point to themselves in NC
 
-    # Build id → (x, y) lookup
-    id_to_x = dict(zip(catchment_id, catchment_x))
-    id_to_y = dict(zip(catchment_id, catchment_y))
+    # Build id → (x, y) lookup with flat arrays
+    max_cid = int(catchment_id.max())
+    grid_to_x = np.full(max_cid + 1, -1, dtype=np.int64)
+    grid_to_y = np.full(max_cid + 1, -1, dtype=np.int64)
+    grid_to_x[catchment_id] = catchment_x
+    grid_to_y[catchment_id] = catchment_y
 
     for i in range(len(catchment_id)):
         ix, iy = int(catchment_x[i]), int(catchment_y[i])
@@ -171,9 +174,9 @@ def _rebuild_nextxy(
             nextxy[ix, iy, :] = _MOUTH_OCEAN
         else:
             ds_id = int(downstream_id[i])
-            if ds_id in id_to_x:
-                nextxy[ix, iy, 0] = int(id_to_x[ds_id]) + 1  # 1-based
-                nextxy[ix, iy, 1] = int(id_to_y[ds_id]) + 1
+            if 0 <= ds_id <= max_cid and grid_to_x[ds_id] >= 0:
+                nextxy[ix, iy, 0] = int(grid_to_x[ds_id]) + 1  # 1-based
+                nextxy[ix, iy, 1] = int(grid_to_y[ds_id]) + 1
             else:
                 # Downstream cell not in subset → treat as mouth
                 nextxy[ix, iy, :] = _MOUTH_OCEAN
@@ -224,29 +227,33 @@ def _write_bifprm(
     n_paths = len(bif_cx)
     n_levels = bif_width.shape[1] if bif_width.ndim == 2 else 1
 
-    # Build coordinate lookups for lat/lon
+    # Build 2D grid lookups (avoids dict altogether)
+    max_x = int(max(catchment_x.max(), bif_cx.max(), bif_dx.max())) if n_paths > 0 else int(catchment_x.max())
+    max_y = int(max(catchment_y.max(), bif_cy.max(), bif_dy.max())) if n_paths > 0 else int(catchment_y.max())
+    grid_shape = (max_x + 1, max_y + 1)
+
+    cid_grid = np.full(grid_shape, -1, dtype=np.int64)
+    cid_grid[catchment_x.astype(int), catchment_y.astype(int)] = catchment_id
+
+    lon_grid = np.zeros(grid_shape, dtype=np.float64)
+    lat_grid = np.zeros(grid_shape, dtype=np.float64)
     if longitude is not None and latitude is not None:
-        id_to_lon = dict(zip(catchment_id, longitude))
-        id_to_lat = dict(zip(catchment_id, latitude))
+        lon_grid[catchment_x.astype(int), catchment_y.astype(int)] = longitude
+        lat_grid[catchment_x.astype(int), catchment_y.astype(int)] = latitude
+        has_latlon = True
     else:
-        id_to_lon = id_to_lat = None
+        has_latlon = False
 
-    # Build river-mouth lookup for basin IDs
+    mouth_grid = np.full(grid_shape, missing_int, dtype=np.int64)
     if river_mouth_id is not None:
-        id_to_mouth = dict(zip(catchment_id, river_mouth_id))
+        mouth_grid[catchment_x.astype(int), catchment_y.astype(int)] = river_mouth_id
+        has_mouth = True
     else:
-        id_to_mouth = None
+        has_mouth = False
 
-    # Map (x, y) → catchment_id
-    xy_to_cid = {}
-    for cid, cx, cy in zip(catchment_id, catchment_x, catchment_y):
-        xy_to_cid[(int(cx), int(cy))] = int(cid)
-
-    # Map (x, y) → ground elevation (for PELV fallback)
-    xy_to_elevtn = {}
+    elevtn_grid = np.full(grid_shape, np.nan, dtype=np.float64)
     if catchment_elevation is not None:
-        for cx, cy, elv in zip(catchment_x, catchment_y, catchment_elevation):
-            xy_to_elevtn[(int(cx), int(cy))] = float(elv)
+        elevtn_grid[catchment_x.astype(int), catchment_y.astype(int)] = catchment_elevation
 
     with open(path, "w") as f:
         f.write(
@@ -291,10 +298,9 @@ def _write_bifprm(
 
             # Fallback: use catchment_elevation at the upstream cell
             if abs(elev_val - (-9999.0)) < 1.0:
-                up_elevtn = xy_to_elevtn.get(
-                    (int(bif_cx[i]), int(bif_cy[i])), None
-                )
-                if up_elevtn is not None and abs(up_elevtn) < 1e10:
+                up_x, up_y = int(bif_cx[i]), int(bif_cy[i])
+                up_elevtn = elevtn_grid[up_x, up_y]
+                if not np.isnan(up_elevtn) and abs(up_elevtn) < 1e10:
                     elev_val = up_elevtn
 
             # Recover PDPH from level 0
@@ -314,20 +320,20 @@ def _write_bifprm(
                 w0 = float(bif_width[i])
                 widths = [w0 if abs(w0) < 1e10 else 0.0]
 
-            # Lat / Lon from upstream cell
-            up_cid = xy_to_cid.get((int(bif_cx[i]), int(bif_cy[i])), None)
-            if id_to_lat is not None and up_cid is not None:
-                lat_val = float(id_to_lat.get(up_cid, 0.0))
-                lon_val = float(id_to_lon.get(up_cid, 0.0))
+            # Lat / Lon from upstream cell via 2D grid
+            up_x, up_y = int(bif_cx[i]), int(bif_cy[i])
+            if has_latlon and cid_grid[up_x, up_y] >= 0:
+                lat_val = float(lat_grid[up_x, up_y])
+                lon_val = float(lon_grid[up_x, up_y])
             else:
                 lat_val = 0.0
                 lon_val = 0.0
 
-            # Basin IDs from river mouths
-            dn_cid = xy_to_cid.get((int(bif_dx[i]), int(bif_dy[i])), None)
-            if id_to_mouth is not None:
-                basin_up = int(id_to_mouth.get(up_cid, missing_int)) if up_cid is not None else missing_int
-                basin_dn = int(id_to_mouth.get(dn_cid, missing_int)) if dn_cid is not None else missing_int
+            # Basin IDs from river mouths via 2D grid
+            dn_x, dn_y = int(bif_dx[i]), int(bif_dy[i])
+            if has_mouth:
+                basin_up = int(mouth_grid[up_x, up_y]) if cid_grid[up_x, up_y] >= 0 else missing_int
+                basin_dn = int(mouth_grid[dn_x, dn_y]) if cid_grid[dn_x, dn_y] >= 0 else missing_int
             else:
                 basin_up = missing_int
                 basin_dn = missing_int
@@ -432,8 +438,9 @@ def _write_dam_params_csv(
         print("  No dams inside the output grid — skipping dam_params.csv")
         return
 
-    # ---- Build catchment_id → array-index lookup ----
-    cid_to_idx = {int(cid): i for i, cid in enumerate(catchment_id)}
+    # ---- Build catchment_id → array-index lookup (flat array) ----
+    grid_to_idx = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
+    grid_to_idx[catchment_id] = np.arange(len(catchment_id), dtype=np.int64)
 
     # ---- Reverse-engineer FldVol from emergency_volume and conservation_volume ----
     #      EmeVol = ConVol + FldVol * 0.95  →  FldVol = (EmeVol - ConVol) / 0.95
@@ -460,15 +467,15 @@ def _write_dam_params_csv(
 
             # Lat / Lon / upstream area from catchment arrays
             cid_int = int(reservoir_catchment_id[i])
-            catch_idx = cid_to_idx.get(cid_int, None)
-            if catch_idx is not None and latitude is not None:
+            catch_idx = int(grid_to_idx[cid_int]) if cid_int < len(grid_to_idx) and grid_to_idx[cid_int] >= 0 else -1
+            if catch_idx >= 0 and latitude is not None:
                 lat_val = float(latitude[catch_idx])
                 lon_val = float(longitude[catch_idx])
             else:
                 lat_val = 0.0
                 lon_val = 0.0
 
-            if catch_idx is not None and upstream_area is not None:
+            if catch_idx >= 0 and upstream_area is not None:
                 upreal_km2 = float(upstream_area[catch_idx]) / 1.0e6  # m² → km²
             else:
                 upreal_km2 = 0.0
@@ -968,15 +975,17 @@ def export_inpmat(
 
     print(f"    Map grid: {out_nx}×{out_ny},  INPN={inpn}")
 
-    # Build npz_catchment_id → row-index in sparse matrix
-    npz_cid_to_row = {int(cid): r for r, cid in enumerate(npz_catchment_ids)}
+    # Build npz_catchment_id → row-index with flat array
+    max_npz_cid = int(npz_catchment_ids.max())
+    npz_grid_to_row = np.full(max_npz_cid + 1, -1, dtype=np.int64)
+    npz_grid_to_row[npz_catchment_ids.astype(np.int64)] = np.arange(len(npz_catchment_ids), dtype=np.int64)
 
-    # Build catchment_id → (cx, cy) in output grid coordinates
-    nc_cid_to_xy = {}
-    for cid, x, y in zip(nc_cid, nc_cx, nc_cy):
-        cx = int(x) - x_min
-        cy = int(y) - y_min
-        nc_cid_to_xy[int(cid)] = (cx, cy)
+    # Build catchment_id → (cx, cy) in output grid coordinates with flat arrays
+    max_nc_cid = int(nc_cid.max())
+    nc_grid_cx = np.full(max_nc_cid + 1, -9999, dtype=np.int64)
+    nc_grid_cy = np.full(max_nc_cid + 1, -9999, dtype=np.int64)
+    nc_grid_cx[nc_cid.astype(np.int64)] = nc_cx.astype(np.int64) - x_min
+    nc_grid_cy[nc_cid.astype(np.int64)] = nc_cy.astype(np.int64) - y_min
 
     # --- Allocate output arrays (out_nx, out_ny, INPN) ---
     INPX = np.zeros((out_nx, out_ny, inpn), dtype="<i4")
@@ -988,10 +997,10 @@ def export_inpmat(
     # --- Populate per-cell mapping ---
     for cid in npz_catchment_ids:
         cid_int = int(cid)
-        if cid_int not in nc_cid_to_xy:
+        if cid_int > max_nc_cid or nc_grid_cx[cid_int] == -9999:
             continue  # catchment not in this NC (e.g. different crop)
-        row = npz_cid_to_row[cid_int]
-        ix, iy = nc_cid_to_xy[cid_int]
+        row = int(npz_grid_to_row[cid_int])
+        ix, iy = int(nc_grid_cx[cid_int]), int(nc_grid_cy[cid_int])
 
         if ix < 0 or ix >= out_nx or iy < 0 or iy >= out_ny:
             continue  # outside cropped grid

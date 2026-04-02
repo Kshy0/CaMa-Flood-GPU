@@ -15,37 +15,94 @@ from netCDF4 import Dataset
 from numba import njit
 
 
-@njit
-def trace_outlets_dict(catchment_id, downstream_id):
-    """Numba-optimized function to trace outlets."""
-    id_to_down = dict()
-    for i in range(len(catchment_id)):
-        id_to_down[catchment_id[i]] = downstream_id[i]
+@njit(cache=True)
+def trace_outlets(catchment_id, downstream_id):
+    """Array-based outlet tracing with path compression.
 
-    result = np.zeros(len(catchment_id), dtype=np.int32)
+    Uses a flat lookup array instead of a typed dict for O(1) access.
+    Path compression ensures each cell is traced at most once.
+    """
+    n = len(catchment_id)
 
-    for i in range(len(catchment_id)):
-        current = catchment_id[i]
-        while id_to_down[current] >= 0:
-            current = id_to_down[current]
-        result[i] = current
+    # Determine array size from max grid id
+    max_id = np.int64(0)
+    for i in range(n):
+        if catchment_id[i] > max_id:
+            max_id = catchment_id[i]
+        if downstream_id[i] > max_id:
+            max_id = downstream_id[i]
+    total = max_id + 1
+
+    # Downstream lookup array (replaces typed dict)
+    #   >= 0  : downstream grid id (unresolved)
+    #   -1    : river mouth (unresolved)
+    #   -2    : not a valid cell
+    #   <= -3 : resolved, outlet = -(value + 3)
+    down = np.full(total, np.int64(-2))
+    for i in range(n):
+        down[catchment_id[i]] = downstream_id[i]
+
+    result = np.empty(n, dtype=np.int64)
+
+    for i in range(n):
+        cid = catchment_id[i]
+        v = down[cid]
+
+        # Already resolved via path compression
+        if v <= -3:
+            result[i] = -(v + 3)
+            continue
+
+        # Trace downstream to mouth or resolved cell
+        current = cid
+        while down[current] >= 0:
+            current = down[current]
+
+        # current is a mouth (down==-1) or already resolved (down<=-3)
+        v = down[current]
+        if v <= -3:
+            mouth = -(v + 3)
+        else:
+            mouth = current
+
+        # Path compression: mark all cells along the path
+        current = cid
+        while down[current] >= 0:
+            nxt = down[current]
+            down[current] = -(mouth + 3)
+            current = nxt
+        down[current] = -(mouth + 3)
+
+        result[i] = mouth
+
     return result
 
-@njit
-def topological_sort(catchment_id, downstream_id):
-    """Numba-optimized topological sorting."""
-    id_to_index = dict()
-    for i in range(len(catchment_id)):
-        id_to_index[catchment_id[i]] = i
 
+@njit(cache=True)
+def topological_sort(catchment_id, downstream_id):
+    """Array-based topological sorting."""
     n = len(catchment_id)
+
+    # Determine array size from max grid id
+    max_id = np.int64(0)
+    for i in range(n):
+        if catchment_id[i] > max_id:
+            max_id = catchment_id[i]
+    total = max_id + 1
+
+    # Grid-id to index lookup (replaces typed dict)
+    grid_to_idx = np.full(total, np.int64(-1))
+    for i in range(n):
+        grid_to_idx[catchment_id[i]] = np.int64(i)
+
     indegree = np.zeros(n, dtype=np.int32)
 
     for i in range(n):
         d_id = downstream_id[i]
-        if d_id >= 0 and d_id in id_to_index:
-            d_idx = id_to_index[d_id]
-            indegree[d_idx] += 1
+        if d_id >= 0 and d_id < total:
+            d_idx = grid_to_idx[d_id]
+            if d_idx >= 0:
+                indegree[d_idx] += 1
 
     result_idx = np.empty(n, dtype=np.int32)
     q = np.empty(n, dtype=np.int32)
@@ -65,12 +122,13 @@ def topological_sort(catchment_id, downstream_id):
         count += 1
 
         d_id = downstream_id[u]
-        if d_id >= 0 and d_id in id_to_index:
-            d_idx = id_to_index[d_id]
-            indegree[d_idx] -= 1
-            if indegree[d_idx] == 0:
-                q[back] = d_idx
-                back += 1
+        if d_id >= 0 and d_id < total:
+            d_idx = grid_to_idx[d_id]
+            if d_idx >= 0:
+                indegree[d_idx] -= 1
+                if indegree[d_idx] == 0:
+                    q[back] = d_idx
+                    back += 1
 
     if count != n:
         raise ValueError("Rings exist and topological sorting is not possible")
@@ -105,16 +163,25 @@ def build_upstream_csr(catchment_id, downstream_id):
     its upstream neighbours are indices[indptr[i]:indptr[i+1]].
     """
     n = len(catchment_id)
-    id_to_idx = dict()
+
+    # Array-based grid-id to index lookup (replaces typed dict)
+    max_id = np.int64(0)
     for i in range(n):
-        id_to_idx[catchment_id[i]] = i
+        if catchment_id[i] > max_id:
+            max_id = catchment_id[i]
+    total = max_id + 1
+    grid_to_idx = np.full(total, np.int64(-1))
+    for i in range(n):
+        grid_to_idx[catchment_id[i]] = np.int64(i)
 
     # Pass 1: count upstream neighbours per node
     count = np.zeros(n, dtype=np.int32)
     for i in range(n):
         did = downstream_id[i]
-        if did >= 0 and did != catchment_id[i] and did in id_to_idx:
-            count[id_to_idx[did]] += 1
+        if did >= 0 and did < total and did != catchment_id[i]:
+            d_idx = grid_to_idx[did]
+            if d_idx >= 0:
+                count[d_idx] += 1
 
     # Pass 2: build indptr
     indptr = np.zeros(n + 1, dtype=np.int32)
@@ -126,10 +193,11 @@ def build_upstream_csr(catchment_id, downstream_id):
     offset = np.zeros(n, dtype=np.int32)
     for i in range(n):
         did = downstream_id[i]
-        if did >= 0 and did != catchment_id[i] and did in id_to_idx:
-            d_idx = id_to_idx[did]
-            indices[indptr[d_idx] + offset[d_idx]] = i
-            offset[d_idx] += 1
+        if did >= 0 and did < total and did != catchment_id[i]:
+            d_idx = grid_to_idx[did]
+            if d_idx >= 0:
+                indices[indptr[d_idx] + offset[d_idx]] = i
+                offset[d_idx] += 1
 
     return indptr, indices
 
@@ -167,6 +235,246 @@ def trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask):
                 back += 1
 
     return visited
+
+
+@njit(cache=True)
+def _uf_find_nb(parent, x):
+    """Find root with path halving (numba)."""
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
+
+
+@njit(cache=True)
+def _bif_merge_one_round(
+    bif_up_bidx, bif_dn_bidx, bsize, parent,
+    grid_thrs, thrs2, num_basins, reverse_paths, reverse_resolve,
+):
+    """One round of proposal + chain-resolution + apply.
+
+    Faithfully replicates one iteration of *set_bif_basin_mpi.F90*:
+      1. Scan paths (forward or reverse) → collect bnew proposals
+      2. Resolve chains (forward or reverse) → apply with size checks
+      3. Return whether any merge happened
+    """
+    num_paths = len(bif_up_bidx)
+    bnew = np.full(num_basins, -9999, dtype=np.int64)
+
+    # --- Phase 1: collect proposals ---
+    if reverse_paths:
+        for ipth in range(num_paths - 1, -1, -1):
+            ib_up = _uf_find_nb(parent, bif_up_bidx[ipth])
+            ib_dn = _uf_find_nb(parent, bif_dn_bidx[ipth])
+            if ib_up == ib_dn:
+                continue
+            ibsn = min(ib_up, ib_dn)
+            jbsn = max(ib_up, ib_dn)
+            sa, sb = bsize[ibsn], bsize[jbsn]
+            if sa + sb >= grid_thrs and sa >= thrs2 and sb >= thrs2:
+                continue
+            if bnew[jbsn] == -9999 or bnew[jbsn] > ibsn:
+                bnew[jbsn] = ibsn
+    else:
+        for ipth in range(num_paths):
+            ib_up = _uf_find_nb(parent, bif_up_bidx[ipth])
+            ib_dn = _uf_find_nb(parent, bif_dn_bidx[ipth])
+            if ib_up == ib_dn:
+                continue
+            ibsn = min(ib_up, ib_dn)
+            jbsn = max(ib_up, ib_dn)
+            sa, sb = bsize[ibsn], bsize[jbsn]
+            if sa + sb >= grid_thrs and sa >= thrs2 and sb >= thrs2:
+                continue
+            if bnew[jbsn] == -9999 or bnew[jbsn] > ibsn:
+                bnew[jbsn] = ibsn
+
+    # --- Phase 2: resolve chains + apply ---
+    changed = False
+    if reverse_resolve:
+        for ibsn in range(num_basins - 1, -1, -1):
+            if bnew[ibsn] == -9999:
+                continue
+            jbsn = bnew[ibsn]
+            while bnew[jbsn] >= 0:  # >= 0: basin 0 is valid (0-based)
+                jbsn = bnew[jbsn]
+            sa, sb = bsize[ibsn], bsize[jbsn]
+            if sa + sb >= grid_thrs and sa >= thrs2 and sb >= thrs2:
+                bnew[ibsn] = -9999  # clear rejected proposal
+                continue
+            bnew[ibsn] = jbsn
+            bsize[jbsn] += bsize[ibsn]
+            bsize[ibsn] = 0
+            parent[ibsn] = jbsn
+            changed = True
+    else:
+        for ibsn in range(num_basins):
+            if bnew[ibsn] == -9999:
+                continue
+            jbsn = bnew[ibsn]
+            while bnew[jbsn] >= 0:  # >= 0: basin 0 is valid (0-based)
+                jbsn = bnew[jbsn]
+            sa, sb = bsize[ibsn], bsize[jbsn]
+            if sa + sb >= grid_thrs and sa >= thrs2 and sb >= thrs2:
+                bnew[ibsn] = -9999  # clear rejected proposal
+                continue
+            bnew[ibsn] = jbsn
+            bsize[jbsn] += bsize[ibsn]
+            bsize[ibsn] = 0
+            parent[ibsn] = jbsn
+            changed = True
+
+    return changed
+
+
+@njit(cache=True)
+def _build_river_only_paths(bif_up_bidx, bif_dn_bidx, bif_is_river):
+    """Extract river-channel-only path arrays (shared pre-computation)."""
+    n_river = 0
+    for i in range(len(bif_is_river)):
+        if bif_is_river[i]:
+            n_river += 1
+    river_up = np.empty(n_river, dtype=np.int64)
+    river_dn = np.empty(n_river, dtype=np.int64)
+    j = 0
+    for i in range(len(bif_is_river)):
+        if bif_is_river[i]:
+            river_up[j] = bif_up_bidx[i]
+            river_dn[j] = bif_dn_bidx[i]
+            j += 1
+    return river_up, river_dn
+
+
+@njit(cache=True)
+def _merge_and_count(river_up, river_dn, bif_up, bif_dn,
+                     init_sizes, grid_thrs, thrs2):
+    """Run two-step merge at given thresholds; return (parent, bsize, count)."""
+    N = len(init_sizes)
+    bsize = init_sizes.copy()
+    parent = np.arange(N, dtype=np.int64)
+    # STEP1: river forward scan, forward resolve
+    for _ in range(200):
+        if not _bif_merge_one_round(river_up, river_dn, bsize, parent,
+                                     grid_thrs, thrs2, N, False, False):
+            break
+    # STEP2: all paths forward scan, reverse resolve
+    for _ in range(200):
+        if not _bif_merge_one_round(bif_up, bif_dn, bsize, parent,
+                                     grid_thrs, thrs2, N, False, True):
+            break
+    # Flatten
+    for i in range(N):
+        _uf_find_nb(parent, i)
+    # Count roots
+    count = np.int64(0)
+    for i in range(N):
+        if bsize[i] > 0:
+            count += 1
+    return parent, bsize, count
+
+
+@njit(cache=True)
+def merge_basins_bifurcation_thresholds(
+    bif_up_bidx,
+    bif_dn_bidx,
+    bif_is_river,
+    initial_basin_sizes,
+    rate,
+):
+    """Two-step basin merger with size thresholds (MPI-style).
+
+    Replicates *set_bif_basin_mpi.F90* logic:
+      STEP 1 — merge river-channel bifurcations (wth[0]>0),
+               forward path scan, forward chain resolution.
+      STEP 2 — merge ALL bifurcation paths (including overland),
+               reverse path scan, reverse chain resolution.
+    Both steps iterate until convergence.
+    Size thresholds prevent creating basins larger than ``rate * total_grid``.
+
+    Parameters
+    ----------
+    bif_up_bidx, bif_dn_bidx : int64 arrays, shape (num_paths,)
+        Basin index (into *initial_basin_sizes*) for each bifurcation endpoint.
+    bif_is_river : bool array, shape (num_paths,)
+        True where the path has river-channel width > 0 (wth[0] > 0).
+    initial_basin_sizes : int64 array, shape (num_basins,)
+        Grid count per basin before merging.
+    rate : float
+        Threshold ratio.  0.06 = normal (≤16 MPI), 0.03 = MaxMPI (≤30).
+
+    Returns
+    -------
+    parent : int64 array, shape (num_basins,)
+        parent[i] = root basin index after merging.
+    bsize : int64 array, shape (num_basins,)
+        Updated basin sizes (only roots have non-zero sizes).
+    """
+    num_basins = len(initial_basin_sizes)
+
+    allgrid = np.int64(0)
+    for i in range(num_basins):
+        allgrid += initial_basin_sizes[i]
+
+    grid_thrs = np.int64(allgrid * rate)
+    thrs2 = np.int64(allgrid * 0.001)
+
+    river_up, river_dn = _build_river_only_paths(bif_up_bidx, bif_dn_bidx, bif_is_river)
+    parent, bsize, _ = _merge_and_count(river_up, river_dn, bif_up_bidx, bif_dn_bidx,
+                                         initial_basin_sizes, grid_thrs, thrs2)
+    return parent, bsize
+
+
+@njit(cache=True)
+def search_optimal_merge_rate(bif_up_bidx, bif_dn_bidx, bif_is_river,
+                              initial_basin_sizes, target_basins,
+                              max_iter=25):
+    """Binary-search rate to get basin count closest to target_basins.
+
+    All computation stays inside numba; river-only path arrays are built once.
+
+    Returns (best_rate, parent, bsize, final_count).
+    """
+    N = len(initial_basin_sizes)
+    allgrid = np.int64(0)
+    for i in range(N):
+        allgrid += initial_basin_sizes[i]
+    thrs2 = np.int64(allgrid * 0.001)
+
+    river_up, river_dn = _build_river_only_paths(
+        bif_up_bidx, bif_dn_bidx, bif_is_river)
+
+    lo = 0.001
+    hi = 1.0
+    best_rate = lo
+    best_parent = np.arange(N, dtype=np.int64)
+    best_bsize = initial_basin_sizes.copy()
+    best_count = np.int64(N)
+    best_diff = abs(N - target_basins)
+
+    for _ in range(max_iter):
+        mid = (lo + hi) * 0.5
+        grid_thrs = np.int64(allgrid * mid)
+
+        parent, bsize, count = _merge_and_count(
+            river_up, river_dn, bif_up_bidx, bif_dn_bidx,
+            initial_basin_sizes, grid_thrs, thrs2)
+
+        diff = abs(count - target_basins)
+        if diff < best_diff:
+            best_diff = diff
+            best_rate = mid
+            best_parent = parent
+            best_bsize = bsize
+            best_count = count
+
+        if count == target_basins:
+            break
+        elif count > target_basins:
+            lo = mid   # too many basins → increase rate → more merging
+        else:
+            hi = mid   # too few → decrease rate → less merging
+
+    return best_rate, best_parent, best_bsize, best_count
 
 
 def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
@@ -393,17 +701,16 @@ def get_kept_basin_ids(
 def _build_upstream_adj(catchment_id, downstream_id):
     """Build upstream adjacency (CSR + mapping).
 
-    Returns ``(indptr, indices, id_to_idx, cid_arr)`` where *indptr* / *indices*
-    are the CSR arrays in index-space, *id_to_idx* maps CID→index, and *cid_arr*
-    is the catchment_id array (int64).
+    Returns ``(indptr, indices, grid_to_idx, cid_arr)`` where *indptr* / *indices*
+    are the CSR arrays in index-space, *grid_to_idx* is a flat array mapping
+    CID→index (−1 for absent IDs), and *cid_arr* is the catchment_id array (int64).
     """
     cid_arr = np.asarray(catchment_id, dtype=np.int64)
     did_arr = np.asarray(downstream_id, dtype=np.int64)
     indptr, indices = build_upstream_csr(cid_arr, did_arr)
-    id_to_idx = {}
-    for i in range(len(cid_arr)):
-        id_to_idx[int(cid_arr[i])] = i
-    return indptr, indices, id_to_idx, cid_arr
+    grid_to_idx = np.full(int(cid_arr.max()) + 1, -1, dtype=np.int64)
+    grid_to_idx[cid_arr] = np.arange(len(cid_arr), dtype=np.int64)
+    return indptr, indices, grid_to_idx, cid_arr
 
 def plot_basins_common(
     map_shape: Tuple[int, int],
@@ -644,7 +951,7 @@ def plot_basins_common(
         cid_map = None
         _csr_indptr = None
         _csr_indices = None
-        cid_to_idx = None
+        grid_to_idx = None
         upstream_cache = {}
         # Mutable state for current selection (xi, yi in index space)
         sel = {'xi': None, 'yi': None}
@@ -657,7 +964,7 @@ def plot_basins_common(
              cid_map[catchment_x, catchment_y] = catchment_id
 
              _adj = _build_upstream_adj(catchment_id, downstream_id)
-             _csr_indptr, _csr_indices, cid_to_idx, _ = _adj
+             _csr_indptr, _csr_indices, grid_to_idx, _ = _adj
 
         def _select_point(xi, yi):
             """Core selection logic shared by click, text input, and arrow keys."""
@@ -720,7 +1027,7 @@ def plot_basins_common(
                           _n = len(catchment_id)
                           _stop = np.zeros(_n, dtype=np.bool_)
                           _vis = trace_upstream_bfs_csr(
-                              cid_to_idx[clicked_cid], _csr_indptr, _csr_indices, _n, _stop
+                              grid_to_idx[clicked_cid], _csr_indptr, _csr_indices, _n, _stop
                           )
                           current_set = set(
                               (int(catchment_x[i]), int(catchment_y[i]))
@@ -959,14 +1266,22 @@ def _trace_upstream_bfs(start_cid, upstream_adj, stop_at=None):
     return set(int(cid_arr[i]) for i in range(n) if visited[i])
 
 
-def _check_poi_overlap(target_cids, poi_upstream):
-    """Raise ValueError if any POI is in the upstream set of another."""
-    target_set = set(int(c) for c in target_cids)
+def _check_poi_overlap(sorted_pois, poi_upstream_list):
+    """Raise ValueError if any POI is in the upstream set of another.
+    
+    Parameters
+    ----------
+    sorted_pois : array-like of int
+        Sorted POI catchment IDs.
+    poi_upstream_list : list of set
+        ``poi_upstream_list[i]`` is the upstream set for ``sorted_pois[i]``.
+    """
+    target_set = set(int(c) for c in sorted_pois)
     overlapping = []
-    for cid_a in target_set:
-        for cid_b in target_set:
-            if cid_a != cid_b and cid_a in poi_upstream[cid_b]:
-                overlapping.append((cid_a, cid_b))
+    for ia, cid_a in enumerate(sorted_pois):
+        for ib, cid_b in enumerate(sorted_pois):
+            if ia != ib and int(cid_a) in poi_upstream_list[ib]:
+                overlapping.append((int(cid_a), int(cid_b)))
     if overlapping:
         pairs_str = "; ".join(f"POI {a} is upstream of POI {b}" for a, b in overlapping)
         raise ValueError(
@@ -1064,21 +1379,19 @@ def crop_parameters_nc(
                 return
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
-            cid_to_idx = upstream_adj[2]
-
-            poi_upstream = {}
-            for cid in target_cids:
-                poi_upstream[int(cid)] = _trace_upstream_bfs(int(cid), upstream_adj)
-
-            _check_poi_overlap(target_cids, poi_upstream)
+            grid_to_idx = upstream_adj[2]
 
             effective_outlets = sorted(int(c) for c in target_cids)
+            poi_upstream_list = [_trace_upstream_bfs(int(cid), upstream_adj) for cid in effective_outlets]
+
+            _check_poi_overlap(effective_outlets, poi_upstream_list)
+
             print(f"crop_upstream: Effective outlet POIs: {effective_outlets}")
 
             # Collect all upstream catchments of effective outlets
             kept_cid_set = set()
-            for cid in effective_outlets:
-                kept_cid_set.update(poi_upstream[cid])
+            for us_set in poi_upstream_list:
+                kept_cid_set.update(us_set)
 
             # Override keep_mask: only keep these catchments
             keep_mask_upstream = np.isin(catchment_id, np.array(sorted(kept_cid_set), dtype=np.int64))
@@ -1089,10 +1402,10 @@ def crop_parameters_nc(
             
             # Assign each kept catchment to the outlet it flows to
             new_basin_assignment = np.full(len(catchment_id), -1, dtype=np.int64)
-            for basin_idx, outlet_cid in enumerate(effective_outlets):
-                for upstream_cid in poi_upstream[outlet_cid]:
-                    if upstream_cid in cid_to_idx:
-                        new_basin_assignment[cid_to_idx[upstream_cid]] = basin_idx
+            for basin_idx, us_set in enumerate(poi_upstream_list):
+                for upstream_cid in us_set:
+                    if grid_to_idx[upstream_cid] >= 0:
+                        new_basin_assignment[grid_to_idx[upstream_cid]] = basin_idx
 
             # For catchments that belong to multiple outlet upstream sets (shouldn't happen
             # after dedup, but just in case from bifurcation), assign to the first.
@@ -1117,15 +1430,14 @@ def crop_parameters_nc(
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
 
-            poi_upstream = {}
-            for cid in target_cids:
-                poi_upstream[int(cid)] = _trace_upstream_bfs(int(cid), upstream_adj)
+            sorted_pois_dn = sorted(int(c) for c in target_cids)
+            poi_upstream_list_dn = [_trace_upstream_bfs(int(cid), upstream_adj) for cid in sorted_pois_dn]
 
-            _check_poi_overlap(target_cids, poi_upstream)
+            _check_poi_overlap(sorted_pois_dn, poi_upstream_list_dn)
 
             # Remove upstream of each POI (excluding the POI itself — it becomes a headwater)
-            for cid in target_cids:
-                removed_cid_set_dn.update(poi_upstream[int(cid)] - {int(cid)})
+            for i, cid in enumerate(sorted_pois_dn):
+                removed_cid_set_dn.update(poi_upstream_list_dn[i] - {cid})
 
             # Recompute kept_basin_ids from remaining catchments
             if removed_cid_set_dn:
@@ -1143,42 +1455,42 @@ def crop_parameters_nc(
                 return
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
-            cid_to_idx = upstream_adj[2]
+            grid_to_idx = upstream_adj[2]
             poi_set = set(int(c) for c in target_cids)
 
             # Interval BFS: trace upstream from each POI, stop at other POIs
-            poi_intervals = {}
-            for cid in target_cids:
-                poi_intervals[int(cid)] = _trace_upstream_bfs(int(cid), upstream_adj, stop_at=poi_set)
+            sorted_pois = sorted(poi_set)
+            poi_interval_list = [_trace_upstream_bfs(int(cid), upstream_adj, stop_at=poi_set) for cid in sorted_pois]
 
             # Assign each catchment to its own POI (priority: self > downstream POI)
             # Since main-stem is a tree, a catchment appears in at most two intervals:
             # its own (if it's a POI) and the downstream POI's. Assign to self.
-            cid_to_interval_poi = {}  # catchment_id -> assigned poi_cid
+            # Use flat array: cid → basin index (POI order)
+            sorted_pois_arr = np.array(sorted_pois, dtype=np.int64)
+            cid_to_poi_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
             # First pass: assign all non-POI catchments
-            sorted_pois = sorted(poi_set)
-            for poi_cid in sorted_pois:
-                for member_cid in poi_intervals[poi_cid]:
+            for pi, poi_cid in enumerate(sorted_pois):
+                for member_cid in poi_interval_list[pi]:
                     if member_cid not in poi_set:
                         # Non-POI: should belong to exactly one interval
-                        cid_to_interval_poi[member_cid] = poi_cid
+                        cid_to_poi_basin[member_cid] = pi
             # Second pass: each POI belongs to its own interval
-            for poi_cid in sorted_pois:
-                cid_to_interval_poi[poi_cid] = poi_cid
+            for pi, poi_cid in enumerate(sorted_pois):
+                cid_to_poi_basin[poi_cid] = pi
 
             # Kept catchments = all assigned catchments
-            kept_cid_set = set(cid_to_interval_poi.keys())
+            kept_cid_mask = cid_to_poi_basin[catchment_id] >= 0
 
-            # Assign basin IDs: each POI gets basin 0..N-1
-            poi_to_basin = {int(cid): i for i, cid in enumerate(sorted_pois)}
+            # Assign basin IDs
             new_basin_assignment = np.full(len(catchment_id), -1, dtype=np.int64)
-            for member_cid, assigned_poi in cid_to_interval_poi.items():
-                if member_cid in cid_to_idx:
-                    new_basin_assignment[cid_to_idx[member_cid]] = poi_to_basin[assigned_poi]
+            for i in range(len(catchment_id)):
+                bp = cid_to_poi_basin[catchment_id[i]]
+                if bp >= 0:
+                    new_basin_assignment[i] = bp
 
             # Set up variables like crop_upstream
             outlet_cids = np.array(sorted_pois, dtype=np.int64)
-            keep_mask = np.isin(catchment_id, np.array(sorted(kept_cid_set), dtype=np.int64))
+            keep_mask = kept_cid_mask
             catchment_basin_id = new_basin_assignment
             kept_basin_ids = np.arange(len(sorted_pois), dtype=np.int64)
             num_kept_catchments = int(np.sum(keep_mask))
@@ -1192,7 +1504,10 @@ def crop_parameters_nc(
             num_merged_basins = len(kept_basin_ids)
             old_unique_basins = np.sort(kept_basin_ids)
             roots = list(kept_basin_ids)
-            old_to_new_id = {b: int(b) for b in kept_basin_ids}
+            # Identity mapping: old_to_new_id[b] = b for all kept basins
+            max_basin_id = int(kept_basin_ids.max()) if len(kept_basin_ids) > 0 else 0
+            old_to_new_id = np.full(max_basin_id + 1, -1, dtype=np.int64)
+            old_to_new_id[kept_basin_ids] = kept_basin_ids.astype(np.int64)
             # keep_mask and num_kept_catchments were already set above
             num_kept_catchments = int(np.sum(keep_mask))
             print(f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})")
@@ -1201,14 +1516,16 @@ def crop_parameters_nc(
                 bif_up_cid = src['bifurcation_catchment_id'][:]
                 bif_dn_cid = src['bifurcation_downstream_id'][:]
                 
-                cid_to_basin = dict(zip(catchment_id, catchment_basin_id))
+                # Flat array: catchment_id → basin_id
+                grid_to_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
+                grid_to_basin[catchment_id] = catchment_basin_id
                 
                 basin_adj = defaultdict(set)
                 for u_cid, d_cid in zip(bif_up_cid, bif_dn_cid):
-                    u_basin = cid_to_basin.get(u_cid)
-                    d_basin = cid_to_basin.get(d_cid)
+                    u_basin = grid_to_basin[int(u_cid)]
+                    d_basin = grid_to_basin[int(d_cid)]
                     
-                    if u_basin is not None and d_basin is not None and u_basin != d_basin:
+                    if u_basin >= 0 and d_basin >= 0 and u_basin != d_basin:
                         basin_adj[u_basin].add(d_basin)
                         basin_adj[d_basin].add(u_basin)
                 
@@ -1224,26 +1541,37 @@ def crop_parameters_nc(
                 
                 kept_basin_ids = np.array(sorted(list(visited)), dtype=kept_basin_ids.dtype)
 
-            parent_map = {b: b for b in kept_basin_ids}
+            # Union-Find with flat array
+            max_basin_id = int(kept_basin_ids.max()) if len(kept_basin_ids) > 0 else 0
+            parent_arr = np.full(max_basin_id + 1, -1, dtype=np.int64)
+            for b in kept_basin_ids:
+                parent_arr[b] = b
             def find_set(x):
-                if parent_map[x] != x:
-                    parent_map[x] = find_set(parent_map[x])
-                return parent_map[x]
+                while parent_arr[x] != x:
+                    parent_arr[x] = parent_arr[parent_arr[x]]  # path compression
+                    x = parent_arr[x]
+                return x
             def union_sets(x, y):
                 rootX, rootY = find_set(x), find_set(y)
                 if rootX != rootY:
-                    parent_map[rootX] = rootY
+                    parent_arr[rootX] = rootY
 
             if 'bifurcation_catchment_id' in src.variables and 'bifurcation_downstream_id' in src.variables:
                  for b in kept_basin_ids:
                      for neighbor in basin_adj[b]:
-                         if neighbor in parent_map:
+                         if parent_arr[neighbor] >= 0:
                              union_sets(b, neighbor)
             
             roots = sorted(list(set(find_set(b) for b in kept_basin_ids)))
-            root_to_new_id = {r: i for i, r in enumerate(roots)}
             
-            old_to_new_id = {b: root_to_new_id[find_set(b)] for b in kept_basin_ids}
+            # Flat arrays for root→new_id and old→new_id
+            root_to_new = np.full(max_basin_id + 1, -1, dtype=np.int64)
+            for i, r in enumerate(roots):
+                root_to_new[r] = i
+            
+            old_to_new_id = np.full(max_basin_id + 1, -1, dtype=np.int64)
+            for b in kept_basin_ids:
+                old_to_new_id[b] = root_to_new[find_set(b)]
             
             num_merged_basins = len(roots)
             
@@ -1258,7 +1586,6 @@ def crop_parameters_nc(
         # We need to compute it for the KEPT catchments only.
         kept_catchment_ids = catchment_id[keep_mask]
         kept_catchment_basin_ids = catchment_basin_id[keep_mask]
-        outlet_cid_set = set(int(c) for c in outlet_cids) if len(outlet_cids) > 0 else set()
         
         if only_save_pois:
             # Filter target_cids to those in kept catchments, preserving order
@@ -1276,7 +1603,7 @@ def crop_parameters_nc(
             dst.setncatts(src.__dict__)
             
             old_unique_basins = np.sort(kept_basin_ids)
-            map_idx_to_new = np.array([old_to_new_id[b] for b in old_unique_basins], dtype=np.int64)
+            map_idx_to_new = old_to_new_id[old_unique_basins]
 
             # Precompute new basin sizes
             kept_catchment_basin_ids = catchment_basin_id[keep_mask]
@@ -1305,17 +1632,21 @@ def crop_parameters_nc(
                      # Filter by both endpoints being in the kept catchment set
                      bif_up = src['bifurcation_catchment_id'][:]
                      bif_dn = src['bifurcation_downstream_id'][:]
-                     kept_set = set(int(c) for c in kept_catchment_ids)
+                     # Flat array for kept-catchment lookup
+                     is_kept_cid = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
+                     is_kept_cid[kept_catchment_ids] = True
+                     bif_up_i = bif_up.astype(np.int64)
+                     bif_dn_i = bif_dn.astype(np.int64)
                      if crop_interval:
                          # For interval mode, both endpoints must also be in the SAME basin
-                         cid_to_new_basin_iv = dict(zip(catchment_id[keep_mask], catchment_basin_id[keep_mask]))
-                         bif_mask = np.array([
-                             int(u) in kept_set and int(d) in kept_set
-                             and cid_to_new_basin_iv.get(int(u), -1) == cid_to_new_basin_iv.get(int(d), -2)
-                             for u, d in zip(bif_up, bif_dn)
-                         ])
+                         grid_to_new_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
+                         grid_to_new_basin[catchment_id[keep_mask]] = catchment_basin_id[keep_mask]
+                         bif_mask = (
+                             is_kept_cid[bif_up_i] & is_kept_cid[bif_dn_i]
+                             & (grid_to_new_basin[bif_up_i] == grid_to_new_basin[bif_dn_i])
+                         )
                      else:
-                         bif_mask = np.array([int(u) in kept_set and int(d) in kept_set for u, d in zip(bif_up, bif_dn)])
+                         bif_mask = is_kept_cid[bif_up_i] & is_kept_cid[bif_dn_i]
                  else:
                      bif_basin_id = src['bifurcation_basin_id'][:]
                      bif_mask = np.isin(bif_basin_id, kept_basin_ids)
@@ -1371,13 +1702,15 @@ def crop_parameters_nc(
                          elif name == 'downstream_id':
                              # Set outlet POIs' downstream_id to self (river mouth)
                              # Also set any catchment whose downstream is not in kept set to self
-                             kept_cid_set_arr = set(int(c) for c in kept_catchment_ids)
+                             is_kept_arr = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
+                             is_kept_arr[kept_catchment_ids] = True
+                             is_outlet = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
+                             if len(outlet_cids) > 0:
+                                 is_outlet[outlet_cids] = True
                              new_cids = catchment_id[keep_mask]
-                             for i in range(len(new_data)):
-                                 did = int(new_data[i])
-                                 cid = int(new_cids[i])
-                                 if cid in outlet_cid_set or did not in kept_cid_set_arr:
-                                     new_data[i] = cid
+                             # Vectorized: set to self where outlet or downstream not kept
+                             need_self = is_outlet[new_cids] | ~is_kept_arr[new_data.astype(np.int64)]
+                             new_data[need_self] = new_cids[need_self]
                      else:
                          if name == 'catchment_basin_id':
                              idx_in_kept = np.searchsorted(old_unique_basins, new_data)
@@ -1402,10 +1735,14 @@ def crop_parameters_nc(
                      new_data = data[bif_mask]
                      if name == 'bifurcation_basin_id':
                           if crop_upstream or crop_interval:
-                              # Remap using catchment-to-new-basin lookup from upstream catchment
+                              # Remap using grid_to_new_basin lookup from upstream catchment
                               bif_up_filtered = src['bifurcation_catchment_id'][:][bif_mask]
-                              cid_to_new_basin = dict(zip(catchment_id[keep_mask], catchment_basin_id[keep_mask]))
-                              new_data = np.array([cid_to_new_basin.get(int(c), 0) for c in bif_up_filtered], dtype=new_data.dtype)
+                              if 'grid_to_new_basin' not in dir():
+                                  grid_to_new_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
+                                  grid_to_new_basin[catchment_id[keep_mask]] = catchment_basin_id[keep_mask]
+                              bif_basin_mapped = grid_to_new_basin[bif_up_filtered.astype(np.int64)]
+                              bif_basin_mapped[bif_basin_mapped < 0] = 0
+                              new_data = bif_basin_mapped.astype(new_data.dtype)
                           else:
                               idx_in_kept = np.searchsorted(old_unique_basins, new_data)
                               new_data = map_idx_to_new[idx_in_kept].astype(new_data.dtype)
@@ -1418,8 +1755,12 @@ def crop_parameters_nc(
                           if crop_upstream or crop_interval:
                               lev_cids_filtered = src['levee_catchment_id'][:][lev_mask] if 'levee_catchment_id' in src.variables else None
                               if lev_cids_filtered is not None:
-                                  cid_to_new_basin = dict(zip(catchment_id[keep_mask], catchment_basin_id[keep_mask]))
-                                  new_data = np.array([cid_to_new_basin.get(int(c), 0) for c in lev_cids_filtered], dtype=new_data.dtype)
+                                  if 'grid_to_new_basin' not in dir():
+                                      grid_to_new_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
+                                      grid_to_new_basin[catchment_id[keep_mask]] = catchment_basin_id[keep_mask]
+                                  lev_basin_mapped = grid_to_new_basin[lev_cids_filtered.astype(np.int64)]
+                                  lev_basin_mapped[lev_basin_mapped < 0] = 0
+                                  new_data = lev_basin_mapped.astype(new_data.dtype)
                               else:
                                   new_data = np.zeros(np.sum(lev_mask), dtype=new_data.dtype)
                           else:
