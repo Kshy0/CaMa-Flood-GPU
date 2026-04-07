@@ -9,10 +9,17 @@
 from hydroforge.runtime.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "metal":
-    from cmfgpu.phys.metal import \
-        compute_flood_stage_kernel as compute_flood_stage  # noqa: F401
+    from cmfgpu.phys.metal import compute_flood_stage_batched_kernel as _fs_b
+    from cmfgpu.phys.metal import compute_flood_stage_kernel as _fs_nb
     from cmfgpu.phys.metal import \
         compute_flood_stage_log_kernel as compute_flood_stage_log
+
+    def compute_flood_stage(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            _fs_b(**kw)
+        else:
+            _fs_nb(**kw)
 
 elif KERNEL_BACKEND == "torch":
     from hydroforge.runtime.backend import adapt_kernel

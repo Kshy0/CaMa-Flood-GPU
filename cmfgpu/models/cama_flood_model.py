@@ -122,19 +122,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 )
         return self
 
-    @model_validator(mode='after')
-    def validate_metal_backend_limitations(self) -> Self:
-        """Metal backend does not support batched (num_trials>1)."""
-        from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND != "metal":
-            return self
-        if self.num_trials is not None and self.num_trials > 1:
-            raise ValueError(
-                f"'{KERNEL_BACKEND}' backend does not support batched execution "
-                f"(num_trials={self.num_trials}). Use the triton backend instead."
-            )
-        return self
-
     @model_validator(mode="after")
     def init_dam_cell_storage(self) -> Self:
         """

@@ -1093,13 +1093,13 @@ def plot_basins_common(
                 xi, yi = int(np.round(v1)), int(np.round(v2))
             _select_point(xi, yi)
 
-        # Lon/Lat input box — upper-right corner, aligned with title
+        # Lon/Lat input box — lower-right corner
         plt.tight_layout()
         ax_pos = ax.get_position()
         box_width = 0.18
         box_height = 0.03
         box_left = ax_pos.x1 - box_width
-        box_bottom = ax_pos.y1 + 0.005
+        box_bottom = ax_pos.y0 - box_height - 0.03
         ax_box = fig.add_axes([box_left, box_bottom, box_width, box_height])
         label = "Lon,Lat:" if use_lonlat else "X,Y:"
         text_box = TextBox(ax_box, label, initial="", textalignment="center")

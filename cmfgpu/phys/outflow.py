@@ -9,9 +9,26 @@
 from hydroforge.runtime.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "metal":
-    from cmfgpu.phys.metal import compute_inflow_kernel as compute_inflow
-    from cmfgpu.phys.metal import \
-        compute_outflow_kernel as compute_outflow  # noqa: F401
+    from cmfgpu.phys.metal import compute_inflow_batched_kernel as _inflow_b
+    from cmfgpu.phys.metal import compute_inflow_kernel as _inflow_nb
+    from cmfgpu.phys.metal import compute_outflow_batched_kernel as _outflow_b
+    from cmfgpu.phys.metal import compute_outflow_kernel as _outflow_nb
+
+    def compute_outflow(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            kw["_grid_size"] = kw["num_catchments"] * nt
+            _outflow_b(**kw)
+        else:
+            _outflow_nb(**kw)
+
+    def compute_inflow(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            kw["_grid_size"] = kw["num_catchments"] * nt
+            _inflow_b(**kw)
+        else:
+            _inflow_nb(**kw)
 
 elif KERNEL_BACKEND == "torch":
     from hydroforge.runtime.backend import adapt_kernel

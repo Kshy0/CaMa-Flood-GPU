@@ -23,8 +23,8 @@ from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
                                  plot_basins_common, read_bifori,
                                  reorder_by_basin_size,
                                  resolve_target_cids_from_poi,
-                                 search_optimal_merge_rate,
-                                 topological_sort, trace_outlets)
+                                 search_optimal_merge_rate, topological_sort,
+                                 trace_outlets)
 
 
 class MERITMap(BaseModel):

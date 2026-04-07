@@ -10,12 +10,28 @@ from hydroforge.runtime.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
-        compute_levee_bifurcation_outflow_kernel as \
-        compute_levee_bifurcation_outflow
+        compute_levee_bifurcation_outflow_batched_kernel as _lbo_b
     from cmfgpu.phys.metal import \
-        compute_levee_stage_kernel as compute_levee_stage  # noqa: F401
+        compute_levee_bifurcation_outflow_kernel as _lbo_nb
+    from cmfgpu.phys.metal import compute_levee_stage_batched_kernel as _ls_b
+    from cmfgpu.phys.metal import compute_levee_stage_kernel as _ls_nb
     from cmfgpu.phys.metal import \
         compute_levee_stage_log_kernel as compute_levee_stage_log
+
+    def compute_levee_stage(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            _ls_b(**kw)
+        else:
+            _ls_nb(**kw)
+
+    def compute_levee_bifurcation_outflow(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            kw["_grid_size"] = kw["num_bifurcation_paths"] * nt
+            _lbo_b(**kw)
+        else:
+            _lbo_nb(**kw)
 
 elif KERNEL_BACKEND == "torch":
     from hydroforge.runtime.backend import adapt_kernel

@@ -158,6 +158,168 @@ kernel void compute_flood_stage(
     flood_fraction_buf[idx]     = fld_frac;
 }
 
+
+// =====================================================================
+// Batched flood stage kernel — loop-based: grid=num_catchments, loops trials
+// =====================================================================
+kernel void compute_flood_stage_batched(
+    device float*         river_inflow_buf         [[buffer(0)]],
+    device float*         flood_inflow_buf         [[buffer(1)]],
+    device float*         river_outflow_buf        [[buffer(2)]],
+    device float*         flood_outflow_buf        [[buffer(3)]],
+    device float*         bif_outflow_buf          [[buffer(4)]],
+    device float*         runoff_buf               [[buffer(5)]],
+    device float*         outgoing_storage_buf     [[buffer(6)]],
+    device float*         river_storage_buf        [[buffer(7)]],
+    device float*         flood_storage_buf        [[buffer(8)]],
+    device float*         protected_storage_buf    [[buffer(9)]],
+    device float*         river_depth_buf          [[buffer(10)]],
+    device float*         flood_depth_buf          [[buffer(11)]],
+    device float*         protected_depth_buf      [[buffer(12)]],
+    device float*         flood_fraction_buf       [[buffer(13)]],
+    device float*         river_height_buf         [[buffer(14)]],
+    device float*         flood_depth_table_buf    [[buffer(15)]],
+    device float*         catchment_area_buf       [[buffer(16)]],
+    device float*         river_width_buf          [[buffer(17)]],
+    device float*         river_length_buf         [[buffer(18)]],
+    constant float&       time_step                [[buffer(19)]],
+    constant int&         num_catchments           [[buffer(20)]],
+    constant int&         has_bifurcation          [[buffer(21)]],
+    constant int&         num_trials               [[buffer(22)]],
+    constant int&         batched_runoff_flag      [[buffer(23)]],
+    constant int&         batched_river_height_flag    [[buffer(24)]],
+    constant int&         batched_flood_depth_table_flag [[buffer(25)]],
+    constant int&         batched_catchment_area_flag  [[buffer(26)]],
+    constant int&         batched_river_width_flag     [[buffer(27)]],
+    constant int&         batched_river_length_flag    [[buffer(28)]],
+    uint idx [[thread_position_in_grid]]
+)
+{
+    if ((int)idx >= num_catchments) return;
+
+    // ---- Load shared (non-trial) params once ----
+    float riv_height_s = batched_river_height_flag     ? 0.0f : river_height_buf[idx];
+    float catch_area_s = batched_catchment_area_flag   ? 0.0f : catchment_area_buf[idx];
+    float riv_width_s  = batched_river_width_flag      ? 0.0f : river_width_buf[idx];
+    float riv_length_s = batched_river_length_flag     ? 0.0f : river_length_buf[idx];
+    float runoff_s     = batched_runoff_flag            ? 0.0f : runoff_buf[idx];
+
+    // Pre-compute derived constants
+    float riv_max_sto_s = 0.0f, width_inc_s = 0.0f;
+    if (!batched_river_height_flag && !batched_river_width_flag && !batched_river_length_flag)
+        riv_max_sto_s = riv_length_s * riv_width_s * riv_height_s;
+    if (!batched_catchment_area_flag && !batched_river_length_flag)
+        width_inc_s = (catch_area_s / riv_length_s) / (float)NUM_FLOOD_LEVELS;
+
+    // ---- Loop over trials ----
+    for (int t = 0; t < num_trials; t++) {
+        int to = t * num_catchments;
+        int s = to + (int)idx;
+
+        // ---- 1. Storage update ----
+        float riv_sto  = river_storage_buf[s];
+        float fld_sto  = flood_storage_buf[s];
+        float prot_sto = protected_storage_buf[s];
+        float riv_in   = river_inflow_buf[s];
+        float fld_in   = flood_inflow_buf[s];
+        float riv_out  = river_outflow_buf[s];
+        float fld_out  = flood_outflow_buf[s];
+        float bif_out  = has_bifurcation ? bif_outflow_buf[s] : 0.0f;
+        float runoff   = batched_runoff_flag ? runoff_buf[s] : runoff_s;
+
+        float riv_sto_upd = riv_sto + (riv_in - riv_out) * time_step;
+        float fld_sto_upd = fld_sto
+            + (riv_sto_upd < 0.0f ? riv_sto_upd : 0.0f)
+            + (fld_in - fld_out - bif_out) * time_step;
+        riv_sto_upd = max(riv_sto_upd, 0.0f);
+        if (fld_sto_upd < 0.0f) {
+            riv_sto_upd = max(riv_sto_upd + fld_sto_upd, 0.0f);
+        }
+        fld_sto_upd = max(fld_sto_upd, 0.0f);
+        float total_sto = max(riv_sto_upd + fld_sto_upd + prot_sto + runoff * time_step, 0.0f);
+
+        // ---- 2. Flood stage via table scan ----
+        float riv_height = batched_river_height_flag ? river_height_buf[s] : riv_height_s;
+        float catch_area = batched_catchment_area_flag ? catchment_area_buf[s] : catch_area_s;
+        float riv_width  = batched_river_width_flag ? river_width_buf[s] : riv_width_s;
+        float riv_length = batched_river_length_flag ? river_length_buf[s] : riv_length_s;
+
+        float riv_max_sto = (batched_river_height_flag || batched_river_width_flag || batched_river_length_flag)
+            ? riv_length * riv_width * riv_height : riv_max_sto_s;
+        float width_inc = (batched_catchment_area_flag || batched_river_length_flag)
+            ? (catch_area / riv_length) / (float)NUM_FLOOD_LEVELS : width_inc_s;
+
+        int   level = (total_sto > riv_max_sto) ? 0 : -1;
+        float S_accum = riv_max_sto;
+        float prev_H = 0.0f;
+        float prev_W = riv_width;
+        float prev_total_sto = riv_max_sto;
+        float prev_fld_depth = 0.0f;
+        float next_fld_depth = 0.0f;
+
+        int table_base = batched_flood_depth_table_flag ? (to * NUM_FLOOD_LEVELS) : 0;
+
+        for (int i = 0; i < NUM_FLOOD_LEVELS; i++) {
+            float H_curr = flood_depth_table_buf[table_base + (int)idx * NUM_FLOOD_LEVELS + i];
+            float W_curr = riv_width + (float)(i + 1) * width_inc;
+            float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
+            float S_curr = S_accum + dS;
+
+            if (level == i) next_fld_depth = H_curr;
+            if (total_sto > S_curr) {
+                level += 1;
+                prev_total_sto = S_curr;
+                prev_fld_depth = H_curr;
+            }
+
+            S_accum = S_curr;
+            prev_H = H_curr;
+            prev_W = W_curr;
+        }
+
+        bool no_flood = (level < 0);
+        level = max(level, 0);
+
+        float prev_total_W = riv_width + (float)level * width_inc;
+        float flood_grad = (level == NUM_FLOOD_LEVELS)
+            ? 0.0f
+            : (next_fld_depth - prev_fld_depth) / width_inc;
+
+        float diff_W = sqrt(
+            prev_total_W * prev_total_W
+            + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
+        ) - prev_total_W;
+        float fld_depth_mid = prev_fld_depth + diff_W * flood_grad;
+        float fld_depth_top = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
+
+        float fld_depth = no_flood ? 0.0f
+            : (level == NUM_FLOOD_LEVELS ? fld_depth_top : fld_depth_mid);
+
+        float riv_sto_final = no_flood
+            ? total_sto
+            : min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
+        float riv_depth = riv_sto_final / (riv_length * riv_width);
+
+        float fld_frac_mid = clamp(
+            (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
+        float fld_frac = no_flood ? 0.0f
+            : (level == NUM_FLOOD_LEVELS ? 1.0f : fld_frac_mid);
+
+        float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
+
+        // ---- 3. Store ----
+        outgoing_storage_buf[s]   = 0.0f;
+        river_storage_buf[s]      = riv_sto_final;
+        flood_storage_buf[s]      = fld_sto_final;
+        protected_storage_buf[s]  = 0.0f;
+        river_depth_buf[s]        = riv_depth;
+        flood_depth_buf[s]        = fld_depth;
+        protected_depth_buf[s]    = fld_depth;
+        flood_fraction_buf[s]     = fld_frac;
+    }
+}
+
+
 kernel void compute_flood_stage_log(
     // Storage update inputs  (buffer binding order matches __init__.py args)
     device float*          river_inflow_buf              [[buffer(0)]],

@@ -585,7 +585,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Current sub-step time step (seconds). "
                     "Updated via .fill_() before each sub-step loop.",
-        shape=("one",),
+        shape=(1,),
         save_idx=None,
         category="shared_state",
     )
@@ -596,7 +596,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Current sub-step index within the time step. "
                     "Updated via .fill_() before each sub-step for log kernels.",
-        shape=("one",),
+        shape=(1,),
         save_idx=None,
         category="shared_state",
         dtype="idx",
@@ -605,9 +605,7 @@ class BaseModule(AbstractModule):
     def current_step(self) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.int32, device=self.device)
 
-    @cached_property
-    def one(self) -> int:
-        return 1
+
 
     # ------------------------------------------------------------------ #
     # Post-init validation

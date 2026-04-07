@@ -55,7 +55,7 @@ def compute_adaptive_time_step_batched_kernel(
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
     is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
-    max_sub_steps_ptr,                      # *i64 (size num_trials)
+    max_sub_steps_ptr,                      # *i32 (size 1, shared_state)
     time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
@@ -105,4 +105,4 @@ def compute_adaptive_time_step_batched_kernel(
     n_steps_float = tl.floor(time_step / min_dt + 0.49) + 1.0
     n_steps = n_steps_float.to(tl.int32)
     
-    tl.atomic_max(max_sub_steps_ptr + trial_idx, n_steps)
+    tl.atomic_max(max_sub_steps_ptr, n_steps)

@@ -25,7 +25,7 @@ class AdaptiveTimeModule(AbstractModule):
     
     @computed_tensor_field(
         description="Minimum time step across all processes",
-        shape=("one",),
+        shape=(1,),
         category="shared_state",
     )
     @cached_property
@@ -34,7 +34,7 @@ class AdaptiveTimeModule(AbstractModule):
 
     @computed_tensor_field(
         description="Maximum number of sub-steps across all processes",
-        shape=("one",),
+        shape=(1,),
         category="shared_state",
         dtype="idx",
     )
@@ -42,6 +42,3 @@ class AdaptiveTimeModule(AbstractModule):
     def max_sub_steps(self) -> torch.Tensor:
         return torch.zeros((1,), dtype=torch.int32, device=self.device)
     
-    @cached_property
-    def one(self) -> int:
-        return 1

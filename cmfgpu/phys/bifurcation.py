@@ -10,10 +10,27 @@ from hydroforge.runtime.backend import KERNEL_BACKEND
 
 if KERNEL_BACKEND == "metal":
     from cmfgpu.phys.metal import \
-        compute_bifurcation_inflow_kernel as compute_bifurcation_inflow
+        compute_bifurcation_inflow_batched_kernel as _bi_b
+    from cmfgpu.phys.metal import compute_bifurcation_inflow_kernel as _bi_nb
     from cmfgpu.phys.metal import \
-        compute_bifurcation_outflow_kernel as \
-        compute_bifurcation_outflow  # noqa: F401
+        compute_bifurcation_outflow_batched_kernel as _bo_b
+    from cmfgpu.phys.metal import compute_bifurcation_outflow_kernel as _bo_nb
+
+    def compute_bifurcation_outflow(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            kw["_grid_size"] = kw["num_bifurcation_paths"] * nt
+            _bo_b(**kw)
+        else:
+            _bo_nb(**kw)
+
+    def compute_bifurcation_inflow(**kw):
+        nt = kw.get("num_trials")
+        if nt is not None and nt > 1:
+            kw["_grid_size"] = kw["num_bifurcation_paths"] * nt
+            _bi_b(**kw)
+        else:
+            _bi_nb(**kw)
 
 elif KERNEL_BACKEND == "torch":
     from hydroforge.runtime.backend import adapt_kernel

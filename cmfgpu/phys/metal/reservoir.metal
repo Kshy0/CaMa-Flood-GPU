@@ -127,3 +127,119 @@ kernel void compute_reservoir_outflow(
         atomic_fetch_add_explicit(&outgoing_storage_buf[ds_idx], -(new_neg * time_step), memory_order_relaxed);
     }
 }
+
+
+// =====================================================================
+// Batched reservoir outflow — flat grid num_reservoirs * num_trials
+// =====================================================================
+kernel void compute_reservoir_outflow_batched(
+    device int*           reservoir_catchment_idx_buf [[buffer(0)]],
+    device int*           downstream_idx_buf          [[buffer(1)]],
+    device atomic_float*  reservoir_total_inflow_buf  [[buffer(2)]],
+    device float*         river_outflow_buf           [[buffer(3)]],
+    device float*         flood_outflow_buf           [[buffer(4)]],
+    device float*         river_storage_buf           [[buffer(5)]],
+    device float*         flood_storage_buf           [[buffer(6)]],
+    device float*         conservation_volume_buf     [[buffer(7)]],
+    device float*         emergency_volume_buf        [[buffer(8)]],
+    device float*         adjustment_volume_buf       [[buffer(9)]],
+    device float*         normal_outflow_buf          [[buffer(10)]],
+    device float*         adjustment_outflow_buf      [[buffer(11)]],
+    device float*         flood_control_outflow_buf   [[buffer(12)]],
+    device float*         runoff_buf                  [[buffer(13)]],
+    device float*         total_storage_buf           [[buffer(14)]],
+    device atomic_float*  outgoing_storage_buf        [[buffer(15)]],
+    constant float&       time_step                   [[buffer(16)]],
+    constant int&         num_reservoirs              [[buffer(17)]],
+    constant int&         num_catchments              [[buffer(18)]],
+    constant int&         num_trials                  [[buffer(19)]],
+    uint gid [[thread_position_in_grid]]
+)
+{
+    int total = num_reservoirs * num_trials;
+    if ((int)gid >= total) return;
+
+    int ri = (int)gid % num_reservoirs;        // reservoir index
+    int trial_idx = (int)gid / num_reservoirs;
+    int to_catch = trial_idx * num_catchments;
+
+    int catch_idx = reservoir_catchment_idx_buf[ri];
+    int ds_idx    = downstream_idx_buf[catch_idx];
+    bool is_river_mouth = (ds_idx == catch_idx);
+
+    int ci_g = to_catch + catch_idx;  // global catchment index
+    int ds_g = to_catch + ds_idx;
+
+    // 1. Undo main outflow kernel's contribution
+    float old_river_outflow = river_outflow_buf[ci_g];
+    float old_flood_outflow = flood_outflow_buf[ci_g];
+
+    float old_pos = max(old_river_outflow, 0.0f) + max(old_flood_outflow, 0.0f);
+    float old_neg = min(old_river_outflow, 0.0f) + min(old_flood_outflow, 0.0f);
+
+    atomic_fetch_add_explicit(&outgoing_storage_buf[ci_g], -(old_pos * time_step), memory_order_relaxed);
+    if (!is_river_mouth) {
+        atomic_fetch_add_explicit(&outgoing_storage_buf[ds_g], old_neg * time_step, memory_order_relaxed);
+    }
+
+    // 2. Compute reservoir outflow
+    float river_storage = river_storage_buf[ci_g];
+    float flood_storage = flood_storage_buf[ci_g];
+    float total_storage = river_storage + flood_storage;
+
+    float total_inflow = atomic_exchange_explicit(&reservoir_total_inflow_buf[ci_g], 0.0f, memory_order_relaxed);
+    float runoff = runoff_buf[ci_g];
+    float reservoir_inflow = total_inflow + runoff;
+
+    // Reservoir params are reservoir-indexed (never trial-expanded in Triton either)
+    float conservation_volume   = conservation_volume_buf[ri];
+    float emergency_volume      = emergency_volume_buf[ri];
+    float adjustment_volume     = adjustment_volume_buf[ri];
+    float normal_outflow        = normal_outflow_buf[ri];
+    float adjustment_outflow    = adjustment_outflow_buf[ri];
+    float flood_control_outflow = flood_control_outflow_buf[ri];
+
+    float reservoir_outflow = 0.0f;
+
+    if (total_storage <= conservation_volume) {
+        reservoir_outflow = normal_outflow * sqrt(total_storage / conservation_volume);
+    } else if (total_storage <= adjustment_volume) {
+        float frac2 = (total_storage - conservation_volume) / (adjustment_volume - conservation_volume);
+        reservoir_outflow = normal_outflow + exp(3.0f * log(frac2)) * (adjustment_outflow - normal_outflow);
+    } else if (total_storage <= emergency_volume) {
+        float frac3 = (total_storage - adjustment_volume) / (emergency_volume - adjustment_volume);
+        bool flood_period = (reservoir_inflow >= flood_control_outflow);
+
+        if (flood_period) {
+            float outflow_flood = normal_outflow + (
+                (total_storage - conservation_volume) / (emergency_volume - conservation_volume)
+            ) * (reservoir_inflow - normal_outflow);
+            float outflow_tmp = adjustment_outflow + exp(0.1f * log(frac3)) * (
+                flood_control_outflow - adjustment_outflow
+            );
+            reservoir_outflow = max(outflow_flood, outflow_tmp);
+        } else {
+            reservoir_outflow = adjustment_outflow + exp(0.1f * log(frac3)) * (
+                flood_control_outflow - adjustment_outflow
+            );
+        }
+    } else {
+        reservoir_outflow = (reservoir_inflow >= flood_control_outflow)
+            ? reservoir_inflow : flood_control_outflow;
+    }
+
+    reservoir_outflow = clamp(reservoir_outflow, 0.0f, total_storage / time_step);
+
+    // 3. Store results
+    river_outflow_buf[ci_g] = reservoir_outflow;
+    flood_outflow_buf[ci_g] = 0.0f;
+    total_storage_buf[ci_g] = total_storage;
+
+    float new_pos = max(reservoir_outflow, 0.0f);
+    atomic_fetch_add_explicit(&outgoing_storage_buf[ci_g], new_pos * time_step, memory_order_relaxed);
+
+    float new_neg = min(reservoir_outflow, 0.0f);
+    if (!is_river_mouth) {
+        atomic_fetch_add_explicit(&outgoing_storage_buf[ds_g], -(new_neg * time_step), memory_order_relaxed);
+    }
+}
