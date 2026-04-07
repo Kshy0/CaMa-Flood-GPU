@@ -1258,12 +1258,13 @@ def _trace_upstream_bfs(start_cid, upstream_adj, stop_at=None):
     start_idx = id_to_idx[int(start_cid)]
     stop_mask = np.zeros(n, dtype=np.bool_)
     if stop_at is not None:
+        id_to_idx_len = len(id_to_idx)
         for s in stop_at:
             si = int(s)
-            if si in id_to_idx:
+            if 0 <= si < id_to_idx_len and id_to_idx[si] >= 0:
                 stop_mask[id_to_idx[si]] = True
     visited = trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
-    return set(int(cid_arr[i]) for i in range(n) if visited[i])
+    return set(cid_arr[visited].tolist())
 
 
 def _check_poi_overlap(sorted_pois, poi_upstream_list):
@@ -1455,25 +1456,31 @@ def crop_parameters_nc(
                 return
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
-            grid_to_idx = upstream_adj[2]
+            indptr, indices, grid_to_idx, cid_arr = upstream_adj
+            n = len(cid_arr)
             poi_set = set(int(c) for c in target_cids)
+
+            # Pre-build stop_mask ONCE (shared across all BFS calls)
+            stop_mask = np.zeros(n, dtype=np.bool_)
+            id_to_idx_len = len(grid_to_idx)
+            for s in poi_set:
+                si = int(s)
+                if 0 <= si < id_to_idx_len and grid_to_idx[si] >= 0:
+                    stop_mask[grid_to_idx[si]] = True
 
             # Interval BFS: trace upstream from each POI, stop at other POIs
             sorted_pois = sorted(poi_set)
-            poi_interval_list = [_trace_upstream_bfs(int(cid), upstream_adj, stop_at=poi_set) for cid in sorted_pois]
-
-            # Assign each catchment to its own POI (priority: self > downstream POI)
-            # Since main-stem is a tree, a catchment appears in at most two intervals:
-            # its own (if it's a POI) and the downstream POI's. Assign to self.
-            # Use flat array: cid → basin index (POI order)
             sorted_pois_arr = np.array(sorted_pois, dtype=np.int64)
+
+            # Use vectorised assignment: run BFS per POI, assign directly via numpy
             cid_to_poi_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
-            # First pass: assign all non-POI catchments
+            # First pass: non-POI catchments assigned to their downstream POI
             for pi, poi_cid in enumerate(sorted_pois):
-                for member_cid in poi_interval_list[pi]:
-                    if member_cid not in poi_set:
-                        # Non-POI: should belong to exactly one interval
-                        cid_to_poi_basin[member_cid] = pi
+                start_idx = grid_to_idx[int(poi_cid)]
+                visited = trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
+                member_cids = cid_arr[visited]
+                # Assign non-POI members (POIs overwritten in second pass)
+                cid_to_poi_basin[member_cids] = pi
             # Second pass: each POI belongs to its own interval
             for pi, poi_cid in enumerate(sorted_pois):
                 cid_to_poi_basin[poi_cid] = pi
@@ -1481,15 +1488,11 @@ def crop_parameters_nc(
             # Kept catchments = all assigned catchments
             kept_cid_mask = cid_to_poi_basin[catchment_id] >= 0
 
-            # Assign basin IDs
-            new_basin_assignment = np.full(len(catchment_id), -1, dtype=np.int64)
-            for i in range(len(catchment_id)):
-                bp = cid_to_poi_basin[catchment_id[i]]
-                if bp >= 0:
-                    new_basin_assignment[i] = bp
+            # Assign basin IDs (vectorised)
+            new_basin_assignment = cid_to_poi_basin[catchment_id].copy()
 
             # Set up variables like crop_upstream
-            outlet_cids = np.array(sorted_pois, dtype=np.int64)
+            outlet_cids = sorted_pois_arr
             keep_mask = kept_cid_mask
             catchment_basin_id = new_basin_assignment
             kept_basin_ids = np.arange(len(sorted_pois), dtype=np.int64)

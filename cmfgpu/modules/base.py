@@ -587,7 +587,7 @@ class BaseModule(AbstractModule):
                     "Updated via .fill_() before each sub-step loop.",
         shape=("one",),
         save_idx=None,
-        category="state",
+        category="shared_state",
     )
     @cached_property
     def time_step(self) -> torch.Tensor:
@@ -598,7 +598,7 @@ class BaseModule(AbstractModule):
                     "Updated via .fill_() before each sub-step for log kernels.",
         shape=("one",),
         save_idx=None,
-        category="state",
+        category="shared_state",
         dtype="idx",
     )
     @cached_property

@@ -370,11 +370,10 @@ def _resolve_dam_catchment_ids(
     if isinstance(dam_alloc, (str, Path)):
         dam_alloc = _read_alloc_file(Path(dam_alloc))
 
-    # Build mapping: alloc dam id → index in alloc array (flat array)
-    alloc_ids = dam_alloc["id"].astype(np.int64)
-    max_alloc_id = int(alloc_ids.max()) if len(alloc_ids) > 0 else 0
-    alloc_grid_to_idx = np.full(max_alloc_id + 1, -1, dtype=np.int64)
-    alloc_grid_to_idx[alloc_ids] = np.arange(len(alloc_ids), dtype=np.int64)
+    # Build mapping: alloc dam id → index in alloc array
+    alloc_id_to_idx: dict[int, int] = {}
+    for i in range(len(dam_alloc)):
+        alloc_id_to_idx[int(dam_alloc["id"][i])] = i
 
     n_dam = len(dam_info["ids"])
     dam_cids = np.full(n_dam, -1, dtype=np.int64)
@@ -384,8 +383,8 @@ def _resolve_dam_catchment_ids(
 
     for i in range(n_dam):
         dam_id = int(dam_info["ids"][i])
-        if dam_id <= max_alloc_id and alloc_grid_to_idx[dam_id] >= 0:
-            j = int(alloc_grid_to_idx[dam_id])
+        if dam_id in alloc_id_to_idx:
+            j = alloc_id_to_idx[dam_id]
             dam_cids[i] = int(dam_alloc["catchment_id"][j])
             # alloc stores 0-based; convert to 1-based for CSV output
             ix_arr[i] = int(dam_alloc["ix"][j]) + 1
