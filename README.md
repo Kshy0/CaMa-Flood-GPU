@@ -43,6 +43,8 @@ conda create -n CMF python=3.14.*
 conda activate CMF
 ```
 
+#### 2a. Latest PyTorch (recommended)
+
 Please follow the official [PyTorch installation guide](https://pytorch.org/get-started/locally/) for your environment. 
 For CUDA 13.0, you may use:
 
@@ -51,8 +53,18 @@ pip install torch --index-url https://download.pytorch.org/whl/cu130
 ```
 
 > **Note:** `triton` ships automatically with PyTorch on supported CUDA systems — no separate installation needed. You also don't need to install `torchvision` or `torchaudio` as stated in the official manual.
->
-> Sometimes, the above command may not be compatible with your system. For example, on some clusters running older systems, you can use `pip index versions torch` to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
+
+#### 2b. Older GPUs / legacy systems
+
+> **Warning:** Starting from PyTorch **2.11.0**, the pre-built wheels no longer include kernels for compute capability 7.0 (e.g. V100). Using these wheels on such GPUs will result in an `Unsupported compute capability` error. Install PyTorch ≤ 2.10.0 instead.
+
+For older GPUs, pin a compatible torch version. For example, with CUDA 12.8:
+
+```shell
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+You can use `pip index versions torch` to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
 ### 3. Install Hydroforge
 
@@ -81,7 +93,6 @@ git pull
 conda activate CMF
 pip uninstall hydroforge -y
 pip install --upgrade git+https://github.com/Kshy0/hydroforge.git
-pip install -e .
 ```
 
 ---
