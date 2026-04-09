@@ -102,7 +102,6 @@ def load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
                 if len(toks) < 2:
                     continue
                 date_str, val_str = toks[0], toks[-1]
-                time_str = "--:--"
             try:
                 # Some files use --:--, ignore time and parse date only
                 dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -150,8 +149,8 @@ class GaugeReader:
     def __init__(
         self,
         base_dir: Union[str, Path],
-        file_resolver: Optional[Callable[[str], Union[str, Path]]] = default_grdc_resolver,
-        loader: Optional[Callable[[str, Union[str, Path]], GaugeSeries]] = load_grdc,
+        file_resolver: Callable[[str], Union[str, Path]] = default_grdc_resolver,
+        loader: Callable[[str, Union[str, Path]], GaugeSeries] = load_grdc,
     ) -> None:
         self.base_dir = Path(base_dir)
         self._file_resolver = file_resolver

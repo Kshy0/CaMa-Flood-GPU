@@ -761,7 +761,7 @@ def plot_basins_common(
         right = intercept_x + slope_x * (nx - 0.5)
         bottom = intercept_y + slope_y * (ny - 0.5)
         top = intercept_y + slope_y * (-0.5)
-        extent = [left, right, bottom, top]
+        extent = (left, right, bottom, top)
         xlabel, ylabel = "Longitude", "Latitude"
         def idx_to_lon(x): return intercept_x + slope_x * x
         def idx_to_lat(y): return intercept_y + slope_y * y
@@ -801,10 +801,13 @@ def plot_basins_common(
                 colors.append(color)
         return np.array(colors)
 
-    special_colors = []
-    if gauges_xy: special_colors.append((0, 1, 0))
-    if bifurcations: special_colors.append((0, 0, 1))
-    if levees_xy: special_colors.append((0.5, 0, 0.5))
+    special_colors: list[tuple[float, float, float]] = []
+    if gauges_xy:
+        special_colors.append((0.0, 1.0, 0.0))
+    if bifurcations:
+        special_colors.append((0.0, 0.0, 1.0))
+    if levees_xy:
+        special_colors.append((0.5, 0.0, 0.5))
 
     basin_colors = generate_random_colors(num_basins, special_colors)
     default_cmap = ListedColormap(basin_colors)
@@ -858,40 +861,46 @@ def plot_basins_common(
              def within_extent(xv, yv):
                  return (xv >= x0_idx) & (xv <= x1_idx) & (yv >= y0_idx) & (yv <= y1_idx)
     else:
-         def within_extent(xv, yv): return np.zeros_like(xv, dtype=bool)
+         def within_extent(xv, yv):
+             return np.zeros_like(xv, dtype=bool)
 
     # Overlays
     if gauges_xy:
         gx, gy = gauges_xy
-        if use_lonlat: gx, gy = idx_to_lon(gx), idx_to_lat(gy)
+        if use_lonlat:
+            gx, gy = idx_to_lon(gx), idx_to_lat(gy)
         m = within_extent(gx, gy)
         if np.any(m):
             plt.scatter(gx[m], gy[m], c='#00FF00', s=0.5, label='Gauges', zorder=5)
 
     if levees_xy:
         lx, ly = levees_xy
-        if use_lonlat: lx, ly = idx_to_lon(lx), idx_to_lat(ly)
+        if use_lonlat:
+            lx, ly = idx_to_lon(lx), idx_to_lat(ly)
         m = within_extent(lx, ly)
         if np.any(m):
             plt.scatter(lx[m], ly[m], c='#800080', s=0.2, label='Levees', zorder=4)
             
     if pois_xy:
         px, py = pois_xy
-        if use_lonlat: px, py = idx_to_lon(px), idx_to_lat(py)
+        if use_lonlat:
+            px, py = idx_to_lon(px), idx_to_lat(py)
         m = within_extent(px, py)
         if np.any(m):
             plt.scatter(px[m], py[m], c="#C10000", s=5.0, label='Points of Interest', zorder=6)
 
     if river_mouths_xy:
         rmx, rmy = river_mouths_xy
-        if use_lonlat: rmx, rmy = idx_to_lon(rmx), idx_to_lat(rmy)
+        if use_lonlat:
+            rmx, rmy = idx_to_lon(rmx), idx_to_lat(rmy)
         m = within_extent(rmx, rmy)
         if np.any(m):
              plt.scatter(rmx[m], rmy[m], c='red', edgecolors='black', s=20.0, marker='*', linewidths=0.3, label='River Mouth', zorder=7)
 
     if dams_xyc is not None:
         dx, dy, dcap = dams_xyc
-        if use_lonlat: dx, dy = idx_to_lon(dx), idx_to_lat(dy)
+        if use_lonlat:
+            dx, dy = idx_to_lon(dx), idx_to_lat(dy)
         m = within_extent(dx, dy)
         if np.any(m):
             cap_m = dcap[m]
@@ -905,7 +914,8 @@ def plot_basins_common(
             )
 
     def plot_bifs(bifs, color, linestyle, label):
-        if not bifs: return
+        if not bifs:
+            return
         x1, y1 = bifs['x1'], bifs['y1']
         x2, y2 = bifs['x2'], bifs['y2']
         if use_lonlat:
@@ -929,7 +939,8 @@ def plot_basins_common(
     plot_bifs(removed_bifurcations, '#FF0000', ':', 'Removed Paths')
 
     handles, labels = plt.gca().get_legend_handles_labels()
-    if labels: plt.legend(loc='lower right')
+    if labels:
+        plt.legend(loc='lower right')
     plt.tight_layout()
 
     # Interactive
@@ -1100,7 +1111,7 @@ def plot_basins_common(
         box_height = 0.03
         box_left = ax_pos.x1 - box_width
         box_bottom = ax_pos.y0 - box_height - 0.03
-        ax_box = fig.add_axes([box_left, box_bottom, box_width, box_height])
+        ax_box = fig.add_axes((box_left, box_bottom, box_width, box_height))
         label = "Lon,Lat:" if use_lonlat else "X,Y:"
         text_box = TextBox(ax_box, label, initial="", textalignment="center")
         text_box.on_submit(on_submit)
@@ -1212,8 +1223,8 @@ def visualize_nc_basins(
             elif 'is_river_mouth' in ds.variables:
                 is_mouth = ds['is_river_mouth'][:]
                 if np.any(is_mouth):
-                     # is_river_mouth is likely a boolean mask or 1/0
-                     mask = (is_mouth == 1) | (is_mouth == True)
+                     # is_river_mouth is a boolean mask or 1/0
+                     mask = is_mouth == 1
                      river_mouths_xy = (catchment_x[mask], catchment_y[mask])
 
         catchment_id = None
@@ -1277,7 +1288,6 @@ def _check_poi_overlap(sorted_pois, poi_upstream_list):
     poi_upstream_list : list of set
         ``poi_upstream_list[i]`` is the upstream set for ``sorted_pois[i]``.
     """
-    target_set = set(int(c) for c in sorted_pois)
     overlapping = []
     for ia, cid_a in enumerate(sorted_pois):
         for ib, cid_b in enumerate(sorted_pois):
@@ -1294,7 +1304,7 @@ def _check_poi_overlap(sorted_pois, poi_upstream_list):
 def crop_parameters_nc(
     input_nc: Union[str, Path],
     output_nc: Union[str, Path],
-    points_of_interest: Dict[str, Any] = None,
+    points_of_interest: Optional[Dict[str, Any]] = None,
     visualize: bool = False,
     only_save_pois: bool = False,
     crop_upstream: bool = False,
@@ -1619,10 +1629,14 @@ def crop_parameters_nc(
                     dst.createDimension(name, num_kept_catchments)
                 elif name == 'basin':
                     dst.createDimension(name, num_merged_basins)
-                elif name == 'bifurcation_path': pass
-                elif name == 'levee': pass
-                elif name == 'gauge': pass
-                elif name == 'saved_catchment': pass  # Will be created below
+                elif name == 'bifurcation_path':
+                    pass
+                elif name == 'levee':
+                    pass
+                elif name == 'gauge':
+                    pass
+                elif name == 'saved_catchment':
+                    pass  # Will be created below
                 else:
                     dst.createDimension(name, len(dim) if not dim.isunlimited() else None)
             
@@ -1654,7 +1668,7 @@ def crop_parameters_nc(
                      bif_basin_id = src['bifurcation_basin_id'][:]
                      bif_mask = np.isin(bif_basin_id, kept_basin_ids)
                  if 'bifurcation_path' not in dst.dimensions:
-                      dst.createDimension('bifurcation_path', np.sum(bif_mask))
+                      dst.createDimension('bifurcation_path', int(np.sum(bif_mask)))
             
             lev_mask = None
             if 'levee_basin_id' in src.variables:
@@ -1669,14 +1683,14 @@ def crop_parameters_nc(
                      lev_basin_id = src['levee_basin_id'][:]
                      lev_mask = np.isin(lev_basin_id, kept_basin_ids)
                  if 'levee' not in dst.dimensions:
-                      dst.createDimension('levee', np.sum(lev_mask))
+                      dst.createDimension('levee', int(np.sum(lev_mask)))
 
             gauge_mask = None
             if 'gauge_catchment_id' in src.variables:
                 gauge_cids = src['gauge_catchment_id'][:]
                 gauge_mask = np.isin(gauge_cids, kept_catchment_ids)
                 if 'gauge' not in dst.dimensions:
-                    dst.createDimension('gauge', np.sum(gauge_mask))
+                    dst.createDimension('gauge', int(np.sum(gauge_mask)))
 
             for name, var in src.variables.items():
                 dims = var.dimensions
@@ -1920,10 +1934,10 @@ def visualize_runoff_mapping(
     if use_lonlat:
         sx, ix_c = np.polyfit(cx, lon_param, 1)
         sy, iy_c = np.polyfit(cy, lat_param, 1)
-        cama_extent = [
+        cama_extent = (
             ix_c + sx * (-0.5), ix_c + sx * (nx - 0.5),
             iy_c + sy * (ny - 0.5), iy_c + sy * (-0.5),
-        ]
+        )
         cama_xlabel, cama_ylabel = "Longitude", "Latitude"
     else:
         cama_extent = None

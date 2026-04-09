@@ -121,7 +121,8 @@ class TopologyReader:
             raise ValueError("Must provide either cid or xy.")
             
         if cid is None:
-            cid = self.get_id_from_xy(*xy)
+            assert xy is not None
+            cid = self.get_id_from_xy(xy[0], xy[1])
             if cid is None:
                 return None
         
@@ -234,7 +235,7 @@ class TopologyReader:
             top_lat = max_lat_basin + (y0 - 0.5 - min_y_basin) * dlat
             bottom_lat = max_lat_basin + (y1 - 0.5 - min_y_basin) * dlat
             
-            extent = [left_lon, right_lon, bottom_lat, top_lat]
+            extent = (left_lon, right_lon, bottom_lat, top_lat)
             xlabel = "Longitude"
             ylabel = "Latitude"
             
@@ -246,7 +247,7 @@ class TopologyReader:
             target_y = max_lat_basin + (info['catchment_y'] - min_y_basin) * dlat
         else:
             # Use indices, centered
-            extent = [x0 - 0.5, x1 - 0.5, y1 - 0.5, y0 - 0.5]
+            extent = (x0 - 0.5, x1 - 0.5, y1 - 0.5, y0 - 0.5)
             xlabel = "X Index"
             ylabel = "Y Index"
             c_x_plot = self.c_x

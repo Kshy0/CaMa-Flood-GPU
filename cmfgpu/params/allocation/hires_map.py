@@ -273,7 +273,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         lons: List[float] = []
         areas: List[float] = []
 
-        with open(self.gauge_list) as f:
+        with open(self.gauge_list) as f:  # type: ignore[arg-type]
             header = f.readline()  # noqa: F841 — skip header
             sep = "," if "," in header else None
             for line in f:
@@ -524,7 +524,7 @@ if __name__ == "__main__":
     )
 
     hires = HiResMap(
-        map_dir=map_dir,
+        map_dir=Path(map_dir),
         gauge_list=gauge_list,
         hires_tag="1min",
     )

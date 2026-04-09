@@ -218,11 +218,16 @@ class LeveeModule(AbstractModule):
         if is_batched:
             # Ensure all inputs are batched (T, L, ...)
             num_trials = self.num_trials or 1
-            if river_length.ndim == 1: river_length = river_length.expand(num_trials, -1)
-            if river_width.ndim == 1: river_width = river_width.expand(num_trials, -1)
-            if river_height.ndim == 1: river_height = river_height.expand(num_trials, -1)
-            if catchment_area.ndim == 1: catchment_area = catchment_area.expand(num_trials, -1)
-            if flood_depth_table.ndim == 2: flood_depth_table = flood_depth_table.expand(num_trials, -1, -1)
+            if river_length.ndim == 1:
+                river_length = river_length.expand(num_trials, -1)
+            if river_width.ndim == 1:
+                river_width = river_width.expand(num_trials, -1)
+            if river_height.ndim == 1:
+                river_height = river_height.expand(num_trials, -1)
+            if catchment_area.ndim == 1:
+                catchment_area = catchment_area.expand(num_trials, -1)
+            if flood_depth_table.ndim == 2:
+                flood_depth_table = flood_depth_table.expand(num_trials, -1, -1)
             
             # Recalculate derived batched vars
             river_max_storage = river_length * river_width * river_height

@@ -238,7 +238,6 @@ def compute_levee_stage_log_kernel(
     num_flood_levels: int,
     BLOCK_SIZE: int = 128,
 ) -> None:
-    NL = num_levees
     lci = levee_catchment_idx
     ca = catchment_area[lci]
 

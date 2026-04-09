@@ -163,7 +163,6 @@ def compute_flood_stage_log_kernel(
     BLOCK_SIZE: int = 128,
 ) -> None:
     """Flood stage kernel with logging. Delegates to base kernel + log."""
-    N = num_catchments
     non_levee = ~is_levee
 
     # Pre-logging (all tensor ops, no .item() – keeps the graph intact)

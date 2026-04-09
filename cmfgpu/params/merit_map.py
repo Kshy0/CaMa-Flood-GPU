@@ -613,7 +613,7 @@ class MERITMap(BaseModel):
         total_load = sum(loads)
         if total_load > 0:
             avg_load = total_load / max(1, int(self.target_gpus))
-            max_dev = max(abs(l - avg_load) / avg_load for l in loads)
+            max_dev = max(abs(ld - avg_load) / avg_load for ld in loads)
         else:
             avg_load = 0.0
             max_dev = 0.0
@@ -891,13 +891,13 @@ class MERITMap(BaseModel):
         rivhgt_path = self.map_dir / "rivhgt.bin"
         if rivhgt_path.exists():
             self.river_height = _read_2d_map("rivhgt.bin")
-            print(f"Loaded river_height from rivhgt.bin")
+            print("Loaded river_height from rivhgt.bin")
 
         # River width (optional — will be estimated by update_river_params if missing)
         rivwth_path = self.map_dir / "rivwth_gwdlr.bin"
         if rivwth_path.exists():
             self.river_width = _read_2d_map("rivwth_gwdlr.bin")
-            print(f"Loaded river_width from rivwth_gwdlr.bin")
+            print("Loaded river_width from rivwth_gwdlr.bin")
 
         # Satellite-derived width (optional, stored for estimate_river_geometry)
         if self.satellite_width_file is not None:
@@ -1197,7 +1197,7 @@ class MERITMap(BaseModel):
              print(f"Saved basin visualization to {self.out_dir / 'basin_map.png'}")
 
     def print_summary(self) -> None:
-        print(f"MERIT Map Processing Summary:")
+        print("MERIT Map Processing Summary:")
         print(f"Grid dimensions          : {self.nx} x {self.ny}")
         print(f"Number of basins         : {self.num_basins}")
         print(f"Number of catchments     : {self.num_catchments}")
@@ -1209,7 +1209,7 @@ class MERITMap(BaseModel):
         print(f"Output directory         : {self.out_dir}")
 
     def build_input(self) -> None:
-        print(f"Starting MERIT Map processing pipeline")
+        print("Starting MERIT Map processing pipeline")
         print(f"Map directory: {self.map_dir}")
         print(f"Output file: {self.out_dir / self.out_file}")
 

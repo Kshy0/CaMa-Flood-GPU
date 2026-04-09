@@ -255,22 +255,28 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
                 f"Header: {header}"
             )
 
+        # After validation, required columns are guaranteed non-None
+        ids_col: int = col["ids"]  # type: ignore[assignment]
+        lats_col: int = col["lats"]  # type: ignore[assignment]
+        lons_col: int = col["lons"]  # type: ignore[assignment]
+        cap_col: int = col["cap_mcm"]  # type: ignore[assignment]
+
         for row in reader:
             if not row or not row[0].strip():
                 continue
             try:
-                ids.append(int(row[col["ids"]]))
-                lats.append(float(row[col["lats"]]))
-                lons.append(float(row[col["lons"]]))
+                ids.append(int(row[ids_col]))
+                lats.append(float(row[lats_col]))
+                lons.append(float(row[lons_col]))
                 upareas.append(
                     float(row[col["upareas"]]) if col["upareas"] is not None
                     else -999.0
                 )
                 names.append(
                     row[col["names"]].strip() if col["names"] is not None
-                    else f"dam_{row[col['ids']]}"
+                    else f"dam_{row[ids_col]}"
                 )
-                cap_mcm_list.append(float(row[col["cap_mcm"]]))
+                cap_mcm_list.append(float(row[cap_col]))
                 years_list.append(
                     int(row[col["years"]]) if col["years"] is not None
                     else -99
@@ -1092,7 +1098,7 @@ def estimate_dam_params(
         grsad_dir = Path(grsad_dir)
         regeom_dir = Path(regeom_dir)
         if verbose:
-            print(f"[dam_params] Estimating flood storage from GRSAD + ReGeom")
+            print("[dam_params] Estimating flood storage from GRSAD + ReGeom")
         for d in range(n_dam):
             fld_vol_mcm[d] = _estimate_flood_storage_grsad(
                 dam_id=int(dam_info["ids"][d]),
@@ -1214,6 +1220,9 @@ def estimate_dam_params(
         )
         if primary_output is None:
             primary_output = nc_path
+
+    if primary_output is None:
+        raise RuntimeError("No output file was generated (neither CSV nor NC was requested).")
 
     return primary_output
 

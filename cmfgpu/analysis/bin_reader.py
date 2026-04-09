@@ -194,9 +194,9 @@ class BinReader:
             
         # Read data
         offset = local_idx * self.nx * self.ny * 4
-        with open(target_file["path"], "rb") as f:
-            f.seek(offset)
-            data = np.fromfile(f, dtype="<f4", count=self.nx * self.ny)
+        with open(target_file["path"], "rb") as fh:
+            fh.seek(offset)
+            data = np.fromfile(fh, dtype="<f4", count=self.nx * self.ny)
             
         grid = data.reshape((self.nx, self.ny), order='F')
         
@@ -274,8 +274,10 @@ class BinReader:
         
         fig, ax = plt.subplots(figsize=figsize)
         
-        if vmin is None: vmin = np.nanmin(grid)
-        if vmax is None: vmax = np.nanmax(grid)
+        if vmin is None:
+            vmin = np.nanmin(grid)
+        if vmax is None:
+            vmax = np.nanmax(grid)
         
         # Plot transposed grid (ny, nx) so x-axis is longitude (nx), y-axis is latitude (ny)
         im = ax.imshow(grid.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax, interpolation='none')
@@ -313,8 +315,10 @@ class BinReader:
         grid = np.ma.masked_equal(grid, -9999.0)
         grid = np.ma.masked_greater(grid, 1e19)
         
-        if vmin is None: vmin = np.nanmin(grid)
-        if vmax is None: vmax = np.nanmax(grid)
+        if vmin is None:
+            vmin = np.nanmin(grid)
+        if vmax is None:
+            vmax = np.nanmax(grid)
         
         im = ax.imshow(grid.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax, interpolation='none')
         title = ax.set_title(f"{self.var_name}")
