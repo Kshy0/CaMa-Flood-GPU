@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import re
+import zipfile
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -55,73 +57,83 @@ class GaugeSeries:
 def default_grdc_resolver(gauge_id: str) -> str: 
     return f"{gauge_id}_Q_Day.Cmd.txt"
 
-def load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
-    file_path = Path(file_path)
+
+def parse_grdc_text(gauge_id: str, text: str) -> GaugeSeries:
+    """Parse raw GRDC daily discharge text into a GaugeSeries.
+
+    Parameters
+    ----------
+    gauge_id : str
+        Station identifier.
+    text : str
+        Full content of a GRDC daily .txt file.
+
+    Returns
+    -------
+    GaugeSeries
+    """
     dates: List[datetime] = []
     vals: List[float] = []
     units = "m3/s"
-
-    # Try extract basic meta from header
     meta: dict = {"source": "GRDC"}
-    with file_path.open("r", encoding="utf-8", errors="ignore") as f:
-        in_data = False
-        for raw in f:
-            line = raw.strip("\n")
-            if not in_data:
-                if line.startswith("#"):
-                    # capture a few optional fields
-                    if "Latitude" in line:
-                        try:
-                            meta["lat"] = float(line.split(":")[-1])
-                        except Exception:
-                            pass
-                    if "Longitude" in line:
-                        try:
-                            meta["lon"] = float(line.split(":")[-1])
-                        except Exception:
-                            pass
-                    if "Unit of measure" in line and ("m3" in line or "m?s" in line):
-                        units = "m3/s"
-                    continue
-                # Switch to data when the header separator or table header has passed
-                if line.upper().startswith("YYYY-") or line.strip().upper() == "# DATA":
-                    in_data = True
-                    continue
-                else:
-                    continue
 
-            # Data section
-            if not line or line.startswith("#"):
+    in_data = False
+    for raw in text.split("\n"):
+        line = raw.strip("\n")
+        if not in_data:
+            if line.startswith("#"):
+                if "Latitude" in line:
+                    try:
+                        meta["lat"] = float(line.split(":")[-1])
+                    except Exception:
+                        pass
+                if "Longitude" in line:
+                    try:
+                        meta["lon"] = float(line.split(":")[-1])
+                    except Exception:
+                        pass
+                if "Catchment area" in line:
+                    try:
+                        meta["area_km2"] = float(line.split(":")[-1])
+                    except Exception:
+                        pass
+                if "Unit of measure" in line and ("m3" in line or "m?s" in line):
+                    units = "m3/s"
                 continue
-            # Support both ';' separated and whitespace
-            parts = [p.strip() for p in line.split(";")]
-            if len(parts) >= 3:
-                date_str, time_str, val_str = parts[:3]
+            if line.upper().startswith("YYYY-") or line.strip().upper() == "# DATA":
+                in_data = True
+                continue
             else:
-                toks = line.split()
-                if len(toks) < 2:
-                    continue
-                date_str, val_str = toks[0], toks[-1]
-            try:
-                # Some files use --:--, ignore time and parse date only
-                dt = datetime.strptime(date_str, "%Y-%m-%d")
-            except Exception:
-                # Try alternative formats
-                try:
-                    dt = datetime.strptime(date_str, "%d.%m.%Y")
-                except Exception:
-                    continue
+                continue
 
-            val_str = val_str.replace(",", ".")  # safety
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) >= 3:
+            date_str, time_str, val_str = parts[:3]
+        else:
+            toks = line.split()
+            if len(toks) < 2:
+                continue
+            date_str, val_str = toks[0], toks[-1]
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+        except Exception:
             try:
-                v = float(val_str)
+                dt = datetime.strptime(date_str, "%d.%m.%Y")
             except Exception:
                 continue
-            if v in (-999.0, -999.000, -9999.0, -9999.000) or int(v) in (-999, -9999):
-                v = np.nan
 
-            dates.append(dt)
-            vals.append(v)
+        val_str = val_str.replace(",", ".")
+        try:
+            v = float(val_str)
+        except Exception:
+            continue
+        if v in (-999.0, -999.000, -9999.0, -9999.000) or int(v) in (-999, -9999):
+            v = np.nan
+
+        dates.append(dt)
+        vals.append(v)
 
     return GaugeSeries(
         gauge_id=gauge_id,
@@ -130,6 +142,64 @@ def load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
         units=units,
         meta=meta if meta else None,
     )
+
+
+def load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
+    """Load a GRDC daily discharge file → GaugeSeries."""
+    file_path = Path(file_path)
+    text = file_path.read_text(encoding="utf-8", errors="ignore")
+    return parse_grdc_text(gauge_id, text)
+
+
+def read_mapdim(map_dir: Union[str, Path]) -> Tuple[int, int]:
+    """Read (nx, ny) from CaMa-Flood mapdim.txt.
+
+    Parameters
+    ----------
+    map_dir : path
+        Directory containing ``mapdim.txt``.
+
+    Returns
+    -------
+    (nx, ny) : tuple of int
+    """
+    with open(Path(map_dir) / "mapdim.txt") as f:
+        nx = int(f.readline().split("!!")[0].strip())
+        ny = int(f.readline().split("!!")[0].strip())
+    return nx, ny
+
+
+def parse_alloc_txt(alloc_path: Union[str, Path]) -> Dict[int, dict]:
+    """Parse CaMa-Flood GRDC_alloc.txt → per-station allocation info.
+
+    Parameters
+    ----------
+    alloc_path : path
+        Path to ``GRDC_alloc.txt``.
+
+    Returns
+    -------
+    dict
+        ``{station_id: {ix1, iy1, ix2, iy2, area_cama, error}}``
+        Grid indices are 1-based (Fortran convention, as in the file).
+    """
+    result: Dict[int, dict] = {}
+    with open(alloc_path) as f:
+        lines = f.readlines()
+    for line in lines[1:]:
+        tok = line.split()
+        if len(tok) < 14:
+            continue
+        sid = int(tok[0])
+        result[sid] = {
+            "ix1": int(tok[8]),
+            "iy1": int(tok[9]),
+            "ix2": int(tok[10]),
+            "iy2": int(tok[11]),
+            "area_cama": float(tok[5]),
+            "error": float(tok[3]),
+        }
+    return result
 
 class GaugeReader:
     """
@@ -434,3 +504,247 @@ class GaugeReader:
             return float("nan")
         num = np.sum((s - o) ** 2)
         return 1.0 - (num / denom)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Batch extraction and NetCDF writing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def scan_grdc_zips(grdc_dir: Union[str, Path]) -> Dict[str, List[Tuple[int, str]]]:
+    """Discover all daily-discharge station files inside GRDC zip archives.
+
+    Scans all ``*.zip`` files in *grdc_dir* for filenames matching
+    ``{station_id}_Q_Day.Cmd.txt``.
+
+    Parameters
+    ----------
+    grdc_dir : path
+        Directory containing ``{country}.zip`` files.
+
+    Returns
+    -------
+    dict
+        ``{zip_stem: [(station_id, filename_in_zip), ...]}``
+        Ready to pass to :func:`extract_grdc_from_zips`.
+    """
+    grdc_dir = Path(grdc_dir)
+    result: Dict[str, List[Tuple[int, str]]] = {}
+    for zf_path in sorted(grdc_dir.glob("*.zip")):
+        entries: List[Tuple[int, str]] = []
+        try:
+            with zipfile.ZipFile(zf_path) as zf:
+                for name in zf.namelist():
+                    if "_Q_Day" not in name:
+                        continue
+                    # Extract station ID from e.g. "6342640_Q_Day.Cmd.txt"
+                    stem = Path(name).name.split("_Q_Day")[0]
+                    try:
+                        sid = int(stem)
+                    except ValueError:
+                        continue
+                    entries.append((sid, name))
+        except Exception:
+            continue
+        if entries:
+            result[zf_path.stem] = entries
+    n_total = sum(len(v) for v in result.values())
+    print(f"Scanned {len(result)} zips, found {n_total} daily station files")
+    return result
+
+
+def extract_grdc_from_zips(
+    grdc_dir: Union[str, Path],
+    zip_file_map: Dict[str, List[Tuple[int, str]]],
+    time_start: str,
+    time_end: str,
+) -> Dict[int, Tuple[np.ndarray, np.ndarray, dict]]:
+    """Extract daily discharge from GRDC zip archives.
+
+    Parameters
+    ----------
+    grdc_dir : path
+        Directory containing ``{country}.zip`` files.
+    zip_file_map : dict
+        ``{zip_name: [(station_id, filename_in_zip), ...]}``
+    time_start, time_end : str
+        ISO date strings (inclusive) for clipping, e.g. ``"1979-01-01"``.
+
+    Returns
+    -------
+    dict
+        ``{station_id: (dates_datetime64, values_f32, meta_dict)}``
+        where *meta_dict* may contain ``lat``, ``lon``, ``area_km2``.
+        Only stations with at least one non-NaN value are included.
+    """
+    grdc_dir = Path(grdc_dir)
+    t0 = np.datetime64(time_start)
+    t1 = np.datetime64(time_end)
+
+    result: Dict[int, Tuple[np.ndarray, np.ndarray, dict]] = {}
+    n_zips = len(zip_file_map)
+
+    for zi, (zf_name, entries) in enumerate(sorted(zip_file_map.items())):
+        zf_path = grdc_dir / f"{zf_name}.zip"
+        if not zf_path.exists():
+            continue
+        try:
+            with zipfile.ZipFile(zf_path) as zf:
+                for sid, fname in entries:
+                    try:
+                        with zf.open(fname) as f:
+                            raw = f.read().decode("utf-8", errors="replace")
+                        gs = parse_grdc_text(str(sid), raw)
+                        if len(gs.dates) == 0:
+                            continue
+                        dates = np.array(gs.dates, dtype="datetime64[D]")
+                        vals = gs.values.astype(np.float32)
+                        mask = (dates >= t0) & (dates <= t1)
+                        dates, vals = dates[mask], vals[mask]
+                        if len(vals) > 0 and np.any(np.isfinite(vals)):
+                            result[sid] = (dates, vals, gs.meta or {})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if (zi + 1) % 20 == 0 or zi + 1 == n_zips:
+            print(f"  {zi+1}/{n_zips} zips done, {len(result)} series")
+
+    print(f"Extracted {len(result)} time series")
+    return result
+
+
+def write_gauge_nc(
+    output_path: Union[str, Path],
+    station_ids: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    reported_area_km2: np.ndarray,
+    downstream_station_id: np.ndarray,
+    observations: np.ndarray,
+    time_start: str,
+    resolution_allocs: Optional[
+        Dict[str, Dict[str, np.ndarray]]
+    ] = None,
+    resolution_dims: Optional[Dict[str, Tuple[int, int]]] = None,
+    title: str = "GRDC daily discharge observations",
+    source: str = "GRDC",
+    error_threshold: float = 0.10,
+) -> Path:
+    """Write a standardised gauge observation NetCDF.
+
+    Parameters
+    ----------
+    output_path : path
+        Destination ``.nc`` file.
+    station_ids : (N,) int64
+    lat, lon : (N,) float32
+    reported_area_km2 : (N,) float32
+    downstream_station_id : (N,) int64  — ``-1`` for none.
+    observations : (T, N) float32  — NaN for missing.
+    time_start : str
+        ISO date of first time step, e.g. ``"1979-01-01"``.
+    resolution_allocs : dict, optional
+        ``{res_name: {"catchment_id": (N,) i64,
+                      "allocated_area_km2": (N,) f32,
+                      "alloc_error": (N,) f32}}``
+    resolution_dims : dict, optional
+        ``{res_name: (nx, ny)}``.  Required if *resolution_allocs* given.
+    title, source : str
+        Global attributes.
+    error_threshold : float
+        Recorded as a global attribute.
+
+    Returns
+    -------
+    Path
+        The written file path.
+    """
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    n_time, n_station = observations.shape
+    ds = nc.Dataset(str(out), "w", format="NETCDF4")
+
+    ds.title = title
+    ds.source = source
+    ds.time_start = time_start
+    ds.allocation_error_threshold = error_threshold
+
+    ds.createDimension("time", None)
+    ds.createDimension("station", n_station)
+
+    # Time
+    t_var = ds.createVariable("time", "f8", ("time",))
+    t_var.units = f"days since {time_start}"
+    t_var.calendar = "standard"
+    t_var.long_name = "Time"
+    t_var[:] = np.arange(n_time, dtype=np.float64)
+
+    # Station ID
+    v = ds.createVariable("station_id", "i8", ("station",), zlib=True)
+    v.long_name = "GRDC station ID"
+    v[:] = station_ids
+
+    # Lat / Lon
+    v = ds.createVariable("lat", "f4", ("station",), zlib=True)
+    v.units = "degrees_north"
+    v.long_name = "Station latitude"
+    v[:] = lat
+
+    v = ds.createVariable("lon", "f4", ("station",), zlib=True)
+    v.units = "degrees_east"
+    v.long_name = "Station longitude"
+    v[:] = lon
+
+    # Reported area
+    v = ds.createVariable("reported_area_km2", "f4", ("station",), zlib=True)
+    v.units = "km2"
+    v.long_name = "Reported upstream drainage area"
+    v[:] = reported_area_km2
+
+    # Downstream station
+    v = ds.createVariable("downstream_station_id", "i8", ("station",), zlib=True)
+    v.long_name = "Nearest downstream station (-1 = none)"
+    v[:] = downstream_station_id
+
+    # Observations (chunked per station time series)
+    v = ds.createVariable(
+        "observations", "f4", ("time", "station"),
+        zlib=True, complevel=4, shuffle=True,
+        fill_value=np.float32(np.nan),
+        chunksizes=(n_time, 1),
+    )
+    v.units = "m3/s"
+    v.long_name = "Daily mean discharge"
+    for j in range(n_station):
+        v[:, j] = observations[:, j]
+
+    # Per-resolution allocation variables
+    if resolution_allocs:
+        for res, arrs in resolution_allocs.items():
+            nx, ny = resolution_dims[res]
+            suffix = f"_{res}"
+
+            v = ds.createVariable(
+                f"catchment_id{suffix}", "i8", ("station",), zlib=True)
+            v.long_name = f"Catchment index on {res} grid (ix*ny+iy, 0-based)"
+            v.setncattr("nx", int(nx))
+            v.setncattr("ny", int(ny))
+            v[:] = arrs["catchment_id"]
+
+            v = ds.createVariable(
+                f"allocated_area{suffix}_km2", "f4", ("station",), zlib=True)
+            v.units = "km2"
+            v.long_name = f"CaMa-allocated drainage area on {res} grid"
+            v[:] = arrs["allocated_area_km2"]
+
+            v = ds.createVariable(
+                f"alloc_error{suffix}", "f4", ("station",), zlib=True)
+            v.long_name = f"Relative area allocation error on {res} grid"
+            v[:] = arrs["alloc_error"]
+
+    ds.close()
+    size_mb = out.stat().st_size / 1e6
+    print(f"Created: {out} ({size_mb:.1f} MB)")
+    print(f"  {n_station} stations × {n_time} days")
+    return out

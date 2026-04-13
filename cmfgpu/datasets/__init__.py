@@ -1,9 +1,5 @@
-from cmfgpu.datasets.abstract_gauge import AbstractGaugeDataset
-from cmfgpu.datasets.csv_gauge import CSVGaugeDataset
-from cmfgpu.datasets.netcdf_gauge import NetCDFGaugeDataset
+from cmfgpu.datasets.gauge_dataset import GaugeDataset
 
 __all__ = [
-    "AbstractGaugeDataset",
-    "CSVGaugeDataset",
-    "NetCDFGaugeDataset",
+    "GaugeDataset",
 ]

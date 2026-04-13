@@ -51,6 +51,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
     _stats_start_time: Optional[Union[datetime, cftime.datetime]] = PrivateAttr(default=None)
     _stats_macro_step: int = PrivateAttr(default=0)
+    _pending_outer_first: bool = PrivateAttr(default=False)
     _stats_cg: Optional[Any] = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
@@ -545,6 +546,14 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         if stat_is_outer_last is None:
             stat_is_outer_last = False
 
+        # Latch outer_first: if signaled on a non-last step, defer to next last step
+        if stat_is_outer_first and not stat_is_last:
+            self._pending_outer_first = True
+            stat_is_outer_first = False
+        if self._pending_outer_first and stat_is_last:
+            stat_is_outer_first = True
+            self._pending_outer_first = False
+
         if self.adaptive_time is not None:
             self.adaptive_time.max_sub_steps.fill_(0)
             self._call_adaptive_time(time_step=time_step)
@@ -612,6 +621,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                     if is_outer_first_0:
                         agg._macro_step_index = 0
                         agg._current_macro_step_count = 0.0
+                        agg._outer_flags_ever_seen = True
                     if is_inner_last_0 or is_outer_last_0:
                         for out_name, out_is_outer in agg._output_is_outer.items():
                             if (not out_is_outer and is_inner_last_0) or (out_is_outer and is_outer_last_0):
@@ -662,6 +672,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                         if is_stat_outer_first:
                             agg._macro_step_index = 0
                             agg._current_macro_step_count = 0.0
+                            agg._outer_flags_ever_seen = True
                         if is_stat_last or is_stat_outer_last:
                             for out_name, out_is_outer in agg._output_is_outer.items():
                                 if (not out_is_outer and is_stat_last) or (out_is_outer and is_stat_outer_last):

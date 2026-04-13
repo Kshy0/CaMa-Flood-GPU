@@ -209,6 +209,10 @@ class MERITMap(BaseModel):
         "flood_control_outflow",
         "reservoir_area",
         "gauge_catchment_id",
+        "gauge_station_id",
+        "gauge_reported_area_km2",
+        "gauge_allocated_area_km2",
+        "gauge_alloc_error",
         "longitude",
         "latitude",
         "satellite_width",
@@ -290,7 +294,12 @@ class MERITMap(BaseModel):
         print(f"Loaded {len(catchment_id)} catchments")
 
     def load_gauge_id(self) -> None:
-        """Load gauge information from gauge file."""
+        """Load gauge information from gauge file.
+
+        Reads GRDC_alloc.txt (columns: ID lat lon err area_GRDC area_CaMa
+        diff ups_num ix1 iy1 ix2 iy2 area1 area2) and stores per-gauge
+        metadata including station ID, reported area, and CaMa-allocated area.
+        """
         if self.gauge_file is None:
             self.num_gauges = 0
             self.gauge_id = np.array([], dtype=np.int64)
@@ -310,6 +319,9 @@ class MERITMap(BaseModel):
             gauge_name = int(data[0])
             lat = float(data[1])
             lon = float(data[2])
+            err = float(data[3])
+            area_grdc = float(data[4])
+            area_cama = float(data[5])
             type_num = int(data[7])
             ix1, iy1 = int(data[8]) - 1, int(data[9]) - 1
             ix2, iy2 = int(data[10]) - 1, int(data[11]) - 1
@@ -342,15 +354,43 @@ class MERITMap(BaseModel):
                 self.gauge_info[gauge_name] = {
                     "upstream_id": catchment_ids,
                     "lat": lat,
-                    "lon": lon
+                    "lon": lon,
+                    "reported_area_km2": area_grdc,
+                    "allocated_area_km2": area_cama,
+                    "alloc_error": err,
                 }
 
         if len(self.gauge_info) == 0:
             print("Warning: No valid gauges found in the gauge file")
 
-        self.gauge_id = np.array(sorted(gauge_id_set), dtype=np.int64)
+        # Build per-catchment gauge arrays (one gauge per catchment,
+        # selecting the one with smallest |err| when duplicates exist).
+        cid_to_best: dict = {}  # catchment_id -> (station_id, err, area_grdc, area_cama)
+        for gname, info in self.gauge_info.items():
+            for cid in info["upstream_id"]:
+                prev = cid_to_best.get(cid)
+                if prev is None or abs(info["alloc_error"]) < abs(prev[1]):
+                    cid_to_best[cid] = (
+                        gname, info["alloc_error"],
+                        info["reported_area_km2"], info["allocated_area_km2"],
+                    )
+
+        sorted_cids = sorted(cid_to_best.keys())
+        self.gauge_id = np.array(sorted_cids, dtype=np.int64)
         self.num_gauges = len(self.gauge_id)
         self.gauge_catchment_id = self.gauge_id
+        self.gauge_station_id = np.array(
+            [cid_to_best[c][0] for c in sorted_cids], dtype=np.int64
+        )
+        self.gauge_reported_area_km2 = np.array(
+            [cid_to_best[c][2] for c in sorted_cids], dtype=np.float32
+        )
+        self.gauge_allocated_area_km2 = np.array(
+            [cid_to_best[c][3] for c in sorted_cids], dtype=np.float32
+        )
+        self.gauge_alloc_error = np.array(
+            [cid_to_best[c][1] for c in sorted_cids], dtype=np.float32
+        )
 
         print(f"Loaded {len(self.gauge_info)} gauges covering {self.num_gauges} catchments")
 
@@ -1054,6 +1094,45 @@ class MERITMap(BaseModel):
                     if hasattr(self, key) and getattr(self, key) is not None:
                         yield key
 
+            # Variable metadata (units, long_name)
+            _var_attrs: Dict[str, Dict[str, str]] = {
+                "catchment_id":        {"long_name": "Linear catchment index (ix*ny+iy)"},
+                "downstream_id":       {"long_name": "Downstream catchment index"},
+                "catchment_x":         {"long_name": "Grid column index (0-based)"},
+                "catchment_y":         {"long_name": "Grid row index (0-based)"},
+                "catchment_basin_id":  {"long_name": "Basin ID"},
+                "basin_sizes":         {"long_name": "Number of catchments per basin"},
+                "river_length":        {"units": "m",  "long_name": "River channel length"},
+                "catchment_elevation": {"units": "m",  "long_name": "Mean catchment elevation"},
+                "catchment_area":      {"units": "m2", "long_name": "Catchment area"},
+                "upstream_area":       {"units": "m2", "long_name": "Total upstream drainage area"},
+                "downstream_distance": {"units": "m",  "long_name": "Distance to downstream catchment"},
+                "flood_depth_table":   {"units": "m",  "long_name": "Flood depth lookup table"},
+                "longitude":           {"units": "degrees_east",  "long_name": "Longitude"},
+                "latitude":            {"units": "degrees_north", "long_name": "Latitude"},
+                "river_width":         {"units": "m",  "long_name": "River channel width"},
+                "river_height":        {"units": "m",  "long_name": "River bank height"},
+                "river_depth":         {"units": "m",  "long_name": "Initial river depth"},
+                "river_storage":       {"units": "m3", "long_name": "Initial river storage"},
+                "satellite_width":     {"units": "m",  "long_name": "Satellite-derived river width"},
+                "gauge_catchment_id":       {"long_name": "Catchment ID for each gauge"},
+                "gauge_station_id":         {"long_name": "GRDC station ID"},
+                "gauge_reported_area_km2":  {"units": "km2", "long_name": "GRDC reported drainage area"},
+                "gauge_allocated_area_km2": {"units": "km2", "long_name": "CaMa-allocated drainage area"},
+                "gauge_alloc_error":        {"long_name": "Relative area allocation error"},
+                "bifurcation_length":       {"units": "m",  "long_name": "Bifurcation channel length"},
+                "bifurcation_width":        {"units": "m",  "long_name": "Bifurcation channel width"},
+                "bifurcation_elevation":    {"units": "m",  "long_name": "Bifurcation elevation"},
+                "reservoir_capacity":       {"units": "m3", "long_name": "Reservoir total capacity"},
+                "conservation_volume":      {"units": "m3", "long_name": "Reservoir conservation volume"},
+                "emergency_volume":         {"units": "m3", "long_name": "Reservoir emergency volume"},
+                "normal_outflow":           {"units": "m3/s", "long_name": "Reservoir normal outflow"},
+                "flood_control_outflow":    {"units": "m3/s", "long_name": "Reservoir flood control outflow"},
+                "reservoir_area":           {"units": "m2", "long_name": "Reservoir surface area"},
+                "levee_crown_height":       {"units": "m",  "long_name": "Levee crown height"},
+                "levee_fraction":           {"long_name": "Levee-protected fraction of floodplain"},
+            }
+
             for key in _vars_to_write():
                 data = getattr(self, key)
                 arr = np.array(data)
@@ -1074,6 +1153,10 @@ class MERITMap(BaseModel):
 
                 var = ds.createVariable(key, vdtype, dims, **kwargs)
                 var[:] = arr_to_write
+
+                # Attach units / long_name if defined
+                for attr_name, attr_val in _var_attrs.get(key, {}).items():
+                    var.setncattr(attr_name, attr_val)
 
             # Save some useful scalar attributes as global too
             ds.setncattr("nx", int(self.nx))
