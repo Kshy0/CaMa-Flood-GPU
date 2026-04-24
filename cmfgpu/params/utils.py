@@ -1808,7 +1808,58 @@ def crop_parameters_nc(
             
             var = dst.createVariable('catchment_save_basin_id', np.int64, ('saved_catchment',), zlib=True)
             var[:] = remapped_save_basin_ids
-            
+
+            # ── Write inflow gauge variables (crop_downstream / crop_interval) ──
+            if (crop_downstream or crop_interval) and len(target_cids) > 0:
+                if crop_interval:
+                    # For crop_interval each POI is a river mouth (downstream_id = self).
+                    # The correct injection point is one step downstream on the
+                    # *original* topology — that catchment is the headwater of the
+                    # downstream interval.
+                    max_cid = int(catchment_id.max())
+                    cid_to_dsid = np.full(max_cid + 1, np.int64(-1))
+                    cid_to_dsid[catchment_id] = downstream_id
+                    kept_flag = np.zeros(max_cid + 1, dtype=np.bool_)
+                    kept_flag[kept_catchment_ids] = True
+                    inject_list = []
+                    for poi_cid in target_cids:
+                        ds = int(cid_to_dsid[int(poi_cid)])
+                        if ds == int(poi_cid) or ds < 0:
+                            # True river mouth — no downstream interval, no injection needed.
+                            continue
+                        if not kept_flag[ds]:
+                            # Downstream catchment not in any kept interval
+                            # (e.g. POI near river mouth, or unmonitored reach).
+                            # No downstream interval to inject into — skip silently.
+                            continue
+                        inject_list.append(ds)
+                    # De-duplicate: multiple POIs sharing the same downstream
+                    # catchment collapse into a single injection point.
+                    # Callers aggregating the inflow time-series externally
+                    # must emit the same de-duplicated ordering.
+                    inflow_cids = np.unique(np.array(inject_list, dtype=np.int64))
+                else:
+                    # crop_downstream: POIs are headwaters, inject at POI itself
+                    inflow_cids = target_cids[np.isin(target_cids, kept_catchment_ids)]
+
+                if len(inflow_cids) > 0:
+                    inflow_idx = find_indices_in(inflow_cids, kept_catchment_ids)
+                    inflow_basin_ids = kept_catchment_basin_ids[inflow_idx]
+                    # Remap basin IDs
+                    inflow_basin_idx = np.searchsorted(old_unique_basins, inflow_basin_ids)
+                    inflow_basin_remapped = map_idx_to_new[inflow_basin_idx].astype(np.int64)
+
+                    dst.createDimension('inflow_gauge', len(inflow_cids))
+                    v = dst.createVariable('inflow_catchment_id', 'i8',
+                                           ('inflow_gauge',), zlib=True, complevel=4)
+                    v[:] = inflow_cids
+                    v.long_name = "catchment id where gauge inflow is injected"
+                    v = dst.createVariable('inflow_basin_id', 'i8',
+                                           ('inflow_gauge',), zlib=True, complevel=4)
+                    v[:] = inflow_basin_remapped
+                    v.long_name = "basin id for each inflow gauge (for distributed sharding)"
+                    print(f"  Written {len(inflow_cids)} inflow gauges")
+
             # Update global attr
             dst.setncattr("num_basins", int(num_merged_basins))
 

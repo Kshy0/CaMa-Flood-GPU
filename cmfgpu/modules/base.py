@@ -56,9 +56,9 @@ def computed_base_field(
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
     depends_on: Optional[str] = None,
+    static_output: bool = False,
     **kwargs
 ):
-
     return computed_tensor_field(
         description=description,
         shape=shape,
@@ -69,6 +69,7 @@ def computed_base_field(
         category=category,
         expr=expr,
         depends_on=depends_on,
+        static_output=static_output,
         **kwargs
     )
 
@@ -157,6 +158,36 @@ class BaseModule(AbstractModule):
         shape=("num_inflow_gauges",),
         default=None,
         category="topology",
+        mode="cpu",
+    )
+
+    basin_shift_days: Optional[torch.Tensor] = BaseField(
+        description=(
+            "Per-inflow-gauge day offset applied when reading forcing / "
+            "injection data. step_calendar(t, inflow_gauge g) = "
+            "period_start + t + basin_shift_days[g]."
+        ),
+        dtype="int",
+        group_by="inflow_basin_id",
+        dim_coords=None,
+        shape=("num_inflow_gauges",),
+        default=None,
+        category="param",
+        mode="cpu",
+    )
+
+    basin_valid_length_days: Optional[torch.Tensor] = BaseField(
+        description=(
+            "Per-inflow-gauge length in days of the first contiguous valid "
+            "observation segment, starting at period_start + basin_shift_days[g]. "
+            "Used to embed valid-observation metadata into output NC files."
+        ),
+        dtype="int",
+        group_by="inflow_basin_id",
+        dim_coords=None,
+        shape=("num_inflow_gauges",),
+        default=None,
+        category="param",
         mode="cpu",
     )
 
@@ -378,6 +409,55 @@ class BaseModule(AbstractModule):
         if self.inflow_catchment_id is None or self.inflow_catchment_id.numel() == 0:
             return None
         return find_indices_in_torch(self.inflow_catchment_id, self.catchment_id)
+
+    @computed_base_field(
+        description=(
+            "Per-catchment day offset derived from basin_shift_days at "
+            "inflow catchments; zero elsewhere.  Consumers apply this "
+            "shift when serving forcing so that at step t, catchment c "
+            "sees data for calendar day period_start + t + "
+            "catchment_shift_days[c]."
+        ),
+        dtype="int",
+        shape=("num_catchments",),
+        category="derived_param",
+        static_output=True,
+    )
+    @cached_property
+    def catchment_shift_days(self) -> torch.Tensor:
+        out = torch.zeros(
+            self.num_catchments, dtype=torch.int64, device=self.device)
+        if (self.basin_shift_days is None
+                or self.inflow_catchment_id is None
+                or self.inflow_catchment_id.numel() == 0):
+            return out
+        idx = find_indices_in_torch(
+            self.inflow_catchment_id, self.catchment_id).to(self.device)
+        out[idx] = self.basin_shift_days.to(torch.int64).to(self.device)
+        return out
+
+    @computed_base_field(
+        description=(
+            "Per-catchment valid-observation length derived from "
+            "basin_valid_length_days at inflow catchments; zero elsewhere."
+        ),
+        dtype="int",
+        shape=("num_catchments",),
+        category="derived_param",
+        static_output=True,
+    )
+    @cached_property
+    def catchment_valid_length_days(self) -> torch.Tensor:
+        out = torch.zeros(
+            self.num_catchments, dtype=torch.int64, device=self.device)
+        if (self.basin_valid_length_days is None
+                or self.inflow_catchment_id is None
+                or self.inflow_catchment_id.numel() == 0):
+            return out
+        idx = find_indices_in_torch(
+            self.inflow_catchment_id, self.catchment_id).to(self.device)
+        out[idx] = self.basin_valid_length_days.to(torch.int64).to(self.device)
+        return out
 
     @computed_base_field(
         description="Boolean mask for reservoir catchments",
@@ -670,6 +750,24 @@ class BaseModule(AbstractModule):
     def validate_catchment_save_idx(self) -> Self:
         if torch.any(self.catchment_save_idx < 0):
             raise ValueError("catchment_save_idx contains invalid indices (< 0). Check that catchment_save_id matches catchment_id.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_basin_valid_length_days(self) -> Self:
+        if self.basin_valid_length_days is not None:
+            if self.inflow_catchment_id is None or self.inflow_catchment_id.numel() == 0:
+                raise ValueError(
+                    "basin_valid_length_days is set but inflow_catchment_id is absent")
+            if self.basin_shift_days is not None:
+                if self.basin_shift_days.numel() != self.basin_valid_length_days.numel():
+                    raise ValueError(
+                        f"basin_shift_days size {self.basin_shift_days.numel()} "
+                        f"!= basin_valid_length_days size {self.basin_valid_length_days.numel()}")
+            if torch.any(self.basin_valid_length_days <= 0):
+                bad = self.inflow_catchment_id[self.basin_valid_length_days <= 0].tolist()
+                raise ValueError(
+                    f"basin_valid_length_days must be > 0 for all inflow catchments; "
+                    f"got <= 0 at catchment_id: {bad}")
         return self
 
     @model_validator(mode="after")

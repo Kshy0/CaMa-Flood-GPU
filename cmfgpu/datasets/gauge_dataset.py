@@ -1,73 +1,35 @@
-"""Unified gauge observation dataset for CaMa-Flood-GPU inflow injection.
+"""Gauge observation dataset for CaMa-Flood-GPU inflow injection.
 
-Reads a gauge / inflow NetCDF file and caches the full observation matrix
-in memory.  Two usage modes:
-
-1. **Station-level gauge NC** (from ``s00_build_gauge_nc.py``):
-   Dimensions ``(time, station)``, with ``catchment_id_{resolution}``
-   per station and ``observations`` that may contain NaN.
-
-2. **Inflow NC** (from ``t01_prepare_cama.py``):
-   Dimensions ``(time, gauge)``, with ``catchment_id`` per inject point
-   and ``discharge`` with NaN already filled to 0.
-
-In both cases, inflow stations are selected at ``build_inflow_mapping``
-time.
-
-Data flow::
-
-    gauge / inflow NC
-            │
-      GaugeDataset.__init__()
-      ├── read catchment IDs, keep allocated (>= 0)
-      ├── optionally fill NaN → 0 (fill_nan=True)
-      └── cache in memory
-            │
-      build_inflow_mapping(desired_cids, full_cids, device)
-      ├── pick columns matching desired inflow catchment IDs
-      ├── validate: no NaN, no negatives, length check
-      └── cache reorder + injection indices
-            │
-      shard_forcing(batch_gauge, batch_runoff)
-      └── batch_runoff[:, inflow_idx] += gauge_flat
+Loads a station-level gauge NetCDF written by ``s01_prepare_intervals.py``
+with dims ``(time, station)`` and variables ``catchment_id_{resolution}``,
+``reported_area_km2`` and ``observations`` (NaN for missing).  The only
+downstream consumer is ``qualify_inflow`` which collapses stations to one
+series per catchment and finds the first contiguous valid segment.
 """
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
-from hydroforge.modeling.distributed import find_indices_in
 from netCDF4 import Dataset as NCDataset
 from netCDF4 import num2date
 
 
 class GaugeDataset(torch.utils.data.Dataset):
-    """Gauge observation dataset backed by a NetCDF file.
+    """Strict-schema gauge NetCDF loader.
 
-    Parameters
-    ----------
-    path : str or Path
-        Path to gauge / inflow NetCDF.
-    start_date, end_date : datetime
-        Inclusive time range to extract.
-    time_interval : timedelta
-        Expected time step (must match the runoff dataset).
-    resolution : str or None
-        Map resolution tag (e.g. ``"glb_15min"``).  When set, reads
-        ``catchment_id_{resolution}`` and ``observations``.
-        When *None*, reads ``catchment_id`` and ``discharge``
-        (inflow NC convention).
-    fill_nan : bool
-        If *True*, replace NaN with 0 after loading.  Useful for inflow
-        injection where missing observations should inject nothing.
-    chunk_len : int
-        Chunk length (must match the runoff dataset).
-    num_prepend_chunks : int
-        Zero-filled chunks to prepend for spin-up alignment.
+    Required variables in *path*:
+
+    - ``time`` (CF units) with dim ``time``.
+    - ``catchment_id_{resolution}`` with dim ``station`` (int64).
+    - ``reported_area_km2`` with dim ``station`` (float).
+    - ``observations`` with dims ``(time, station)`` (float32, NaN = missing).
+
+    No fallbacks are attempted.  Stations whose ``catchment_id`` is < 0
+    are dropped as unallocated.
     """
 
     def __init__(
@@ -77,31 +39,26 @@ class GaugeDataset(torch.utils.data.Dataset):
         start_date: datetime,
         end_date: datetime,
         time_interval: timedelta,
-        resolution: str | None = "glb_15min",
-        fill_nan: bool = False,
-        chunk_len: int = 24,
-        num_prepend_chunks: int = 0,
+        resolution: str,
     ):
         super().__init__()
         path = Path(path)
 
-        # Determine variable names from resolution
-        if resolution is not None:
-            cid_var = f"catchment_id_{resolution}"
-            obs_var = "observations"
-        else:
-            cid_var = "catchment_id"
-            obs_var = "discharge"
+        cid_var = f"catchment_id_{resolution}"
+        obs_var = "observations"
+        area_var = "reported_area_km2"
 
         with NCDataset(str(path), "r") as ds:
-            if cid_var not in ds.variables:
-                raise ValueError(
-                    f"Variable '{cid_var}' not found in {path}. "
-                    f"Available: {list(ds.variables.keys())}"
-                )
+            for v in (cid_var, obs_var, area_var, "time"):
+                if v not in ds.variables:
+                    raise ValueError(
+                        f"{path}: missing required variable '{v}'. "
+                        f"Available: {list(ds.variables)}"
+                    )
             cids_all = np.asarray(ds.variables[cid_var][:], dtype=np.int64)
+            area_all = np.asarray(
+                ds.variables[area_var][:], dtype=np.float64)
 
-            # Time axis
             time_var = ds.variables["time"]
             raw_times = num2date(
                 time_var[:], units=time_var.units,
@@ -115,52 +72,30 @@ class GaugeDataset(torch.utils.data.Dataset):
             mask = (times >= start_date) & (times <= end_date)
             if not np.any(mask):
                 raise ValueError(
-                    f"No data in [{start_date}, {end_date}] in {path}"
-                )
+                    f"No data in [{start_date}, {end_date}] in {path}")
             time_idx = np.where(mask)[0]
 
-            # Read full observations for the time window
             raw = ds.variables[obs_var][time_idx, :]
-            if isinstance(raw, np.ma.MaskedArray):
-                obs = raw.filled(np.nan)
-            else:
-                obs = np.asarray(raw, dtype=np.float32)
+            obs = raw.filled(np.nan) if isinstance(raw, np.ma.MaskedArray) \
+                else np.asarray(raw, dtype=np.float32)
             obs = obs.astype(np.float32)
 
-        # Keep only stations allocated for this resolution
         allocated = cids_all >= 0
         n_total = len(cids_all)
         n_alloc = int(allocated.sum())
-        res_label = resolution if resolution is not None else "inflow"
-        print(
-            f"[GaugeDataset] {n_alloc}/{n_total} stations allocated "
-            f"on {res_label}"
-        )
+        print(f"[GaugeDataset] {n_alloc}/{n_total} stations allocated "
+              f"on {resolution}")
 
         self._gauge_catchment_ids = cids_all[allocated]
         self._data = obs[:, allocated]
-
-        if fill_nan:
-            n_nan = int(np.isnan(self._data).sum())
-            if n_nan > 0:
-                self._data = np.nan_to_num(self._data, nan=0.0)
-                print(f"[GaugeDataset] Filled {n_nan} NaN values with 0")
-        self.chunk_len = chunk_len
-        self._num_prepend_chunks = num_prepend_chunks
+        self._gauge_area_km2 = area_all[allocated]
         self._time_interval = time_interval
         self._start_date = start_date
         self._end_date = end_date
 
-        # Set after build_inflow_mapping
-        self._local_indices: Optional[np.ndarray] = None
-        self._inflow_catchment_idx: Optional[torch.Tensor] = None
-
-    # ------------------------------------------------------------------
-    # Properties
     # ------------------------------------------------------------------
     @property
     def gauge_catchment_ids(self) -> np.ndarray:
-        """All allocated catchment IDs in this dataset, shape ``(G,)``."""
         return self._gauge_catchment_ids
 
     @property
@@ -168,157 +103,134 @@ class GaugeDataset(torch.utils.data.Dataset):
         return len(self._gauge_catchment_ids)
 
     # ------------------------------------------------------------------
-    # Inflow mapping + validation
-    # ------------------------------------------------------------------
-    def build_inflow_mapping(
-        self,
-        desired_catchment_ids: np.ndarray,
-        catchment_id: np.ndarray,
-        device: torch.device,
-    ) -> None:
-        """Select inflow stations from the gauge pool and validate.
+    def interp_small_gaps(self, max_gap: int) -> None:
+        """Linearly interpolate NaN runs of length ``<= max_gap`` in-place.
 
-        Parameters
-        ----------
-        desired_catchment_ids : np.ndarray
-            Inflow catchment IDs from ``parameters.nc``
-            (``model.base.inflow_catchment_id.numpy()``).
-        catchment_id : np.ndarray
-            Full model catchment ID array
-            (``model.base.catchment_id.numpy()``).
-        device : torch.device
-            Target device for the injection index tensor.
-
-        Raises
-        ------
-        ValueError
-            If any desired ID is missing, or selected columns contain
-            NaN / negative values, or time length does not match.
+        Gaps longer than ``max_gap`` or touching either end are left as NaN.
         """
-        desired = np.asarray(desired_catchment_ids, dtype=np.int64)
-
-        # Column reorder: gauge-file order → desired order
-        col_pos = find_indices_in(desired, self._gauge_catchment_ids)
-        if np.any(col_pos == -1):
-            missing = desired[col_pos == -1].tolist()
-            raise ValueError(f"Gauge data missing catchment IDs: {missing}")
-
-        # Validate selected columns
-        selected = self._data[:, col_pos]
-
-        n_nan = int(np.isnan(selected).sum())
-        if n_nan > 0:
-            raise ValueError(
-                f"Selected inflow stations contain {n_nan} NaN values. "
-                f"Only stations with complete coverage can be used for inflow."
-            )
-
-        n_neg = int((selected < 0).sum())
-        if n_neg > 0:
-            raise ValueError(
-                f"Selected inflow stations contain {n_neg} negative values. "
-                f"Discharge must be >= 0."
-            )
-
-        expected_steps = int(
-            (self._end_date - self._start_date).total_seconds()
-            / self._time_interval.total_seconds()
-        ) + 1
-        if self._data.shape[0] != expected_steps:
-            print(
-                f"[GaugeDataset] Warning: expected {expected_steps} time "
-                f"steps but got {self._data.shape[0]}"
-            )
-
-        self._local_indices = col_pos.astype(np.int64)
-
-        # Injection indices: desired → position in the full catchment array
-        inflow_idx = find_indices_in(
-            desired, np.asarray(catchment_id, dtype=np.int64)
-        )
-        if np.any(inflow_idx == -1):
-            missing = desired[inflow_idx == -1].tolist()
-            raise ValueError(
-                f"Inflow catchment IDs not in model catchment array: {missing}"
-            )
-        self._inflow_catchment_idx = torch.from_numpy(
-            inflow_idx.astype(np.int64)
-        ).to(device)
-
-        print(
-            f"[GaugeDataset] Mapped {len(desired)} inflow gauges "
-            f"from {self.num_gauges} in file"
-        )
+        max_gap = int(max_gap)
+        if max_gap <= 0:
+            return
+        data = self._data
+        is_nan_any = np.isnan(data)
+        if not is_nan_any.any():
+            return
+        n_t = data.shape[0]
+        for g in range(data.shape[1]):
+            col = data[:, g]
+            is_nan = np.isnan(col)
+            if not is_nan.any():
+                continue
+            diff = np.diff(
+                np.concatenate(([False], is_nan, [False])).astype(np.int8))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+            for s, e in zip(starts, ends):
+                if e - s > max_gap or s == 0 or e >= n_t:
+                    continue
+                left, right = col[s - 1], col[e]
+                col[s:e] = np.linspace(left, right, e - s + 2)[1:-1]
 
     # ------------------------------------------------------------------
-    # Forcing injection
-    # ------------------------------------------------------------------
-    def shard_forcing(
-        self,
-        batch_data: torch.Tensor,
-        batch_runoff: torch.Tensor,
-    ) -> torch.Tensor:
-        """Inject gauge discharge into the runoff tensor.
+    def qualify_inflow(self, max_gap: int) -> dict:
+        """Merge stations per catchment and qualify first contiguous window.
 
-        Parameters
-        ----------
-        batch_data : torch.Tensor
-            Gauge discharge from ``DataLoader``, shape ``(B, T, G)``.
-        batch_runoff : torch.Tensor
-            Runoff tensor, shape ``(B*T, C)``.
+        Pipeline:
+
+        1. :meth:`interp_small_gaps` in place.
+        2. Area-weighted mm/day merge per catchment id, strict NaN: for
+           every day where *any* contributor is NaN the merged value is
+           NaN.  ``y_c(t) = Σ_i q_i(t) / A_i * 86400 * 1000`` (mm/day)
+           and ``q_c(t) = y_c(t) * A_total_c / (86400 * 1000)`` recovers
+           the m³/s aggregate.  A_total_c := Σ A_i.  When a catchment
+           has only one contributor this reduces to the identity.
+        3. Per merged column, take the **longest** contiguous non-NaN
+           segment; ``basin_shift_days[c]`` = # leading invalid days before
+           that segment, ``valid_length_days[c]`` = segment length.  Ties
+           resolve to the earliest segment.
 
         Returns
         -------
-        torch.Tensor
-            Modified *batch_runoff* with gauge discharge added at
-            inflow catchment locations.
+        dict with keys
+            ``catchment_ids`` : (N,) int64
+            ``basin_shift_days`` : (N,) int64
+                Number of leading NaN days before the first contiguous
+                valid segment on the native observation axis.  Consumers
+                feed this to :meth:`~cmfgpu.modules.base.BaseModule.
+                catchment_shift_days` so that ExportedDataset / the
+                inflow overlay read the gauge series at
+                ``raw[t + shift[c], c]`` for simulation step *t*.
+            ``valid_length_days`` : (N,) int64
+                Length of the first contiguous valid segment.
+            ``data`` : (T, N) float32
+                Merged gauge discharge on the **native observation
+                axis** (row *t* == calendar day *t*), NaN replaced by 0.
+                Not pre-shifted; ExportedDataset is responsible for
+                applying ``basin_shift_days`` at read time via the same
+                ``catchment_shift_days`` used for runoff.
         """
-        if self._inflow_catchment_idx is None:
-            raise RuntimeError(
-                "build_inflow_mapping must be called before shard_forcing"
-            )
+        self.interp_small_gaps(int(max_gap))
 
-        if batch_data.dim() == 3:
-            B, T, G = batch_data.shape
-            gauge_flat = batch_data.reshape(B * T, G).contiguous()
-        else:
-            raise ValueError(f"Expected 3D gauge tensor, got {batch_data.dim()}D")
+        cids = self._gauge_catchment_ids.astype(np.int64)
+        obs = self._data
+        area = self._gauge_area_km2 * 1e6  # km² → m²
 
-        batch_runoff[:, self._inflow_catchment_idx] += gauge_flat
-        return batch_runoff
+        unique_cid, inv = np.unique(cids, return_inverse=True)
+        T = obs.shape[0]
+        N = unique_cid.size
 
-    # ------------------------------------------------------------------
-    # Dataset interface
-    # ------------------------------------------------------------------
-    def __getitem__(self, idx: int) -> np.ndarray:
-        if idx < 0:
-            idx += len(self)
+        obs64 = obs.astype(np.float64)
+        nan_mask = np.isnan(obs64)
 
-        G = (
-            len(self._local_indices)
-            if self._local_indices is not None
-            else self.num_gauges
-        )
+        area_total = np.zeros(N, dtype=np.float64)
+        np.add.at(area_total, inv, area)
+        if np.any(area_total <= 0):
+            bad = unique_cid[area_total <= 0]
+            raise ValueError(
+                f"qualify_inflow: non-positive A_total for catchments "
+                f"{bad.tolist()[:5]}")
 
-        # Prepend chunks are all-zero (spin-up: no injection)
-        if idx < self._num_prepend_chunks:
-            return np.zeros((self.chunk_len, G), dtype=np.float32)
+        # Per-station mm/day (zero on NaN days; NaN flag tracked separately).
+        yield_mm = np.where(
+            nan_mask, 0.0, obs64 * 86400.0 * 1000.0 / area[None, :])
+        merged_mm = np.zeros((T, N), dtype=np.float64)
+        nan_any = np.zeros((T, N), dtype=bool)
+        np.add.at(merged_mm, (slice(None), inv), yield_mm)
+        np.logical_or.at(nan_any, (slice(None), inv), nan_mask)
 
-        real_idx = idx - self._num_prepend_chunks
-        start = real_idx * self.chunk_len
-        end = min(start + self.chunk_len, self._data.shape[0])
-        chunk = self._data[start:end]
+        merged_q = merged_mm * area_total[None, :] / (86400.0 * 1000.0)
 
-        if self._local_indices is not None:
-            chunk = chunk[:, self._local_indices]
+        shift = np.zeros(N, dtype=np.int64)
+        length = np.zeros(N, dtype=np.int64)
+        keep = np.ones(N, dtype=bool)
+        for c in range(N):
+            valid = ~nan_any[:, c]
+            if not valid.any():
+                keep[c] = False
+                continue
+            # Find longest run of True in `valid`; ties → earliest.
+            padded = np.concatenate(([False], valid, [False]))
+            diff = np.diff(padded.astype(np.int8))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+            lengths = ends - starts
+            k = int(np.argmax(lengths))
+            shift[c] = int(starts[k])
+            length[c] = int(lengths[k])
 
-        T = chunk.shape[0]
-        if T < self.chunk_len:
-            pad = np.zeros((self.chunk_len - T, G), dtype=np.float32)
-            chunk = np.vstack([chunk, pad])
+        if not keep.all():
+            raise ValueError(
+                f"qualify_inflow: {(~keep).sum()} catchments have no valid "
+                f"data in [{self._start_date}, {self._end_date}]: "
+                f"{unique_cid[~keep].tolist()[:10]}")
 
-        return np.ascontiguousarray(chunk)
+        # Replace NaN with 0 on native axis; ExportedDataset.attach_inflow
+        # will apply the shift.
+        data = np.where(nan_any, 0.0, merged_q).astype(np.float32)
 
-    def __len__(self) -> int:
-        real_chunks = (self._data.shape[0] + self.chunk_len - 1) // self.chunk_len
-        return self._num_prepend_chunks + real_chunks
+        return {
+            "catchment_ids": unique_cid,
+            "basin_shift_days": shift,
+            "valid_length_days": length,
+            "data": data,
+        }

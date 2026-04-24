@@ -55,6 +55,23 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     _stats_cg: Optional[Any] = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
+        if ("inflow_catchment_id" in self.input_proxy.data
+                and "basin_shift_days" in self.input_proxy.data):
+            if self.variables_to_save is None:
+                self.variables_to_save = {}
+            existing = self.variables_to_save.get("static")
+            if existing is None:
+                static_list: list = []
+            elif isinstance(existing, str):
+                static_list = [existing]
+            else:
+                static_list = list(existing)
+            for name in ("catchment_shift_days",
+                         "catchment_valid_length_days"):
+                if name not in static_list:
+                    static_list.append(name)
+            self.variables_to_save["static"] = static_list
+
         super().model_post_init(__context)
         # Auto-enable CUDA graphs for the triton backend
         from hydroforge.runtime.backend import KERNEL_BACKEND
