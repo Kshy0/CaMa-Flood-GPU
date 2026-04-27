@@ -90,6 +90,7 @@ class LeveeModule(AbstractModule):
         dtype="int",
         category="topology",
         mode="cpu",
+        is_key=True,
     )
 
     # ------------------------------------------------------------------ #

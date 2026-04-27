@@ -87,6 +87,7 @@ class ReservoirModule(AbstractModule):
         dtype="int",
         category="topology",
         mode="cpu",
+        is_key=True,
     )
 
     # ------------------------------------------------------------------ #

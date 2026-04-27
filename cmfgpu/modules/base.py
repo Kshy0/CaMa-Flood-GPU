@@ -108,6 +108,14 @@ class BaseModule(AbstractModule):
         dtype="int",
         category="topology",
         mode="cpu",
+        is_key=True,
+    )
+
+    catchment_basin_id: torch.Tensor = BaseField(
+        description="Basin identifier for distributed sharding",
+        dtype="int",
+        category="topology",
+        mode="cpu",
     )
 
 
@@ -148,10 +156,34 @@ class BaseModule(AbstractModule):
         default=None,
         category="topology",
         mode="cpu",
+        is_key=True,
+    )
+
+    reservoir_basin_id: Optional[torch.Tensor] = BaseField(
+        description="Basin ID for each reservoir",
+        dtype="int",
+        group_by="reservoir_basin_id",
+        dim_coords=None,
+        shape=("num_reservoirs",),
+        default=None,
+        category="topology",
+        mode="cpu",
     )
 
     inflow_catchment_id: Optional[torch.Tensor] = BaseField(
         description="Catchment ID for each inflow injection gauge",
+        dtype="int",
+        group_by="inflow_basin_id",
+        dim_coords=None,
+        shape=("num_inflow_gauges",),
+        default=None,
+        category="topology",
+        mode="cpu",
+        is_key=True,
+    )
+
+    inflow_basin_id: Optional[torch.Tensor] = BaseField(
+        description="Basin ID for each inflow gauge",
         dtype="int",
         group_by="inflow_basin_id",
         dim_coords=None,
@@ -218,10 +250,34 @@ class BaseModule(AbstractModule):
         default=None,
         category="topology",
         mode="cpu",
+        is_key=True,
+    )
+
+    levee_basin_id: Optional[torch.Tensor] = BaseField(
+        description="Basin ID for each levee",
+        dtype="int",
+        group_by="levee_basin_id",
+        dim_coords=None,
+        shape=("num_levees",),
+        default=None,
+        category="topology",
+        mode="cpu",
     )
 
     catchment_save_id: torch.Tensor = BaseField(
         description="Catchment IDs for which output will be saved. Order is preserved in output.",
+        dtype="int",
+        group_by="catchment_save_basin_id",
+        save_idx=None,
+        save_coord=None,
+        dim_coords=None,
+        shape=("num_saved_catchments",),
+        category="topology",
+        mode="cpu",
+    )
+
+    catchment_save_basin_id: torch.Tensor = BaseField(
+        description="Basin ID for each saved catchment",
         dtype="int",
         group_by="catchment_save_basin_id",
         save_idx=None,

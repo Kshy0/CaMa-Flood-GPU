@@ -92,6 +92,7 @@ class BifurcationModule(AbstractModule):
         dtype="int",
         category="topology",
         mode="cpu",
+        is_key=True,
     )
 
     bifurcation_basin_id: torch.Tensor = BifurcationField(
