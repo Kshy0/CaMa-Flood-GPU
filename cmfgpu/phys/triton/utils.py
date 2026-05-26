@@ -6,7 +6,13 @@
 
 """Utility helpers for Triton physics kernels."""
 
+import torch
 import triton
+from triton.language.extra import libdevice
+import triton.language as tl
+
+
+IS_HIP_BUILD = torch.version.hip is not None
 
 
 @triton.jit
@@ -28,3 +34,15 @@ def to_compute_dtype(hp_value, ref_value):
     compiles to a no-op with zero overhead.
     """
     return hp_value.to(ref_value.dtype)
+
+
+if IS_HIP_BUILD:
+    @triton.jit
+    def cbrt_compat(x):
+        # HIP libdevice may not expose cbrt; use pow(x, 1/3) with dtype-matched exponent.
+        one_third = tl.zeros_like(x) + (1.0 / 3.0)
+        return libdevice.pow(x, one_third)
+else:
+    @triton.jit
+    def cbrt_compat(x):
+        return libdevice.cbrt(x)
