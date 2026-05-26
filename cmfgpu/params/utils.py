@@ -1310,6 +1310,7 @@ def crop_parameters_nc(
     crop_upstream: bool = False,
     crop_downstream: bool = False,
     crop_interval: bool = False,
+    extend_downstream_steps: int = 0,
     # Visualization options (forwarded to visualize_nc_basins)
     visualize_gauges: bool = True,
     visualize_bifurcations: bool = True,
@@ -1337,6 +1338,13 @@ def crop_parameters_nc(
     traversed further). Each POI's downstream_id is set to self (river mouth), creating
     independent interval basins. Catchments not reachable from any POI are removed.
     POIs on the same flow path are allowed (this is the primary use case).
+
+    If extend_downstream_steps > 0 together with crop_interval/crop_upstream,
+    each outlet POI gets a ghost downstream subgraph: the main downstream
+    corridor is followed for N steps, and each corridor node's side-upstream
+    subgraph is copied as ghost catchments. Ghost rows use fresh catchment_id
+    values, keep the outlet basin id, and record their original full-grid cid
+    in catchment_source_id for runoff/feature lookup.
     
     crop_upstream, crop_downstream, and crop_interval are mutually exclusive.
     For crop_upstream and crop_downstream, overlapping POIs are not allowed.
@@ -1612,21 +1620,173 @@ def crop_parameters_nc(
             new_save_ids = kept_catchment_ids.copy()
             new_save_basin_ids = kept_catchment_basin_ids.copy()
 
+        # ─────────────────────────────────────────────────────────────
+        # Ghost downstream-subgraph extension.
+        #
+        # For each outlet POI, follow the original full-grid downstream
+        # mainstem for ``extend_downstream_steps`` steps.  Every corridor
+        # node and its side-upstream subgraph is copied as ghost rows with
+        # fresh catchment_id values and the outlet's interval basin id.  The
+        # copied ghost subgraph is internally routed with downstream_id
+        # remapped source-cid → ghost-cid; terminal ghosts self-loop.
+        # ─────────────────────────────────────────────────────────────
+        ghost_full_idx = np.empty(0, dtype=np.int64)
+        ghost_new_cid = np.empty(0, dtype=np.int64)
+        ghost_basin_id = np.empty(0, dtype=np.int64)
+        ghost_outlet_cid = np.empty(0, dtype=np.int64)
+        ghost_entry_cid = np.empty(0, dtype=np.int64)
+        ghost_downstream_cid = np.empty(0, dtype=np.int64)
+        ghost_level = np.empty(0, dtype=np.int64)
+        n_ghost = 0
+        extend_downstream_steps = int(extend_downstream_steps)
+        if extend_downstream_steps < 0:
+            raise ValueError("extend_downstream_steps must be >= 0")
+        if extend_downstream_steps > 0:
+            if not (crop_interval or crop_upstream):
+                raise ValueError(
+                    "extend_downstream_steps > 0 requires crop_interval=True "
+                    "or crop_upstream=True."
+                )
+            if downstream_id is None:
+                raise ValueError(
+                    "extend_downstream_steps requires 'downstream_id' in input NC."
+                )
+            max_cid_lookup = int(catchment_id.max())
+            full_idx_of_arr = np.full(max_cid_lookup + 2, -1, dtype=np.int64)
+            full_idx_of_arr[catchment_id] = np.arange(len(catchment_id), dtype=np.int64)
+            indptr_ext, indices_ext, grid_to_idx_ext, cid_arr_ext = _build_upstream_adj(
+                catchment_id, downstream_id,
+            )
+            stop_mask_base = np.zeros(len(catchment_id), dtype=np.bool_)
+            kept_idx_ext = full_idx_of_arr[kept_catchment_ids]
+            kept_idx_ext = kept_idx_ext[kept_idx_ext >= 0]
+            stop_mask_base[kept_idx_ext] = True
+            poi_set_ext = set(int(c) for c in outlet_cids)
+            for poi_cid_v in poi_set_ext:
+                if 0 <= poi_cid_v <= max_cid_lookup:
+                    pidx = int(full_idx_of_arr[poi_cid_v])
+                    if pidx >= 0:
+                        stop_mask_base[pidx] = True
+            kept_source_set = set(int(c) for c in kept_catchment_ids)
+            g_full, g_cid_new, g_basin = [], [], []
+            g_outlet, g_entry, g_downstream, g_level = [], [], [], []
+            next_cid = max_cid_lookup + 1
+            for poi_cid_v in outlet_cids:
+                poi_cid_v = int(poi_cid_v)
+                if poi_cid_v < 0 or poi_cid_v > max_cid_lookup:
+                    continue
+                fidx = int(full_idx_of_arr[poi_cid_v])
+                if fidx < 0:
+                    continue
+                poi_basin_v = int(catchment_basin_id[fidx])
+                corridor: list[tuple[int, int, int]] = []
+                current_src_cid = poi_cid_v
+                for level in range(1, extend_downstream_steps + 1):
+                    if current_src_cid < 0 or current_src_cid > max_cid_lookup:
+                        break
+                    current_fidx = int(full_idx_of_arr[current_src_cid])
+                    if current_fidx < 0:
+                        break
+                    src_ds_cid = int(downstream_id[current_fidx])
+                    if src_ds_cid == current_src_cid or src_ds_cid < 0 \
+                            or src_ds_cid > max_cid_lookup:
+                        break
+                    src_fidx = int(full_idx_of_arr[src_ds_cid])
+                    if src_fidx < 0:
+                        break
+                    corridor.append((src_ds_cid, src_fidx, level))
+                    current_src_cid = src_ds_cid
+                    if src_ds_cid in poi_set_ext:
+                        break
+                if not corridor:
+                    continue
+
+                selected_level: dict[int, int] = {}
+                for src_cid, src_fidx, level in corridor:
+                    selected_level[src_cid] = min(
+                        selected_level.get(src_cid, level), level)
+                    if src_cid in poi_set_ext:
+                        continue
+                    visited = trace_upstream_bfs_csr(
+                        src_fidx, indptr_ext, indices_ext,
+                        len(cid_arr_ext), stop_mask_base,
+                    )
+                    for upstream_cid in cid_arr_ext[visited]:
+                        upstream_cid = int(upstream_cid)
+                        if upstream_cid in kept_source_set:
+                            continue
+                        selected_level[upstream_cid] = min(
+                            selected_level.get(upstream_cid, level), level)
+
+                selected_sources = np.asarray(
+                    list(selected_level.keys()), dtype=np.int64)
+                selected_full_idx = np.asarray(
+                    [full_idx_of_arr[int(c)] for c in selected_sources],
+                    dtype=np.int64,
+                )
+                valid_selected = selected_full_idx >= 0
+                selected_sources = selected_sources[valid_selected]
+                selected_full_idx = selected_full_idx[valid_selected]
+                if selected_sources.size == 0:
+                    continue
+                order = np.argsort(selected_full_idx, kind="stable")
+                selected_sources = selected_sources[order]
+                selected_full_idx = selected_full_idx[order]
+
+                local_new_cid: dict[int, int] = {}
+                for src_cid in selected_sources:
+                    local_new_cid[int(src_cid)] = next_cid
+                    next_cid += 1
+                first_corridor_cid = int(corridor[0][0])
+                if first_corridor_cid in local_new_cid:
+                    g_outlet.append(poi_cid_v)
+                    g_entry.append(local_new_cid[first_corridor_cid])
+                for src_cid, src_fidx in zip(selected_sources, selected_full_idx):
+                    src_cid = int(src_cid)
+                    src_fidx = int(src_fidx)
+                    new_cid = local_new_cid[src_cid]
+                    src_downstream_cid = int(downstream_id[src_fidx])
+                    downstream_new = local_new_cid.get(src_downstream_cid, new_cid)
+                    g_full.append(src_fidx)
+                    g_cid_new.append(new_cid)
+                    g_basin.append(poi_basin_v)
+                    g_downstream.append(downstream_new)
+                    g_level.append(int(selected_level[src_cid]))
+            n_ghost = len(g_full)
+            if n_ghost > 0:
+                ghost_full_idx = np.asarray(g_full, dtype=np.int64)
+                ghost_new_cid = np.asarray(g_cid_new, dtype=np.int64)
+                ghost_basin_id = np.asarray(g_basin, dtype=np.int64)
+                ghost_outlet_cid = np.asarray(g_outlet, dtype=np.int64)
+                ghost_entry_cid = np.asarray(g_entry, dtype=np.int64)
+                ghost_downstream_cid = np.asarray(g_downstream, dtype=np.int64)
+                ghost_level = np.asarray(g_level, dtype=np.int64)
+            print("extend_downstream_steps="
+                  f"{extend_downstream_steps}: prepared {n_ghost} "
+                  "ghost catchment(s)")
+
         with Dataset(output_nc, 'w') as dst:
             dst.setncatts(src.__dict__)
             
             old_unique_basins = np.sort(kept_basin_ids)
             map_idx_to_new = old_to_new_id[old_unique_basins]
 
-            # Precompute new basin sizes
+            # Precompute new basin sizes (each basin receiving a ghost
+            # gains +1 to its size, computed here so basin_sizes write
+            # below picks up the inflated counts in one shot).
             kept_catchment_basin_ids = catchment_basin_id[keep_mask]
             idx_in_kept = np.searchsorted(old_unique_basins, kept_catchment_basin_ids)
             mapped_basin_ids = map_idx_to_new[idx_in_kept]
             new_basin_sizes = np.bincount(mapped_basin_ids, minlength=num_merged_basins).astype(np.int64)
+            if n_ghost > 0:
+                ghost_basin_counts = np.bincount(
+                    ghost_basin_id.astype(np.int64), minlength=num_merged_basins
+                ).astype(np.int64)
+                new_basin_sizes = new_basin_sizes + ghost_basin_counts[:num_merged_basins]
 
             for name, dim in src.dimensions.items():
                 if name == 'catchment':
-                    dst.createDimension(name, num_kept_catchments)
+                    dst.createDimension(name, num_kept_catchments + n_ghost)
                 elif name == 'basin':
                     dst.createDimension(name, num_merged_basins)
                 elif name == 'bifurcation_path':
@@ -1728,10 +1888,33 @@ def crop_parameters_nc(
                              # Vectorized: set to self where outlet or downstream not kept
                              need_self = is_outlet[new_cids] | ~is_kept_arr[new_data.astype(np.int64)]
                              new_data[need_self] = new_cids[need_self]
+                             # Ghost rewire: redirect outlet POIs from self-loop to
+                             # their ghost catchment id (overrides the self-loop set above).
+                             if n_ghost > 0:
+                                 poi_to_ghost = np.full(
+                                     int(catchment_id.max()) + 2, -1, dtype=np.int64,
+                                 )
+                                 poi_to_ghost[ghost_outlet_cid] = ghost_entry_cid
+                                 mapped = poi_to_ghost[new_cids.astype(np.int64)]
+                                 mask_g = mapped >= 0
+                                 new_data[mask_g] = mapped[mask_g].astype(new_data.dtype)
                      else:
                          if name == 'catchment_basin_id':
                              idx_in_kept = np.searchsorted(old_unique_basins, new_data)
                              new_data = map_idx_to_new[idx_in_kept].astype(new_data.dtype)
+                     # Append ghost rows by copying from the source NC. For the
+                     # three special catchment-axis variables ghost values are
+                     # overridden to enforce the (cid_new / basin_id / self-loop)
+                     # contract; everything else inherits from the source row.
+                     if n_ghost > 0:
+                         ghost_data = data[ghost_full_idx]
+                         if name == 'catchment_id':
+                             ghost_data = ghost_new_cid.astype(new_data.dtype)
+                         elif name == 'catchment_basin_id':
+                             ghost_data = ghost_basin_id.astype(new_data.dtype)
+                         elif name == 'downstream_id':
+                             ghost_data = ghost_downstream_cid.astype(new_data.dtype)
+                         new_data = np.concatenate([new_data, ghost_data.astype(new_data.dtype)])
                      dst.createVariable(name, var.dtype, dims, zlib=True)
                      dst[name][:] = new_data
                      
@@ -1808,6 +1991,35 @@ def crop_parameters_nc(
             
             var = dst.createVariable('catchment_save_basin_id', np.int64, ('saved_catchment',), zlib=True)
             var[:] = remapped_save_basin_ids
+
+            # ── Write catchment_source_id / catchment_ghost_level ──
+            # cid in pre-crop full parameters that each row corresponds to —
+            # equals catchment_id for real rows, source cid for ghost rows.
+            # Consumers infer ghost rows via (catchment_source_id != catchment_id).
+            # Use this for runoff / spatial-feature lookups so the same code
+            # path handles both real and ghost catchments.
+            if extend_downstream_steps > 0:
+                n_total = num_kept_catchments + n_ghost
+                src_id_arr = np.empty(n_total, dtype=np.int64)
+                src_id_arr[:num_kept_catchments] = kept_catchment_ids.astype(np.int64)
+                if n_ghost > 0:
+                    src_id_arr[num_kept_catchments:] = catchment_id[ghost_full_idx].astype(np.int64)
+                v = dst.createVariable('catchment_source_id', 'i8', ('catchment',), zlib=True)
+                v[:] = src_id_arr
+                v.long_name = (
+                    "catchment_id in pre-crop full parameters that this row "
+                    "corresponds to; equals catchment_id for real rows, source "
+                    "cid for ghost rows. Use this for runoff/feature lookups."
+                )
+                level_arr = np.zeros(n_total, dtype=np.int64)
+                if n_ghost > 0:
+                    level_arr[num_kept_catchments:] = ghost_level
+                v = dst.createVariable('catchment_ghost_level', 'i8', ('catchment',), zlib=True)
+                v[:] = level_arr
+                v.long_name = (
+                    "0 for real catchments; for ghost rows, downstream corridor "
+                    "step whose upstream subgraph introduced this ghost."
+                )
 
             # ── Write inflow gauge variables (crop_downstream / crop_interval) ──
             if (crop_downstream or crop_interval) and len(target_cids) > 0:

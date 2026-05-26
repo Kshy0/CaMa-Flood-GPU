@@ -111,11 +111,21 @@ def main():
         calendar=dataset0.calendar,
     )
     model.set_total_steps(dataset0.total_steps)
+    if dataset0.total_steps != dataset1.total_steps:
+        raise ValueError(
+            f"dataset0 total_steps ({dataset0.total_steps}) != "
+            f"dataset1 total_steps ({dataset1.total_steps})"
+        )
 
-    # assume both datasets have the same formatting and mapping
-    local_mapping = dataset0.build_local_mapping(
+    desired_catchment_ids = model.base.catchment_id.to("cpu").numpy()
+    local_mapping0 = dataset0.build_local_mapping(
         mapping_file=runoff_mapping_file,
-        desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
+        desired_catchment_ids=desired_catchment_ids,
+        device=device,
+    )
+    dataset1.build_local_mapping(
+        mapping_file=runoff_mapping_file,
+        desired_catchment_ids=desired_catchment_ids,
         device=device,
     )
     loader0 = DataLoader(
@@ -140,7 +150,10 @@ def main():
     last_valid_time = start_date
     for batch_runoff0, batch_runoff1 in zip(loader0, loader1):
         with stream_ctx:
-            batch_runoff = dataset0.shard_forcing((batch_runoff0.to(device) + batch_runoff1.to(device)), local_mapping)
+            batch_runoff = dataset0.shard_forcing(
+                batch_runoff0.to(device) + batch_runoff1.to(device),
+                local_mapping0,
+            )
             for runoff in batch_runoff:
                 current_time, is_valid, is_spin_up = next(time_iter)
                 if not is_valid:

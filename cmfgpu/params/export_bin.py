@@ -795,7 +795,12 @@ def export_map_params(
             )
 
         # ---- dam_params.csv (reservoir parameters) ----
-        if "reservoir_catchment_id" in ds.variables:
+        _required_dam_vars = (
+            "reservoir_catchment_id", "reservoir_capacity",
+            "conservation_volume", "emergency_volume",
+            "normal_outflow", "flood_control_outflow",
+        )
+        if all(v in ds.variables for v in _required_dam_vars):
             res_cid = ds.variables["reservoir_catchment_id"][:].astype(np.int64)
             res_cap = ds.variables["reservoir_capacity"][:].astype("<f4")
             res_con = ds.variables["conservation_volume"][:].astype("<f4")
