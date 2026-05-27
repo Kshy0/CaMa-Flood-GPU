@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 import zipfile
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -707,9 +706,9 @@ def write_gauge_nc(
     v.long_name = "Nearest downstream station (-1 = none)"
     v[:] = downstream_station_id
 
-    # Observations (chunked per station time series)
+    # Discharge observations (chunked per station time series)
     v = ds.createVariable(
-        "observations", "f4", ("time", "station"),
+        "discharge", "f4", ("time", "station"),
         zlib=True, complevel=4, shuffle=True,
         fill_value=np.float32(np.nan),
         chunksizes=(n_time, 1),

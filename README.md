@@ -46,10 +46,10 @@ conda activate CMF
 #### 2a. Latest PyTorch (recommended)
 
 Please follow the official [PyTorch installation guide](https://pytorch.org/get-started/locally/) for your environment. 
-For CUDA 13.0, you may use:
+For CUDA 13.2, you may use:
 
 ```shell
-pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install torch --index-url https://download.pytorch.org/whl/cu132
 ```
 
 > **Note:** `triton` ships automatically with PyTorch on supported CUDA systems — no separate installation needed. You also don't need to install `torchvision` or `torchaudio` as stated in the official manual.

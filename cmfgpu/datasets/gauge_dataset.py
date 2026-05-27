@@ -2,7 +2,7 @@
 
 Loads a station-level gauge NetCDF written by ``s01_prepare_intervals.py``
 with dims ``(time, station)`` and variables ``catchment_id_{resolution}``,
-``reported_area_km2`` and ``observations`` (NaN for missing).  The only
+``reported_area_km2`` and ``discharge`` (NaN for missing).  The only
 downstream consumer is ``qualify_inflow`` which collapses stations to one
 series per catchment and finds the first contiguous valid segment.
 """
@@ -26,7 +26,7 @@ class GaugeDataset(torch.utils.data.Dataset):
     - ``time`` (CF units) with dim ``time``.
     - ``catchment_id_{resolution}`` with dim ``station`` (int64).
     - ``reported_area_km2`` with dim ``station`` (float).
-    - ``observations`` with dims ``(time, station)`` (float32, NaN = missing).
+    - ``discharge`` with dims ``(time, station)`` (float32, NaN = missing).
 
     No fallbacks are attempted.  Stations whose ``catchment_id`` is < 0
     are dropped as unallocated.
@@ -45,7 +45,7 @@ class GaugeDataset(torch.utils.data.Dataset):
         path = Path(path)
 
         cid_var = f"catchment_id_{resolution}"
-        obs_var = "observations"
+        obs_var = "discharge"
         area_var = "reported_area_km2"
 
         with NCDataset(str(path), "r") as ds:
