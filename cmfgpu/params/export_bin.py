@@ -28,8 +28,8 @@ Binary conventions (matching CaMa-Flood Fortran):
     * Fortran column-major (order='F')
     * nextxy.bin uses 1-based indexing; all river mouths → (-9, -9)
     * inpmat is Fortran DIRECT ACCESS (RECL = 4*NX*NY), no record markers.
-    * Manning coefficients are not stored in the NC; uniform defaults
-      (river_manning=0.03, flood_manning=0.1) are used.
+    * Manning coefficients are not stored in the NC; a uniform river default
+      (river_manning=0.03) is used.
 
 Usage example
 -------------
@@ -69,7 +69,9 @@ def _compute_bbox(
     full_nx: int,
     full_ny: int,
     full_west: float = -180.0,
+    full_east: float = 180.0,
     full_north: float = 90.0,
+    full_south: float = -90.0,
 ) -> Tuple[int, int, int, int, int, int, float, float, float, float]:
     """Compute the bounding box of the catchment subset.
 
@@ -89,8 +91,8 @@ def _compute_bbox(
     crop_nx = x_max - x_min + 1
     crop_ny = y_max - y_min + 1
 
-    dlon = (360.0) / full_nx   # e.g. 0.25° for 1440
-    dlat = (180.0) / full_ny   # e.g. 0.25° for 720
+    dlon = (full_east - full_west) / full_nx   # e.g. 0.25° for global 1440
+    dlat = (full_north - full_south) / full_ny  # e.g. 0.25° for global 720
     west = full_west + x_min * dlon
     east = full_west + (x_max + 1) * dlon
     north = full_north - y_min * dlat
@@ -584,7 +586,10 @@ def export_map_params(
     *,
     crop_to_bbox: bool = False,
     river_manning_default: float = 0.03,
-    flood_manning_default: float = 0.1,
+    west: float = -180.0,
+    east: float = 180.0,
+    north: float = 90.0,
+    south: float = -90.0,
     missing_float: float = -9999.0,
     missing_int: int = -9999,
 ) -> Tuple[Path, int, int, int, float, float, float, float]:
@@ -630,10 +635,11 @@ def export_map_params(
         catchment subset (default False for backward compatibility).
     river_manning_default : float
         Manning coefficient written to ``rivman.bin`` (default 0.03).
-    flood_manning_default : float
-        Floodplain Manning coefficient written to ``fldman.bin`` (default 0.1).
-        This file is optional in CaMa-Flood; it is only written when the
-        value differs from the hardcoded Fortran default.
+    west, east, north, south : float
+        Geographic extent of the *full* source grid (default global
+        -180/180/90/-90).  Used as the anchor and resolution
+        (``dlon=(east-west)/nx``, ``dlat=(north-south)/ny``) for the diminfo
+        extent and for cropping; set these for a regional, non-global grid.
     missing_float / missing_int : float / int
         Fill values for ocean/invalid cells.
 
@@ -670,7 +676,11 @@ def export_map_params(
             (x_min, x_max, y_min, y_max,
              out_nx, out_ny,
              out_west, out_east, out_north, out_south,
-             ) = _compute_bbox(catchment_x, catchment_y, full_nx, full_ny)
+             ) = _compute_bbox(
+                catchment_x, catchment_y, full_nx, full_ny,
+                full_west=west, full_east=east,
+                full_north=north, full_south=south,
+            )
             # Offset coordinates to the cropped grid
             cx = catchment_x - x_min
             cy = catchment_y - y_min
@@ -683,8 +693,8 @@ def export_map_params(
             out_nx, out_ny = full_nx, full_ny
             cx, cy = catchment_x, catchment_y
             x_min, y_min = 0, 0
-            out_west, out_east = -180.0, 180.0
-            out_north, out_south = 90.0, -90.0
+            out_west, out_east = west, east
+            out_north, out_south = north, south
 
         print(f"    Output grid: {out_nx}×{out_ny},  catchments: {n_catch},  "
               f"flood levels: {nlfp}")
@@ -865,7 +875,6 @@ def export_inpmat(
     *,
     inpmat_name: str = "inpmat.bin",
     diminfo_name: str = "diminfo.txt",
-    inpn: int = 24,
     out_nx: Optional[int] = None,
     out_ny: Optional[int] = None,
     nlfp: Optional[int] = None,
@@ -898,9 +907,6 @@ def export_inpmat(
         Output binary file name.
     diminfo_name : str
         Output diminfo text file name.
-    inpn : int
-        Maximum number of contributing runoff-grid cells per map cell
-        (must match CaMa-Flood's ``diminfo``; default 24).
     out_nx, out_ny : int, optional
         Output grid dimensions.  If provided (e.g. from a prior
         ``export_map_params`` call with ``crop_to_bbox=True``), the inpmat
@@ -945,6 +951,15 @@ def export_inpmat(
         (sparse_data, sparse_indices, sparse_indptr),
         shape=matrix_shape,
     )
+
+    # INPN is the actual maximum number of contributing runoff cells per
+    # catchment, so the inpmat has no zero-padding columns and no truncation.
+    inpn = int(np.diff(full_sparse.indptr).max())
+    if inpn > 100:
+        raise ValueError(
+            f"INPN={inpn} exceeds 100; this is unexpectedly large and "
+            f"likely indicates a malformed runoff mapping."
+        )
 
     # --- Load NC to get grid dims + catchment positions ---
     with Dataset(str(nc_path), "r") as ds:
@@ -997,8 +1012,6 @@ def export_inpmat(
     INPY = np.zeros((out_nx, out_ny, inpn), dtype="<i4")
     INPA = np.zeros((out_nx, out_ny, inpn), dtype="<f4")
 
-    truncated = 0  # count of cells where entries exceeded INPN
-
     # --- Populate per-cell mapping ---
     for cid in npz_catchment_ids:
         cid_int = int(cid)
@@ -1017,18 +1030,7 @@ def export_inpmat(
 
         col_indices = full_sparse.indices[start:end]
         area_weights = full_sparse.data[start:end]
-
-        # Sort by descending weight so that truncation drops the smallest
-        order = np.argsort(-area_weights)
-        col_indices = col_indices[order]
-        area_weights = area_weights[order]
-
         n_entries = len(col_indices)
-        if n_entries > inpn:
-            truncated += 1
-            col_indices = col_indices[:inpn]
-            area_weights = area_weights[:inpn]
-            n_entries = inpn
 
         # Convert flattened column index → (ixin, iyin)
         # Column convention: col = iyin * nxin + ixin
@@ -1041,10 +1043,6 @@ def export_inpmat(
         INPX[ix, iy, :n_entries] = ixin + 1
         INPY[ix, iy, :n_entries] = iyin + 1
         INPA[ix, iy, :n_entries] = area_weights.astype("<f4")
-
-    if truncated > 0:
-        print(f"    WARNING: {truncated} cells had > {inpn} contributing sources;"
-              f" smallest weights were dropped.")
 
     # --- Write inpmat binary (Fortran DIRECT ACCESS, RECL = 4*out_nx*out_ny) ---
     inpmat_path = out_dir / inpmat_name
@@ -1088,10 +1086,8 @@ def export_to_cama_bin(
     *,
     npz_path: Optional[Union[str, Path]] = None,
     river_manning_default: float = 0.03,
-    flood_manning_default: float = 0.1,
     inpmat_name: str = "inpmat.bin",
     diminfo_name: str = "diminfo.txt",
-    inpn: int = 24,
     west: float = -180.0,
     east: float = 180.0,
     north: float = 90.0,
@@ -1111,14 +1107,12 @@ def export_to_cama_bin(
         are also generated.
     river_manning_default : float
         River Manning coefficient (default 0.03).
-    flood_manning_default : float
-        Floodplain Manning coefficient (default 0.1).
     inpmat_name / diminfo_name : str
         File names for the input-matrix binary and dimension-info text.
-    inpn : int
-        Max contributing sources per cell for ``inpmat`` (default 24).
     west, east, north, south : float
-        Geographic extent written into ``diminfo``.
+        Geographic extent of the *full* source grid (default global
+        -180/180/90/-90).  Set these for a regional, non-global grid; they
+        anchor the diminfo extent and the crop bounding box.
     crop_to_bbox : bool
         If ``True``, shrink the output grid to the bounding box of
         catchments present in the NC, producing much smaller files for
@@ -1134,7 +1128,7 @@ def export_to_cama_bin(
     result = export_map_params(
         nc_path, out_dir,
         river_manning_default=river_manning_default,
-        flood_manning_default=flood_manning_default,
+        west=west, east=east, north=north, south=south,
         crop_to_bbox=crop_to_bbox,
     )
     _, out_nx, out_ny, nlfp, c_west, c_east, c_north, c_south = result
@@ -1144,7 +1138,6 @@ def export_to_cama_bin(
             npz_path, nc_path, out_dir,
             inpmat_name=inpmat_name,
             diminfo_name=diminfo_name,
-            inpn=inpn,
             out_nx=out_nx,
             out_ny=out_ny,
             nlfp=nlfp,
@@ -1171,9 +1164,6 @@ if __name__ == "__main__":
     parser.add_argument("--npz", default=None, help="Path to runoff_mapping.npz (optional)")
     parser.add_argument("--river-manning", type=float, default=0.03,
                         help="River Manning coefficient (default 0.03)")
-    parser.add_argument("--flood-manning", type=float, default=0.1,
-                        help="Floodplain Manning coefficient (default 0.1)")
-    parser.add_argument("--inpn", type=int, default=24, help="Max input sources per cell")
     parser.add_argument("--inpmat-name", default="inpmat.bin", help="inpmat output filename")
     parser.add_argument("--diminfo-name", default="diminfo.txt", help="diminfo output filename")
     parser.add_argument("--west", type=float, default=-180.0)
@@ -1192,10 +1182,8 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         npz_path=args.npz,
         river_manning_default=args.river_manning,
-        flood_manning_default=args.flood_manning,
         inpmat_name=args.inpmat_name,
         diminfo_name=args.diminfo_name,
-        inpn=args.inpn,
         west=args.west,
         east=args.east,
         north=args.north,

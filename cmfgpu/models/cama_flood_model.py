@@ -513,9 +513,17 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
         if self._stats_cg is None:
             pool = self.__dict__.get("_cg_pool")
+            # Snapshot accumulators so warmup launches don't corrupt them
+            snapshot = {
+                k: v.clone()
+                for k, v in states.items()
+                if isinstance(v, torch.Tensor) and not k.startswith('__')
+            }
             # Warmup
             for _ in range(3):
                 agg._aggregator_function(states, BLOCK_SIZE)
+            for k, saved in snapshot.items():
+                states[k].copy_(saved)
             # Capture
             self._stats_cg = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._stats_cg, pool=pool):

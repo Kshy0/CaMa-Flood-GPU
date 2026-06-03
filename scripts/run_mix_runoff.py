@@ -78,6 +78,7 @@ def main():
         spin_up_cycles=spin_up_cycles if do_spin_up else 0,
         spin_up_start_date=spin_up_start_date,
         spin_up_end_date=spin_up_end_date,
+        clip_negative=True,
     )
     dataset1 = NetCDFDataset(
         base_dir=runoff_dir,
@@ -92,6 +93,7 @@ def main():
         spin_up_cycles=spin_up_cycles if do_spin_up else 0,
         spin_up_start_date=spin_up_start_date,
         spin_up_end_date=spin_up_end_date,
+        clip_negative=True,
     )
 
     model = CaMaFlood(
