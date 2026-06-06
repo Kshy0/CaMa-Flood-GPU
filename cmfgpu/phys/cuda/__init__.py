@@ -20,7 +20,6 @@ from hydroforge.runtime.cuda_kernel import (
 )
 
 _DIR = Path(__file__).resolve().parent
-_BACKEND_KIND = "cuda"
 _MODULE_PREFIX = "cmfgpu_cuda"
 
 
@@ -135,11 +134,31 @@ _EXTENSION_BUILDERS = (
 )
 
 
+_precompiled = False
+
+
+def _ensure_precompiled() -> None:
+    """Build every extension in parallel on first dispatch (idempotent).
+
+    Without this, a script that never called :func:`precompile_cuda_extensions`
+    would compile the six extensions one at a time as each kernel is first
+    touched.  Hooked at the dispatch layer rather than inside the per-extension
+    ``_ext_*`` builders, because the worker subprocesses spawned by
+    ``precompile_extension_builders`` invoke those builders directly and must
+    not re-enter here.
+    """
+    global _precompiled
+    if _precompiled:
+        return
+    _precompiled = True
+    precompile_extension_builders(__name__, _EXTENSION_BUILDERS)
+
+
 def precompile_cuda_extensions():
     """Precompile all cmfgpu CUDA extensions via hydroforge's shared loader."""
-    return precompile_extension_builders(
-        __name__, _EXTENSION_BUILDERS, toolchain=_BACKEND_KIND
-    )
+    global _precompiled
+    _precompiled = True
+    return precompile_extension_builders(__name__, _EXTENSION_BUILDERS)
 
 
 # Cached zero-element placeholders for absent optional pointers.  These are
@@ -196,6 +215,7 @@ def compute_flood_stage(**kw):
     Optional pointers (``global_bifurcation_outflow_ptr`` when bifurcation is
     off) may be ``None``; a zero-element placeholder is substituted.
     """
+    _ensure_precompiled()
     ext = _ext()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_catchments = int(kw["num_catchments"])
@@ -238,6 +258,7 @@ def compute_outflow(**kw):
     ``is_dam_upstream_ptr`` may be ``None`` (reservoir off); zero-element
     placeholders are substituted and the corresponding flag cleared.
     """
+    _ensure_precompiled()
     ext = _ext_outflow()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_catchments = int(kw["num_catchments"])
@@ -281,6 +302,7 @@ def compute_inflow(**kw):
     ``reservoir_total_inflow_ptr`` / ``is_reservoir_ptr`` may be ``None`` when
     the reservoir module is inactive.
     """
+    _ensure_precompiled()
     ext = _ext_outflow()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_catchments = int(kw["num_catchments"])
@@ -311,6 +333,7 @@ def compute_adaptive_time_step(**kw):
     ``time_step`` is a runtime scalar (matches the Triton kernel signature, not
     a pointer).  ``is_dam_related_ptr`` may be ``None`` when reservoir is off.
     """
+    _ensure_precompiled()
     ext = _ext_adaptive()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_catchments = int(kw["num_catchments"])
@@ -329,6 +352,7 @@ def compute_adaptive_time_step(**kw):
 
 def compute_bifurcation_outflow(**kw):
     """Dispatch the bifurcation outflow CUDA kernel."""
+    _ensure_precompiled()
     ext = _ext_bifurcation()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_paths = int(kw["num_bifurcation_paths"])
@@ -347,6 +371,7 @@ def compute_bifurcation_outflow(**kw):
 
 def compute_bifurcation_inflow(**kw):
     """Dispatch the bifurcation inflow (limiter + global scatter) CUDA kernel."""
+    _ensure_precompiled()
     ext = _ext_bifurcation()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_paths = int(kw["num_bifurcation_paths"])
@@ -366,6 +391,7 @@ def compute_reservoir_outflow(**kw):
     parameter arrays are reservoir-indexed.
     """
     import torch
+    _ensure_precompiled()
     ext = _ext_reservoir()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_reservoirs = int(kw["num_reservoirs"])
@@ -385,6 +411,7 @@ def compute_reservoir_outflow(**kw):
 
 def compute_levee_stage(**kw):
     """Dispatch the levee-aware flood-stage CUDA kernel."""
+    _ensure_precompiled()
     ext = _ext_levee()
     block = int(kw.get("BLOCK_SIZE", 256))
     ext.launch_levee_stage(
@@ -406,6 +433,7 @@ compute_levee_stage_log = None
 
 def compute_levee_bifurcation_outflow(**kw):
     """Dispatch the levee-aware bifurcation outflow CUDA kernel."""
+    _ensure_precompiled()
     ext = _ext_levee()
     block = int(kw.get("BLOCK_SIZE", 256))
     ext.launch_levee_bif_outflow(

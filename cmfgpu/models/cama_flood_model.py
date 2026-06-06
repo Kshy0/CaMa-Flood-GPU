@@ -73,10 +73,10 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             self.variables_to_save["static"] = static_list
 
         super().model_post_init(__context)
-        # Auto-enable CUDA graphs for the triton / cuda / hip backends (all launch
+        # Auto-enable CUDA graphs for the triton / cuda backends (both launch
         # kernels onto the current CUDA stream, so stream capture works).
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND in ("triton", "cuda", "hip") and torch.cuda.is_available():
+        if KERNEL_BACKEND in ("triton", "cuda") and torch.cuda.is_available():
             self.enable_cuda_graph()
 
     @cached_property

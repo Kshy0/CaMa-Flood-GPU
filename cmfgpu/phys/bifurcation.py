@@ -46,10 +46,6 @@ elif KERNEL_BACKEND == "cuda":
     from cmfgpu.phys.cuda import (compute_bifurcation_inflow,
                                   compute_bifurcation_outflow)
 
-elif KERNEL_BACKEND == "hip":
-    from cmfgpu.phys.hip import (compute_bifurcation_inflow,
-                                 compute_bifurcation_outflow)
-
 else:  # triton
     from hydroforge.runtime.backend import make_triton_dispatcher
 

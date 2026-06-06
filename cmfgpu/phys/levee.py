@@ -51,11 +51,6 @@ elif KERNEL_BACKEND == "cuda":
                                   compute_levee_stage,
                                   compute_levee_stage_log)
 
-elif KERNEL_BACKEND == "hip":
-    from cmfgpu.phys.hip import (compute_levee_bifurcation_outflow,
-                                 compute_levee_stage,
-                                 compute_levee_stage_log)
-
 else:  # triton
     from hydroforge.runtime.backend import make_triton_dispatcher
 
