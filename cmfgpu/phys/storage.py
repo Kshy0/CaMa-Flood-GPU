@@ -31,6 +31,12 @@ elif KERNEL_BACKEND == "torch":
     compute_flood_stage = adapt_kernel(_raw_stage)
     compute_flood_stage_log = adapt_kernel(_raw_stage_log)
 
+elif KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import compute_flood_stage, compute_flood_stage_log
+
+elif KERNEL_BACKEND == "hip":
+    from cmfgpu.phys.hip import compute_flood_stage, compute_flood_stage_log
+
 else:  # triton
     from hydroforge.runtime.backend import make_triton_dispatcher
 

@@ -90,7 +90,20 @@ kernel void compute_flood_stage(
     float catch_width  = catch_area / riv_length;
     float width_inc    = catch_width / (float)NUM_FLOOD_LEVELS;
 
-    int   level = (total_sto > riv_max_sto) ? 0 : -1;
+    if (total_sto <= riv_max_sto) {
+        float riv_depth_dry = total_sto / (riv_length * riv_width);
+        outgoing_storage_buf[idx]   = 0.0f;
+        river_storage_buf[idx]      = total_sto;
+        flood_storage_buf[idx]      = 0.0f;
+        protected_storage_buf[idx]  = 0.0f;
+        river_depth_buf[idx]        = riv_depth_dry;
+        flood_depth_buf[idx]        = 0.0f;
+        protected_depth_buf[idx]    = 0.0f;
+        flood_fraction_buf[idx]     = 0.0f;
+        return;
+    }
+
+    int   level = 0;
     float S_accum = riv_max_sto;
     float prev_H = 0.0f;
     float prev_W = riv_width;
@@ -104,46 +117,39 @@ kernel void compute_flood_stage(
         float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
         float S_curr = S_accum + dS;
 
-        if (level == i) next_fld_depth = H_curr;
-
         if (total_sto > S_curr) {
             level += 1;
             prev_total_sto = S_curr;
             prev_fld_depth = H_curr;
+            S_accum = S_curr;
+            prev_H = H_curr;
+            prev_W = W_curr;
+        } else {
+            next_fld_depth = H_curr;
+            break;
         }
-
-        S_accum = S_curr;
-        prev_H = H_curr;
-        prev_W = W_curr;
     }
 
-    bool no_flood = (level < 0);
-    level = max(level, 0);
-
     float prev_total_W = riv_width + (float)level * width_inc;
-    float flood_grad = (level == NUM_FLOOD_LEVELS)
-        ? 0.0f
-        : (next_fld_depth - prev_fld_depth) / width_inc;
+    float diff_W = 0.0f;
+    float fld_depth;
+    if (level == NUM_FLOOD_LEVELS) {
+        fld_depth = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
+    } else {
+        float flood_grad = (next_fld_depth - prev_fld_depth) / width_inc;
+        diff_W = sqrt(
+            prev_total_W * prev_total_W
+            + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
+        ) - prev_total_W;
+        fld_depth = prev_fld_depth + diff_W * flood_grad;
+    }
 
-    float diff_W = sqrt(
-        prev_total_W * prev_total_W
-        + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
-    ) - prev_total_W;
-    float fld_depth_mid = prev_fld_depth + diff_W * flood_grad;
-    float fld_depth_top = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
-
-    float fld_depth = no_flood ? 0.0f
-        : (level == NUM_FLOOD_LEVELS ? fld_depth_top : fld_depth_mid);
-
-    float riv_sto_final = no_flood
-        ? total_sto
-        : min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
+    float riv_sto_final = min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
     float riv_depth = riv_sto_final / (riv_length * riv_width);
 
     float fld_frac_mid = clamp(
         (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
-    float fld_frac = no_flood ? 0.0f
-        : (level == NUM_FLOOD_LEVELS ? 1.0f : fld_frac_mid);
+    float fld_frac = (level == NUM_FLOOD_LEVELS) ? 1.0f : fld_frac_mid;
 
     float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
 
@@ -249,7 +255,20 @@ kernel void compute_flood_stage_batched(
         float width_inc = (batched_catchment_area_flag || batched_river_length_flag)
             ? (catch_area / riv_length) / (float)NUM_FLOOD_LEVELS : width_inc_s;
 
-        int   level = (total_sto > riv_max_sto) ? 0 : -1;
+        if (total_sto <= riv_max_sto) {
+            float riv_depth_dry = total_sto / (riv_length * riv_width);
+            outgoing_storage_buf[s]   = 0.0f;
+            river_storage_buf[s]      = total_sto;
+            flood_storage_buf[s]      = 0.0f;
+            protected_storage_buf[s]  = 0.0f;
+            river_depth_buf[s]        = riv_depth_dry;
+            flood_depth_buf[s]        = 0.0f;
+            protected_depth_buf[s]    = 0.0f;
+            flood_fraction_buf[s]     = 0.0f;
+            continue;
+        }
+
+        int   level = 0;
         float S_accum = riv_max_sto;
         float prev_H = 0.0f;
         float prev_W = riv_width;
@@ -265,45 +284,39 @@ kernel void compute_flood_stage_batched(
             float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
             float S_curr = S_accum + dS;
 
-            if (level == i) next_fld_depth = H_curr;
             if (total_sto > S_curr) {
                 level += 1;
                 prev_total_sto = S_curr;
                 prev_fld_depth = H_curr;
+                S_accum = S_curr;
+                prev_H = H_curr;
+                prev_W = W_curr;
+            } else {
+                next_fld_depth = H_curr;
+                break;
             }
-
-            S_accum = S_curr;
-            prev_H = H_curr;
-            prev_W = W_curr;
         }
 
-        bool no_flood = (level < 0);
-        level = max(level, 0);
-
         float prev_total_W = riv_width + (float)level * width_inc;
-        float flood_grad = (level == NUM_FLOOD_LEVELS)
-            ? 0.0f
-            : (next_fld_depth - prev_fld_depth) / width_inc;
+        float diff_W = 0.0f;
+        float fld_depth;
+        if (level == NUM_FLOOD_LEVELS) {
+            fld_depth = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
+        } else {
+            float flood_grad = (next_fld_depth - prev_fld_depth) / width_inc;
+            diff_W = sqrt(
+                prev_total_W * prev_total_W
+                + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
+            ) - prev_total_W;
+            fld_depth = prev_fld_depth + diff_W * flood_grad;
+        }
 
-        float diff_W = sqrt(
-            prev_total_W * prev_total_W
-            + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
-        ) - prev_total_W;
-        float fld_depth_mid = prev_fld_depth + diff_W * flood_grad;
-        float fld_depth_top = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
-
-        float fld_depth = no_flood ? 0.0f
-            : (level == NUM_FLOOD_LEVELS ? fld_depth_top : fld_depth_mid);
-
-        float riv_sto_final = no_flood
-            ? total_sto
-            : min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
+        float riv_sto_final = min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
         float riv_depth = riv_sto_final / (riv_length * riv_width);
 
         float fld_frac_mid = clamp(
             (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
-        float fld_frac = no_flood ? 0.0f
-            : (level == NUM_FLOOD_LEVELS ? 1.0f : fld_frac_mid);
+        float fld_frac = (level == NUM_FLOOD_LEVELS) ? 1.0f : fld_frac_mid;
 
         float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
 
@@ -414,7 +427,30 @@ kernel void compute_flood_stage_log(
     float catch_width  = catch_area / riv_length;
     float width_inc    = catch_width / (float)NUM_FLOOD_LEVELS;
 
-    int   level = (total_sto > riv_max_sto) ? 0 : -1;
+    if (total_sto <= riv_max_sto) {
+        float riv_depth_dry = total_sto / (riv_length * riv_width);
+        float total_storage_stage_new = total_sto;
+        atomic_add_float(&log_sums_buf[6 * lbs + current_step], total_storage_stage_new * 1e-9f);
+        if (non_levee) {
+            atomic_add_float(&log_sums_buf[8  * lbs + current_step], total_sto * 1e-9f);
+            atomic_add_float(&log_sums_buf[9  * lbs + current_step], 0.0f);
+            atomic_add_float(&log_sums_buf[10 * lbs + current_step], 0.0f);
+            atomic_add_float(&log_sums_buf[7  * lbs + current_step],
+                (total_storage_stage_new - total_sto) * 1e-9f);
+        }
+
+        outgoing_storage_buf[idx]   = 0.0f;
+        river_storage_buf[idx]      = total_sto;
+        flood_storage_buf[idx]      = 0.0f;
+        protected_storage_buf[idx]  = 0.0f;
+        river_depth_buf[idx]        = riv_depth_dry;
+        flood_depth_buf[idx]        = 0.0f;
+        protected_depth_buf[idx]    = 0.0f;
+        flood_fraction_buf[idx]     = 0.0f;
+        return;
+    }
+
+    int   level = 0;
     float S_accum = riv_max_sto;
     float prev_H = 0.0f;
     float prev_W = riv_width;
@@ -428,46 +464,39 @@ kernel void compute_flood_stage_log(
         float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
         float S_curr = S_accum + dS;
 
-        if (level == i) next_fld_depth = H_curr;
-
         if (total_sto > S_curr) {
             level += 1;
             prev_total_sto = S_curr;
             prev_fld_depth = H_curr;
+            S_accum = S_curr;
+            prev_H = H_curr;
+            prev_W = W_curr;
+        } else {
+            next_fld_depth = H_curr;
+            break;
         }
-
-        S_accum = S_curr;
-        prev_H = H_curr;
-        prev_W = W_curr;
     }
 
-    bool no_flood = (level < 0);
-    level = max(level, 0);
-
     float prev_total_W = riv_width + (float)level * width_inc;
-    float flood_grad = (level == NUM_FLOOD_LEVELS)
-        ? 0.0f
-        : (next_fld_depth - prev_fld_depth) / width_inc;
+    float diff_W = 0.0f;
+    float fld_depth;
+    if (level == NUM_FLOOD_LEVELS) {
+        fld_depth = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
+    } else {
+        float flood_grad = (next_fld_depth - prev_fld_depth) / width_inc;
+        diff_W = sqrt(
+            prev_total_W * prev_total_W
+            + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
+        ) - prev_total_W;
+        fld_depth = prev_fld_depth + diff_W * flood_grad;
+    }
 
-    float diff_W = sqrt(
-        prev_total_W * prev_total_W
-        + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
-    ) - prev_total_W;
-    float fld_depth_mid = prev_fld_depth + diff_W * flood_grad;
-    float fld_depth_top = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
-
-    float fld_depth = no_flood ? 0.0f
-        : (level == NUM_FLOOD_LEVELS ? fld_depth_top : fld_depth_mid);
-
-    float riv_sto_final = no_flood
-        ? total_sto
-        : min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
+    float riv_sto_final = min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
     float riv_depth = riv_sto_final / (riv_length * riv_width);
 
     float fld_frac_mid = clamp(
         (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
-    float fld_frac = no_flood ? 0.0f
-        : (level == NUM_FLOOD_LEVELS ? 1.0f : fld_frac_mid);
+    float fld_frac = (level == NUM_FLOOD_LEVELS) ? 1.0f : fld_frac_mid;
 
     float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
 

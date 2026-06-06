@@ -1,0 +1,58 @@
+// LICENSE HEADER MANAGED BY add-license-header
+// Copyright (c) 2025 Shengyu Kang (Wuhan University)
+// Licensed under the Apache License, Version 2.0
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// HIP backend for the adaptive-time-step (CFL) kernel.
+//
+// Mirrors cmfgpu/phys/triton/adaptive_time.py::compute_adaptive_time_step_kernel.
+//
+// The Triton kernel does a block-min reduction of the per-cell CFL dt, then
+//   n_steps = floor(time_step / min_dt + 0.49) + 1
+// and a grid-wide atomic_max into max_sub_steps.  Because
+//   n(dt) = floor(time_step/dt + 0.49) + 1
+// is monotonically *decreasing* in dt, the maximum of n over the cells equals
+// n evaluated at the minimum dt.  So a plain per-thread atomicMax(n_i) yields a
+// bit-identical result to block-min-then-n, with no reduction needed.
+
+#include <hip/hip_runtime.h>
+#include <torch/extension.h>
+#include <c10/hip/HIPStream.h>
+
+__global__ void k_adaptive_time(
+    const float* __restrict__ river_depth,
+    const float* __restrict__ downstream_distance,
+    const bool*  __restrict__ is_dam_related,
+    int* __restrict__ max_sub_steps,
+    float time_step, float adaptive_time_factor, float gravity,
+    long num_catchments, int has_reservoir)
+{
+    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (t >= num_catchments) return;
+    // Fortran I2MASK==0 only: skip dam + upstream-of-dam cells from CFL.
+    if (has_reservoir && is_dam_related && is_dam_related[t]) return;
+
+    float dist = __ldg(downstream_distance + t);
+    float depth = fmaxf(__ldg(river_depth + t), 0.01f);
+    float dt = adaptive_time_factor * dist / sqrtf(gravity * depth);
+    float dt_clamped = fminf(dt, time_step);
+    float n_steps_f = floorf(time_step / dt_clamped + 0.49f) + 1.0f;
+    int n_steps = (int)n_steps_f;
+    atomicMax(max_sub_steps, n_steps);
+}
+
+void launch_adaptive_time(
+    at::Tensor river_depth, at::Tensor downstream_distance,
+    at::Tensor is_dam_related, at::Tensor max_sub_steps,
+    double time_step, double adaptive_time_factor, double gravity,
+    long num_catchments, long has_reservoir, long block)
+{
+    int grid = (int)((num_catchments + block - 1) / block);
+    hipStream_t stream = c10::hip::getCurrentHIPStream();
+    const bool* dam = is_dam_related.numel() ? is_dam_related.data_ptr<bool>() : nullptr;
+    k_adaptive_time<<<grid, (int)block, 0, stream>>>(
+        river_depth.data_ptr<float>(), downstream_distance.data_ptr<float>(),
+        dam, max_sub_steps.data_ptr<int>(),
+        (float)time_step, (float)adaptive_time_factor, (float)gravity,
+        num_catchments, (int)has_reservoir);
+}

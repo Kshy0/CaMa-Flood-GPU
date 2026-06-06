@@ -70,18 +70,20 @@ kernel void compute_levee_bifurcation_outflow(
             semi_d = updated_csd;
         }
 
-        float width   = bif_width_buf[level_idx];
-        float outflow = bif_outflow_buf[level_idx];
-        float unit_q  = outflow / width;
+        bool flow_cond = semi_d > 1e-5f;
+        float updated_outflow = 0.0f;
+        if (flow_cond) {
+            float width   = bif_width_buf[level_idx];
+            float outflow = bif_outflow_buf[level_idx];
+            float unit_q  = outflow / width;
 
-        float num = width * (
-            unit_q + gravity * time_step * semi_d * bif_slope
-        );
-        float den = 1.0f + gravity * time_step * (manning * manning) * fabs(unit_q)
-                    * pow(semi_d, -7.0f / 3.0f);
-
-        float updated_outflow = num / den;
-        updated_outflow = (semi_d > 1e-5f) ? updated_outflow : 0.0f;
+            float num = width * (
+                unit_q + gravity * time_step * semi_d * bif_slope
+            );
+            float den = 1.0f + gravity * time_step * (manning * manning) * fabs(unit_q)
+                        * pow(semi_d, -7.0f / 3.0f);
+            updated_outflow = num / den;
+        }
 
         sum_outflow += updated_outflow;
         bif_cross_section_depth_buf[level_idx] = updated_csd;
@@ -191,18 +193,20 @@ kernel void compute_levee_bifurcation_outflow_batched(
             semi_d = updated_csd;
         }
 
-        float width   = bif_width_buf[width_base + level_idx];
-        float outflow = bif_outflow_buf[to_levels + level_idx];
-        float unit_q  = outflow / width;
+        bool flow_cond = semi_d > 1e-5f;
+        float updated_outflow = 0.0f;
+        if (flow_cond) {
+            float width   = bif_width_buf[width_base + level_idx];
+            float outflow = bif_outflow_buf[to_levels + level_idx];
+            float unit_q  = outflow / width;
 
-        float num = width * (
-            unit_q + gravity * time_step * semi_d * bif_slope
-        );
-        float den = 1.0f + gravity * time_step * (manning * manning) * fabs(unit_q)
-                    * pow(semi_d, -7.0f / 3.0f);
-
-        float updated_outflow = num / den;
-        updated_outflow = (semi_d > 1e-5f) ? updated_outflow : 0.0f;
+            float num = width * (
+                unit_q + gravity * time_step * semi_d * bif_slope
+            );
+            float den = 1.0f + gravity * time_step * (manning * manning) * fabs(unit_q)
+                        * pow(semi_d, -7.0f / 3.0f);
+            updated_outflow = num / den;
+        }
 
         sum_outflow += updated_outflow;
         bif_cross_section_depth_buf[to_levels + level_idx] = updated_csd;

@@ -39,6 +39,12 @@ elif KERNEL_BACKEND == "torch":
     compute_outflow = adapt_kernel(_raw_outflow, compile=False)
     compute_inflow = adapt_kernel(_raw_inflow, compile=False)
 
+elif KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import compute_inflow, compute_outflow
+
+elif KERNEL_BACKEND == "hip":
+    from cmfgpu.phys.hip import compute_inflow, compute_outflow
+
 else:  # triton
     from hydroforge.runtime.backend import make_triton_dispatcher
 

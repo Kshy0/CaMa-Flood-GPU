@@ -102,7 +102,6 @@ kernel void compute_outflow(
 
     // (6) Flood area
     float upd_fld_xs_area = max(fld_storage / riv_length - fld_depth * riv_width, 0.0f);
-    float fld_impl_area   = max(sqrt(upd_fld_xs_area * max(fld_xs_area, 1e-6f)), 1e-6f);
 
     // (7) River outflow
     float riv_xs_area = upd_riv_xs * riv_width;
@@ -115,10 +114,14 @@ kernel void compute_outflow(
 
     // (8) Flood outflow
     bool fld_cond = (fld_flow_d > 1e-5f) && (upd_fld_xs_area > 1e-5f);
-    float num_fld = fld_outflow + gravity * time_step * fld_impl_area * fld_slope;
-    float den_fld = 1.0f + gravity * time_step * (fld_manning * fld_manning)
-                    * abs(fld_outflow) * pow(fld_flow_d, -4.0f / 3.0f) / fld_impl_area;
-    float upd_fld_out = fld_cond ? (num_fld / den_fld) : 0.0f;
+    float upd_fld_out = 0.0f;
+    if (fld_cond) {
+        float fld_impl_area = max(sqrt(upd_fld_xs_area * max(fld_xs_area, 1e-6f)), 1e-6f);
+        float num_fld = fld_outflow + gravity * time_step * fld_impl_area * fld_slope;
+        float den_fld = 1.0f + gravity * time_step * (fld_manning * fld_manning)
+                        * abs(fld_outflow) * pow(fld_flow_d, -4.0f / 3.0f) / fld_impl_area;
+        upd_fld_out = num_fld / den_fld;
+    }
 
     // (9) Prevent opposite directions + negative-flow limiting
     if (upd_riv_out * upd_fld_out < 0.0f) upd_fld_out = 0.0f;
@@ -339,7 +342,6 @@ kernel void compute_outflow_batched(
 
     // (6) Flood area
     float upd_fld_xs_area = max(fld_storage / riv_length - fld_depth * riv_width, 0.0f);
-    float fld_impl_area   = max(sqrt(upd_fld_xs_area * max(fld_xs_area, 1e-6f)), 1e-6f);
 
     // (7) River outflow
     float riv_xs_area = upd_riv_xs * riv_width;
@@ -352,10 +354,14 @@ kernel void compute_outflow_batched(
 
     // (8) Flood outflow
     bool fld_cond = (fld_flow_d > 1e-5f) && (upd_fld_xs_area > 1e-5f);
-    float num_fld = fld_outflow + gravity * time_step * fld_impl_area * fld_slope;
-    float den_fld = 1.0f + gravity * time_step * (fld_manning * fld_manning)
-                    * abs(fld_outflow) * pow(fld_flow_d, -4.0f / 3.0f) / fld_impl_area;
-    float upd_fld_out = fld_cond ? (num_fld / den_fld) : 0.0f;
+    float upd_fld_out = 0.0f;
+    if (fld_cond) {
+        float fld_impl_area = max(sqrt(upd_fld_xs_area * max(fld_xs_area, 1e-6f)), 1e-6f);
+        float num_fld = fld_outflow + gravity * time_step * fld_impl_area * fld_slope;
+        float den_fld = 1.0f + gravity * time_step * (fld_manning * fld_manning)
+                        * abs(fld_outflow) * pow(fld_flow_d, -4.0f / 3.0f) / fld_impl_area;
+        upd_fld_out = num_fld / den_fld;
+    }
 
     // (9) Prevent opposite directions + negative-flow limiting
     if (upd_riv_out * upd_fld_out < 0.0f) upd_fld_out = 0.0f;

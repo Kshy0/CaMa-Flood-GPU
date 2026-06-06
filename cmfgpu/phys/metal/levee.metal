@@ -60,6 +60,14 @@ kernel void compute_levee_stage(
     float total_storage = river_storage_curr + flood_storage_curr;
 
     float river_max_storage = river_length * river_width * river_height;
+    if (total_storage <= river_max_storage) {
+        river_storage_buf[ci]     = river_storage_curr;
+        flood_storage_buf[ci]     = flood_storage_curr;
+        protected_storage_buf[ci] = 0.0f;
+        protected_depth_buf[ci]   = 0.0f;
+        return;
+    }
+
     float dwth_inc = (catchment_area / river_length) / (float)NUM_FLOOD_LEVELS;
     float levee_distance = levee_fraction * (catchment_area / river_length);
 
@@ -132,6 +140,7 @@ kernel void compute_levee_stage(
         s_curr = s_next;
         dhgt_pre = depth_val;
         dwth_pre += dwth_inc;
+        if (found_base && found_fill && found_B) break;
     }
 
     // Handle out of bounds
@@ -293,6 +302,14 @@ kernel void compute_levee_stage_batched(
         float total_storage = river_storage_curr + flood_storage_curr;
 
         float river_max_storage = river_length * river_width * river_height;
+        if (total_storage <= river_max_storage) {
+            river_storage_buf[ci_g]     = river_storage_curr;
+            flood_storage_buf[ci_g]     = flood_storage_curr;
+            protected_storage_buf[ci_g] = 0.0f;
+            protected_depth_buf[ci_g]   = 0.0f;
+            continue;
+        }
+
         float dwth_inc = (catchment_area / river_length) / (float)NF;
         float levee_distance = levee_fraction * (catchment_area / river_length);
 
@@ -351,6 +368,7 @@ kernel void compute_levee_stage_batched(
             s_curr = s_next;
             dhgt_pre = depth_val;
             dwth_pre += dwth_inc;
+            if (found_base && found_fill && found_B) break;
         }
 
         if (!found_base) {
@@ -481,6 +499,20 @@ kernel void compute_levee_stage_log(
     float total_storage = river_storage_curr + flood_storage_curr;
 
     float river_max_storage = river_length * river_width * river_height;
+    if (total_storage <= river_max_storage) {
+        float total_storage_stage_new = river_storage_curr + flood_storage_curr;
+        atomic_add_float(&log_sums_buf[6  * lbs + current_step], total_storage_stage_new * 1e-9f);
+        atomic_add_float(&log_sums_buf[8  * lbs + current_step], river_storage_curr * 1e-9f);
+        atomic_add_float(&log_sums_buf[9  * lbs + current_step], flood_storage_curr * 1e-9f);
+        atomic_add_float(&log_sums_buf[10 * lbs + current_step], flood_fraction_buf[ci] * catchment_area * 1e-9f);
+
+        river_storage_buf[ci]     = river_storage_curr;
+        flood_storage_buf[ci]     = flood_storage_curr;
+        protected_storage_buf[ci] = 0.0f;
+        protected_depth_buf[ci]   = 0.0f;
+        return;
+    }
+
     float dwth_inc = (catchment_area / river_length) / (float)NUM_FLOOD_LEVELS;
     float levee_distance = levee_fraction * (catchment_area / river_length);
 
@@ -551,6 +583,7 @@ kernel void compute_levee_stage_log(
         s_curr = s_next;
         dhgt_pre = depth_val;
         dwth_pre += dwth_inc;
+        if (found_base && found_fill && found_B) break;
     }
 
     // Handle out of bounds

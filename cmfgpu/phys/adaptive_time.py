@@ -28,6 +28,12 @@ elif KERNEL_BACKEND == "torch":
         compute_adaptive_time_step_kernel as _raw_adaptive
     compute_adaptive_time_step = adapt_kernel(_raw_adaptive)
 
+elif KERNEL_BACKEND == "cuda":
+    from cmfgpu.phys.cuda import compute_adaptive_time_step
+
+elif KERNEL_BACKEND == "hip":
+    from cmfgpu.phys.hip import compute_adaptive_time_step
+
 else:  # triton
     from hydroforge.runtime.backend import make_triton_dispatcher
 
