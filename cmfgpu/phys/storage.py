@@ -21,20 +21,10 @@ if KERNEL_BACKEND == "metal":
         else:
             _fs_nb(**kw)
 
-elif KERNEL_BACKEND == "torch":
-    from hydroforge.runtime.backend import adapt_kernel
-
-    from cmfgpu.phys.torch.storage import \
-        compute_flood_stage_kernel as _raw_stage
-    from cmfgpu.phys.torch.storage import \
-        compute_flood_stage_log_kernel as _raw_stage_log
-    compute_flood_stage = adapt_kernel(_raw_stage)
-    compute_flood_stage_log = adapt_kernel(_raw_stage_log)
-
 elif KERNEL_BACKEND == "cuda":
     from cmfgpu.phys.cuda import compute_flood_stage, compute_flood_stage_log
 
-else:  # triton
+elif KERNEL_BACKEND == "triton":
     from hydroforge.runtime.backend import make_triton_dispatcher
 
     from cmfgpu.phys.triton.storage import (compute_flood_stage_batched_kernel,
@@ -45,3 +35,6 @@ else:  # triton
         batched_grid="loop",
     )
     compute_flood_stage_log = make_triton_dispatcher(compute_flood_stage_log_kernel)
+
+else:
+    raise ValueError(f"Unsupported cmfgpu backend: {KERNEL_BACKEND!r}")

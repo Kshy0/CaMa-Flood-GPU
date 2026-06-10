@@ -7,7 +7,7 @@
 """
 River channel width and depth estimation from runoff climatology.
 
-Mirrors the logic of CaMa-Flood's ``calc_rivwth.F90``:
+Uses the CaMa-Flood river geometry power-law formulas:
 
 .. code-block:: text
 
@@ -120,7 +120,7 @@ def _power_law(
 ):
     """Compute river height and width from discharge via power law.
 
-    Formulae (matching ``calc_rivwth.F90``):
+    Formulae:
 
     .. code-block:: text
 
@@ -162,7 +162,7 @@ def _fuse_satellite_width(
 ):
     """Fuse power-law width with satellite (GWD-LR) width.
 
-    Mirrors the logic of ``set_gwdlr.F90``::
+    Width fusion rule::
 
         if   gwdlr <  sat_min_threshold:   fused = max(gwdlr, rivwth)
         elif gwdlr <  rivwth * lower_ratio: fused = rivwth * lower_ratio
@@ -226,7 +226,7 @@ def _update_bifurcation_elevation(
 ) -> np.ndarray:
     """Recompute bifurcation level-0 elevation using updated river heights.
 
-    Mirrors the Fortran ``set_bifparam`` logic:
+    Level-0 update rule:
 
     .. code-block:: text
 

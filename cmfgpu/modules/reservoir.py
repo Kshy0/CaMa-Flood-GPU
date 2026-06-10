@@ -142,7 +142,7 @@ class ReservoirModule(AbstractModule):
         return (self.emergency_volume - self.conservation_volume) / 0.95
 
     @computed_reservoir_field(
-        description="Volume threshold triggering regulation (m³).  Fortran: AdjVol = ConVol + FldVol * 0.1",
+        description="Volume threshold triggering regulation (m³): AdjVol = ConVol + FldVol * 0.1",
     )
     @cached_property
     def adjustment_volume(self) -> torch.Tensor:
@@ -150,7 +150,7 @@ class ReservoirModule(AbstractModule):
 
     @computed_reservoir_field(
         description="Effective normal outflow after Yamazaki & Funato modification (m³ s⁻¹). "
-                    "Fortran: Qn = min(Qn, Qsto) * 1.5  where Qsto = (ConVol*0.7 + Vyr/4) / (180 days).",
+                    "Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days).",
     )
     @cached_property
     def effective_normal_outflow(self) -> torch.Tensor:
@@ -161,7 +161,7 @@ class ReservoirModule(AbstractModule):
         return torch.minimum(self.normal_outflow, Qsto) * 1.5
 
     @computed_reservoir_field(
-        description="Regulated outflow rate (m³ s⁻¹).  Fortran: Qa = (modified_Qn + Qf) * 0.5",
+        description="Regulated outflow rate (m³ s⁻¹): Qa = (modified_Qn + Qf) * 0.5",
     )
     @cached_property
     def adjustment_outflow(self) -> torch.Tensor:

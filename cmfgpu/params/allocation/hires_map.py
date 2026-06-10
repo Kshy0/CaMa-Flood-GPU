@@ -7,7 +7,7 @@
 """
 High-resolution map data handler for CaMa-Flood-GPU gauge allocation.
 
-Python re-implementation of the three Fortran allocation programs:
+Includes the three allocation pipelines:
 
 * ``allocate_flow_gauge.F90``  → :class:`FlowGaugeMixin`
 * ``allocate_dam.F90``         → :class:`DamAllocMixin`
@@ -156,7 +156,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         )
         self.uparea = np.where(uparea_raw > 0, uparea_raw * 1e-6, uparea_raw).astype(np.float32)
 
-        # Downstream pointers (Fortran 1-based → Python 0-based)
+        # Downstream pointers (1-based → Python 0-based)
         nextxy = binread(
             self.map_dir / "nextxy.bin", (self.nXX, self.nYY, 2), dtype_str=self.lowres_idx_precision
         )
@@ -460,8 +460,8 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
     ) -> Path:
         """Convert a CaMa-Flood ``GRDC_alloc.txt`` to a simple gauge list.
 
-        The official ``GRDC_alloc.txt`` produced by CaMa-Flood's Fortran
-        ``allocate_flow_gauge`` has 14 fixed-width columns per data line::
+        The official ``GRDC_alloc.txt`` produced by CaMa-Flood's
+        ``allocate_flow_gauge`` tool has 14 fixed-width columns per data line::
 
             ID  lat  lon  err  area_GRDC  area_CaMa  diff  ups_num
             ix1  iy1  ix2  iy2  area1  area2

@@ -32,21 +32,11 @@ if KERNEL_BACKEND == "metal":
         else:
             _bi_nb(**kw)
 
-elif KERNEL_BACKEND == "torch":
-    from hydroforge.runtime.backend import adapt_kernel
-
-    from cmfgpu.phys.torch.bifurcation import \
-        compute_bifurcation_inflow_kernel as _raw_bif_in
-    from cmfgpu.phys.torch.bifurcation import \
-        compute_bifurcation_outflow_kernel as _raw_bif_out
-    compute_bifurcation_outflow = adapt_kernel(_raw_bif_out, compile=False)
-    compute_bifurcation_inflow = adapt_kernel(_raw_bif_in, compile=False)
-
 elif KERNEL_BACKEND == "cuda":
     from cmfgpu.phys.cuda import (compute_bifurcation_inflow,
                                   compute_bifurcation_outflow)
 
-else:  # triton
+elif KERNEL_BACKEND == "triton":
     from hydroforge.runtime.backend import make_triton_dispatcher
 
     from cmfgpu.phys.triton.bifurcation import (
@@ -66,3 +56,6 @@ else:  # triton
         size_key="num_bifurcation_paths",
         non_batched_drop=("num_catchments",),
     )
+
+else:
+    raise ValueError(f"Unsupported cmfgpu backend: {KERNEL_BACKEND!r}")

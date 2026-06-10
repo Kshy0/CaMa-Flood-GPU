@@ -19,9 +19,9 @@ import numpy as np
 class BinReader:
     """
     Reader for CaMa-Flood CPU version binary outputs (e.g., rivoutYYYY.bin).
-    Assumes global binary files in Fortran order (nx, ny).
+    Assumes global binary files use column-major (nx, ny) frame layout.
     
-    Mimics the interface of MultiRankStatsReader for compatibility.
+    Provides the same public reader interface as MultiRankStatsReader.
     """
 
     def _load_dims(self):
@@ -241,8 +241,7 @@ class BinReader:
             path = f_info["path"]
             n_frames = f_info["n_frames"]
             
-            # Memmap as (n_frames, ny, nx) C-order
-            # This matches the disk layout of Fortran (nx, ny) frames
+            # Memmap as (n_frames, ny, nx) C-order over column-major frames.
             mmap = np.memmap(path, dtype="<f4", mode="r", shape=(n_frames, self.ny, self.nx))
             
             # Extract points

@@ -77,7 +77,7 @@ def compute_reservoir_outflow_kernel(
     river_storage = tl.load(river_storage_ptr + catchment_idx, mask=mask, other=0.0)
     flood_storage = tl.load(flood_storage_ptr + catchment_idx, mask=mask, other=0.0)
 
-    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    # Downcast hpfloat storage to the active computation dtype.
     river_storage = to_compute_dtype(river_storage, old_river_outflow)
     flood_storage = to_compute_dtype(flood_storage, old_river_outflow)
 

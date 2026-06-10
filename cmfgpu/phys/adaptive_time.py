@@ -21,17 +21,10 @@ if KERNEL_BACKEND == "metal":
         else:
             _at_nb(**kw)
 
-elif KERNEL_BACKEND == "torch":
-    from hydroforge.runtime.backend import adapt_kernel
-
-    from cmfgpu.phys.torch.adaptive_time import \
-        compute_adaptive_time_step_kernel as _raw_adaptive
-    compute_adaptive_time_step = adapt_kernel(_raw_adaptive)
-
 elif KERNEL_BACKEND == "cuda":
     from cmfgpu.phys.cuda import compute_adaptive_time_step
 
-else:  # triton
+elif KERNEL_BACKEND == "triton":
     from hydroforge.runtime.backend import make_triton_dispatcher
 
     from cmfgpu.phys.triton.adaptive_time import (
@@ -41,3 +34,6 @@ else:  # triton
         compute_adaptive_time_step_kernel,
         batched_kernel=compute_adaptive_time_step_batched_kernel,
     )
+
+else:
+    raise ValueError(f"Unsupported cmfgpu backend: {KERNEL_BACKEND!r}")

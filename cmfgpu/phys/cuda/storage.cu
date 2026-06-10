@@ -5,10 +5,10 @@
 //
 // CUDA backend for the fused storage-update + flood-stage kernel.
 //
-// Faithfully mirrors cmfgpu/phys/triton/storage.py::compute_flood_stage_kernel,
-// with lane-local early exits for dry cells and per-cell scan completion.  There
-// is no warp/group vote path here; divergent lanes are left to the CUDA compiler
-// and SIMT scheduler.
+// CUDA storage-update + flood-stage implementation.  Lane-local early exits are
+// used for dry cells and completed flood-level scans.  There is no warp/group
+// vote path here; divergent lanes are left to the CUDA compiler and SIMT
+// scheduler.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -34,28 +34,27 @@ __global__ void k_flood_stage(
     if (t >= num_catchments) return;
 
     float ts = __ldg(time_step_ptr);
-    STO dt = (STO)ts;
     STO rsto = river_storage[t];
     STO fsto = flood_storage[t];
     STO prot = protected_storage[t];
-    STO rinf = river_inflow[t];
-    STO finf = flood_inflow[t];
-    STO gbif = has_bifurcation ? global_bif_outflow[t] : (STO)0;
+    float rinf = (float)river_inflow[t];
+    float finf = (float)flood_inflow[t];
+    float gbif = has_bifurcation ? (float)global_bif_outflow[t] : 0.f;
     float rout = __ldg(river_outflow + t);
     float fout = __ldg(flood_outflow + t);
     float ro = __ldg(runoff + t);
 
-    STO river_su = rsto + (rinf - (STO)rout) * dt;
+    STO river_su = rsto + (rinf - rout) * ts;
     STO flood_su = fsto
         + (river_su < (STO)0 ? river_su : (STO)0)
-        + (finf - (STO)fout - gbif) * dt;
+        + (finf - fout - gbif) * ts;
     river_su = river_su > (STO)0 ? river_su : (STO)0;
     if (flood_su < (STO)0) {
         STO tt = river_su + flood_su;
         river_su = tt > (STO)0 ? tt : (STO)0;
     }
     flood_su = flood_su > (STO)0 ? flood_su : (STO)0;
-    STO total_s = river_su + flood_su + prot + (STO)ro * dt;
+    STO total_s = river_su + flood_su + prot + ro * ts;
     total_s = total_s > (STO)0 ? total_s : (STO)0;
     float total_storage = (float)total_s;
 

@@ -30,19 +30,10 @@ if KERNEL_BACKEND == "metal":
         else:
             _inflow_nb(**kw)
 
-elif KERNEL_BACKEND == "torch":
-    from hydroforge.runtime.backend import adapt_kernel
-
-    from cmfgpu.phys.torch.outflow import compute_inflow_kernel as _raw_inflow
-    from cmfgpu.phys.torch.outflow import \
-        compute_outflow_kernel as _raw_outflow
-    compute_outflow = adapt_kernel(_raw_outflow, compile=False)
-    compute_inflow = adapt_kernel(_raw_inflow, compile=False)
-
 elif KERNEL_BACKEND == "cuda":
     from cmfgpu.phys.cuda import compute_inflow, compute_outflow
 
-else:  # triton
+elif KERNEL_BACKEND == "triton":
     from hydroforge.runtime.backend import make_triton_dispatcher
 
     from cmfgpu.phys.triton.outflow import (compute_inflow_batched_kernel,
@@ -56,3 +47,6 @@ else:  # triton
     compute_inflow = make_triton_dispatcher(
         compute_inflow_kernel, batched_kernel=compute_inflow_batched_kernel,
     )
+
+else:
+    raise ValueError(f"Unsupported cmfgpu backend: {KERNEL_BACKEND!r}")

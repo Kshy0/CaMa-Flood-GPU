@@ -258,14 +258,13 @@ def trace_gauge_downstream(
 
 
 # ---------------------------------------------------------------------------
-# Geodesic distance (Fortran rgetlen equivalent)
+# Geodesic distance
 # ---------------------------------------------------------------------------
 
 @njit(cache=True)
 def rgetlen(rlon1: float, rlat1: float, rlon2: float, rlat2: float) -> float:
     """Geodesic distance between two lon/lat points [km].
 
-    Mirrors the Fortran ``rgetlen`` function in ``allocate_level_gauge.F90``.
     Uses the chord-length formula on an ellipsoidal Earth (WGS-84 semi-major
     axis, eccentricity²=0.006694470).
     """

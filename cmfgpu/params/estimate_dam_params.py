@@ -7,8 +7,8 @@
 """
 Dam / reservoir parameter estimation from naturalized discharge.
 
-Mirrors the logic of the Fortran CaMa-Flood dam parameter pipeline
-(``fortran/dam/script/p01–p04``):
+Builds dam parameters from the standard CaMa-Flood discharge statistics
+pipeline:
 
 .. code-block:: text
 
@@ -31,7 +31,7 @@ Mirrors the logic of the Fortran CaMa-Flood dam parameter pipeline
 4. Compute flood-control / conservation storage (GRSAD + ReGeom **or**
    37 % fallback).
 5. De-duplicate multiple dams on one grid cell (keep largest capacity).
-6. Write results to a Fortran-compatible CSV **and/or** append reservoir
+6. Write results to a CaMa-Flood-compatible CSV **and/or** append reservoir
    variables to an existing ``parameters.nc``.
 
 Example
@@ -604,7 +604,7 @@ def _write_dam_csv(
     qf: np.ndarray,
     years: np.ndarray,
 ) -> None:
-    """Write dam parameters in Fortran CaMa-Flood CSV format.
+    """Write dam parameters in CaMa-Flood CSV format.
 
     Format
     ------
@@ -676,7 +676,7 @@ def _write_dam_to_nc(
     dam_idx_in_param = find_indices_in(dam_cids, all_cids)
     dam_basin_id = all_basins[dam_idx_in_param]
 
-    # Emergency volume = ConVol + FldVol * 0.95  (Fortran convention)
+    # Emergency volume = ConVol + FldVol * 0.95.
     eme_vol = con_vol_m3 + fld_vol_m3 * 0.95
 
     with Dataset(str(nc_path), "r+") as ds:
@@ -1033,7 +1033,7 @@ def estimate_dam_params(
         to the allocation output text file from
         ``DamAllocMixin.write_dam_alloc_file()``.
     output_csv : path or None
-        Fortran-compatible CSV output path.
+        CaMa-Flood-compatible CSV output path.
     output_nc : path or None
         NetCDF to update with reservoir variables.  If same as
         *parameter_nc*, updates in-place; otherwise copies first.

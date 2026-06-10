@@ -25,7 +25,7 @@ def compute_adaptive_time_step_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
 
-    # Skip dam-related cells from CFL calculation (Fortran: I2MASK==0 only)
+    # Skip dam-related cells from the CFL calculation.
     if HAS_RESERVOIR:
         is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
         mask = mask & (~is_dam)
@@ -75,7 +75,7 @@ def compute_adaptive_time_step_batched_kernel(
     
     mask = idx < (num_catchments * num_trials)
     
-    # Skip dam-related cells from CFL calculation (Fortran: I2MASK==0 only)
+    # Skip dam-related cells from the CFL calculation.
     if HAS_RESERVOIR:
         is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
         mask = mask & (~is_dam)

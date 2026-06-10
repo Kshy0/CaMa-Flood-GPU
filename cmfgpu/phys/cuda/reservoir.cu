@@ -5,12 +5,11 @@
 //
 // CUDA backend for the reservoir outflow kernel.
 //
-// Mirrors cmfgpu/phys/triton/reservoir.py::compute_reservoir_outflow_kernel.
 // One thread per reservoir.  Undoes the main outflow kernel's outgoing-storage
 // scatter, recomputes the regulated release (4 storage regimes), re-applies the
 // corrected scatter.  if/else-if regime chain evaluates only the matching branch
 // (avoids log() of a negative argument).  Templated on STO (hpfloat).  No
-// --use_fast_math (sqrt/exp/log parity).
+// --use_fast_math, keeping sqrt/exp/log behavior predictable.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>

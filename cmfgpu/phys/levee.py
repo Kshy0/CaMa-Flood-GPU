@@ -33,25 +33,12 @@ if KERNEL_BACKEND == "metal":
         else:
             _lbo_nb(**kw)
 
-elif KERNEL_BACKEND == "torch":
-    from hydroforge.runtime.backend import adapt_kernel
-
-    from cmfgpu.phys.torch.levee import \
-        compute_levee_bifurcation_outflow_kernel as _raw_levee_bif
-    from cmfgpu.phys.torch.levee import \
-        compute_levee_stage_kernel as _raw_levee_stage
-    from cmfgpu.phys.torch.levee import \
-        compute_levee_stage_log_kernel as _raw_levee_stage_log
-    compute_levee_stage = adapt_kernel(_raw_levee_stage)
-    compute_levee_stage_log = adapt_kernel(_raw_levee_stage_log)
-    compute_levee_bifurcation_outflow = adapt_kernel(_raw_levee_bif, compile=False)
-
 elif KERNEL_BACKEND == "cuda":
     from cmfgpu.phys.cuda import (compute_levee_bifurcation_outflow,
                                   compute_levee_stage,
                                   compute_levee_stage_log)
 
-else:  # triton
+elif KERNEL_BACKEND == "triton":
     from hydroforge.runtime.backend import make_triton_dispatcher
 
     from cmfgpu.phys.triton.levee import (
@@ -72,3 +59,6 @@ else:  # triton
         size_key="num_bifurcation_paths",
         non_batched_drop=("num_catchments",),
     )
+
+else:
+    raise ValueError(f"Unsupported cmfgpu backend: {KERNEL_BACKEND!r}")

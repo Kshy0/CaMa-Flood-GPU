@@ -6,8 +6,6 @@
 
 """
 Dam allocation kernel and mixin for :class:`HiResMap`.
-
-Python re-implementation of ``fortran/allocate_dam.F90``.
 """
 from __future__ import annotations
 
@@ -146,8 +144,7 @@ def allocate_all_dams(
                         if abs(err1) < 0.1:
                             break
 
-        # If outlet error still > 100%, mark as sub-grid
-        # (Fortran: reclassify regardless of snum)
+        # If outlet error still > 100%, mark as sub-grid.
         if snum == 0:
             area_cmf[g] = uparea[iXX0, iYY0]
 

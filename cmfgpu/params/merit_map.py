@@ -99,7 +99,7 @@ class MERITMap(BaseModel):
 
     dam_file: Optional[FilePath] = Field(
         default=None,
-        description="Path to dam/reservoir parameter CSV file (Fortran CaMa-Flood format)."
+        description="Path to dam/reservoir parameter CSV file (CaMa-Flood format)."
     )
     
     gauge_file: Optional[FilePath] = Field(
@@ -240,7 +240,7 @@ class MERITMap(BaseModel):
 
     @staticmethod
     def _open_memmap(path, dtype, shape):
-        """Memory-map a Fortran-ordered binary file (read-only)."""
+        """Memory-map a column-major binary file (read-only)."""
         return np.memmap(str(path), dtype=dtype, mode='r',
                          shape=shape, order='F')
 
@@ -489,8 +489,8 @@ class MERITMap(BaseModel):
                 bif_dn_mouth = self.river_mouth_id[tmp_idx_dn[valid_bif]]
 
                 # Map unique mouth IDs to contiguous indices, sorted by
-                # DESCENDING initial size so that min(ib, jb) always picks
-                # the larger basin — matching Fortran set_bif_basin_mpi.F90.
+                # DESCENDING initial size so that min(ib, jb) picks the larger
+                # basin.
                 unique_mouths_raw = np.unique(self.river_mouth_id)
                 raw_idx = np.searchsorted(unique_mouths_raw, self.river_mouth_id)
                 num_unique = len(unique_mouths_raw)
@@ -795,16 +795,16 @@ class MERITMap(BaseModel):
 
     def _load_reservoir_parameters(self) -> None:
         """
-        Load dam/reservoir parameters from a CSV file (Fortran CaMa-Flood format).
+        Load dam/reservoir parameters from a CSV file (CaMa-Flood format).
 
-        CSV format (following ``cmf_ctrl_damout_mod.F90``):
+        CSV format:
             Line 1:  NDAM (number of dams)
             Line 2:  header (skipped)
             Line 3+: DamID, DamName, DamLat, DamLon, upreal,
                       DamIX, DamIY, FldVol_mcm, ConVol_mcm, TotVol_mcm,
                       Qn, Qf
 
-        DamIX/DamIY are 1-based Fortran indices, converted to 0-based here.
+        DamIX/DamIY are 1-based indices, converted to 0-based here.
         Only dams that fall within the current catchment domain are retained.
         """
         if self.dam_file is None:
@@ -844,7 +844,7 @@ class MERITMap(BaseModel):
                 qf_list.append(float(parts[11]))
 
         dam_ids = np.array(dam_ids, dtype=np.int64)
-        dam_ix = np.array(dam_ix, dtype=np.int64) - 1   # Fortran 1-based → 0-based
+        dam_ix = np.array(dam_ix, dtype=np.int64) - 1   # 1-based → 0-based
         dam_iy = np.array(dam_iy, dtype=np.int64) - 1
         fld_vol_mcm = np.array(fld_vol_mcm, dtype=self.numpy_precision)
         con_vol_mcm = np.array(con_vol_mcm, dtype=self.numpy_precision)
@@ -889,7 +889,7 @@ class MERITMap(BaseModel):
         fld_vol = fld_vol_mcm * 1.0e6      # flood control storage
         con_vol = con_vol_mcm * 1.0e6       # conservation storage
         tot_vol = tot_vol_mcm * 1.0e6       # total capacity
-        eme_vol = con_vol + fld_vol * 0.95  # emergency threshold (Fortran: EmeVol)
+        eme_vol = con_vol + fld_vol * 0.95  # emergency threshold
 
         # Reservoir area: not available from CSV; set to 0 (can be overridden later)
         res_area = np.zeros(n_kept, dtype=self.numpy_precision)

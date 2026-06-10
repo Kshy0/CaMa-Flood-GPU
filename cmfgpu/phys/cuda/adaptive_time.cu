@@ -5,15 +5,10 @@
 //
 // CUDA backend for the adaptive-time-step (CFL) kernel.
 //
-// Mirrors cmfgpu/phys/triton/adaptive_time.py::compute_adaptive_time_step_kernel.
-//
-// The Triton kernel does a block-min reduction of the per-cell CFL dt, then
-//   n_steps = floor(time_step / min_dt + 0.49) + 1
-// and a grid-wide atomic_max into max_sub_steps.  Because
+// The CFL sub-step count is monotonic with respect to the per-cell dt:
 //   n(dt) = floor(time_step/dt + 0.49) + 1
-// is monotonically *decreasing* in dt, the maximum of n over the cells equals
-// n evaluated at the minimum dt.  So a plain per-thread atomicMax(n_i) yields a
-// bit-identical result to block-min-then-n, with no reduction needed.
+// decreases as dt increases, so a per-thread atomicMax over n_i gives the
+// global maximum sub-step count without a separate reduction.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -29,7 +24,7 @@ __global__ void k_adaptive_time(
 {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     if (t >= num_catchments) return;
-    // Fortran I2MASK==0 only: skip dam + upstream-of-dam cells from CFL.
+    // Skip dam and upstream-of-dam cells from the CFL calculation.
     if (has_reservoir && is_dam_related && is_dam_related[t]) return;
 
     float dist = __ldg(downstream_distance + t);

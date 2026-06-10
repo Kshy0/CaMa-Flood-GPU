@@ -126,18 +126,24 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
     @model_validator(mode='after')
     def validate_backend_precision(self) -> Self:
-        """Metal backend only supports float32, no mixed precision."""
+        """Backend precision constraints.
+
+        The hand-written CUDA / Metal kernels hard-code ``float`` (f32) for all
+        flux / depth tensors, so the *base* precision must be float32.  Storage
+        variables are ``hpfloat`` and the CUDA backend additionally supports
+        ``mixed_precision`` (f64 storage + f32 compute); Metal does not.
+        """
         from hydroforge.runtime.backend import KERNEL_BACKEND
-        if KERNEL_BACKEND not in ("triton", "torch"):
+        if KERNEL_BACKEND != "triton":
             if self.precision != "float32":
                 raise ValueError(
-                    f"Backend '{KERNEL_BACKEND}' only supports float32 precision, "
+                    f"Backend '{KERNEL_BACKEND}' only supports float32 base precision, "
                     f"got '{self.precision}'. Use the triton backend for float64."
                 )
-            if self.mixed_precision:
+            if self.mixed_precision and KERNEL_BACKEND != "cuda":
                 raise ValueError(
                     f"Backend '{KERNEL_BACKEND}' does not support mixed precision. "
-                    f"Set mixed_precision=False or use the triton backend."
+                    f"Set mixed_precision=False or use the triton/cuda backend."
                 )
         return self
 
@@ -145,7 +151,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     def init_dam_cell_storage(self) -> Self:
         """
         At cold start, bump river_storage at dam cells to conservation_volume,
-        following Fortran CMF_DAMOUT_INIT:
+        using the dam-cell initialization rule:
           P2DAMSTO(ISEQ) = MAX(P2RIVSTO(ISEQ)+P2FLDSTO(ISEQ), DamVol_cons)
           P2RIVSTO(ISEQ) = P2DAMSTO(ISEQ)
           P2FLDSTO(ISEQ) = 0
@@ -163,7 +169,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 con_vol.to(self.base.river_storage.dtype),
                 current,
             )
-            # Also zero out flood_storage at fixed dam cells (Fortran: P2FLDSTO=0)
+            # Also zero out flood_storage at fixed dam cells.
             flood_current = self.base.flood_storage[res_idx]
             self.base.flood_storage[res_idx] = torch.where(
                 need_fix,
@@ -178,7 +184,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     def mask_bifurcation_at_dam_cells(self) -> Self:
         """
         Disable bifurcation at dam and upstream-of-dam cells by setting
-        bifurcation elevation to 1E20, following Fortran CMF_DAMOUT_INIT:
+        bifurcation elevation to 1E20:
           IF( I1DAM(ISEQP)>0 .or. I1DAM(JSEQP)>0 ) PTH_ELV(IPTH,:)=1.E20
         """
         if not self.reservoir_flag or not self.bifurcation_flag:
@@ -619,11 +625,8 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
         # Determine if stats CUDA graph is safe to use:
         # only when no outer windowing (num_macro_steps/macro_step_index don't affect output)
-        # torch backend's @torch.compile is incompatible with CUDA graph stream capture
-        from hydroforge.runtime.backend import KERNEL_BACKEND
         agg = self._statistics_aggregator
         use_stats_cg = (self.cuda_graph_enabled
-                        and KERNEL_BACKEND != "torch"
                         and output_enabled and agg is not None and agg._aggregator_generated)
 
         self.base.time_step.fill_(time_sub_step)

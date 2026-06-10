@@ -19,16 +19,10 @@ IS_HIP_BUILD = torch.version.hip is not None
 def to_compute_dtype(hp_value, ref_value):
     """Downcast a high-precision (hpfloat) value to match the base computation dtype.
 
-    Mirrors Fortran CaMa-Flood's pattern of explicitly casting double-precision
-    storage variables to single-precision before arithmetic::
-
-        DFSTO = REAL(P2FLDSTO(ISEQ,1), KIND=JPRB)   ! JPRD → JPRB
-        DSTO  = REAL((P2RIVSTO+P2FLDSTO), KIND=JPRB) ! JPRD → JPRB
-
     In the GPU code, ``hp_value`` is loaded from an hpfloat pointer (e.g. float64
     when mixed_precision is enabled) and ``ref_value`` is any variable already in
     base precision (e.g. float32).  The cast ensures all subsequent arithmetic
-    stays in base precision, matching the Fortran semantics.
+    stays in the selected computation dtype.
 
     When mixed_precision is disabled both dtypes are identical and the ``.to()``
     compiles to a no-op with zero overhead.

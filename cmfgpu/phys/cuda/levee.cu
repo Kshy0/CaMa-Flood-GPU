@@ -5,10 +5,10 @@
 //
 // CUDA backend for levee-aware flood-stage and levee bifurcation outflow.
 //
-// Mirrors cmfgpu/phys/triton/levee.py.  The stage kernel uses one thread per
-// levee, writes back to the indexed catchment, and uses lane-local early exits
-// for in-bank levee lanes and completed flood-level scans.  The levee
-// bifurcation kernel uses the same lane-level skip style as outflow.cu.
+// The stage kernel uses one thread per levee, writes back to the indexed
+// catchment, and uses lane-local early exits for in-bank levee lanes and
+// completed flood-level scans.  The levee bifurcation kernel uses the same
+// lane-level skip style as outflow.cu.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -54,7 +54,7 @@ __global__ void k_levee_stage(
     float riv_max_sto = rl * rw * rh;
 
     // Below bank, no levee case can change river/flood state.  Still zero the
-    // protected side to match the Triton false-case stores.
+    // protected side to keep outputs deterministic.
     bool possible_levee_case = total_sto >= riv_max_sto;
     if (!possible_levee_case) {
         river_storage[ci] = (STO)riv_sto_curr;

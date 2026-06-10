@@ -7,7 +7,7 @@
 """CUDA backend for cmfgpu physics kernels.
 
 JIT-compiles the hand-written CUDA kernels and exposes dispatch functions
-matching the unified hydroforge kwargs convention.  Storage uses the per-lane
+using the unified hydroforge kwargs convention.  Storage uses the per-lane
 early-exit implementation only.
 """
 
@@ -51,8 +51,7 @@ def _ext_outflow():
     """Compile the outflow / inflow kernels.
 
     Built **without** ``--use_fast_math`` so that ``/`` and ``sqrt`` keep IEEE
-    round-to-nearest, matching Triton's default precise lowering (these kernels
-    are division / sqrt / cbrt heavy and benefit from exact rounding parity).
+    round-to-nearest behavior in division / sqrt / cbrt heavy sections.
     """
     src = (_DIR / "outflow.cu").read_text()
     cpp = (
@@ -245,8 +244,7 @@ def compute_flood_stage(**kw):
     )
 
 
-# The log / batched variants are not yet ported to CUDA; callers that need them
-# should keep the Triton backend for those paths.
+# The log / batched variants are not implemented in CUDA.
 compute_flood_stage_log = None
 
 
@@ -330,8 +328,8 @@ def compute_inflow(**kw):
 def compute_adaptive_time_step(**kw):
     """Dispatch the CFL adaptive-time-step CUDA kernel (per-thread atomicMax).
 
-    ``time_step`` is a runtime scalar (matches the Triton kernel signature, not
-    a pointer).  ``is_dam_related_ptr`` may be ``None`` when reservoir is off.
+    ``time_step`` is passed as a runtime scalar, not a pointer.
+    ``is_dam_related_ptr`` may be ``None`` when reservoir is off.
     """
     _ensure_precompiled()
     ext = _ext_adaptive()
@@ -426,8 +424,7 @@ def compute_levee_stage(**kw):
     )
 
 
-# Log / batched levee variants are not yet ported to CUDA.  Matching storage,
-# callers fall back to the non-log CUDA stage when this is None.
+# Log / batched levee variants are not implemented in CUDA.
 compute_levee_stage_log = None
 
 

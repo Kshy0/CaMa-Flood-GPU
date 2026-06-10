@@ -253,8 +253,7 @@ def _bif_merge_one_round(
 ):
     """One round of proposal + chain-resolution + apply.
 
-    Faithfully replicates one iteration of *set_bif_basin_mpi.F90*:
-      1. Scan paths (forward or reverse) → collect bnew proposals
+      1. Scan paths (forward or reverse) → collect basin merge proposals
       2. Resolve chains (forward or reverse) → apply with size checks
       3. Return whether any merge happened
     """
@@ -501,7 +500,7 @@ def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
 
 def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_to_keep: int):
     """
-    Vectorized reader for bifori.txt replicating the core logic of Fortran set_bifparam:
+    Vectorized reader for bifori.txt:
       - Keep only paths where any width>0 within the first keepN levels
       - Compute dph from wth(1) with an empirical formula and clamp to [0.5, max(rivhgt(up), rivhgt(dn))]
         (rivhgt clamping is skipped when rivhgt_2d is None)
@@ -608,8 +607,6 @@ def resolve_target_cids_from_poi(
 ) -> np.ndarray:
     """
     Resolve Points of Interest (POI) dict to a list of unique target catchment IDs.
-    
-    Logic mirrors MERITMap.filter_to_poi_basins but is functional.
     """
     target_cids: List[int] = []
 

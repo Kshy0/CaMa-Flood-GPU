@@ -90,7 +90,7 @@ def compute_outflow_kernel(
     flood_cross_section_depth = tl.load(flood_cross_section_depth_ptr + offs, mask=mask, other=0.0)
     flood_cross_section_area = tl.load(flood_cross_section_area_ptr + offs, mask=mask, other=0.0)
 
-    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    # Downcast hpfloat storage to the active computation dtype.
     river_storage = to_compute_dtype(river_storage, river_outflow)
     flood_storage = to_compute_dtype(flood_storage, river_outflow)
     protected_storage = to_compute_dtype(protected_storage, river_outflow)
@@ -200,7 +200,7 @@ def compute_outflow_kernel(
     updated_flood_outflow = tl.where(is_negative_flow, updated_flood_outflow * limit_rate, updated_flood_outflow)
 
     #----------------------------------------------------------------------
-    # (9b) Kinematic wave override for upstream-of-dam cells (Fortran I1DAM=10)
+    # (9b) Kinematic wave override for upstream-of-dam cells.
     #      Uses bed slope (catchment elevation gradient) instead of water-surface slope.
     #----------------------------------------------------------------------
     if HAS_RESERVOIR:
@@ -267,7 +267,7 @@ def compute_inflow_kernel(
     outgoing_storage_ptr,          # *f64: Outgoing storage
     river_inflow_ptr,              # *f64: River inflow (output, atomic add)
     flood_inflow_ptr,              # *f64: Flood inflow (output, atomic add)
-    limit_rate_ptr,                # *f32: Limit rate (reference)
+    limit_rate_ptr,                # *f32: Limit rate diagnostic
     reservoir_total_inflow_ptr,    # *f64: Reservoir total inflow (catchment-sized, atomic add)
     is_reservoir_ptr,              # *i1:  Boolean mask for reservoir catchments
     num_catchments: tl.constexpr,  # Total number of units
@@ -283,7 +283,7 @@ def compute_inflow_kernel(
     flood_outflow   = tl.load(flood_outflow_ptr      + offs, mask=mask, other=0.0)
     outgoing_storage = to_compute_dtype(tl.load(outgoing_storage_ptr + offs, mask=mask, other=0.0), river_outflow)
 
-    # d2rate: Fortran uses DSTO=REAL((P2RIVSTO+P2FLDSTO), KIND=JPRB); DOUT=REAL(P2STOOUT, KIND=JPRB)
+    # Convert storage terms to the same dtype before applying the limiter.
     rate_storage = to_compute_dtype(
         tl.load(river_storage_ptr + offs, mask=mask, other=0.0) + tl.load(flood_storage_ptr + offs, mask=mask, other=0.0),
         river_outflow
@@ -412,7 +412,7 @@ def compute_outflow_batched_kernel(
     flood_cross_section_depth = tl.load(flood_cross_section_depth_ptr + idx, mask=mask, other=0.0)
     flood_cross_section_area = tl.load(flood_cross_section_area_ptr + idx, mask=mask, other=0.0)
 
-    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    # Downcast hpfloat storage to the active computation dtype.
     river_storage = to_compute_dtype(river_storage, river_outflow)
     flood_storage = to_compute_dtype(flood_storage, river_outflow)
     protected_storage = to_compute_dtype(protected_storage, river_outflow)
@@ -567,7 +567,7 @@ def compute_inflow_batched_kernel(
     outgoing_storage_ptr,          # *f64: Outgoing storage
     river_inflow_ptr,              # *f64: River inflow (output, atomic add)
     flood_inflow_ptr,              # *f64: Flood inflow (output, atomic add)
-    limit_rate_ptr,                # *f32: Limit rate (reference)
+    limit_rate_ptr,                # *f32: Limit rate diagnostic
     reservoir_total_inflow_ptr,    # *f64: Reservoir total inflow (catchment-sized, atomic add)
     is_reservoir_ptr,              # *i1:  Boolean mask for reservoir catchments
     num_catchments: tl.constexpr,  # Total number of units
@@ -586,7 +586,7 @@ def compute_inflow_batched_kernel(
     flood_outflow   = tl.load(flood_outflow_ptr      + idx, mask=mask, other=0.0)
     outgoing_storage = to_compute_dtype(tl.load(outgoing_storage_ptr + idx, mask=mask, other=0.0), river_outflow)
 
-    # d2rate: Fortran uses DSTO=REAL((P2RIVSTO+P2FLDSTO), KIND=JPRB); DOUT=REAL(P2STOOUT, KIND=JPRB)
+    # Convert storage terms to the same dtype before applying the limiter.
     rate_storage = to_compute_dtype(
         tl.load(river_storage_ptr + idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + idx, mask=mask, other=0.0),
         river_outflow

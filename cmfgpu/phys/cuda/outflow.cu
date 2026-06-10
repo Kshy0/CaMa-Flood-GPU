@@ -5,12 +5,11 @@
 //
 // CUDA backend for the outflow / inflow kernels.
 //
-// Mirrors cmfgpu/phys/triton/outflow.py::compute_outflow_kernel and
-// compute_inflow_kernel.  Straight-line memory-bound kernels (downstream gather
-// + atomic scatter), using lane-local skips for branch-heavy flood momentum.
+// Straight-line memory-bound kernels (downstream gather + atomic scatter), using
+// lane-local skips for branch-heavy flood momentum.
 // Templated on STO = hpfloat storage dtype (float/double): storage is always
 // downcast to float for the physics, but pointer/atomic/store types follow STO.
-// Compiled WITHOUT --use_fast_math to keep IEEE div/sqrt parity with Triton.
+// Compiled WITHOUT --use_fast_math for predictable IEEE div/sqrt behavior.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>

@@ -58,7 +58,7 @@ def compute_levee_stage_kernel(
     flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
-    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    # Downcast hpfloat storage to the active computation dtype.
     river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
     flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
 
@@ -295,7 +295,7 @@ def compute_levee_stage_log_kernel(
     flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
-    # Downcast hpfloat storage to computation dtype (Fortran: REAL(P2VAR, KIND=JPRB))
+    # Downcast hpfloat storage to the active computation dtype.
     river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
     flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
 

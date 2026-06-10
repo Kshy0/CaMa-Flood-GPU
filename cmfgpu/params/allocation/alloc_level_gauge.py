@@ -6,8 +6,6 @@
 
 """
 Level-gauge allocation kernel and mixin for :class:`HiResMap`.
-
-Python re-implementation of ``fortran/allocate_level_gauge.F90``.
 """
 from __future__ import annotations
 

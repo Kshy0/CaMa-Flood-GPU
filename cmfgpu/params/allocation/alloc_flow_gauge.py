@@ -6,8 +6,6 @@
 
 """
 Flow-gauge allocation kernel and mixin for :class:`HiResMap`.
-
-Python re-implementation of ``fortran/allocate_flow_gauge.F90``.
 """
 from __future__ import annotations
 
@@ -39,7 +37,7 @@ def allocate_all_gauges(
     cty1m: np.ndarray,
     dwx1m: np.ndarray,
     dwy1m: np.ndarray,
-    uparea: np.ndarray,          # (nXX, nYY) float32, in km² (Fortran convention)
+    uparea: np.ndarray,          # (nXX, nYY) float32, in km²
     upstXX: np.ndarray,          # (nXX, nYY, n_ups)
     upstYY: np.ndarray,
     outx: np.ndarray,            # (nXX, nYY)
@@ -168,7 +166,6 @@ def allocate_all_gauges(
                             break
 
         # ── Final rejection: small-tributary gauge with no CaMa grid ──
-        # Fortran: if( snum==0 .and. err1>1 ) → unallocated
         if snum == 0:
             upa_sum = uparea[iXX0, iYY0]
             err1_final = (upa_sum - area0_km2) / area0_km2
@@ -295,7 +292,7 @@ class FlowGaugeMixin:
         return arr
 
     def write_alloc_file(self: HiResMap) -> Path:
-        """Write Fortran-compatible ``gauge_alloc.txt`` output."""
+        """Write CaMa-Flood-compatible ``gauge_alloc.txt`` output."""
         out_path = (self.out_dir or self.map_dir) / self.out_file
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -338,7 +335,7 @@ class FlowGaugeMixin:
             diff = upa_sum - area_in
             err = diff / area_in if area_in > 0 else 0.0
 
-            # Output uses **1-based** coordinates for Fortran compatibility
+            # Output uses **1-based** coordinates for CaMa-Flood compatibility.
             lines.append(
                 f"{gid:10d}{lat:10.3f}{lon:10.3f}{area_in:12.2f}"
                 f"{upa_sum:12.2f}{err:12.2f}{diff:12.2f}"

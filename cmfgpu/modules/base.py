@@ -93,7 +93,7 @@ class BaseModule(AbstractModule):
     )
     min_kinematic_slope: float = Field(
         default=1.0e-5,
-        description="Minimum bed slope for kinematic wave (Fortran PMINSLP)",
+        description="Minimum bed slope for kinematic wave",
         gt=0.0,
     )
 
@@ -536,8 +536,7 @@ class BaseModule(AbstractModule):
 
     @computed_base_field(
         description="Mask for dam-related cells: dam itself OR upstream of dam "
-                    "(Fortran I2MASK > 0).  Used to skip adaptive time step and "
-                    "bifurcation for these cells.",
+                    "Used to skip adaptive time step and bifurcation for these cells.",
         dtype="bool",
         category="topology",
         depends_on="reservoir",
@@ -555,8 +554,8 @@ class BaseModule(AbstractModule):
         return is_res | is_upstream
 
     @computed_base_field(
-        description="Mask for upstream-of-dam cells only (Fortran I1DAM=10). "
-                    "These cells use kinematic wave instead of local-inertial.",
+        description="Mask for upstream-of-dam cells only. These cells use "
+                    "kinematic wave instead of local-inertial.",
         dtype="bool",
         category="topology",
         depends_on="reservoir",

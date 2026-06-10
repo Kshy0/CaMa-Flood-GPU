@@ -5,11 +5,11 @@
 //
 // CUDA backend for the bifurcation outflow / inflow kernels.
 //
-// Mirrors cmfgpu/phys/triton/bifurcation.py.  One thread per bifurcation path;
-// each path owns num_bifurcation_levels contiguous level entries.  Cross-path
-// collisions on (catchment, downstream) cells use atomics.  Templated on STO
-// (hpfloat) for total_storage / outgoing_storage / global_bif_outflow; all
-// bifurcation geometry / outflow / manning are float.  No --use_fast_math.
+// One thread per bifurcation path; each path owns num_bifurcation_levels
+// contiguous level entries.  Cross-path collisions on (catchment, downstream)
+// cells use atomics.  Templated on STO (hpfloat) for total_storage /
+// outgoing_storage / global_bif_outflow; all bifurcation geometry / outflow /
+// manning are float.  No --use_fast_math.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>

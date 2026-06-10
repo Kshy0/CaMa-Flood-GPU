@@ -18,16 +18,16 @@ This module converts:
 Both full-grid and cropped (POI-filtered) parameters are supported.
 When ``crop_to_bbox=True`` (default for cropped NC), the output grid is
 shrunk to the bounding box of the catchment subset, producing much smaller
-binary files.  All Fortran-facing indices (nextxy, bifprm, inpmat RECL) are
+binary files.  All CaMa-Flood-facing indices (nextxy, bifprm, inpmat RECL) are
 remapped to the cropped coordinate system.
 
-Binary conventions (matching CaMa-Flood Fortran):
+Binary conventions:
     * Little-endian
     * Indices: int32 (<i4)
     * Physical fields: float32 (<f4)
-    * Fortran column-major (order='F')
+    * Column-major layout (order='F')
     * nextxy.bin uses 1-based indexing; all river mouths → (-9, -9)
-    * inpmat is Fortran DIRECT ACCESS (RECL = 4*NX*NY), no record markers.
+    * inpmat uses fixed-size direct-access records (RECL = 4*NX*NY), no record markers.
     * Manning coefficients are not stored in the NC; a uniform river default
       (river_manning=0.03) is used.
 
@@ -101,7 +101,7 @@ def _compute_bbox(
     return x_min, x_max, y_min, y_max, crop_nx, crop_ny, west, east, north, south
 
 def _write_bin(path: Path, data: np.ndarray) -> None:
-    """Write *data* as a Fortran-order flat binary file (no record markers)."""
+    """Write *data* as a column-major flat binary file (no record markers)."""
     data.flatten(order="F").tofile(path)
     print(f"  Wrote {path.name}  shape={data.shape}  dtype={data.dtype}")
 
@@ -217,7 +217,7 @@ def _write_bifprm(
 
     **Elevation / depth recovery** — The NetCDF stores per-level ``PTH_ELV``
     (the threshold elevation at which flow activates for each level), but
-    Fortran expects ``PELV`` (ground surface elevation) and ``PDPH``
+    the binary format stores ``PELV`` (ground surface elevation) and ``PDPH``
     (channel depth) and **recomputes** ``PTH_ELV`` at runtime via::
 
         Level 0 (channel):   PTH_ELV = PELV - PDPH
@@ -274,7 +274,7 @@ def _write_bifprm(
             # Recover PELV (ground elevation) and PDPH (channel depth)
             # from the per-level PTH_ELV stored in the NetCDF.
             #
-            # Fortran formula (1-based ILEV):
+            # Level formula (1-based ILEV):
             #   ILEV=1 (channel):    PTH_ELV = PELV - PDPH
             #   ILEV>=2 (floodplain): PTH_ELV = PELV + ILEV - 2
             #
@@ -381,12 +381,12 @@ def _write_dam_params_csv(
     latitude: Optional[np.ndarray] = None,
     upstream_area: Optional[np.ndarray] = None,
 ) -> None:
-    """Write ``dam_params.csv`` in the format expected by CaMa-Flood Fortran.
+    """Write ``dam_params.csv`` in the CaMa-Flood dam-parameter CSV format.
 
-    The CSV has the same layout as ``cmf_ctrl_damout_mod.F90``::
+    The CSV layout is::
 
         Line 1  :  NDAM
-        Line 2  :  header (skipped by Fortran)
+        Line 2  :  header (skipped by the reader)
         Line 3+ :  DamID  DamName  DamLat  DamLon  upreal
                     DamIX  DamIY  FldVol_mcm  ConVol_mcm  TotVol_mcm  Qn  Qf
 
@@ -401,7 +401,7 @@ def _write_dam_params_csv(
         Storage parameters in m³.  ``emergency_volume = ConVol + FldVol*0.95``.
     normal_outflow, flood_control_outflow : 1-D float
         Outflow parameters in m³ s⁻¹ (**raw**, before Yamazaki–Funato
-        modification; Fortran re-derives effective values at runtime).
+        adjustment; effective values are re-derived at runtime).
     catchment_id : 1-D int64
         Catchment IDs of the domain (already filtered to current NC).
     full_ny : int
@@ -458,7 +458,7 @@ def _write_dam_params_csv(
             dam_id = rank + 1                        # sequential 1-based ID
             dam_name = f"DAM_{dam_id}"
 
-            ix_out = int(dam_cx[i]) + 1              # 1-based Fortran index
+            ix_out = int(dam_cx[i]) + 1              # 1-based output index
             iy_out = int(dam_cy[i]) + 1
 
             fld_mcm = float(flood_volume[i]) / 1.0e6
@@ -519,14 +519,14 @@ def _write_crop_info(
     full-grid coordinate systems.
 
     This file is **essential** when the exported binaries use a cropped grid
-    (``crop_to_bbox=True``).  Without it, CaMa-Flood Fortran output cannot
+    (``crop_to_bbox=True``).  Without it, CaMa-Flood output cannot
     be mapped back to the original GPU ``catchment_id`` values, because:
 
         ``catchment_id = catchment_x × full_ny + catchment_y``
 
     After cropping, the bin grid uses offset coordinates
     ``(crop_x, crop_y) = (catchment_x − x_min, catchment_y − y_min)``.
-    To recover the original ``catchment_id`` from Fortran output:
+    To recover the original ``catchment_id`` from cropped output:
 
         ``catchment_id = (crop_x + x_min) × full_ny + (crop_y + y_min)``
 
@@ -886,7 +886,8 @@ def export_inpmat(
 ) -> Path:
     """Convert a CaMa-Flood-GPU runoff mapping ``.npz`` to a CaMa-Flood ``inpmat*.bin``.
 
-    The ``inpmat`` binary is Fortran DIRECT ACCESS (``RECL = 4*NX*NY``) with
+    The ``inpmat`` binary uses fixed-size direct-access records
+    (``RECL = 4*NX*NY``) with
     ``3 * INPN`` records:
 
     * Records  1 … INPN      : ``INPX`` – int32 x-indices into the runoff grid (1-based)
@@ -1044,7 +1045,7 @@ def export_inpmat(
         INPY[ix, iy, :n_entries] = iyin + 1
         INPA[ix, iy, :n_entries] = area_weights.astype("<f4")
 
-    # --- Write inpmat binary (Fortran DIRECT ACCESS, RECL = 4*out_nx*out_ny) ---
+    # --- Write inpmat binary (fixed-size records, RECL = 4*out_nx*out_ny) ---
     inpmat_path = out_dir / inpmat_name
     record_bytes = 4 * out_nx * out_ny
 

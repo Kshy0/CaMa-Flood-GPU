@@ -180,7 +180,7 @@ def parse_alloc_txt(alloc_path: Union[str, Path]) -> Dict[int, dict]:
     -------
     dict
         ``{station_id: {ix1, iy1, ix2, iy2, area_cama, error}}``
-        Grid indices are 1-based (Fortran convention, as in the file).
+        Grid indices are 1-based, as stored in the file.
     """
     result: Dict[int, dict] = {}
     with open(alloc_path) as f:

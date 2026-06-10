@@ -50,7 +50,7 @@ def compute_flood_stage_kernel(
     mask = offs < num_catchments
     time_step = tl.load(time_step_ptr)
 
-    # ---- 1. Storage update (from update_storage_kernel) ----
+    # ---- 1. Storage update ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
     protected_storage = tl.load(protected_storage_ptr + offs, mask=mask, other=0.0)
@@ -62,7 +62,7 @@ def compute_flood_stage_kernel(
         global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
 
-    # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
+    # Downcast hpfloat inputs to the active computation dtype.
     river_inflow = to_compute_dtype(river_inflow, river_outflow)
     flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
     if HAS_BIFURCATION:
@@ -79,10 +79,10 @@ def compute_flood_stage_kernel(
     flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
     total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
 
-    # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
+    # Keep flood-stage arithmetic in the active computation dtype.
     total_storage = to_compute_dtype(total_storage, river_outflow)
 
-    # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
+    # ---- 2. Flood stage computation ----
     river_height        = tl.load(river_height_ptr        + offs, mask=mask)
     catchment_area      = tl.load(catchment_area_ptr      + offs, mask=mask)
     river_width         = tl.load(river_width_ptr         + offs, mask=mask)
@@ -218,7 +218,7 @@ def compute_flood_stage_log_kernel(
     is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=True)
     non_levee = ~is_levee
 
-    # ---- 1. Storage update (from update_storage_kernel) ----
+    # ---- 1. Storage update ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
     protected_storage = tl.load(protected_storage_ptr + offs, mask=mask, other=0.0)
@@ -234,7 +234,7 @@ def compute_flood_stage_log_kernel(
     #                  6=stage, 7=stage_err, 8=riv_sto, 9=fld_sto, 10=fld_area
     tl.atomic_add(log_sums_ptr + 0 * log_buffer_size + current_step, tl.sum(total_stage_pre) * 1e-9)
 
-    # Downcast hpfloat to computation dtype (Fortran: D2RIVINF=REAL(P2RIVINF, KIND=JPRB))
+    # Downcast hpfloat inputs to the active computation dtype.
     river_inflow = to_compute_dtype(river_inflow, river_outflow)
     flood_inflow = to_compute_dtype(flood_inflow, river_outflow)
     if HAS_BIFURCATION:
@@ -257,10 +257,10 @@ def compute_flood_stage_log_kernel(
     tl.atomic_add(log_sums_ptr + 5 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
     tl.atomic_add(log_sums_ptr + 3 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff - river_outflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step, 0)) * 1e-9)
 
-    # Downcast total_storage to computation dtype for flood stage (Fortran: D2STORGE is JPRB)
+    # Keep flood-stage arithmetic in the active computation dtype.
     total_storage = to_compute_dtype(total_storage, river_outflow)
 
-    # ---- 2. Flood stage computation (from original compute_flood_stage_kernel) ----
+    # ---- 2. Flood stage computation ----
     river_height        = tl.load(river_height_ptr        + offs, mask=mask)
     catchment_area     = tl.load(catchment_area_ptr     + offs, mask=mask)
     river_width         = tl.load(river_width_ptr         + offs, mask=mask)
