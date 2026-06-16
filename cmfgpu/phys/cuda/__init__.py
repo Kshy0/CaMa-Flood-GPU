@@ -123,6 +123,15 @@ def _ext_levee():
                           ["launch_levee_stage", "launch_levee_bif_outflow"])
 
 
+@functools.lru_cache(maxsize=1)
+def _ext_march():
+    """Device-side sub-step march bookkeeping kernel."""
+    src = (_DIR / "device_march.cu").read_text()
+    cpp = "void launch_march_step(at::Tensor,at::Tensor,at::Tensor,at::Tensor,long);\n"
+    return _load_or_build(f"{_MODULE_PREFIX}_march", cpp, src, ["-O3"],
+                          ["launch_march_step"])
+
+
 _EXTENSION_BUILDERS = (
     ("storage", "_ext"),
     ("outflow", "_ext_outflow"),
@@ -130,6 +139,7 @@ _EXTENSION_BUILDERS = (
     ("bifurcation", "_ext_bifurcation"),
     ("reservoir", "_ext_reservoir"),
     ("levee", "_ext_levee"),
+    ("march", "_ext_march"),
 )
 
 
@@ -286,9 +296,9 @@ def compute_outflow(**kw):
         gbif, kw["total_storage_ptr"],
         kw["outgoing_storage_ptr"], kw["water_surface_elevation_ptr"],
         kw["protected_water_surface_elevation_ptr"],
-        float(kw["gravity"]), kw["time_step_ptr"],
+        kw["gravity"], kw["time_step_ptr"],
         num_catchments, has_bif,
-        is_dam_up, has_res, float(kw.get("MIN_KINEMATIC_SLOPE", 1.0e-5)),
+        is_dam_up, has_res, kw.get("MIN_KINEMATIC_SLOPE", 1.0e-5),
         block,
     )
 
@@ -343,7 +353,7 @@ def compute_adaptive_time_step(**kw):
         has_res = 0
     ext.launch_adaptive_time(
         river_depth, kw["downstream_distance_ptr"], is_dam, kw["max_sub_steps_ptr"],
-        float(kw["time_step"]), float(kw["adaptive_time_factor"]), float(kw["gravity"]),
+        kw["time_step"], kw["adaptive_time_factor"], kw["gravity"],
         num_catchments, has_res, block,
     )
 
@@ -362,7 +372,7 @@ def compute_bifurcation_outflow(**kw):
         kw["bifurcation_elevation_ptr"], kw["bifurcation_cross_section_depth_ptr"],
         kw["water_surface_elevation_ptr"], kw["total_storage_ptr"],
         kw["outgoing_storage_ptr"],
-        float(kw["gravity"]), kw["time_step_ptr"],
+        kw["gravity"], kw["time_step_ptr"],
         num_paths, num_levels, block,
     )
 
@@ -440,6 +450,13 @@ def compute_levee_bifurcation_outflow(**kw):
         kw["bifurcation_elevation_ptr"], kw["bifurcation_cross_section_depth_ptr"],
         kw["water_surface_elevation_ptr"], kw["protected_water_surface_elevation_ptr"],
         kw["total_storage_ptr"], kw["outgoing_storage_ptr"],
-        float(kw["gravity"]), kw["time_step_ptr"],
+        kw["gravity"], kw["time_step_ptr"],
         int(kw["num_bifurcation_paths"]), int(kw["num_bifurcation_levels"]), block,
     )
+
+
+def compute_march_step(*, num_sub_steps, counter, current_step, continue_flag, stream):
+    """Per-sub-step device march bookkeeping (see ``device_march.cu``)."""
+    _ensure_precompiled()
+    ext = _ext_march()
+    ext.launch_march_step(num_sub_steps, counter, current_step, continue_flag, stream)

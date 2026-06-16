@@ -53,6 +53,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     _stats_macro_step: int = PrivateAttr(default=0)
     _pending_outer_first: bool = PrivateAttr(default=False)
     _stats_cg: Optional[Any] = PrivateAttr(default=None)
+    _device_march_enabled: bool = PrivateAttr(default=False)
 
     def model_post_init(self, __context: Any) -> None:
         if ("inflow_catchment_id" in self.input_proxy.data
@@ -78,6 +79,8 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         from hydroforge.runtime.backend import KERNEL_BACKEND
         if KERNEL_BACKEND in ("triton", "cuda") and torch.cuda.is_available():
             self.enable_cuda_graph()
+        if KERNEL_BACKEND == "cuda" and torch.cuda.is_available():
+            self.enable_conditional_graph()
 
     @cached_property
     def base(self) -> BaseModule:
@@ -492,6 +495,108 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         """The kernel sequence captured into a CUDA Graph."""
         self.do_one_sub_step(runoff, output_enabled=(self.log is not None))
 
+    # ------------------------------------------------------------------ #
+    # Device-side sub-step march (CUDAGraphMixin conditional-graph helpers)
+    # ------------------------------------------------------------------ #
+    def enable_device_march(self) -> None:
+        """Opt into the device-side conditional-graph sub-step march.
+
+        Folds the whole uniform sub-step loop (and the per-sub-step statistics
+        accumulation) into one CUDA conditional-``WHILE`` launch per interval,
+        eliminating the per-sub-step host launches.  Requires the CUDA backend
+        and the ``adaptive_time`` module.  Multi-GPU is supported: the sub-step
+        count is agreed across ranks (``all_reduce`` MAX on ``max_sub_steps``)
+        before the march, and CaMa's catchment-basin partitioning keeps each
+        rank's sub-steps independent (no per-sub-step halo exchange)."""
+        from hydroforge.runtime.backend import KERNEL_BACKEND
+        if KERNEL_BACKEND != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("device_march requires the CUDA backend")
+        self._device_march_enabled = True
+
+    @cached_property
+    def _is_cuda_backend(self) -> bool:
+        from hydroforge.runtime.backend import KERNEL_BACKEND
+        return KERNEL_BACKEND == "cuda" and torch.cuda.is_available()
+
+    def _device_march_body(self, graph, stream_ptr: int, fold_stats: bool) -> None:
+        """One captured sub-step: bookkeeping (sets ``current_step`` / counter /
+        ``continue_flag``), the physics sub-step on the persistent runoff buffer,
+        then (when ``fold_stats``) the per-sub-step statistics accumulation."""
+        from cmfgpu.phys.cuda import compute_march_step
+        s = self._dm
+        compute_march_step(
+            num_sub_steps=s["num_sub_steps"], counter=s["counter"],
+            current_step=self.base.current_step, continue_flag=s["continue_flag"],
+            stream=stream_ptr,
+        )
+        self.do_one_sub_step(s["runoff_buf"], output_enabled=(self.log is not None))
+        if fold_stats:
+            self.conditional_stats_body(
+                self._statistics_aggregator,
+                graph=graph,
+                weight_src=self.base.time_step,
+                counter=s["counter"],
+                continue_flag=s["continue_flag"],
+                BLOCK_SIZE=self.BLOCK_SIZE,
+                stream_ptr=stream_ptr,
+            )
+
+    def _get_device_march(self, runoff: torch.Tensor, fold: bool):
+        """Lazily allocate the march scalars + capture the per-interval graph.
+
+        State lives in the model's ``_dm`` dict (no wrapper object):
+        ``num_sub_steps`` (filled per interval), the loop ``counter`` /
+        ``continue_flag``, and the persistent ``runoff_buf``.
+        """
+        graph = self.__dict__.get("_device_march_graph")
+        if graph is not None:
+            return graph
+        dev = self.device
+        s = {
+            "num_sub_steps": torch.zeros(1, device=dev, dtype=torch.int32),
+            "counter": torch.zeros(1, device=dev, dtype=torch.int32),
+            "continue_flag": torch.zeros(1, device=dev, dtype=torch.int32),
+            "runoff_buf": torch.zeros_like(runoff),
+        }
+        self.__dict__["_dm"] = s
+
+        def reset_fn():
+            s["counter"].zero_()
+
+        extra = (self.conditional_stats_accumulators(self._statistics_aggregator)
+                 if fold else None)
+        graph = self.build_conditional_graph(
+            body_fn=lambda g, set_cond, sp: self._device_march_body(g, sp, fold),
+            reset_fn=reset_fn,
+            continue_flag=s["continue_flag"],
+            extra_snapshot=extra,
+        )
+        self.__dict__["_device_march_graph"] = graph
+        return graph
+
+    def _run_device_march(self, runoff, num_sub_steps, flags, total_weight,
+                          time_sub_step, output_enabled) -> None:
+        """March the whole interval on-device in one conditional-graph launch."""
+        agg = self._statistics_aggregator
+        run_stats = (output_enabled and agg is not None
+                     and getattr(agg, "_aggregator_generated", False))
+        fold = run_stats and self.conditional_stats_should_fold(agg)
+        graph = self._get_device_march(runoff, fold)
+        s = self._dm
+        s["num_sub_steps"].fill_(num_sub_steps)
+        s["counter"].zero_()
+        s["runoff_buf"].copy_(runoff)
+        if fold:
+            self.conditional_stats_prelaunch(agg, flags, total_weight)
+        graph.launch(torch.cuda.current_stream(self.device).cuda_stream)
+        if run_stats and not fold:
+            # Single end-of-interval finalize covers the ``last`` outputs.
+            self.update_statistics(
+                sub_step=0, num_sub_steps=1, flags=flags,
+                weight=num_sub_steps * time_sub_step, total_weight=total_weight,
+                BLOCK_SIZE=self.BLOCK_SIZE)
+        self._stats_elapsed_time += num_sub_steps * time_sub_step
+
     def disable_cuda_graph(self) -> None:
         """Disable CUDA Graph and release all cached graphs including statistics."""
         self._stats_cg = None
@@ -631,108 +736,117 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
         self.base.time_step.fill_(time_sub_step)
 
-        # ------------------------------------------------------------------ #
-        # Sub-step 0: use standard code paths (handles first-time capture)
-        # ------------------------------------------------------------------ #
-        self.base.current_step.fill_(0)
-        if self.cuda_graph_enabled:
-            self.cuda_graph_replay(cache_key=0, runoff=runoff)
+        device_march = (self._device_march_enabled and self._is_cuda_backend
+                        and self.adaptive_time is not None
+                        and self.conditional_stats_device_compatible(
+                            self._statistics_aggregator))
+        if device_march:
+            self._run_device_march(runoff, num_sub_steps, flags, total_weight,
+                                   time_sub_step, output_enabled)
         else:
-            self.do_one_sub_step(runoff, output_enabled)
-        self._stats_elapsed_time += time_sub_step
-
-        if output_enabled:
-            if use_stats_cg:
-                if num_sub_steps == 1:
-                    is_inner_last_0 = bool(flags & 2)
-                    is_outer_first_0 = bool(flags & 4) and is_inner_last_0
-                    is_outer_last_0 = bool(flags & 8) and is_inner_last_0
-                    if is_outer_first_0:
-                        agg._macro_step_index = 0
-                        agg._current_macro_step_count = 0.0
-                        agg._outer_flags_ever_seen = True
-                    if is_inner_last_0 or is_outer_last_0:
-                        for out_name, out_is_outer in agg._output_is_outer.items():
-                            if (not out_is_outer and is_inner_last_0) or (out_is_outer and is_outer_last_0):
-                                agg._dirty_outputs.add(out_name)
-                    if is_inner_last_0:
-                        agg._current_macro_step_count += 1.0
-                self._stats_graph_replay(
-                    sub_step=0,
-                    num_sub_steps=num_sub_steps,
-                    flags=flags,
-                    weight=time_sub_step,
-                    total_weight=total_weight,
-                    num_macro_steps=agg._current_macro_step_count,
-                    macro_step_index=agg._macro_step_index,
-                    BLOCK_SIZE=self.BLOCK_SIZE,
-                )
+            # ------------------------------------------------------------------ #
+            # Sub-step 0: use standard code paths (handles first-time capture)
+            # ------------------------------------------------------------------ #
+            self.base.current_step.fill_(0)
+            if self.cuda_graph_enabled:
+                self.cuda_graph_replay(cache_key=0, runoff=runoff)
             else:
-                self.update_statistics(
-                    sub_step=0,
-                    num_sub_steps=num_sub_steps,
-                    flags=flags,
-                    weight=time_sub_step,
-                    total_weight=total_weight,
-                    BLOCK_SIZE=self.BLOCK_SIZE
-                )
+                self.do_one_sub_step(runoff, output_enabled)
+            self._stats_elapsed_time += time_sub_step
 
-        # ------------------------------------------------------------------ #
-        # Sub-steps 1..N-1
-        # ------------------------------------------------------------------ #
-        if num_sub_steps > 1:
-            if use_stats_cg:
-                # === FAST PATH ===
-                phys_graph = self.__dict__["_cg_cache"][0][0]
-                stats_graph = self._stats_cg
-                states = agg._kernel_states
-                sub_step_t = states['__sub_step']
-                current_step_t = self.base.current_step
-                last_sub = num_sub_steps - 1
-                is_stat_last = bool(flags & 2)
-                is_stat_outer_first = bool(flags & 4) and is_stat_last
-                is_stat_outer_last = bool(flags & 8) and is_stat_last
-
-                for sub_step in range(1, num_sub_steps):
-                    current_step_t.fill_(sub_step)
-                    phys_graph.replay()
-                    sub_step_t.fill_(sub_step)
-                    if sub_step == last_sub:
-                        if is_stat_outer_first:
+            if output_enabled:
+                if use_stats_cg:
+                    if num_sub_steps == 1:
+                        is_inner_last_0 = bool(flags & 2)
+                        is_outer_first_0 = bool(flags & 4) and is_inner_last_0
+                        is_outer_last_0 = bool(flags & 8) and is_inner_last_0
+                        if is_outer_first_0:
                             agg._macro_step_index = 0
                             agg._current_macro_step_count = 0.0
                             agg._outer_flags_ever_seen = True
-                        if is_stat_last or is_stat_outer_last:
+                        if is_inner_last_0 or is_outer_last_0:
                             for out_name, out_is_outer in agg._output_is_outer.items():
-                                if (not out_is_outer and is_stat_last) or (out_is_outer and is_stat_outer_last):
+                                if (not out_is_outer and is_inner_last_0) or (out_is_outer and is_outer_last_0):
                                     agg._dirty_outputs.add(out_name)
-                        if is_stat_last:
+                        if is_inner_last_0:
                             agg._current_macro_step_count += 1.0
-                            states['__num_macro_steps'].fill_(agg._current_macro_step_count)
-                    stats_graph.replay()
+                    self._stats_graph_replay(
+                        sub_step=0,
+                        num_sub_steps=num_sub_steps,
+                        flags=flags,
+                        weight=time_sub_step,
+                        total_weight=total_weight,
+                        num_macro_steps=agg._current_macro_step_count,
+                        macro_step_index=agg._macro_step_index,
+                        BLOCK_SIZE=self.BLOCK_SIZE,
+                    )
+                else:
+                    self.update_statistics(
+                        sub_step=0,
+                        num_sub_steps=num_sub_steps,
+                        flags=flags,
+                        weight=time_sub_step,
+                        total_weight=total_weight,
+                        BLOCK_SIZE=self.BLOCK_SIZE
+                    )
 
-                self._stats_elapsed_time += (num_sub_steps - 1) * time_sub_step
-            else:
-                # Standard path for remaining sub-steps
-                for sub_step in range(1, num_sub_steps):
-                    self.base.current_step.fill_(sub_step)
-                    if self.cuda_graph_enabled:
-                        self.cuda_graph_replay(
-                            cache_key=0,
-                            runoff=runoff,
-                        )
-                    else:
-                        self.do_one_sub_step(runoff, output_enabled)
-                    self._stats_elapsed_time += time_sub_step
-                    if output_enabled:
-                        self.update_statistics(
-                            sub_step=sub_step,
-                            num_sub_steps=num_sub_steps,
-                            flags=flags,
-                            weight=time_sub_step,
-                            total_weight=total_weight,
-                            BLOCK_SIZE=self.BLOCK_SIZE
-                        )
+            # ------------------------------------------------------------------ #
+            # Sub-steps 1..N-1
+            # ------------------------------------------------------------------ #
+            if num_sub_steps > 1:
+                if use_stats_cg:
+                    # === FAST PATH ===
+                    phys_graph = self.__dict__["_cg_cache"][0][0]
+                    stats_graph = self._stats_cg
+                    states = agg._kernel_states
+                    sub_step_t = states['__sub_step']
+                    current_step_t = self.base.current_step
+                    last_sub = num_sub_steps - 1
+                    is_stat_last = bool(flags & 2)
+                    is_stat_outer_first = bool(flags & 4) and is_stat_last
+                    is_stat_outer_last = bool(flags & 8) and is_stat_last
+
+                    for sub_step in range(1, num_sub_steps):
+                        current_step_t.fill_(sub_step)
+                        phys_graph.replay()
+                        sub_step_t.fill_(sub_step)
+                        if sub_step == last_sub:
+                            if is_stat_outer_first:
+                                agg._macro_step_index = 0
+                                agg._current_macro_step_count = 0.0
+                                agg._outer_flags_ever_seen = True
+                            if is_stat_last or is_stat_outer_last:
+                                for out_name, out_is_outer in agg._output_is_outer.items():
+                                    if (not out_is_outer and is_stat_last) or (out_is_outer and is_stat_outer_last):
+                                        agg._dirty_outputs.add(out_name)
+                            if is_stat_last:
+                                agg._current_macro_step_count += 1.0
+                                states['__num_macro_steps'].fill_(agg._current_macro_step_count)
+                        stats_graph.replay()
+
+                    self._stats_elapsed_time += (num_sub_steps - 1) * time_sub_step
+                else:
+                    # Standard path for remaining sub-steps
+                    for sub_step in range(1, num_sub_steps):
+                        self.base.current_step.fill_(sub_step)
+                        if self.cuda_graph_enabled:
+                            self.cuda_graph_replay(
+                                cache_key=0,
+                                runoff=runoff,
+                            )
+                        else:
+                            self.do_one_sub_step(runoff, output_enabled)
+                        self._stats_elapsed_time += time_sub_step
+                        if output_enabled:
+                            self.update_statistics(
+                                sub_step=sub_step,
+                                num_sub_steps=num_sub_steps,
+                                flags=flags,
+                                weight=time_sub_step,
+                                total_weight=total_weight,
+                                BLOCK_SIZE=self.BLOCK_SIZE
+                            )
+
 
         # Reset elapsed counter after closing a window
         if stat_is_last:
