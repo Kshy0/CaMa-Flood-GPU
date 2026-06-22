@@ -14,6 +14,7 @@ from typing import Any, ClassVar, Dict, Optional, Self, Type, Union
 import cftime
 import torch
 from hydroforge.modeling.model import AbstractModel
+from hydroforge.runtime.backend import KERNEL_BACKEND
 from hydroforge.runtime.cuda_graph import CUDAGraphMixin
 from pydantic import PrivateAttr, computed_field, model_validator
 from torch import distributed as dist
@@ -76,7 +77,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         super().model_post_init(__context)
         # Auto-enable CUDA graphs for the triton / cuda backends (both launch
         # kernels onto the current CUDA stream, so stream capture works).
-        from hydroforge.runtime.backend import KERNEL_BACKEND
         if KERNEL_BACKEND in ("triton", "cuda") and torch.cuda.is_available():
             self.enable_cuda_graph()
         if KERNEL_BACKEND == "cuda" and torch.cuda.is_available():
@@ -136,7 +136,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         variables are ``hpfloat`` and the CUDA backend additionally supports
         ``mixed_precision`` (f64 storage + f32 compute); Metal does not.
         """
-        from hydroforge.runtime.backend import KERNEL_BACKEND
         if KERNEL_BACKEND != "triton":
             if self.precision != "float32":
                 raise ValueError(
@@ -508,14 +507,12 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         count is agreed across ranks (``all_reduce`` MAX on ``max_sub_steps``)
         before the march, and CaMa's catchment-basin partitioning keeps each
         rank's sub-steps independent (no per-sub-step halo exchange)."""
-        from hydroforge.runtime.backend import KERNEL_BACKEND
         if KERNEL_BACKEND != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("device_march requires the CUDA backend")
         self._device_march_enabled = True
 
     @cached_property
     def _is_cuda_backend(self) -> bool:
-        from hydroforge.runtime.backend import KERNEL_BACKEND
         return KERNEL_BACKEND == "cuda" and torch.cuda.is_available()
 
     def _device_march_body(self, graph, stream_ptr: int, fold_stats: bool) -> None:
