@@ -1,6 +1,6 @@
 # CaMa-Flood-GPU
 
-**CaMa-Flood-GPU** is a high-performance, GPU-accelerated re-implementation of the [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) hydrodynamic model. This project leverages the [Triton](https://github.com/openai/triton) language and the [PyTorch](https://github.com/pytorch/pytorch) tensor ecosystem to achieve rapid, scalable global river simulations. By using Triton's custom GPU kernels and PyTorch's tensor abstraction, CaMa-Flood-GPU delivers significant speed-ups over both the original Fortran and the MATLAB-based versions introduced during [the CaMa-Flood developer/user international meeting 2024](https://global-hydrodynamics.github.io/cmf-meet-2024/).
+**CaMa-Flood-GPU** is a high-performance, GPU-accelerated re-implementation of the [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) hydrodynamic model. This project leverages the [Triton](https://github.com/openai/triton) language and the [PyTorch](https://github.com/pytorch/pytorch) tensor ecosystem to achieve rapid, scalable global river simulations. By using Triton's custom GPU kernels and PyTorch's tensor abstraction, CaMa-Flood-GPU delivers significant speed-ups over the original Fortran implementation.
 
 **Note:** This repository is under active development, and both the code structure and content are subject to significant changes at any time.
 
@@ -10,10 +10,36 @@
 
 ---
 
+## Citation
+
+If you find CaMa-Flood-GPU helpful for your research or applications, we would appreciate it if you cite our paper:
+
+**BibTeX**
+
+```bibtex
+@article{kang2026camafloodgpu,
+  author  = {Kang, Shengyu and Yin, Jiabo and Yamazaki, Dai},
+  title   = {CaMa-Flood-GPU: a GPU-based hydrodynamic model implementation for scalable global simulations},
+  journal = {Geoscientific Model Development},
+  year    = {2026},
+  volume  = {19},
+  number  = {12},
+  pages   = {5623--5640},
+  doi     = {10.5194/gmd-19-5623-2026},
+  url     = {https://gmd.copernicus.org/articles/19/5623/2026/}
+}
+```
+
+**APA**
+
+Kang, S., Yin, J., & Yamazaki, D. (2026). CaMa-Flood-GPU: A GPU-based hydrodynamic model implementation for scalable global simulations. Geoscientific Model Development, 19(12), 5623–5640. https://doi.org/10.5194/gmd-19-5623-2026
+
+---
+
 ## Prerequisites
 
 - Python == 3.14.*  
-- PyTorch (with CUDA support) == 2.12.0+cu132 — `triton` ships automatically with PyTorch on supported systems
+- PyTorch (with CUDA support) == 2.12.1+cu132 — `triton` ships automatically with PyTorch on supported systems
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4
@@ -214,7 +240,7 @@ Regardless of this setting, the system always computes and reports GPU load assi
 ## Features
 
 - **Ultra-fast computation:** Even with the standard CPython interpreter, CaMa-Flood-GPU achieves superior performance. 
-  **Benchmark:** `test1-glb_15min`, simulation from 2000-01-01 to 2000-12-31 with `adaptive_time_step` enabled runs in ~32 seconds (single 4070Ti GPU + i7-13700 CPU)—even faster than the MATLAB version.
+  **Benchmark:** `test1-glb_15min`, simulation from 2000-01-01 to 2000-12-31 with `adaptive_time_step` enabled runs in ~20 seconds (single 4070Ti GPU + i7-13700 CPU).
 - **Modular design:** The codebase is structured for easy expansion and maintenance, allowing users to add or replace modules as needed.
 - **Scalable architecture:** This codebase is designed to be suitable for multi-node, multi-GPU. It has the ability to simulate floods on extremely high-resolution geographic maps.
 
@@ -222,7 +248,7 @@ Regardless of this setting, the system always computes and reports GPU load assi
 
 ## Disclaimer
 
-CaMa-Flood-GPU is is intended for research, development, and educational purposes. Please verify results independently before relying on them for critical applications.
+CaMa-Flood-GPU is intended for research, development, and educational purposes. Please verify results independently before relying on them for critical applications.
 
 ---
 
