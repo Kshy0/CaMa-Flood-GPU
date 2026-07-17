@@ -47,7 +47,9 @@ class GaugeSeries:
             mask &= dates_arr <= np.datetime64(end)
         return GaugeSeries(
             gauge_id=self.gauge_id,
-            dates=[d for d, m in zip(self.dates, mask.tolist()) if m],
+            dates=[
+                d for d, m in zip(self.dates, mask.tolist(), strict=True) if m
+            ],
             values=self.values[mask],
             units=self.units,
             meta=self.meta,
@@ -407,7 +409,8 @@ class GaugeReader:
         self._gauge_catchments.clear()
 
         nx_, ny_ = self._map_shape  # type: ignore[misc]
-        assert nx_ is not None and ny_ is not None
+        if nx_ is None or ny_ is None:
+            raise ValueError("Map shape must be initialized before loading gauges")
 
         # Temp storage for gauges per catchment
         temp_gauges = {}  # ct_id -> list of (gid, err, xy1, xy2, a1, a2)
@@ -440,7 +443,7 @@ class GaugeReader:
             temp_gauges.setdefault(ct1, []).append((gid, err, xy1, xy2, a1, a2))
 
         # Now select one gauge per catchment with min abs(err)
-        for ct_id, gauges in temp_gauges.items():
+        for gauges in temp_gauges.values():
             if len(gauges) == 1:
                 gid, err, xy1, xy2, a1, a2 = gauges[0]
             else:

@@ -13,20 +13,19 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from hydroforge.modeling.distributed import find_indices_in_torch
-from hydroforge.modeling.module import (AbstractModule, TensorField,
-                                        computed_tensor_field)
-from pydantic import Field, model_validator
+from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+                                        ReferenceField, ReferenceIndexField,
+                                        TensorField, computed_tensor_field)
+from pydantic import Field, computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
 
 
 def ReservoirField(
     description: str,
-    shape: Tuple[str, ...] = ("base.num_reservoirs",),
+    shape: Tuple[str, ...] = ("num_reservoirs",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    group_by: Optional[str] = "reservoir_basin_id",
-    dim_coords: Optional[str] = "base.reservoir_catchment_id",
+    dim_coords: Optional[str] = "reservoir_id",
     category: Literal["topology", "param"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
@@ -35,9 +34,6 @@ def ReservoirField(
         description=description,
         shape=shape,
         dtype=dtype,
-        group_by=group_by,
-        save_idx=None,
-        save_coord=None,
         dim_coords=dim_coords,
         category=category,
         mode=mode,
@@ -46,9 +42,9 @@ def ReservoirField(
 
 def computed_reservoir_field(
     description: str,
-    shape: Tuple[str, ...] = ("base.num_reservoirs",),
+    shape: Tuple[str, ...] = ("num_reservoirs",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "base.reservoir_catchment_id",
+    dim_coords: Optional[str] = "reservoir_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
     **kwargs
@@ -57,8 +53,6 @@ def computed_reservoir_field(
         description=description,
         shape=shape,
         dtype=dtype,
-        save_idx=None,
-        save_coord=None,
         dim_coords=dim_coords,
         category=category,
         expr=expr,
@@ -73,8 +67,7 @@ class ReservoirModule(AbstractModule):
     description: ClassVar[str] = "Reservoir operation module with storage and outflow regulation"
     dependencies: ClassVar[list] = ["base"]
 
-    base: Optional[BaseModule] = Field(
-        default=None,
+    base: BaseModule = Field(
         exclude=True,
         description="Reference to BaseModule",
     )
@@ -82,12 +75,19 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Reservoir topology
     # ------------------------------------------------------------------ #
-    reservoir_id: torch.Tensor = ReservoirField(
+    reservoir_catchment_id: torch.Tensor = ReferenceField(
+        description="Catchment ID hosting each reservoir",
+        dtype="int",
+        shape=("num_reservoirs",),
+        dim_coords="reservoir_id",
+        references="catchment_id",
+    )
+
+    reservoir_id: torch.Tensor = CoordinateField(
         description="Unique ID for each reservoir",
         dtype="int",
-        category="topology",
-        mode="cpu",
-        is_key=True,
+        shape=("num_reservoirs",),
+        partition_by="reservoir_catchment_id",
     )
 
     # ------------------------------------------------------------------ #
@@ -120,15 +120,59 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed tensor fields
     # ------------------------------------------------------------------ #
-    @computed_reservoir_field(
-        description="Catchment-array indices for each reservoir",
-        dtype="idx",
-        category="topology",
+    @computed_field(description="Total number of reservoirs")
+    @cached_property
+    def num_reservoirs(self) -> int:
+        return self.reservoir_catchment_id.shape[0]
+
+    reservoir_catchment_idx = ReferenceIndexField("reservoir_catchment_id")
+
+    @computed_tensor_field(
+        description="Boolean mask for reservoir catchments",
+        shape=("base.num_catchments",), dtype="bool",
+        dim_coords="base.catchment_id", category="topology",
     )
     @cached_property
-    def reservoir_catchment_idx(self) -> torch.Tensor:
-        assert self.base is not None
-        return find_indices_in_torch(self.base.reservoir_catchment_id, self.base.catchment_id)
+    def is_reservoir(self) -> torch.Tensor:
+        mask = torch.zeros(
+            self.base.num_catchments, dtype=torch.bool,
+            device=self.base.catchment_id.device,
+        )
+        mask[self.reservoir_catchment_idx] = True
+        return mask
+
+    @computed_tensor_field(
+        description="Mask for reservoir cells and their immediate upstream cells",
+        shape=("base.num_catchments",), dtype="bool",
+        dim_coords="base.catchment_id", category="topology",
+    )
+    @cached_property
+    def is_dam_related(self) -> torch.Tensor:
+        downstream_is_dam = self.is_reservoir[self.base.downstream_idx]
+        idx = torch.arange(self.base.num_catchments, device=self.base.catchment_id.device)
+        not_mouth = self.base.downstream_idx != idx
+        upstream = (~self.is_reservoir) & not_mouth & downstream_is_dam
+        return self.is_reservoir | upstream
+
+    @computed_tensor_field(
+        description="Mask for immediate upstream-of-reservoir cells",
+        shape=("base.num_catchments",), dtype="bool",
+        dim_coords="base.catchment_id", category="topology",
+    )
+    @cached_property
+    def is_dam_upstream(self) -> torch.Tensor:
+        return self.is_dam_related & ~self.is_reservoir
+
+    @computed_tensor_field(
+        description="Accumulated reservoir total inflow from upstream (m³ s⁻¹)",
+        shape=("base.num_catchments",), dtype="hpfloat",
+        dim_coords="base.catchment_id", category="state",
+    )
+    @cached_property
+    def reservoir_total_inflow(self) -> torch.Tensor:
+        return torch.zeros_like(
+            self.base.river_outflow, dtype=self.base.high_precision,
+        )
 
     # ------------------------------------------------------------------ #
     # Computed tensors (operations)
@@ -170,12 +214,6 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Validators
     # ------------------------------------------------------------------ #
-    @model_validator(mode="after")
-    def validate_reservoir_catchment_idx(self) -> Self:
-        if torch.any(self.reservoir_catchment_idx < 0):
-            raise ValueError("reservoir_catchment_id contains entries absent from catchment_id")
-        return self
-
     @model_validator(mode="after")
     def validate_reservoir_volumes(self) -> Self:
         if torch.any(self.emergency_volume > self.reservoir_capacity):

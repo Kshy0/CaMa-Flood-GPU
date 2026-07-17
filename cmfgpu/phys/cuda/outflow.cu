@@ -37,7 +37,9 @@ __global__ void k_outflow(
     float* __restrict__ protected_water_surface_elevation,
     float gravity, const float* __restrict__ time_step_ptr,
     long num_catchments, int has_bifurcation,
-    const bool* __restrict__ is_dam_upstream, int has_reservoir, float min_kinematic_slope)
+    const bool* __restrict__ is_dam_upstream, int has_reservoir, float min_kinematic_slope,
+    const float* __restrict__ sea_surface_elevation,
+    const int* __restrict__ catchment_sea_level_idx, int has_sea_level)
 {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     if (t >= num_catchments) return;
@@ -79,8 +81,12 @@ __global__ void k_outflow(
     float river_elevation_dn = c_elv_dn - r_hgt_dn;
     float wse_dn = r_dep_dn + river_elevation_dn;
 
-    float max_wse = fmaxf(wse, wse_dn);
     if (is_river_mouth) wse_dn = c_elv;
+    if (has_sea_level) {
+        int sea_idx = __ldg(catchment_sea_level_idx + t);
+        if (sea_idx >= 0) wse_dn = __ldg(sea_surface_elevation + sea_idx);
+    }
+    float max_wse = fmaxf(wse, wse_dn);
 
     float river_slope = (wse - wse_dn) / dn_dist;
     float flood_slope = fminf(fmaxf(river_slope, -0.005f), 0.005f);
@@ -211,6 +217,12 @@ static inline float* PF(at::Tensor& x) { return x.numel() ? x.data_ptr<float>() 
 static inline bool*  PB(at::Tensor& x) { return x.numel() ? x.data_ptr<bool>()  : nullptr; }
 static inline int*   PI(at::Tensor& x) { return x.numel() ? x.data_ptr<int>()   : nullptr; }
 template <typename STO> static inline STO* PS(at::Tensor& x) { return x.numel() ? x.data_ptr<STO>() : nullptr; }
+static inline float* PFO(c10::optional<at::Tensor>& x) { return x ? x->data_ptr<float>() : nullptr; }
+static inline bool*  PBO(c10::optional<at::Tensor>& x) { return x ? x->data_ptr<bool>() : nullptr; }
+static inline int*   PIO(c10::optional<at::Tensor>& x) { return x ? x->data_ptr<int>() : nullptr; }
+template <typename STO> static inline STO* PSO(c10::optional<at::Tensor>& x) {
+    return x ? x->data_ptr<STO>() : nullptr;
+}
 
 template <typename STO>
 static void launch_outflow_t(
@@ -219,9 +231,12 @@ static void launch_outflow_t(
     at::Tensor& fi, at::Tensor& fo, at::Tensor& fman, at::Tensor& fd, at::Tensor& pd,
     at::Tensor& ce, at::Tensor& dd, at::Tensor& fsto, at::Tensor& psto,
     at::Tensor& rcsd, at::Tensor& fcsd, at::Tensor& fcsa,
-    at::Tensor& gb, at::Tensor& ts_out, at::Tensor& outs, at::Tensor& wse, at::Tensor& pwse,
+    c10::optional<at::Tensor>& gb, at::Tensor& ts_out, at::Tensor& outs,
+    at::Tensor& wse, at::Tensor& pwse,
     float gravity, at::Tensor& tsp, long n, int has_bif,
-    at::Tensor& dam, int has_res, float minslope, int block)
+    c10::optional<at::Tensor>& dam, int has_res, float minslope,
+    c10::optional<at::Tensor>& sea, c10::optional<at::Tensor>& sea_idx,
+    int has_sea, int block)
 {
     int grid = (int)((n + block - 1) / block);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -229,8 +244,9 @@ static void launch_outflow_t(
         PI(di), PS<STO>(ri), PF(ro), PF(rman), PF(rd), PF(rw), PF(rl), PF(rh), PS<STO>(rs),
         PS<STO>(fi), PF(fo), PF(fman), PF(fd), PF(pd), PF(ce), PF(dd), PS<STO>(fsto), PS<STO>(psto),
         PF(rcsd), PF(fcsd), PF(fcsa),
-        PS<STO>(gb), PS<STO>(ts_out), PS<STO>(outs), PF(wse), PF(pwse),
-        gravity, PF(tsp), n, has_bif, PB(dam), has_res, minslope);
+        PSO<STO>(gb), PS<STO>(ts_out), PS<STO>(outs), PF(wse), PF(pwse),
+        gravity, PF(tsp), n, has_bif, PBO(dam), has_res, minslope,
+        PFO(sea), PIO(sea_idx), has_sea);
 }
 
 void launch_outflow(
@@ -243,12 +259,16 @@ void launch_outflow(
     at::Tensor downstream_distance, at::Tensor flood_storage, at::Tensor protected_storage,
     at::Tensor river_cross_section_depth, at::Tensor flood_cross_section_depth,
     at::Tensor flood_cross_section_area,
-    at::Tensor global_bifurcation_outflow, at::Tensor total_storage,
+    c10::optional<at::Tensor> global_bifurcation_outflow, at::Tensor total_storage,
     at::Tensor outgoing_storage, at::Tensor water_surface_elevation,
     at::Tensor protected_water_surface_elevation,
     double gravity, at::Tensor time_step,
     long num_catchments, long has_bifurcation,
-    at::Tensor is_dam_upstream, long has_reservoir, double min_kinematic_slope, long block)
+    c10::optional<at::Tensor> is_dam_upstream, long has_reservoir,
+    double min_kinematic_slope,
+    c10::optional<at::Tensor> sea_surface_elevation,
+    c10::optional<at::Tensor> catchment_sea_level_idx,
+    long has_sea_level, long block)
 {
     if (river_storage.scalar_type() == at::kDouble)
         launch_outflow_t<double>(downstream_idx, river_inflow, river_outflow, river_manning,
@@ -259,7 +279,9 @@ void launch_outflow(
             global_bifurcation_outflow, total_storage, outgoing_storage,
             water_surface_elevation, protected_water_surface_elevation,
             (float)gravity, time_step, num_catchments, (int)has_bifurcation,
-            is_dam_upstream, (int)has_reservoir, (float)min_kinematic_slope, (int)block);
+            is_dam_upstream, (int)has_reservoir, (float)min_kinematic_slope,
+            sea_surface_elevation, catchment_sea_level_idx,
+            (int)has_sea_level, (int)block);
     else
         launch_outflow_t<float>(downstream_idx, river_inflow, river_outflow, river_manning,
             river_depth, river_width, river_length, river_height, river_storage,
@@ -269,20 +291,23 @@ void launch_outflow(
             global_bifurcation_outflow, total_storage, outgoing_storage,
             water_surface_elevation, protected_water_surface_elevation,
             (float)gravity, time_step, num_catchments, (int)has_bifurcation,
-            is_dam_upstream, (int)has_reservoir, (float)min_kinematic_slope, (int)block);
+            is_dam_upstream, (int)has_reservoir, (float)min_kinematic_slope,
+            sea_surface_elevation, catchment_sea_level_idx,
+            (int)has_sea_level, (int)block);
 }
 
 template <typename STO>
 static void launch_inflow_t(
     at::Tensor& di, at::Tensor& ro, at::Tensor& fo, at::Tensor& rs, at::Tensor& fs,
     at::Tensor& outs, at::Tensor& ri, at::Tensor& fi, at::Tensor& lr,
-    at::Tensor& rti, at::Tensor& isres, long n, int has_res, int block)
+    c10::optional<at::Tensor>& rti, c10::optional<at::Tensor>& isres,
+    long n, int has_res, int block)
 {
     int grid = (int)((n + block - 1) / block);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     k_inflow<STO><<<grid, block, 0, stream>>>(
         PI(di), PF(ro), PF(fo), PS<STO>(rs), PS<STO>(fs), PS<STO>(outs),
-        PS<STO>(ri), PS<STO>(fi), PF(lr), PS<STO>(rti), PB(isres), n, has_res);
+        PS<STO>(ri), PS<STO>(fi), PF(lr), PSO<STO>(rti), PBO(isres), n, has_res);
 }
 
 void launch_inflow(
@@ -290,7 +315,8 @@ void launch_inflow(
     at::Tensor river_outflow, at::Tensor flood_outflow,
     at::Tensor river_storage, at::Tensor flood_storage, at::Tensor outgoing_storage,
     at::Tensor river_inflow, at::Tensor flood_inflow, at::Tensor limit_rate,
-    at::Tensor reservoir_total_inflow, at::Tensor is_reservoir,
+    c10::optional<at::Tensor> reservoir_total_inflow,
+    c10::optional<at::Tensor> is_reservoir,
     long num_catchments, long has_reservoir, long block)
 {
     if (river_storage.scalar_type() == at::kDouble)

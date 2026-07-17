@@ -5,26 +5,49 @@
 
 #include <metal_stdlib>
 using namespace metal;
+constant bool batched_bif_manning_flag [[function_constant(0)]];
+constant bool batched_bif_width_flag [[function_constant(1)]];
+constant bool batched_bif_length_flag [[function_constant(2)]];
+constant bool batched_bif_elevation_flag [[function_constant(3)]];
+
+struct compute_levee_bifurcation_outflow_args {
+    device int* bif_catchment_idx_buf [[id(0)]];
+    device int* bif_downstream_idx_buf [[id(1)]];
+    device float* bif_manning_buf [[id(2)]];
+    device float* bif_outflow_buf [[id(3)]];
+    device float* bif_width_buf [[id(4)]];
+    device float* bif_length_buf [[id(5)]];
+    device float* bif_elevation_buf [[id(6)]];
+    device float* bif_cross_section_depth_buf [[id(7)]];
+    device float* water_surface_elevation_buf [[id(8)]];
+    device float* protected_wse_buf [[id(9)]];
+    device float* total_storage_buf [[id(10)]];
+    device atomic_float* outgoing_storage_buf [[id(11)]];
+    constant float* gravity [[id(12)]];
+    constant float* time_step [[id(13)]];
+    constant int* num_bifurcation_paths [[id(14)]];
+};
 
 kernel void compute_levee_bifurcation_outflow(
-    device int*           bif_catchment_idx_buf          [[buffer(0)]],
-    device int*           bif_downstream_idx_buf         [[buffer(1)]],
-    device float*         bif_manning_buf                [[buffer(2)]],
-    device float*         bif_outflow_buf                [[buffer(3)]],
-    device float*         bif_width_buf                  [[buffer(4)]],
-    device float*         bif_length_buf                 [[buffer(5)]],
-    device float*         bif_elevation_buf              [[buffer(6)]],
-    device float*         bif_cross_section_depth_buf    [[buffer(7)]],
-    device float*         water_surface_elevation_buf    [[buffer(8)]],
-    device float*         protected_wse_buf              [[buffer(9)]],
-    device float*         total_storage_buf              [[buffer(10)]],
-    device atomic_float*  outgoing_storage_buf           [[buffer(11)]],
-    constant float&       gravity                        [[buffer(12)]],
-    constant float&       time_step                      [[buffer(13)]],
-    constant int&         num_bifurcation_paths          [[buffer(14)]],
+    constant compute_levee_bifurcation_outflow_args& args [[buffer(0)]],
     uint idx_g [[thread_position_in_grid]]
 )
 {
+    device int* bif_catchment_idx_buf = args.bif_catchment_idx_buf;
+    device int* bif_downstream_idx_buf = args.bif_downstream_idx_buf;
+    device float* bif_manning_buf = args.bif_manning_buf;
+    device float* bif_outflow_buf = args.bif_outflow_buf;
+    device float* bif_width_buf = args.bif_width_buf;
+    device float* bif_length_buf = args.bif_length_buf;
+    device float* bif_elevation_buf = args.bif_elevation_buf;
+    device float* bif_cross_section_depth_buf = args.bif_cross_section_depth_buf;
+    device float* water_surface_elevation_buf = args.water_surface_elevation_buf;
+    device float* protected_wse_buf = args.protected_wse_buf;
+    device float* total_storage_buf = args.total_storage_buf;
+    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
+    const float gravity = *args.gravity;
+    const float time_step = *args.time_step;
+    const int num_bifurcation_paths = *args.num_bifurcation_paths;
     const int NUM_BIF_LEVELS = __NUM_BIF_LEVELS__;
 
     if ((int)idx_g >= num_bifurcation_paths) return;
@@ -113,31 +136,48 @@ kernel void compute_levee_bifurcation_outflow(
 // Batched levee bifurcation outflow — flat-grid pattern
 // grid = num_bifurcation_paths * num_trials
 // =====================================================================
+struct compute_levee_bifurcation_outflow_batched_args {
+    device int* bif_catchment_idx_buf [[id(0)]];
+    device int* bif_downstream_idx_buf [[id(1)]];
+    device float* bif_manning_buf [[id(2)]];
+    device float* bif_outflow_buf [[id(3)]];
+    device float* bif_width_buf [[id(4)]];
+    device float* bif_length_buf [[id(5)]];
+    device float* bif_elevation_buf [[id(6)]];
+    device float* bif_cross_section_depth_buf [[id(7)]];
+    device float* water_surface_elevation_buf [[id(8)]];
+    device float* protected_wse_buf [[id(9)]];
+    device float* total_storage_buf [[id(10)]];
+    device atomic_float* outgoing_storage_buf [[id(11)]];
+    constant float* gravity [[id(12)]];
+    constant float* time_step [[id(13)]];
+    constant int* num_bifurcation_paths [[id(14)]];
+    constant int* num_catchments [[id(15)]];
+    constant int* num_trials [[id(16)]];
+};
+
 kernel void compute_levee_bifurcation_outflow_batched(
-    device int*           bif_catchment_idx_buf          [[buffer(0)]],
-    device int*           bif_downstream_idx_buf         [[buffer(1)]],
-    device float*         bif_manning_buf                [[buffer(2)]],
-    device float*         bif_outflow_buf                [[buffer(3)]],
-    device float*         bif_width_buf                  [[buffer(4)]],
-    device float*         bif_length_buf                 [[buffer(5)]],
-    device float*         bif_elevation_buf              [[buffer(6)]],
-    device float*         bif_cross_section_depth_buf    [[buffer(7)]],
-    device float*         water_surface_elevation_buf    [[buffer(8)]],
-    device float*         protected_wse_buf              [[buffer(9)]],
-    device float*         total_storage_buf              [[buffer(10)]],
-    device atomic_float*  outgoing_storage_buf           [[buffer(11)]],
-    constant float&       gravity                        [[buffer(12)]],
-    constant float&       time_step                      [[buffer(13)]],
-    constant int&         num_bifurcation_paths          [[buffer(14)]],
-    constant int&         num_catchments                 [[buffer(15)]],
-    constant int&         num_trials                     [[buffer(16)]],
-    constant int&         batched_bif_manning_flag       [[buffer(17)]],
-    constant int&         batched_bif_width_flag         [[buffer(18)]],
-    constant int&         batched_bif_length_flag        [[buffer(19)]],
-    constant int&         batched_bif_elevation_flag     [[buffer(20)]],
+    constant compute_levee_bifurcation_outflow_batched_args& args [[buffer(0)]],
     uint idx_g [[thread_position_in_grid]]
 )
 {
+    device int* bif_catchment_idx_buf = args.bif_catchment_idx_buf;
+    device int* bif_downstream_idx_buf = args.bif_downstream_idx_buf;
+    device float* bif_manning_buf = args.bif_manning_buf;
+    device float* bif_outflow_buf = args.bif_outflow_buf;
+    device float* bif_width_buf = args.bif_width_buf;
+    device float* bif_length_buf = args.bif_length_buf;
+    device float* bif_elevation_buf = args.bif_elevation_buf;
+    device float* bif_cross_section_depth_buf = args.bif_cross_section_depth_buf;
+    device float* water_surface_elevation_buf = args.water_surface_elevation_buf;
+    device float* protected_wse_buf = args.protected_wse_buf;
+    device float* total_storage_buf = args.total_storage_buf;
+    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
+    const float gravity = *args.gravity;
+    const float time_step = *args.time_step;
+    const int num_bifurcation_paths = *args.num_bifurcation_paths;
+    const int num_catchments = *args.num_catchments;
+    const int num_trials = *args.num_trials;
     const int NUM_BIF_LEVELS = __NUM_BIF_LEVELS__;
 
     if ((int)idx_g >= num_bifurcation_paths * num_trials) return;

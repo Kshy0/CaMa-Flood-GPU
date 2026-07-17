@@ -22,9 +22,11 @@ from torch import distributed as dist
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
+from cmfgpu.modules.inflow import InflowModule
 from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
 from cmfgpu.modules.reservoir import ReservoirModule
+from cmfgpu.modules.sea_level import SeaLevelModule
 from cmfgpu.phys.adaptive_time import compute_adaptive_time_step
 from cmfgpu.phys.bifurcation import (compute_bifurcation_inflow,
                                      compute_bifurcation_outflow)
@@ -42,38 +44,25 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
     module_list: ClassVar[Dict[str, Type[BaseModule]]] = {
         "base": BaseModule,
+        "inflow": InflowModule,
+        "sea_level": SeaLevelModule,
         "bifurcation": BifurcationModule,
         "log": LogModule,
         "adaptive_time": AdaptiveTimeModule,
         "levee": LeveeModule,
         "reservoir": ReservoirModule,
     }
-    group_by: ClassVar[str] = "catchment_basin_id"
+    partition_key: ClassVar[str] = "catchment_id"
+    partition_group: ClassVar[str] = "catchment_basin_id"
     _stats_elapsed_time: float = PrivateAttr(default=0.0)
     _stats_start_time: Optional[Union[datetime, cftime.datetime]] = PrivateAttr(default=None)
     _stats_macro_step: int = PrivateAttr(default=0)
     _pending_outer_first: bool = PrivateAttr(default=False)
     _stats_cg: Optional[Any] = PrivateAttr(default=None)
     _device_march_enabled: bool = PrivateAttr(default=False)
+    _metal_substep_graphs: dict[Any, Any] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
-        if ("inflow_catchment_id" in self.input_proxy.data
-                and "basin_shift_days" in self.input_proxy.data):
-            if self.variables_to_save is None:
-                self.variables_to_save = {}
-            existing = self.variables_to_save.get("static")
-            if existing is None:
-                static_list: list = []
-            elif isinstance(existing, str):
-                static_list = [existing]
-            else:
-                static_list = list(existing)
-            for name in ("catchment_shift_days",
-                         "catchment_valid_length_days"):
-                if name not in static_list:
-                    static_list.append(name)
-            self.variables_to_save["static"] = static_list
-
         super().model_post_init(__context)
         # Auto-enable CUDA graphs for the triton / cuda backends (both launch
         # kernels onto the current CUDA stream, so stream capture works).
@@ -85,6 +74,14 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     @cached_property
     def base(self) -> BaseModule:
         return self.get_module("base")
+
+    @cached_property
+    def inflow(self) -> Optional[InflowModule]:
+        return self.get_module("inflow")
+
+    @cached_property
+    def sea_level(self) -> Optional[SeaLevelModule]:
+        return self.get_module("sea_level")
     
     @cached_property
     def bifurcation(self) -> Optional[BifurcationModule]:
@@ -147,6 +144,12 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                     f"Backend '{KERNEL_BACKEND}' does not support mixed precision. "
                     f"Set mixed_precision=False or use the triton/cuda backend."
                 )
+        if KERNEL_BACKEND == "cuda" and self.num_trials is not None:
+            raise ValueError(
+                "The hand-written CUDA backend does not implement batched kernels; "
+                "num_trials would otherwise use incorrect tensor strides. "
+                "Use the Triton backend for ensemble trials."
+            )
         return self
 
     @model_validator(mode="after")
@@ -191,9 +194,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         """
         if not self.reservoir_flag or not self.bifurcation_flag:
             return self
-        is_dam = self.base.is_dam_related
-        if is_dam is None:
-            return self
+        is_dam = self.reservoir.is_dam_related
         # Check each bifurcation path: if upstream or downstream touches a dam-related cell
         up_idx = self.bifurcation.bifurcation_catchment_idx
         dn_idx = self.bifurcation.bifurcation_downstream_idx
@@ -243,16 +244,31 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             num_catchments=self.base.num_catchments,
             BLOCK_SIZE=self.BLOCK_SIZE,
             HAS_BIFURCATION=self.bifurcation_flag,
-            is_dam_upstream_ptr=self.base.is_dam_upstream,
+            is_dam_upstream_ptr=(
+                self.reservoir.is_dam_upstream if self.reservoir_flag else None
+            ),
             HAS_RESERVOIR=self.reservoir_flag,
             MIN_KINEMATIC_SLOPE=self.base.min_kinematic_slope,
+            sea_surface_elevation_ptr=(
+                self.sea_level.sea_surface_elevation
+                if self.sea_level is not None else None
+            ),
+            catchment_sea_level_idx_ptr=(
+                self.sea_level.catchment_sea_level_idx
+                if self.sea_level is not None else None
+            ),
+            HAS_SEA_LEVEL=self.sea_level is not None,
+            num_sea_level_boundaries=(
+                self.sea_level.num_sea_level_boundaries
+                if self.sea_level is not None else 0
+            ),
             num_trials=self.num_trials,
-            batched_river_manning=self.base.batched_river_manning,
-            batched_flood_manning=self.base.batched_flood_manning,
-            batched_river_width=self.base.batched_river_width,
-            batched_river_length=self.base.batched_river_length,
-            batched_river_height=self.base.batched_river_height,
-            batched_catchment_elevation=self.base.batched_catchment_elevation,
+            batched_river_manning=self.base.is_batched('river_manning'),
+            batched_flood_manning=self.base.is_batched('flood_manning'),
+            batched_river_width=self.base.is_batched('river_width'),
+            batched_river_length=self.base.is_batched('river_length'),
+            batched_river_height=self.base.is_batched('river_height'),
+            batched_catchment_elevation=self.base.is_batched('catchment_elevation'),
         )
 
     @cached_property
@@ -260,7 +276,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         return partial(compute_reservoir_outflow,
             reservoir_catchment_idx_ptr=self.reservoir.reservoir_catchment_idx,
             downstream_idx_ptr=self.base.downstream_idx,
-            reservoir_total_inflow_ptr=self.base.reservoir_total_inflow,
+            reservoir_total_inflow_ptr=self.reservoir.reservoir_total_inflow,
             river_outflow_ptr=self.base.river_outflow,
             flood_outflow_ptr=self.base.flood_outflow,
             river_storage_ptr=self.base.river_storage,
@@ -273,7 +289,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             flood_control_outflow_ptr=self.reservoir.flood_control_outflow,
             total_storage_ptr=self.base.total_storage,
             outgoing_storage_ptr=self.base.outgoing_storage,
-            num_reservoirs=self.base.num_reservoirs,
+            num_reservoirs=self.reservoir.num_reservoirs,
             time_step_ptr=self.base.time_step,
             BLOCK_SIZE=self.BLOCK_SIZE,
         )
@@ -299,10 +315,10 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             BLOCK_SIZE=self.BLOCK_SIZE,
             num_trials=self.num_trials,
             num_catchments=self.base.num_catchments,
-            batched_bifurcation_manning=self.bifurcation.batched_bifurcation_manning,
-            batched_bifurcation_width=self.bifurcation.batched_bifurcation_width,
-            batched_bifurcation_length=self.bifurcation.batched_bifurcation_length,
-            batched_bifurcation_elevation=self.bifurcation.batched_bifurcation_elevation,
+            batched_bifurcation_manning=self.bifurcation.is_batched('bifurcation_manning'),
+            batched_bifurcation_width=self.bifurcation.is_batched('bifurcation_width'),
+            batched_bifurcation_length=self.bifurcation.is_batched('bifurcation_length'),
+            batched_bifurcation_elevation=self.bifurcation.is_batched('bifurcation_elevation'),
         )
         if self.levee_flag:
             kw['protected_water_surface_elevation_ptr'] = self.base.protected_water_surface_elevation
@@ -321,8 +337,12 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             river_inflow_ptr=self.base.river_inflow,
             flood_inflow_ptr=self.base.flood_inflow,
             limit_rate_ptr=self.base.limit_rate,
-            reservoir_total_inflow_ptr=self.base.reservoir_total_inflow,
-            is_reservoir_ptr=self.base.is_reservoir,
+            reservoir_total_inflow_ptr=(
+                self.reservoir.reservoir_total_inflow if self.reservoir_flag else None
+            ),
+            is_reservoir_ptr=(
+                self.reservoir.is_reservoir if self.reservoir_flag else None
+            ),
             num_catchments=self.base.num_catchments,
             HAS_RESERVOIR=self.reservoir_flag,
             BLOCK_SIZE=self.BLOCK_SIZE,
@@ -352,6 +372,17 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             river_outflow_ptr=self.base.river_outflow,
             flood_outflow_ptr=self.base.flood_outflow,
             global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+            inflow_ptr=(
+                self.inflow.gauge_inflow
+                if self.inflow is not None else None
+            ),
+            catchment_inflow_idx_ptr=(
+                self.inflow.catchment_inflow_idx
+                if self.inflow is not None else None
+            ),
+            num_inflow_gauges=(
+                self.inflow.num_inflow_gauges if self.inflow is not None else 0
+            ),
             outgoing_storage_ptr=self.base.outgoing_storage,
             river_storage_ptr=self.base.river_storage,
             flood_storage_ptr=self.base.flood_storage,
@@ -370,12 +401,13 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             num_flood_levels=self.base.num_flood_levels,
             BLOCK_SIZE=self.BLOCK_SIZE,
             HAS_BIFURCATION=self.bifurcation_flag,
+            HAS_INFLOW=self.inflow is not None,
             num_trials=self.num_trials,
-            batched_river_height=self.base.batched_river_height,
-            batched_flood_depth_table=self.base.batched_flood_depth_table,
-            batched_catchment_area=self.base.batched_catchment_area,
-            batched_river_width=self.base.batched_river_width,
-            batched_river_length=self.base.batched_river_length,
+            batched_river_height=self.base.is_batched('river_height'),
+            batched_flood_depth_table=self.base.is_batched('flood_depth_table'),
+            batched_catchment_area=self.base.is_batched('catchment_area'),
+            batched_river_width=self.base.is_batched('river_width'),
+            batched_river_length=self.base.is_batched('river_length'),
         )
 
     @cached_property
@@ -386,6 +418,17 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             river_outflow_ptr=self.base.river_outflow,
             flood_outflow_ptr=self.base.flood_outflow,
             global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
+            inflow_ptr=(
+                self.inflow.gauge_inflow
+                if self.inflow is not None else None
+            ),
+            catchment_inflow_idx_ptr=(
+                self.inflow.catchment_inflow_idx
+                if self.inflow is not None else None
+            ),
+            num_inflow_gauges=(
+                self.inflow.num_inflow_gauges if self.inflow is not None else 0
+            ),
             outgoing_storage_ptr=self.base.outgoing_storage,
             river_storage_ptr=self.base.river_storage,
             flood_storage_ptr=self.base.flood_storage,
@@ -399,7 +442,10 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             catchment_area_ptr=self.base.catchment_area,
             river_width_ptr=self.base.river_width,
             river_length_ptr=self.base.river_length,
-            is_levee_ptr=self.base.is_levee,
+            is_levee_ptr=(
+                self.levee.is_levee
+                if self.levee_flag else None
+            ),
             log_sums_ptr=self.log.log_sums,
             num_catchments=self.base.num_catchments,
             time_step_ptr=self.base.time_step,
@@ -408,6 +454,8 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             log_buffer_size=self.log.log_buffer_size,
             BLOCK_SIZE=self.BLOCK_SIZE,
             HAS_BIFURCATION=self.bifurcation_flag,
+            HAS_INFLOW=self.inflow is not None,
+            HAS_LEVEE=self.levee_flag,
         )
 
     @cached_property
@@ -429,19 +477,19 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             levee_crown_height_ptr=self.levee.levee_crown_height,
             levee_fraction_ptr=self.levee.levee_fraction,
             flood_fraction_ptr=self.base.flood_fraction,
-            num_levees=self.base.num_levees,
+            num_levees=self.levee.num_levees,
             num_flood_levels=self.base.num_flood_levels,
             BLOCK_SIZE=self.BLOCK_SIZE,
             num_trials=self.num_trials,
             num_catchments=self.base.num_catchments,
-            batched_river_height=self.base.batched_river_height,
-            batched_flood_depth_table=self.base.batched_flood_depth_table,
-            batched_catchment_area=self.base.batched_catchment_area,
-            batched_river_width=self.base.batched_river_width,
-            batched_river_length=self.base.batched_river_length,
-            batched_levee_base_height=self.levee.batched_levee_base_height,
-            batched_levee_crown_height=self.levee.batched_levee_crown_height,
-            batched_levee_fraction=self.levee.batched_levee_fraction,
+            batched_river_height=self.base.is_batched('river_height'),
+            batched_flood_depth_table=self.base.is_batched('flood_depth_table'),
+            batched_catchment_area=self.base.is_batched('catchment_area'),
+            batched_river_width=self.base.is_batched('river_width'),
+            batched_river_length=self.base.is_batched('river_length'),
+            batched_levee_base_height=self.levee.is_batched('levee_base_height'),
+            batched_levee_crown_height=self.levee.is_batched('levee_crown_height'),
+            batched_levee_fraction=self.levee.is_batched('levee_fraction'),
         )
 
     @cached_property
@@ -464,7 +512,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             levee_fraction_ptr=self.levee.levee_fraction,
             flood_fraction_ptr=self.base.flood_fraction,
             log_sums_ptr=self.log.log_sums,
-            num_levees=self.base.num_levees,
+            num_levees=self.levee.num_levees,
             current_step_ptr=self.base.current_step,
             num_flood_levels=self.base.num_flood_levels,
             log_buffer_size=self.log.log_buffer_size,
@@ -476,7 +524,9 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         return partial(compute_adaptive_time_step,
             river_depth_ptr=self.base.river_depth,
             downstream_distance_ptr=self.base.downstream_distance,
-            is_dam_related_ptr=self.base.is_dam_related,
+            is_dam_related_ptr=(
+                self.reservoir.is_dam_related if self.reservoir_flag else None
+            ),
             max_sub_steps_ptr=self.adaptive_time.max_sub_steps,
             adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
             gravity=self.base.gravity,
@@ -484,15 +534,15 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             BLOCK_SIZE=self.BLOCK_SIZE,
             HAS_RESERVOIR=self.reservoir_flag,
             num_trials=self.num_trials,
-            batched_downstream_distance=self.base.batched_downstream_distance,
+            batched_downstream_distance=self.base.is_batched('downstream_distance'),
         )
 
     # ------------------------------------------------------------------ #
     # CUDA Graph support (via CUDAGraphMixin)
     # ------------------------------------------------------------------ #
-    def cuda_graph_target(self, *, runoff, **kw):
+    def cuda_graph_target(self, **kw):
         """The kernel sequence captured into a CUDA Graph."""
-        self.do_one_sub_step(runoff, output_enabled=(self.log is not None))
+        self.do_one_sub_step(output_enabled=(self.log is not None))
 
     # ------------------------------------------------------------------ #
     # Device-side sub-step march (CUDAGraphMixin conditional-graph helpers)
@@ -526,7 +576,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             current_step=self.base.current_step, continue_flag=s["continue_flag"],
             stream=stream_ptr,
         )
-        self.do_one_sub_step(s["runoff_buf"], output_enabled=(self.log is not None))
+        self.do_one_sub_step(output_enabled=(self.log is not None))
         if fold_stats:
             self.conditional_stats_body(
                 self._statistics_aggregator,
@@ -538,12 +588,12 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 stream_ptr=stream_ptr,
             )
 
-    def _get_device_march(self, runoff: torch.Tensor, fold: bool):
+    def _get_device_march(self, fold: bool):
         """Lazily allocate the march scalars + capture the per-interval graph.
 
         State lives in the model's ``_dm`` dict (no wrapper object):
         ``num_sub_steps`` (filled per interval), the loop ``counter`` /
-        ``continue_flag``, and the persistent ``runoff_buf``.
+        ``continue_flag``. Runoff lives in ``BaseModule.runoff``.
         """
         graph = self.__dict__.get("_device_march_graph")
         if graph is not None:
@@ -553,7 +603,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             "num_sub_steps": torch.zeros(1, device=dev, dtype=torch.int32),
             "counter": torch.zeros(1, device=dev, dtype=torch.int32),
             "continue_flag": torch.zeros(1, device=dev, dtype=torch.int32),
-            "runoff_buf": torch.zeros_like(runoff),
         }
         self.__dict__["_dm"] = s
 
@@ -571,18 +620,17 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         self.__dict__["_device_march_graph"] = graph
         return graph
 
-    def _run_device_march(self, runoff, num_sub_steps, flags, total_weight,
+    def _run_device_march(self, num_sub_steps, flags, total_weight,
                           time_sub_step, output_enabled) -> None:
         """March the whole interval on-device in one conditional-graph launch."""
         agg = self._statistics_aggregator
         run_stats = (output_enabled and agg is not None
                      and getattr(agg, "_aggregator_generated", False))
         fold = run_stats and self.conditional_stats_should_fold(agg)
-        graph = self._get_device_march(runoff, fold)
+        graph = self._get_device_march(fold)
         s = self._dm
         s["num_sub_steps"].fill_(num_sub_steps)
         s["counter"].zero_()
-        s["runoff_buf"].copy_(runoff)
         if fold:
             self.conditional_stats_prelaunch(agg, flags, total_weight)
         graph.launch(torch.cuda.current_stream(self.device).cuda_stream)
@@ -647,6 +695,8 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         time_step: float,
         default_num_sub_steps: int,
         current_time: Optional[Union[datetime, cftime.datetime]],
+        inflow: Optional[torch.Tensor] = None,
+        sea_surface_elevation: Optional[torch.Tensor] = None,
         stat_is_first: bool = True,
         stat_is_last: bool = True,
         stat_is_outer_first: Optional[bool] = None,
@@ -664,6 +714,11 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
 
         Args:
             runoff (torch.Tensor): Input runoff tensor for this time step.
+            inflow (torch.Tensor, optional): Compact prescribed discharge on
+                ``InflowModule.inflow_catchment_id``. It remains a separate
+                component until the primal physics boundary.
+            sea_surface_elevation (torch.Tensor, optional): Compact absolute
+                downstream water levels on ``SeaLevelModule.sea_level_catchment_id``.
             time_step (float): Duration of the time step (seconds).
             default_num_sub_steps (int): Default sub-steps if adaptive time stepping is disabled.
             current_time (Optional[datetime]): Current simulation time. Used for logging.
@@ -673,6 +728,41 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             stat_is_outer_last (bool, optional): Explicit end of outer window. Defaults to None.
         """
         self.execute_parameter_change_plan(current_time)
+
+        if runoff.shape != self.base.runoff.shape:
+            if not (
+                self.num_trials is not None
+                and runoff.shape == self.base.runoff.shape[1:]
+            ):
+                raise ValueError(
+                    f"runoff shape {tuple(runoff.shape)} does not match model forcing "
+                    f"shape {tuple(self.base.runoff.shape)}"
+                )
+        self.base.runoff.copy_(runoff)
+
+        # Bind dynamic forcing into the module-owned, address-stable buffer.
+        # The storage kernel injects it through catchment_inflow_idx; keeping
+        # the address fixed makes this safe for CUDA Graph capture/replay.
+        if self.inflow is not None:
+            if inflow is None:
+                self.inflow.gauge_inflow.zero_()
+            else:
+                self.inflow.gauge_inflow.copy_(inflow)
+        elif inflow is not None:
+            raise ValueError(
+                "inflow forcing was provided but InflowModule is not opened"
+            )
+
+        if self.sea_level is not None:
+            if sea_surface_elevation is None:
+                raise ValueError(
+                    "SeaLevelModule is opened but sea_surface_elevation was not provided"
+                )
+            self.sea_level.sea_surface_elevation.copy_(sea_surface_elevation)
+        elif sea_surface_elevation is not None:
+            raise ValueError(
+                "sea_surface_elevation was provided but SeaLevelModule is not opened"
+            )
 
         # Handle defaults for outer stats (default to False, only running inner stats)
         if stat_is_outer_first is None:
@@ -738,7 +828,7 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                         and self.conditional_stats_device_compatible(
                             self._statistics_aggregator))
         if device_march:
-            self._run_device_march(runoff, num_sub_steps, flags, total_weight,
+            self._run_device_march(num_sub_steps, flags, total_weight,
                                    time_sub_step, output_enabled)
         else:
             # ------------------------------------------------------------------ #
@@ -746,9 +836,9 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             # ------------------------------------------------------------------ #
             self.base.current_step.fill_(0)
             if self.cuda_graph_enabled:
-                self.cuda_graph_replay(cache_key=0, runoff=runoff)
+                self.cuda_graph_replay(cache_key=0)
             else:
-                self.do_one_sub_step(runoff, output_enabled)
+                self.do_one_sub_step(output_enabled=output_enabled)
             self._stats_elapsed_time += time_sub_step
 
             if output_enabled:
@@ -827,12 +917,9 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                     for sub_step in range(1, num_sub_steps):
                         self.base.current_step.fill_(sub_step)
                         if self.cuda_graph_enabled:
-                            self.cuda_graph_replay(
-                                cache_key=0,
-                                runoff=runoff,
-                            )
+                            self.cuda_graph_replay(cache_key=0)
                         else:
-                            self.do_one_sub_step(runoff, output_enabled)
+                            self.do_one_sub_step(output_enabled=output_enabled)
                         self._stats_elapsed_time += time_sub_step
                         if output_enabled:
                             self.update_statistics(
@@ -867,27 +954,67 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
             print(f"\r\033[K{msg}", end="", flush=True)
             
-    def do_one_sub_step(self, runoff: torch.Tensor, output_enabled: bool = True) -> None:
+    def do_one_sub_step(self, output_enabled: bool = True) -> None:
         """Execute one sub time step calculation."""
+        if KERNEL_BACKEND == "metal":
+            self._replay_metal_sub_step(output_enabled)
+            return
+        self._do_one_sub_step_impl(output_enabled)
+
+    def _replay_metal_sub_step(
+        self, output_enabled: bool,
+    ) -> None:
+        """Replay the fixed-address Metal sub-step ICB."""
+        from hydroforge.runtime.metal_kernel import (
+            MetalCommandSequence,
+            record_metal_commands,
+        )
+
+        key = bool(output_enabled)
+
+        graph = self._metal_substep_graphs.get(key)
+        if graph is None:
+            sequence = MetalCommandSequence()
+            with record_metal_commands(sequence):
+                self._do_one_sub_step_impl(output_enabled)
+            graph = sequence.capture()
+            self._metal_substep_graphs[key] = graph
+        graph.replay()
+
+    def _do_one_sub_step_impl(
+        self, output_enabled: bool = True,
+    ) -> None:
+        """Encode the backend kernels forming one sub time step."""
+        def stage_barrier() -> None:
+            if KERNEL_BACKEND == "metal":
+                from hydroforge.runtime.metal_kernel import mark_metal_barrier
+                mark_metal_barrier()
+
         self._call_outflow()
+        stage_barrier()
 
         if self.reservoir_flag:
-            self._call_reservoir_outflow(runoff_ptr=runoff)
+            self._call_reservoir_outflow(runoff_ptr=self.base.runoff)
 
         if self.bifurcation_flag:
             self._call_bif_outflow()
+
+        if self.reservoir_flag or self.bifurcation_flag:
+            stage_barrier()
 
         self._call_inflow()
 
         if self.bifurcation_flag:
             self._call_bif_inflow()
 
+        stage_barrier()
+
         if self.log is not None and output_enabled and compute_flood_stage_log is not None and self.num_trials is None:
-            self._call_flood_stage_log(runoff_ptr=runoff)
+            self._call_flood_stage_log(runoff_ptr=self.base.runoff)
         else:
             self._call_flood_stage(
-                runoff_ptr=runoff,
-                batched_runoff=(runoff.ndim > 1 and runoff.shape[0] == (self.num_trials or 0)),
+                runoff_ptr=self.base.runoff,
+                batched_runoff=self.num_trials is not None,
             )
 
         if self.levee_flag:
@@ -895,3 +1022,6 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
                 self._call_levee_stage_log()
             else:
                 self._call_levee_stage()
+
+        # Separate the final state writes from the next ICB replay.
+        stage_barrier()

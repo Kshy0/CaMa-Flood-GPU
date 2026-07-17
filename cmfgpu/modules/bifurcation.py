@@ -11,13 +11,14 @@ for concise tensor metadata.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Optional, Tuple
 
 import torch
-from hydroforge.modeling.distributed import find_indices_in_torch
-from hydroforge.modeling.module import (AbstractModule, TensorField,
+from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+                                        ReferenceField, ReferenceIndexField,
+                                        SelectionField, TensorField,
                                         computed_tensor_field)
-from pydantic import Field, computed_field, model_validator
+from pydantic import Field, computed_field
 
 from cmfgpu.modules.base import BaseModule
 
@@ -26,9 +27,6 @@ def BifurcationField(
     description: str,
     shape: Tuple[str, ...] = ("num_bifurcation_paths",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    group_by: Optional[str] = "bifurcation_basin_id",
-    save_idx: Optional[str] = "bifurcation_path_save_idx",
-    save_coord: Optional[str] = "bifurcation_path_save_id",
     dim_coords: Optional[str] = "bifurcation_path_id",
     category: Literal["topology", "param", "init_state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
@@ -38,9 +36,6 @@ def BifurcationField(
         description=description,
         shape=shape,
         dtype=dtype,
-        group_by=group_by,
-        save_idx=save_idx,
-        save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
         mode=mode,
@@ -51,8 +46,6 @@ def computed_bifurcation_field(
     description: str,
     shape: Tuple[str, ...] = ("num_bifurcation_paths",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    save_idx: Optional[str] = "bifurcation_path_save_idx",
-    save_coord: Optional[str] = "bifurcation_path_save_id",
     dim_coords: Optional[str] = "bifurcation_path_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
@@ -62,8 +55,6 @@ def computed_bifurcation_field(
         description=description,
         shape=shape,
         dtype=dtype,
-        save_idx=save_idx,
-        save_coord=save_coord,
         dim_coords=dim_coords,
         category=category,
         expr=expr,
@@ -78,8 +69,7 @@ class BifurcationModule(AbstractModule):
     description: ClassVar[str] = "Bifurcation flow module with multi-level channel calculations"
     dependencies: ClassVar[list] = ["base"]
 
-    base: Optional[BaseModule] = Field(
-        default=None,
+    base: BaseModule = Field(
         exclude=True,
         description="Reference to BaseModule",
     )
@@ -87,50 +77,39 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # IDs
     # ------------------------------------------------------------------ #
-    bifurcation_path_id: torch.Tensor = BifurcationField(
+    bifurcation_path_id: torch.Tensor = CoordinateField(
         description="Unique ID for each bifurcation path (used to distinguish paths for identification in saved results)",
         dtype="int",
-        category="topology",
-        mode="cpu",
-        is_key=True,
-    )
-
-    bifurcation_basin_id: torch.Tensor = BifurcationField(
-        description="Basin ID for each bifurcation path (used to group paths by basin)",
-        dtype="int",
-        category="topology",
-        mode="cpu",
+        shape=("num_bifurcation_paths",),
+        partition_by="bifurcation_catchment_id",
     )
 
     # ------------------------------------------------------------------ #
     # Bifurcation topology
     # ------------------------------------------------------------------ #
-    bifurcation_path_save_id: Optional[torch.Tensor] = BifurcationField(
+    output_bifurcation_path_id: Optional[torch.Tensor] = SelectionField(
         description="Bifurcation path IDs to save in output. "
                     "None means save all paths.",
         dtype="int",
-        group_by=None,
-        save_idx=None,
-        save_coord=None,
-        dim_coords=None,
-        shape=("num_saved_bifurcation_paths",),
+        shape=("num_output_bifurcation_paths",),
+        selects="bifurcation_path_id",
         default=None,
-        category="topology",
-        mode="cpu",
     )
 
-    bifurcation_catchment_id: torch.Tensor = BifurcationField(
+    bifurcation_catchment_id: torch.Tensor = ReferenceField(
         description="Upstream catchment IDs for each bifurcation path",
         dtype="int",
-        category="topology",
-        mode="cpu",
+        shape=("num_bifurcation_paths",),
+        dim_coords="bifurcation_path_id",
+        references="catchment_id",
     )
 
-    bifurcation_downstream_id: torch.Tensor = BifurcationField(
+    bifurcation_downstream_id: torch.Tensor = ReferenceField(
         description="Downstream catchment IDs for each bifurcation path",
         dtype="int",
-        category="topology",
-        mode="cpu",
+        shape=("num_bifurcation_paths",),
+        dim_coords="bifurcation_path_id",
+        references="catchment_id",
     )
 
     # ------------------------------------------------------------------ #
@@ -180,37 +159,12 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed tensor indices
     # ------------------------------------------------------------------ #
-    @computed_bifurcation_field(
-        description="Indices of upstream catchments for each bifurcation path",
-        dtype="idx",
-        category="topology",
+    bifurcation_catchment_idx = ReferenceIndexField(
+        "bifurcation_catchment_id",
     )
-    @cached_property
-    def bifurcation_catchment_idx(self) -> torch.Tensor:
-        assert self.base is not None
-        return find_indices_in_torch(self.bifurcation_catchment_id, self.base.catchment_id)
-
-    @computed_bifurcation_field(
-        description="Indices of downstream catchments for each bifurcation path",
-        dtype="idx",
-        category="topology",
+    bifurcation_downstream_idx = ReferenceIndexField(
+        "bifurcation_downstream_id",
     )
-    @cached_property
-    def bifurcation_downstream_idx(self) -> torch.Tensor:
-        assert self.base is not None
-        return find_indices_in_torch(self.bifurcation_downstream_id, self.base.catchment_id)
-
-    @computed_bifurcation_field(
-        description="Indices of bifurcation paths to save in output",
-        shape=("num_saved_bifurcation_paths",),
-        dtype="idx",
-        category="topology",
-    )
-    @cached_property
-    def bifurcation_path_save_idx(self) -> Optional[torch.Tensor]:
-        if self.bifurcation_path_save_id is None:
-            return None
-        return find_indices_in_torch(self.bifurcation_path_save_id, self.bifurcation_path_id)
 
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
@@ -219,10 +173,10 @@ class BifurcationModule(AbstractModule):
         description="Number of paths saved in output."
     )
     @cached_property
-    def num_saved_bifurcation_paths(self) -> int:
-        if self.bifurcation_path_save_id is None:
+    def num_output_bifurcation_paths(self) -> int:
+        if self.output_bifurcation_path_id is None:
             return self.num_bifurcation_paths
-        return self.bifurcation_path_save_id.shape[0]
+        return self.output_bifurcation_path_id.shape[0]
 
     @computed_field(
         description="Total number of bifurcation paths."
@@ -238,70 +192,6 @@ class BifurcationModule(AbstractModule):
     def num_bifurcation_levels(self) -> int:
         return self.bifurcation_width.shape[1]
 
-    @computed_field(
-        description="Total number of catchments in the domain."
-    )
-    @cached_property
-    def num_catchments(self) -> int:
-        assert self.base is not None
-        return self.base.catchment_id.shape[0]
-
     # ------------------------------------------------------------------ #
     # Validators
     # ------------------------------------------------------------------ #
-    @model_validator(mode="after")
-    def validate_bifurcation_path_save_idx(self) -> Self:
-        if self.bifurcation_path_save_idx is not None:
-            if not torch.all(
-                (self.bifurcation_path_save_idx >= 0)
-                & (self.bifurcation_path_save_idx < self.num_bifurcation_paths)
-            ):
-                raise ValueError("bifurcation_path_save_id contains entries absent from bifurcation_path_id")
-        return self
-
-    @model_validator(mode="after")
-    def validate_bifurcation_catchment_idx(self) -> Self:
-        if not torch.all(
-            (self.bifurcation_catchment_idx >= 0)
-            & (self.bifurcation_catchment_idx < self.num_catchments)
-        ):
-            raise ValueError("bifurcation_catchment_idx contains invalid indices")
-        return self
-
-    @model_validator(mode="after")
-    def validate_bifurcation_downstream_idx(self) -> Self:
-        if not torch.all(
-            (self.bifurcation_downstream_idx >= 0)
-            & (self.bifurcation_downstream_idx < self.num_catchments)
-        ):
-            raise ValueError("bifurcation_downstream_idx contains invalid indices")
-        return self
-
-    @model_validator(mode="after")
-    def validate_num_bifurcation_paths(self) -> Self:
-        if self.num_bifurcation_paths <= 0:
-            raise ValueError("num_bifurcation_paths must be positive")
-        return self
-
-    # ------------------------------------------------------------------ #
-    # Batched flags
-    # ------------------------------------------------------------------ #
-    @computed_field
-    @cached_property
-    def batched_bifurcation_manning(self) -> bool:
-        return self._is_batched(self.bifurcation_manning)
-
-    @computed_field
-    @cached_property
-    def batched_bifurcation_width(self) -> bool:
-        return self._is_batched(self.bifurcation_width)
-
-    @computed_field
-    @cached_property
-    def batched_bifurcation_length(self) -> bool:
-        return self._is_batched(self.bifurcation_length)
-
-    @computed_field
-    @cached_property
-    def batched_bifurcation_elevation(self) -> bool:
-        return self._is_batched(self.bifurcation_elevation)

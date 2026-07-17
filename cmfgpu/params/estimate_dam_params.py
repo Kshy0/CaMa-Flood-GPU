@@ -425,7 +425,7 @@ def _deduplicate_dams(
             cid_to_indices[int(cid)].append(i)
 
     n_removed = 0
-    for cid, indices in cid_to_indices.items():
+    for indices in cid_to_indices.values():
         if len(indices) <= 1:
             continue
         caps = cap_mcm[indices]
@@ -662,19 +662,11 @@ def _write_dam_to_nc(
     """Append / update reservoir variables in an existing parameters.nc.
 
     Variables written (reservoir-indexed):
-        reservoir_id, reservoir_catchment_id, reservoir_basin_id,
+        reservoir_id, reservoir_catchment_id,
         reservoir_capacity, conservation_volume, emergency_volume,
         normal_outflow, flood_control_outflow, reservoir_area.
     """
     n_res = len(dam_ids)
-
-    # Map dam catchment IDs → basin IDs
-    with Dataset(str(nc_path), "r") as ds:
-        all_cids = np.asarray(ds.variables["catchment_id"][:]).astype(np.int64)
-        all_basins = np.asarray(ds.variables["catchment_basin_id"][:]).astype(np.int64)
-
-    dam_idx_in_param = find_indices_in(dam_cids, all_cids)
-    dam_basin_id = all_basins[dam_idx_in_param]
 
     # Emergency volume = ConVol + FldVol * 0.95.
     eme_vol = con_vol_m3 + fld_vol_m3 * 0.95
@@ -682,8 +674,12 @@ def _write_dam_to_nc(
     with Dataset(str(nc_path), "r+") as ds:
         # Create reservoir dimension (replace if already exists)
         if "reservoir" in ds.dimensions:
-            # Cannot resize — must recreate variables
-            pass
+            existing = len(ds.dimensions["reservoir"])
+            if existing != n_res:
+                raise ValueError(
+                    f"Existing reservoir dimension has size {existing}, "
+                    f"but {n_res} reservoirs were provided"
+                )
         else:
             ds.createDimension("reservoir", n_res)
 
@@ -707,9 +703,6 @@ def _write_dam_to_nc(
         _put("reservoir_catchment_id",
              dam_cids, "i8",
              long_name="catchment id of this reservoir")
-        _put("reservoir_basin_id",
-             dam_basin_id, "i8",
-             long_name="basin id of this reservoir")
         _put("reservoir_capacity",
              tot_vol_m3, "f8", "m3",
              "total reservoir capacity")

@@ -36,10 +36,11 @@ def _load_or_build(name, cpp, src, cflags, funcs):
 @functools.lru_cache(maxsize=1)
 def _ext():
     cpp = (
-        "void launch_flood_stage(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
+        "void launch_flood_stage(at::Tensor,at::Tensor,at::Tensor,at::Tensor,c10::optional<at::Tensor>,"
+        "at::Tensor,c10::optional<at::Tensor>,c10::optional<at::Tensor>,"
         "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
         "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,long,long,long,long);\n"
+        "long,long,long,long,long);\n"
     )
     src = (_DIR / "storage.cu").read_text()
     return _load_or_build(f"{_MODULE_PREFIX}_storage", cpp, src, ["-O3", "--use_fast_math"],
@@ -58,10 +59,10 @@ def _ext_outflow():
         "void launch_outflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
         "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
         "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "double,at::Tensor,long,long,at::Tensor,long,double,long);\n"
+        "at::Tensor,at::Tensor,c10::optional<at::Tensor>,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
+        "double,at::Tensor,long,long,c10::optional<at::Tensor>,long,double,c10::optional<at::Tensor>,c10::optional<at::Tensor>,long,long);\n"
         "void launch_inflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,long,long,long);\n"
+        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,c10::optional<at::Tensor>,c10::optional<at::Tensor>,long,long,long);\n"
     )
     return _load_or_build(f"{_MODULE_PREFIX}_outflow", cpp, src, ["-O3", "--use_fast_math"],
                           ["launch_outflow", "launch_inflow"])
@@ -71,7 +72,7 @@ def _ext_outflow():
 def _ext_adaptive():
     src = (_DIR / "adaptive_time.cu").read_text()
     cpp = (
-        "void launch_adaptive_time(at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
+        "void launch_adaptive_time(at::Tensor,at::Tensor,c10::optional<at::Tensor>,at::Tensor,"
         "double,double,double,long,long,long);\n"
     )
     return _load_or_build(f"{_MODULE_PREFIX}_adaptive", cpp, src, ["-O3", "--use_fast_math"],
@@ -170,59 +171,12 @@ def precompile_cuda_extensions():
     return precompile_extension_builders(__name__, _EXTENSION_BUILDERS)
 
 
-# Cached zero-element placeholders for absent optional pointers.  These are
-# device-constant, so allocating them once (instead of every dispatch call)
-# removes ~16us/sub-step of aten::empty overhead from the hot loop.
-_PLACEHOLDER_CACHE: dict = {}
-
-
-def _ph_double(ref):
-    import torch
-    key = ("d", ref.device)
-    t = _PLACEHOLDER_CACHE.get(key)
-    if t is None:
-        t = torch.empty(0, dtype=torch.float64, device=ref.device)
-        _PLACEHOLDER_CACHE[key] = t
-    return t
-
-
-def _ph_float0(ref):
-    import torch
-    key = ("f0", ref.device)
-    t = _PLACEHOLDER_CACHE.get(key)
-    if t is None:
-        t = torch.empty(0, dtype=torch.float32, device=ref.device)
-        _PLACEHOLDER_CACHE[key] = t
-    return t
-
-
-def _ph_bool(ref):
-    import torch
-    key = ("b", ref.device)
-    t = _PLACEHOLDER_CACHE.get(key)
-    if t is None:
-        t = torch.empty(0, dtype=torch.bool, device=ref.device)
-        _PLACEHOLDER_CACHE[key] = t
-    return t
-
-
-def _ph_runoff(ref, n):
-    """Cached zero runoff buffer (read-only in the kernels, so sharing is safe)."""
-    import torch
-    key = ("runoff", ref.device, n)
-    t = _PLACEHOLDER_CACHE.get(key)
-    if t is None:
-        t = torch.zeros(n, dtype=torch.float32, device=ref.device)
-        _PLACEHOLDER_CACHE[key] = t
-    return t
-
-
 def compute_flood_stage(**kw):
     """Dispatch the fused storage-update + flood-stage CUDA kernel.
 
     Accepts the same kwargs as the Triton ``compute_flood_stage`` dispatcher.
     Optional pointers (``global_bifurcation_outflow_ptr`` when bifurcation is
-    off) may be ``None``; a zero-element placeholder is substituted.
+    off) may be ``None`` and is passed as a native optional tensor.
     """
     _ensure_precompiled()
     ext = _ext()
@@ -233,24 +187,26 @@ def compute_flood_stage(**kw):
 
     river_outflow = kw["river_outflow_ptr"]
     gbif = kw.get("global_bifurcation_outflow_ptr")
-    if gbif is None:
-        gbif = _ph_double(river_outflow)
-        has_bif = 0
-    runoff = kw.get("runoff_ptr")
-    if runoff is None:
-        runoff = _ph_runoff(river_outflow, num_catchments)
+    if has_bif and gbif is None:
+        raise ValueError("HAS_BIFURCATION requires global_bifurcation_outflow_ptr")
+    runoff = kw["runoff_ptr"]
+    has_inflow = 1 if kw.get("HAS_INFLOW", False) else 0
+    inflow = kw.get("inflow_ptr")
+    catchment_inflow_idx = kw.get("catchment_inflow_idx_ptr")
+    if has_inflow and (inflow is None or catchment_inflow_idx is None):
+        raise ValueError("HAS_INFLOW requires inflow_ptr and catchment_inflow_idx_ptr")
 
     ext.launch_flood_stage(
         kw["river_inflow_ptr"], kw["flood_inflow_ptr"],
         river_outflow, kw["flood_outflow_ptr"],
-        gbif, runoff, kw["time_step_ptr"],
+        gbif, runoff, inflow, catchment_inflow_idx, kw["time_step_ptr"],
         kw["outgoing_storage_ptr"],
         kw["river_storage_ptr"], kw["flood_storage_ptr"], kw["protected_storage_ptr"],
         kw["river_depth_ptr"], kw["flood_depth_ptr"], kw["protected_depth_ptr"],
         kw["flood_fraction_ptr"],
         kw["river_height_ptr"], kw["flood_depth_table_ptr"],
         kw["catchment_area_ptr"], kw["river_width_ptr"], kw["river_length_ptr"],
-        num_catchments, num_flood_levels, has_bif, block,
+        num_catchments, num_flood_levels, has_bif, has_inflow, block,
     )
 
 
@@ -263,8 +219,7 @@ def compute_outflow(**kw):
 
     Accepts the same kwargs as the Triton ``compute_outflow`` dispatcher.
     ``global_bifurcation_outflow_ptr`` may be ``None`` (bifurcation off) and
-    ``is_dam_upstream_ptr`` may be ``None`` (reservoir off); zero-element
-    placeholders are substituted and the corresponding flag cleared.
+    ``is_dam_upstream_ptr`` may be ``None`` when its module is disabled.
     """
     _ensure_precompiled()
     ext = _ext_outflow()
@@ -272,16 +227,22 @@ def compute_outflow(**kw):
     num_catchments = int(kw["num_catchments"])
     has_bif = 1 if kw.get("HAS_BIFURCATION", True) else 0
     has_res = 1 if kw.get("HAS_RESERVOIR", False) else 0
+    has_sea = 1 if kw.get("HAS_SEA_LEVEL", False) else 0
 
     river_outflow = kw["river_outflow_ptr"]
     gbif = kw.get("global_bifurcation_outflow_ptr")
-    if gbif is None:
-        gbif = _ph_double(river_outflow)
-        has_bif = 0
+    if has_bif and gbif is None:
+        raise ValueError("HAS_BIFURCATION requires global_bifurcation_outflow_ptr")
     is_dam_up = kw.get("is_dam_upstream_ptr")
-    if is_dam_up is None:
-        is_dam_up = _ph_bool(river_outflow)
-        has_res = 0
+    if has_res and is_dam_up is None:
+        raise ValueError("HAS_RESERVOIR requires is_dam_upstream_ptr")
+    sea_surface = kw.get("sea_surface_elevation_ptr")
+    sea_idx = kw.get("catchment_sea_level_idx_ptr")
+    if has_sea and (sea_surface is None or sea_idx is None):
+        raise ValueError(
+            "HAS_SEA_LEVEL requires sea_surface_elevation_ptr and "
+            "catchment_sea_level_idx_ptr"
+        )
 
     ext.launch_outflow(
         kw["downstream_idx_ptr"],
@@ -299,6 +260,8 @@ def compute_outflow(**kw):
         kw["gravity"], kw["time_step_ptr"],
         num_catchments, has_bif,
         is_dam_up, has_res, kw.get("MIN_KINEMATIC_SLOPE", 1.0e-5),
+        sea_surface, sea_idx,
+        has_sea,
         block,
     )
 
@@ -319,11 +282,10 @@ def compute_inflow(**kw):
     river_outflow = kw["river_outflow_ptr"]
     res_inflow = kw.get("reservoir_total_inflow_ptr")
     is_res = kw.get("is_reservoir_ptr")
-    if res_inflow is None:
-        res_inflow = _ph_double(river_outflow)
-        has_res = 0
-    if is_res is None:
-        is_res = _ph_bool(river_outflow)
+    if has_res and (res_inflow is None or is_res is None):
+        raise ValueError(
+            "HAS_RESERVOIR requires reservoir_total_inflow_ptr and is_reservoir_ptr"
+        )
 
     ext.launch_inflow(
         kw["downstream_idx_ptr"],
@@ -348,9 +310,8 @@ def compute_adaptive_time_step(**kw):
     has_res = 1 if kw.get("HAS_RESERVOIR", False) else 0
     river_depth = kw["river_depth_ptr"]
     is_dam = kw.get("is_dam_related_ptr")
-    if is_dam is None:
-        is_dam = _ph_bool(river_depth)
-        has_res = 0
+    if has_res and is_dam is None:
+        raise ValueError("HAS_RESERVOIR requires is_dam_related_ptr")
     ext.launch_adaptive_time(
         river_depth, kw["downstream_distance_ptr"], is_dam, kw["max_sub_steps_ptr"],
         kw["time_step"], kw["adaptive_time_factor"], kw["gravity"],
@@ -398,14 +359,11 @@ def compute_reservoir_outflow(**kw):
     ``runoff_ptr`` is supplied at call time (like flood-stage); the reservoir
     parameter arrays are reservoir-indexed.
     """
-    import torch
     _ensure_precompiled()
     ext = _ext_reservoir()
     block = int(kw.get("BLOCK_SIZE", 256))
     num_reservoirs = int(kw["num_reservoirs"])
-    runoff = kw.get("runoff_ptr")
-    if runoff is None:
-        runoff = _ph_runoff(kw["river_outflow_ptr"], 1)
+    runoff = kw["runoff_ptr"]
     ext.launch_reservoir_outflow(
         kw["reservoir_catchment_idx_ptr"], kw["downstream_idx_ptr"],
         kw["reservoir_total_inflow_ptr"], kw["river_outflow_ptr"], kw["flood_outflow_ptr"],

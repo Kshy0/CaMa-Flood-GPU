@@ -22,6 +22,8 @@ def compute_flood_stage_kernel(
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
+    inflow_ptr,                  # *f32: Compact prescribed inflow
+    catchment_inflow_idx_ptr,    # *i32: Catchment -> inflow gauge index
     time_step_ptr,                   # f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
@@ -43,6 +45,7 @@ def compute_flood_stage_kernel(
     num_flood_levels: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    HAS_INFLOW: tl.constexpr = False,
 ):
     # --- Block and lane indexing ---
     pid = tl.program_id(0)
@@ -61,6 +64,13 @@ def compute_flood_stage_kernel(
     if HAS_BIFURCATION:
         global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
+    inflow = 0.0
+    if HAS_INFLOW:
+        inflow_idx = tl.load(catchment_inflow_idx_ptr + offs, mask=mask, other=-1)
+        inflow = tl.load(
+            inflow_ptr + inflow_idx,
+            mask=mask & (inflow_idx >= 0), other=0.0,
+        )
 
     # Downcast hpfloat inputs to the active computation dtype.
     river_inflow = to_compute_dtype(river_inflow, river_outflow)
@@ -77,7 +87,11 @@ def compute_flood_stage_kernel(
         river_storage_updated
     )
     flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
-    total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+    total_storage = tl.maximum(
+        river_storage_updated + flood_storage_updated + protected_storage
+        + runoff * time_step + inflow * time_step,
+        0.0,
+    )
 
     # Keep flood-stage arithmetic in the active computation dtype.
     total_storage = to_compute_dtype(total_storage, river_outflow)
@@ -181,6 +195,8 @@ def compute_flood_stage_log_kernel(
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr,  # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
+    inflow_ptr,
+    catchment_inflow_idx_ptr,
     time_step_ptr,                   # f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
@@ -207,6 +223,8 @@ def compute_flood_stage_log_kernel(
     log_buffer_size: tl.constexpr = 1000,
     BLOCK_SIZE: tl.constexpr = 128,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    HAS_LEVEE: tl.constexpr = False,
+    HAS_INFLOW: tl.constexpr = False,
 ):
     # --- Block and lane indexing ---
     pid = tl.program_id(0)
@@ -215,8 +233,11 @@ def compute_flood_stage_log_kernel(
     time_step = tl.load(time_step_ptr)
     current_step = tl.load(current_step_ptr)
 
-    is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=True)
-    non_levee = ~is_levee
+    if HAS_LEVEE:
+        is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=True)
+        non_levee = ~is_levee
+    else:
+        non_levee = tl.full(offs.shape, True, tl.int1)
 
     # ---- 1. Storage update ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
@@ -227,6 +248,13 @@ def compute_flood_stage_log_kernel(
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
     flood_outflow = tl.load(flood_outflow_ptr + offs, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
+    inflow = 0.0
+    if HAS_INFLOW:
+        inflow_idx = tl.load(catchment_inflow_idx_ptr + offs, mask=mask, other=-1)
+        inflow = tl.load(
+            inflow_ptr + inflow_idx,
+            mask=mask & (inflow_idx >= 0), other=0.0,
+        )
     if HAS_BIFURCATION:
         global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     total_stage_pre = river_storage + flood_storage + protected_storage
@@ -249,13 +277,16 @@ def compute_flood_stage_log_kernel(
         river_storage_updated
     )
     flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
-    total_storage_next = river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step
+    total_storage_next = (
+        river_storage_updated + flood_storage_updated + protected_storage
+        + runoff * time_step + inflow * time_step
+    )
     tl.atomic_add(log_sums_ptr + 1 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, total_storage_next, 0)) * 1e-9)
-    total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+    total_storage = tl.maximum(total_storage_next, 0.0)
     tl.atomic_add(log_sums_ptr + 2 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, total_storage, 0)) * 1e-9)
-    tl.atomic_add(log_sums_ptr + 4 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, (river_inflow + flood_inflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 4 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, (river_inflow + flood_inflow + inflow) * time_step, 0)) * 1e-9)
     tl.atomic_add(log_sums_ptr + 5 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
-    tl.atomic_add(log_sums_ptr + 3 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff - river_outflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step, 0)) * 1e-9)
+    tl.atomic_add(log_sums_ptr + 3 * log_buffer_size + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff + inflow - river_outflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step, 0)) * 1e-9)
 
     # Keep flood-stage arithmetic in the active computation dtype.
     total_storage = to_compute_dtype(total_storage, river_outflow)
@@ -366,6 +397,8 @@ def compute_flood_stage_batched_kernel(
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
+    inflow_ptr,
+    catchment_inflow_idx_ptr,
     time_step_ptr,                   # f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
@@ -395,6 +428,8 @@ def compute_flood_stage_batched_kernel(
     batched_river_width: tl.constexpr,
     batched_river_length: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    HAS_INFLOW: tl.constexpr = False,
+    num_inflow_gauges: tl.constexpr = 0,
 ):
     # --- Loop-based batched kernel ---
     # Grid = cdiv(num_catchments, BLOCK_SIZE), each block loops over trials.
@@ -416,7 +451,6 @@ def compute_flood_stage_batched_kernel(
         river_length_shared = tl.load(river_length_ptr + offs, mask=mask)
     if not batched_runoff:
         runoff_shared = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
-
     # Pre-compute derived constants that don't change across trials
     if not batched_river_height and not batched_river_width and not batched_river_length:
         river_max_storage_shared = river_length_shared * river_width_shared * river_height_shared
@@ -441,6 +475,15 @@ def compute_flood_stage_batched_kernel(
             global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + idx, mask=mask, other=0.0)
 
         runoff = tl.load(runoff_ptr + idx, mask=mask, other=0.0) if batched_runoff else runoff_shared
+        inflow = 0.0
+        if HAS_INFLOW:
+            inflow_idx = tl.load(
+                catchment_inflow_idx_ptr + offs, mask=mask, other=-1,
+            )
+            inflow = tl.load(
+                inflow_ptr + t * num_inflow_gauges + inflow_idx,
+                mask=mask & (inflow_idx >= 0), other=0.0,
+            )
 
         # Downcast hpfloat
         river_inflow = to_compute_dtype(river_inflow, river_outflow)
@@ -448,7 +491,9 @@ def compute_flood_stage_batched_kernel(
         if HAS_BIFURCATION:
             global_bifurcation_outflow = to_compute_dtype(global_bifurcation_outflow, river_outflow)
 
-        river_storage_updated = river_storage + (river_inflow - river_outflow) * time_step
+        river_storage_updated = river_storage + (
+            river_inflow - river_outflow
+        ) * time_step
         flood_storage_updated = flood_storage + tl.where(river_storage_updated < 0.0, river_storage_updated, 0.0) + (flood_inflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step
         river_storage_updated = tl.maximum(river_storage_updated, 0.0)
         river_storage_updated = tl.where(
@@ -457,7 +502,11 @@ def compute_flood_stage_batched_kernel(
             river_storage_updated
         )
         flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
-        total_storage = tl.maximum(river_storage_updated + flood_storage_updated + protected_storage + runoff * time_step, 0.0)
+        total_storage = tl.maximum(
+            river_storage_updated + flood_storage_updated + protected_storage
+            + runoff * time_step + inflow * time_step,
+            0.0,
+        )
         total_storage = to_compute_dtype(total_storage, river_outflow)
 
         # ---- 2. Flood stage computation ----

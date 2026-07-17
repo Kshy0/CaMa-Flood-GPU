@@ -39,7 +39,7 @@ Kang, S., Yin, J., & Yamazaki, D. (2026). CaMa-Flood-GPU: A GPU-based hydrodynam
 ## Prerequisites
 
 - Python == 3.14.*  
-- PyTorch (with CUDA support) == 2.12.1+cu132 — `triton` ships automatically with PyTorch on supported systems
+- PyTorch (with CUDA support) == 2.13.0+cu132 — `triton` ships automatically with PyTorch on supported systems
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4

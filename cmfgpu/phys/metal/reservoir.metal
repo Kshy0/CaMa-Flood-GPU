@@ -6,28 +6,50 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct compute_reservoir_outflow_args {
+    device int* reservoir_catchment_idx_buf [[id(0)]];
+    device int* downstream_idx_buf [[id(1)]];
+    device atomic_float* reservoir_total_inflow_buf [[id(2)]];
+    device float* river_outflow_buf [[id(3)]];
+    device float* flood_outflow_buf [[id(4)]];
+    device float* river_storage_buf [[id(5)]];
+    device float* flood_storage_buf [[id(6)]];
+    device float* conservation_volume_buf [[id(7)]];
+    device float* emergency_volume_buf [[id(8)]];
+    device float* adjustment_volume_buf [[id(9)]];
+    device float* normal_outflow_buf [[id(10)]];
+    device float* adjustment_outflow_buf [[id(11)]];
+    device float* flood_control_outflow_buf [[id(12)]];
+    device float* runoff_buf [[id(13)]];
+    device float* total_storage_buf [[id(14)]];
+    device atomic_float* outgoing_storage_buf [[id(15)]];
+    constant float* time_step [[id(16)]];
+    constant int* num_reservoirs [[id(17)]];
+};
+
 kernel void compute_reservoir_outflow(
-    device int*           reservoir_catchment_idx_buf [[buffer(0)]],
-    device int*           downstream_idx_buf          [[buffer(1)]],
-    device atomic_float*  reservoir_total_inflow_buf  [[buffer(2)]],
-    device float*         river_outflow_buf           [[buffer(3)]],
-    device float*         flood_outflow_buf           [[buffer(4)]],
-    device float*         river_storage_buf           [[buffer(5)]],
-    device float*         flood_storage_buf           [[buffer(6)]],
-    device float*         conservation_volume_buf     [[buffer(7)]],
-    device float*         emergency_volume_buf        [[buffer(8)]],
-    device float*         adjustment_volume_buf       [[buffer(9)]],
-    device float*         normal_outflow_buf          [[buffer(10)]],
-    device float*         adjustment_outflow_buf      [[buffer(11)]],
-    device float*         flood_control_outflow_buf   [[buffer(12)]],
-    device float*         runoff_buf                  [[buffer(13)]],
-    device float*         total_storage_buf           [[buffer(14)]],
-    device atomic_float*  outgoing_storage_buf        [[buffer(15)]],
-    constant float&       time_step                   [[buffer(16)]],
-    constant int&         num_reservoirs              [[buffer(17)]],
+    constant compute_reservoir_outflow_args& args [[buffer(0)]],
     uint idx [[thread_position_in_grid]]
 )
 {
+    device int* reservoir_catchment_idx_buf = args.reservoir_catchment_idx_buf;
+    device int* downstream_idx_buf = args.downstream_idx_buf;
+    device atomic_float* reservoir_total_inflow_buf = args.reservoir_total_inflow_buf;
+    device float* river_outflow_buf = args.river_outflow_buf;
+    device float* flood_outflow_buf = args.flood_outflow_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* conservation_volume_buf = args.conservation_volume_buf;
+    device float* emergency_volume_buf = args.emergency_volume_buf;
+    device float* adjustment_volume_buf = args.adjustment_volume_buf;
+    device float* normal_outflow_buf = args.normal_outflow_buf;
+    device float* adjustment_outflow_buf = args.adjustment_outflow_buf;
+    device float* flood_control_outflow_buf = args.flood_control_outflow_buf;
+    device float* runoff_buf = args.runoff_buf;
+    device float* total_storage_buf = args.total_storage_buf;
+    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
+    const float time_step = *args.time_step;
+    const int num_reservoirs = *args.num_reservoirs;
     if ((int)idx >= num_reservoirs) return;
 
     // Index mapping
@@ -132,30 +154,54 @@ kernel void compute_reservoir_outflow(
 // =====================================================================
 // Batched reservoir outflow — flat grid num_reservoirs * num_trials
 // =====================================================================
+struct compute_reservoir_outflow_batched_args {
+    device int* reservoir_catchment_idx_buf [[id(0)]];
+    device int* downstream_idx_buf [[id(1)]];
+    device atomic_float* reservoir_total_inflow_buf [[id(2)]];
+    device float* river_outflow_buf [[id(3)]];
+    device float* flood_outflow_buf [[id(4)]];
+    device float* river_storage_buf [[id(5)]];
+    device float* flood_storage_buf [[id(6)]];
+    device float* conservation_volume_buf [[id(7)]];
+    device float* emergency_volume_buf [[id(8)]];
+    device float* adjustment_volume_buf [[id(9)]];
+    device float* normal_outflow_buf [[id(10)]];
+    device float* adjustment_outflow_buf [[id(11)]];
+    device float* flood_control_outflow_buf [[id(12)]];
+    device float* runoff_buf [[id(13)]];
+    device float* total_storage_buf [[id(14)]];
+    device atomic_float* outgoing_storage_buf [[id(15)]];
+    constant float* time_step [[id(16)]];
+    constant int* num_reservoirs [[id(17)]];
+    constant int* num_catchments [[id(18)]];
+    constant int* num_trials [[id(19)]];
+};
+
 kernel void compute_reservoir_outflow_batched(
-    device int*           reservoir_catchment_idx_buf [[buffer(0)]],
-    device int*           downstream_idx_buf          [[buffer(1)]],
-    device atomic_float*  reservoir_total_inflow_buf  [[buffer(2)]],
-    device float*         river_outflow_buf           [[buffer(3)]],
-    device float*         flood_outflow_buf           [[buffer(4)]],
-    device float*         river_storage_buf           [[buffer(5)]],
-    device float*         flood_storage_buf           [[buffer(6)]],
-    device float*         conservation_volume_buf     [[buffer(7)]],
-    device float*         emergency_volume_buf        [[buffer(8)]],
-    device float*         adjustment_volume_buf       [[buffer(9)]],
-    device float*         normal_outflow_buf          [[buffer(10)]],
-    device float*         adjustment_outflow_buf      [[buffer(11)]],
-    device float*         flood_control_outflow_buf   [[buffer(12)]],
-    device float*         runoff_buf                  [[buffer(13)]],
-    device float*         total_storage_buf           [[buffer(14)]],
-    device atomic_float*  outgoing_storage_buf        [[buffer(15)]],
-    constant float&       time_step                   [[buffer(16)]],
-    constant int&         num_reservoirs              [[buffer(17)]],
-    constant int&         num_catchments              [[buffer(18)]],
-    constant int&         num_trials                  [[buffer(19)]],
+    constant compute_reservoir_outflow_batched_args& args [[buffer(0)]],
     uint gid [[thread_position_in_grid]]
 )
 {
+    device int* reservoir_catchment_idx_buf = args.reservoir_catchment_idx_buf;
+    device int* downstream_idx_buf = args.downstream_idx_buf;
+    device atomic_float* reservoir_total_inflow_buf = args.reservoir_total_inflow_buf;
+    device float* river_outflow_buf = args.river_outflow_buf;
+    device float* flood_outflow_buf = args.flood_outflow_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* conservation_volume_buf = args.conservation_volume_buf;
+    device float* emergency_volume_buf = args.emergency_volume_buf;
+    device float* adjustment_volume_buf = args.adjustment_volume_buf;
+    device float* normal_outflow_buf = args.normal_outflow_buf;
+    device float* adjustment_outflow_buf = args.adjustment_outflow_buf;
+    device float* flood_control_outflow_buf = args.flood_control_outflow_buf;
+    device float* runoff_buf = args.runoff_buf;
+    device float* total_storage_buf = args.total_storage_buf;
+    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
+    const float time_step = *args.time_step;
+    const int num_reservoirs = *args.num_reservoirs;
+    const int num_catchments = *args.num_catchments;
+    const int num_trials = *args.num_trials;
     int total = num_reservoirs * num_trials;
     if ((int)gid >= total) return;
 

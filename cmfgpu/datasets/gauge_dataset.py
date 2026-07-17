@@ -125,7 +125,7 @@ class GaugeDataset(torch.utils.data.Dataset):
                 np.concatenate(([False], is_nan, [False])).astype(np.int8))
             starts = np.where(diff == 1)[0]
             ends = np.where(diff == -1)[0]
-            for s, e in zip(starts, ends):
+            for s, e in zip(starts, ends, strict=True):
                 if e - s > max_gap or s == 0 or e >= n_t:
                     continue
                 left, right = col[s - 1], col[e]
@@ -156,8 +156,8 @@ class GaugeDataset(torch.utils.data.Dataset):
             ``basin_shift_days`` : (N,) int64
                 Number of leading NaN days before the first contiguous
                 valid segment on the native observation axis.  Consumers
-                feed this to :meth:`~cmfgpu.modules.base.BaseModule.
-                catchment_shift_days` so that ExportedDataset / the
+                feed this to ``InflowModule.basin_shift_days`` so that
+                ExportedDataset / the
                 inflow overlay read the gauge series at
                 ``raw[t + shift[c], c]`` for simulation step *t*.
             ``valid_length_days`` : (N,) int64
@@ -167,7 +167,7 @@ class GaugeDataset(torch.utils.data.Dataset):
                 axis** (row *t* == calendar day *t*), NaN replaced by 0.
                 Not pre-shifted; ExportedDataset is responsible for
                 applying ``basin_shift_days`` at read time via the same
-                ``catchment_shift_days`` used for runoff.
+                gauge-axis ``basin_shift_days`` used for inflow.
         """
         self.interp_small_gaps(int(max_gap))
 

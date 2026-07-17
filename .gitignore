@@ -13,6 +13,7 @@ scripts_*/
 temp/
 inp/
 etc/
+web/
 fortran/
 *_cpu.py
 *cutile.py

@@ -6,45 +6,93 @@
 #include <metal_stdlib>
 using namespace metal;
 
+constant bool kHasBifurcation [[function_constant(0)]];
+constant bool kHasSeaLevel [[function_constant(1)]];
+constant bool kHasReservoir [[function_constant(2)]];
+constant bool kBatchedRiverManning [[function_constant(3)]];
+constant bool kBatchedFloodManning [[function_constant(4)]];
+constant bool kBatchedRiverWidth [[function_constant(5)]];
+constant bool kBatchedRiverLength [[function_constant(6)]];
+constant bool kBatchedRiverHeight [[function_constant(7)]];
+constant bool kBatchedCatchmentElevation [[function_constant(8)]];
+
 // =====================================================================
 // Outflow kernel — computes river/flood outflow via semi-implicit method
 // =====================================================================
-kernel void compute_outflow(
+struct compute_outflow_args {
     // Tensor buffers
-    device int*           downstream_idx_buf           [[buffer(0)]],
-    device float*         river_inflow_buf              [[buffer(1)]],
-    device float*         river_outflow_buf             [[buffer(2)]],
-    device float*         river_manning_buf             [[buffer(3)]],
-    device float*         river_depth_buf               [[buffer(4)]],
-    device float*         river_width_buf               [[buffer(5)]],
-    device float*         river_length_buf              [[buffer(6)]],
-    device float*         river_height_buf              [[buffer(7)]],
-    device float*         river_storage_buf             [[buffer(8)]],
-    device float*         flood_inflow_buf              [[buffer(9)]],
-    device float*         flood_outflow_buf             [[buffer(10)]],
-    device float*         flood_manning_buf             [[buffer(11)]],
-    device float*         flood_depth_buf               [[buffer(12)]],
-    device float*         protected_depth_buf           [[buffer(13)]],
-    device float*         catchment_elevation_buf       [[buffer(14)]],
-    device float*         downstream_distance_buf       [[buffer(15)]],
-    device float*         flood_storage_buf             [[buffer(16)]],
-    device float*         protected_storage_buf         [[buffer(17)]],
-    device float*         river_cross_section_depth_buf [[buffer(18)]],
-    device float*         flood_cross_section_depth_buf [[buffer(19)]],
-    device float*         flood_cross_section_area_buf  [[buffer(20)]],
-    device atomic_float*  global_bifurcation_outflow_buf [[buffer(21)]],
-    device float*         total_storage_buf             [[buffer(22)]],
-    device atomic_float*  outgoing_storage_buf          [[buffer(23)]],
-    device float*         water_surface_elevation_buf   [[buffer(24)]],
-    device float*         prot_wse_buf                  [[buffer(25)]],
-    // Scalars packed in a constant buffer
-    constant float&       gravity                       [[buffer(26)]],
-    constant float&       time_step                     [[buffer(27)]],
-    constant int&         num_catchments                [[buffer(28)]],
-    constant int&         has_bifurcation               [[buffer(29)]],
+    device int* downstream_idx_buf [[id(0)]];
+    device float* river_inflow_buf [[id(1)]];
+    device float* river_outflow_buf [[id(2)]];
+    device float* river_manning_buf [[id(3)]];
+    device float* river_depth_buf [[id(4)]];
+    device float* river_width_buf [[id(5)]];
+    device float* river_length_buf [[id(6)]];
+    device float* river_height_buf [[id(7)]];
+    device float* river_storage_buf [[id(8)]];
+    device float* flood_inflow_buf [[id(9)]];
+    device float* flood_outflow_buf [[id(10)]];
+    device float* flood_manning_buf [[id(11)]];
+    device float* flood_depth_buf [[id(12)]];
+    device float* protected_depth_buf [[id(13)]];
+    device float* catchment_elevation_buf [[id(14)]];
+    device float* downstream_distance_buf [[id(15)]];
+    device float* flood_storage_buf [[id(16)]];
+    device float* protected_storage_buf [[id(17)]];
+    device float* river_cross_section_depth_buf [[id(18)]];
+    device float* flood_cross_section_depth_buf [[id(19)]];
+    device float* flood_cross_section_area_buf [[id(20)]];
+    device atomic_float* global_bifurcation_outflow_buf [[id(21)]];
+    device float* total_storage_buf [[id(22)]];
+    device atomic_float* outgoing_storage_buf [[id(23)]];
+    device float* water_surface_elevation_buf [[id(24)]];
+    device float* prot_wse_buf [[id(25)]];
+    // Scalars packed in constant buffers
+    constant float* gravity [[id(26)]];
+    constant float* time_step [[id(27)]];
+    constant int* num_catchments [[id(28)]];
+    device float* sea_surface_elevation_buf [[id(29)]];
+    device int* catchment_sea_level_idx_buf [[id(30)]];
+};
+
+kernel void compute_outflow(
+    constant compute_outflow_args& args [[buffer(0)]],
     uint idx [[thread_position_in_grid]]
 )
 {
+    // Tensor buffers
+    device int* downstream_idx_buf = args.downstream_idx_buf;
+    device float* river_inflow_buf = args.river_inflow_buf;
+    device float* river_outflow_buf = args.river_outflow_buf;
+    device float* river_manning_buf = args.river_manning_buf;
+    device float* river_depth_buf = args.river_depth_buf;
+    device float* river_width_buf = args.river_width_buf;
+    device float* river_length_buf = args.river_length_buf;
+    device float* river_height_buf = args.river_height_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_inflow_buf = args.flood_inflow_buf;
+    device float* flood_outflow_buf = args.flood_outflow_buf;
+    device float* flood_manning_buf = args.flood_manning_buf;
+    device float* flood_depth_buf = args.flood_depth_buf;
+    device float* protected_depth_buf = args.protected_depth_buf;
+    device float* catchment_elevation_buf = args.catchment_elevation_buf;
+    device float* downstream_distance_buf = args.downstream_distance_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* protected_storage_buf = args.protected_storage_buf;
+    device float* river_cross_section_depth_buf = args.river_cross_section_depth_buf;
+    device float* flood_cross_section_depth_buf = args.flood_cross_section_depth_buf;
+    device float* flood_cross_section_area_buf = args.flood_cross_section_area_buf;
+    device atomic_float* global_bifurcation_outflow_buf = args.global_bifurcation_outflow_buf;
+    device float* total_storage_buf = args.total_storage_buf;
+    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
+    device float* water_surface_elevation_buf = args.water_surface_elevation_buf;
+    device float* prot_wse_buf = args.prot_wse_buf;
+    // Scalars packed in constant buffers
+    const float gravity = *args.gravity;
+    const float time_step = *args.time_step;
+    const int num_catchments = *args.num_catchments;
+    device float* sea_surface_elevation_buf = args.sea_surface_elevation_buf;
+    device int* catchment_sea_level_idx_buf = args.catchment_sea_level_idx_buf;
     if ((int)idx >= num_catchments) return;
 
     // (1) Load
@@ -85,9 +133,12 @@ kernel void compute_outflow(
     float riv_elev_ds   = catch_elev_ds - riv_height_ds;
     float wse_ds        = riv_depth_ds + riv_elev_ds;
 
-    // (3) Max WSE
-    float max_wse = max(wse, wse_ds);
     float wse_ds_eff = is_mouth ? catch_elev : wse_ds;
+    if (kHasSeaLevel) {
+        int sea_idx = catchment_sea_level_idx_buf[idx];
+        if (sea_idx >= 0) wse_ds_eff = sea_surface_elevation_buf[sea_idx];
+    }
+    float max_wse = max(wse, wse_ds_eff);
 
     // (4) Slopes
     float riv_slope = (wse - wse_ds_eff) / ds_dist;
@@ -144,7 +195,7 @@ kernel void compute_outflow(
 
     river_inflow_buf[idx] = 0.0f;
     flood_inflow_buf[idx] = 0.0f;
-    if (has_bifurcation) {
+    if (kHasBifurcation) {
         atomic_store_explicit(&global_bifurcation_outflow_buf[idx], 0.0f, memory_order_relaxed);
     }
 
@@ -161,23 +212,38 @@ kernel void compute_outflow(
 // =====================================================================
 // Inflow kernel — limits outflow, accumulates inflow to downstream
 // =====================================================================
+struct compute_inflow_args {
+    device int* downstream_idx_buf [[id(0)]];
+    device float* river_outflow_buf [[id(1)]];
+    device float* flood_outflow_buf [[id(2)]];
+    device float* river_storage_buf [[id(3)]];
+    device float* flood_storage_buf [[id(4)]];
+    device float* outgoing_storage_buf [[id(5)]];
+    device atomic_float* river_inflow_buf [[id(6)]];
+    device atomic_float* flood_inflow_buf [[id(7)]];
+    device float* limit_rate_buf [[id(8)]];
+    device atomic_float* res_total_inflow_buf [[id(9)]];
+    device int* is_reservoir_buf [[id(10)]];
+    constant int* num_catchments [[id(11)]];
+};
+
 kernel void compute_inflow(
-    device int*           downstream_idx_buf     [[buffer(0)]],
-    device float*         river_outflow_buf      [[buffer(1)]],
-    device float*         flood_outflow_buf      [[buffer(2)]],
-    device float*         river_storage_buf      [[buffer(3)]],
-    device float*         flood_storage_buf      [[buffer(4)]],
-    device float*         outgoing_storage_buf   [[buffer(5)]],
-    device atomic_float*  river_inflow_buf       [[buffer(6)]],
-    device atomic_float*  flood_inflow_buf       [[buffer(7)]],
-    device float*         limit_rate_buf         [[buffer(8)]],
-    device atomic_float*  res_total_inflow_buf   [[buffer(9)]],
-    device int*           is_reservoir_buf       [[buffer(10)]],
-    constant int&         num_catchments         [[buffer(11)]],
-    constant int&         has_reservoir          [[buffer(12)]],
+    constant compute_inflow_args& args [[buffer(0)]],
     uint idx [[thread_position_in_grid]]
 )
 {
+    device int* downstream_idx_buf = args.downstream_idx_buf;
+    device float* river_outflow_buf = args.river_outflow_buf;
+    device float* flood_outflow_buf = args.flood_outflow_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* outgoing_storage_buf = args.outgoing_storage_buf;
+    device atomic_float* river_inflow_buf = args.river_inflow_buf;
+    device atomic_float* flood_inflow_buf = args.flood_inflow_buf;
+    device float* limit_rate_buf = args.limit_rate_buf;
+    device atomic_float* res_total_inflow_buf = args.res_total_inflow_buf;
+    device int* is_reservoir_buf = args.is_reservoir_buf;
+    const int num_catchments = *args.num_catchments;
     if ((int)idx >= num_catchments) return;
 
     float riv_out = river_outflow_buf[idx];
@@ -208,7 +274,7 @@ kernel void compute_inflow(
         atomic_fetch_add_explicit(&river_inflow_buf[ds_idx], upd_riv, memory_order_relaxed);
         atomic_fetch_add_explicit(&flood_inflow_buf[ds_idx], upd_fld, memory_order_relaxed);
 
-        if (has_reservoir) {
+        if (kHasReservoir) {
             if (is_reservoir_buf[ds_idx] != 0) {
                 float total_out = upd_riv + upd_fld;
                 atomic_fetch_add_explicit(&res_total_inflow_buf[ds_idx], total_out, memory_order_relaxed);
@@ -224,65 +290,89 @@ kernel void compute_inflow(
 
 // Packed scalar/flag parameters — avoids exceeding the 31-buffer limit.
 // time_step is kept as a separate buffer because it changes every sub-step.
-// All members are 4-byte aligned; total 40 bytes, no padding.
+// All members are 4-byte aligned; total 12 bytes, no padding. Feature and
+// parameter-layout flags are compile-time-specialized above.
 struct OutflowBatchedConfig {
     float gravity;
     int   num_catchments;
     int   num_trials;
-    int   has_bifurcation;
-    int   batched_river_manning;
-    int   batched_flood_manning;
-    int   batched_river_width;
-    int   batched_river_length;
-    int   batched_river_height;
-    int   batched_catchment_elevation;
+};
+
+struct compute_outflow_batched_args {
+    device int* downstream_idx_buf [[id(0)]];
+    device float* river_inflow_buf [[id(1)]];
+    device float* river_outflow_buf [[id(2)]];
+    device float* river_manning_buf [[id(3)]];
+    device float* river_depth_buf [[id(4)]];
+    device float* river_width_buf [[id(5)]];
+    device float* river_length_buf [[id(6)]];
+    device float* river_height_buf [[id(7)]];
+    device float* river_storage_buf [[id(8)]];
+    device float* flood_inflow_buf [[id(9)]];
+    device float* flood_outflow_buf [[id(10)]];
+    device float* flood_manning_buf [[id(11)]];
+    device float* flood_depth_buf [[id(12)]];
+    device float* protected_depth_buf [[id(13)]];
+    device float* catchment_elevation_buf [[id(14)]];
+    device float* downstream_distance_buf [[id(15)]];
+    device float* flood_storage_buf [[id(16)]];
+    device float* protected_storage_buf [[id(17)]];
+    device float* river_cross_section_depth_buf [[id(18)]];
+    device float* flood_cross_section_depth_buf [[id(19)]];
+    device float* flood_cross_section_area_buf [[id(20)]];
+    device atomic_float* global_bifurcation_outflow_buf [[id(21)]];
+    device float* total_storage_buf [[id(22)]];
+    device atomic_float* outgoing_storage_buf [[id(23)]];
+    device float* water_surface_elevation_buf [[id(24)]];
+    device float* prot_wse_buf [[id(25)]];
+    constant float* time_step [[id(26)]];
+    constant OutflowBatchedConfig* config [[id(27)]];
+    device float* sea_surface_elevation_buf [[id(28)]];
+    device int* catchment_sea_level_idx_buf [[id(29)]];
+    constant int* num_sea_level_boundaries [[id(30)]];
 };
 
 kernel void compute_outflow_batched(
-    device int*           downstream_idx_buf           [[buffer(0)]],
-    device float*         river_inflow_buf              [[buffer(1)]],
-    device float*         river_outflow_buf             [[buffer(2)]],
-    device float*         river_manning_buf             [[buffer(3)]],
-    device float*         river_depth_buf               [[buffer(4)]],
-    device float*         river_width_buf               [[buffer(5)]],
-    device float*         river_length_buf              [[buffer(6)]],
-    device float*         river_height_buf              [[buffer(7)]],
-    device float*         river_storage_buf             [[buffer(8)]],
-    device float*         flood_inflow_buf              [[buffer(9)]],
-    device float*         flood_outflow_buf             [[buffer(10)]],
-    device float*         flood_manning_buf             [[buffer(11)]],
-    device float*         flood_depth_buf               [[buffer(12)]],
-    device float*         protected_depth_buf           [[buffer(13)]],
-    device float*         catchment_elevation_buf       [[buffer(14)]],
-    device float*         downstream_distance_buf       [[buffer(15)]],
-    device float*         flood_storage_buf             [[buffer(16)]],
-    device float*         protected_storage_buf         [[buffer(17)]],
-    device float*         river_cross_section_depth_buf [[buffer(18)]],
-    device float*         flood_cross_section_depth_buf [[buffer(19)]],
-    device float*         flood_cross_section_area_buf  [[buffer(20)]],
-    device atomic_float*  global_bifurcation_outflow_buf [[buffer(21)]],
-    device float*         total_storage_buf             [[buffer(22)]],
-    device atomic_float*  outgoing_storage_buf          [[buffer(23)]],
-    device float*         water_surface_elevation_buf   [[buffer(24)]],
-    device float*         prot_wse_buf                  [[buffer(25)]],
-    constant float&       time_step                     [[buffer(26)]],
-    constant OutflowBatchedConfig& config               [[buffer(27)]],
+    constant compute_outflow_batched_args& args [[buffer(0)]],
     uint gid [[thread_position_in_grid]]
 )
 {
+    device int* downstream_idx_buf = args.downstream_idx_buf;
+    device float* river_inflow_buf = args.river_inflow_buf;
+    device float* river_outflow_buf = args.river_outflow_buf;
+    device float* river_manning_buf = args.river_manning_buf;
+    device float* river_depth_buf = args.river_depth_buf;
+    device float* river_width_buf = args.river_width_buf;
+    device float* river_length_buf = args.river_length_buf;
+    device float* river_height_buf = args.river_height_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_inflow_buf = args.flood_inflow_buf;
+    device float* flood_outflow_buf = args.flood_outflow_buf;
+    device float* flood_manning_buf = args.flood_manning_buf;
+    device float* flood_depth_buf = args.flood_depth_buf;
+    device float* protected_depth_buf = args.protected_depth_buf;
+    device float* catchment_elevation_buf = args.catchment_elevation_buf;
+    device float* downstream_distance_buf = args.downstream_distance_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* protected_storage_buf = args.protected_storage_buf;
+    device float* river_cross_section_depth_buf = args.river_cross_section_depth_buf;
+    device float* flood_cross_section_depth_buf = args.flood_cross_section_depth_buf;
+    device float* flood_cross_section_area_buf = args.flood_cross_section_area_buf;
+    device atomic_float* global_bifurcation_outflow_buf = args.global_bifurcation_outflow_buf;
+    device float* total_storage_buf = args.total_storage_buf;
+    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
+    device float* water_surface_elevation_buf = args.water_surface_elevation_buf;
+    device float* prot_wse_buf = args.prot_wse_buf;
+    const float time_step = *args.time_step;
+    const OutflowBatchedConfig config = *args.config;
+    device float* sea_surface_elevation_buf = args.sea_surface_elevation_buf;
+    device int* catchment_sea_level_idx_buf = args.catchment_sea_level_idx_buf;
+    const int num_sea_level_boundaries = *args.num_sea_level_boundaries;
     int num_catchments = config.num_catchments;
     int total = num_catchments * config.num_trials;
     if ((int)gid >= total) return;
 
     float gravity   = config.gravity;
-    bool has_bifurcation               = (config.has_bifurcation != 0);
-    bool batched_river_manning_flag    = (config.batched_river_manning != 0);
-    bool batched_flood_manning_flag    = (config.batched_flood_manning != 0);
-    bool batched_river_width_flag      = (config.batched_river_width != 0);
-    bool batched_river_length_flag     = (config.batched_river_length != 0);
-    bool batched_river_height_flag     = (config.batched_river_height != 0);
-    bool batched_catchment_elevation_flag = (config.batched_catchment_elevation != 0);
-
     int ci = (int)gid % num_catchments;           // catchment index
     int to = ((int)gid / num_catchments) * num_catchments; // trial offset
 
@@ -304,12 +394,12 @@ kernel void compute_outflow_batched(
     float fld_xs_area  = flood_cross_section_area_buf[to + ci];
 
     // Params — conditionally batched
-    float riv_manning = river_manning_buf[batched_river_manning_flag ? (to + ci) : ci];
-    float riv_width   = river_width_buf[batched_river_width_flag ? (to + ci) : ci];
-    float riv_length  = river_length_buf[batched_river_length_flag ? (to + ci) : ci];
-    float riv_height  = river_height_buf[batched_river_height_flag ? (to + ci) : ci];
-    float fld_manning = flood_manning_buf[batched_flood_manning_flag ? (to + ci) : ci];
-    float catch_elev  = catchment_elevation_buf[batched_catchment_elevation_flag ? (to + ci) : ci];
+    float riv_manning = river_manning_buf[kBatchedRiverManning ? (to + ci) : ci];
+    float riv_width   = river_width_buf[kBatchedRiverWidth ? (to + ci) : ci];
+    float riv_length  = river_length_buf[kBatchedRiverLength ? (to + ci) : ci];
+    float riv_height  = river_height_buf[kBatchedRiverHeight ? (to + ci) : ci];
+    float fld_manning = flood_manning_buf[kBatchedFloodManning ? (to + ci) : ci];
+    float catch_elev  = catchment_elevation_buf[kBatchedCatchmentElevation ? (to + ci) : ci];
     float ds_dist     = downstream_distance_buf[ci]; // never batched in outflow
 
     // (2) Water surface elevation
@@ -321,13 +411,20 @@ kernel void compute_outflow_batched(
     // Downstream WSE
     int ds_global = to + ds_idx;
     float riv_depth_ds  = river_depth_buf[ds_global];
-    float riv_height_ds = river_height_buf[batched_river_height_flag ? ds_global : ds_idx];
-    float catch_elev_ds = catchment_elevation_buf[batched_catchment_elevation_flag ? ds_global : ds_idx];
+    float riv_height_ds = river_height_buf[kBatchedRiverHeight ? ds_global : ds_idx];
+    float catch_elev_ds = catchment_elevation_buf[kBatchedCatchmentElevation ? ds_global : ds_idx];
     float riv_elev_ds   = catch_elev_ds - riv_height_ds;
     float wse_ds        = riv_depth_ds + riv_elev_ds;
 
-    float max_wse = max(wse, wse_ds);
     float wse_ds_eff = is_mouth ? catch_elev : wse_ds;
+    if (kHasSeaLevel) {
+        int sea_idx = catchment_sea_level_idx_buf[ci];
+        if (sea_idx >= 0)
+            wse_ds_eff = sea_surface_elevation_buf[
+                ((int)gid / num_catchments) * num_sea_level_boundaries + sea_idx
+            ];
+    }
+    float max_wse = max(wse, wse_ds_eff);
 
     // (4) Slopes
     float riv_slope = (wse - wse_ds_eff) / ds_dist;
@@ -385,7 +482,7 @@ kernel void compute_outflow_batched(
 
     river_inflow_buf[s] = 0.0f;
     flood_inflow_buf[s] = 0.0f;
-    if (has_bifurcation) {
+    if (kHasBifurcation) {
         atomic_store_explicit(&global_bifurcation_outflow_buf[s], 0.0f, memory_order_relaxed);
     }
 
@@ -402,24 +499,40 @@ kernel void compute_outflow_batched(
 // =====================================================================
 // Batched inflow kernel — flat grid num_catchments * num_trials
 // =====================================================================
+struct compute_inflow_batched_args {
+    device int* downstream_idx_buf [[id(0)]];
+    device float* river_outflow_buf [[id(1)]];
+    device float* flood_outflow_buf [[id(2)]];
+    device float* river_storage_buf [[id(3)]];
+    device float* flood_storage_buf [[id(4)]];
+    device float* outgoing_storage_buf [[id(5)]];
+    device atomic_float* river_inflow_buf [[id(6)]];
+    device atomic_float* flood_inflow_buf [[id(7)]];
+    device float* limit_rate_buf [[id(8)]];
+    device atomic_float* res_total_inflow_buf [[id(9)]];
+    device int* is_reservoir_buf [[id(10)]];
+    constant int* num_catchments [[id(11)]];
+    constant int* num_trials [[id(12)]];
+};
+
 kernel void compute_inflow_batched(
-    device int*           downstream_idx_buf     [[buffer(0)]],
-    device float*         river_outflow_buf      [[buffer(1)]],
-    device float*         flood_outflow_buf      [[buffer(2)]],
-    device float*         river_storage_buf      [[buffer(3)]],
-    device float*         flood_storage_buf      [[buffer(4)]],
-    device float*         outgoing_storage_buf   [[buffer(5)]],
-    device atomic_float*  river_inflow_buf       [[buffer(6)]],
-    device atomic_float*  flood_inflow_buf       [[buffer(7)]],
-    device float*         limit_rate_buf         [[buffer(8)]],
-    device atomic_float*  res_total_inflow_buf   [[buffer(9)]],
-    device int*           is_reservoir_buf       [[buffer(10)]],
-    constant int&         num_catchments         [[buffer(11)]],
-    constant int&         has_reservoir          [[buffer(12)]],
-    constant int&         num_trials             [[buffer(13)]],
+    constant compute_inflow_batched_args& args [[buffer(0)]],
     uint gid [[thread_position_in_grid]]
 )
 {
+    device int* downstream_idx_buf = args.downstream_idx_buf;
+    device float* river_outflow_buf = args.river_outflow_buf;
+    device float* flood_outflow_buf = args.flood_outflow_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* outgoing_storage_buf = args.outgoing_storage_buf;
+    device atomic_float* river_inflow_buf = args.river_inflow_buf;
+    device atomic_float* flood_inflow_buf = args.flood_inflow_buf;
+    device float* limit_rate_buf = args.limit_rate_buf;
+    device atomic_float* res_total_inflow_buf = args.res_total_inflow_buf;
+    device int* is_reservoir_buf = args.is_reservoir_buf;
+    const int num_catchments = *args.num_catchments;
+    const int num_trials = *args.num_trials;
     int total = num_catchments * num_trials;
     if ((int)gid >= total) return;
 
@@ -453,7 +566,7 @@ kernel void compute_inflow_batched(
         atomic_fetch_add_explicit(&river_inflow_buf[ds_global], upd_riv, memory_order_relaxed);
         atomic_fetch_add_explicit(&flood_inflow_buf[ds_global], upd_fld, memory_order_relaxed);
 
-        if (has_reservoir) {
+        if (kHasReservoir) {
             if (is_reservoir_buf[ds_idx] != 0) {
                 float total_out = upd_riv + upd_fld;
                 atomic_fetch_add_explicit(&res_total_inflow_buf[ds_global], total_out, memory_order_relaxed);

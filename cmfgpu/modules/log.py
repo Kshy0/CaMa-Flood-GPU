@@ -106,7 +106,7 @@ class LogModule(AbstractModule):
             f.write(
                 "".join(
                     f"{h:<{w}}" if i == 0 else f"{h:>{w}}"
-                    for i, (h, w) in enumerate(zip(headers, widths))
+                    for i, (h, w) in enumerate(zip(headers, widths, strict=True))
                 )
                 + "\n"
             )
@@ -155,7 +155,10 @@ class LogModule(AbstractModule):
         with log_path.open("a") as f:
             for i in range(num_steps):
                 row = [time_strs[i]] + [data_arrays[field][i] for field in self.log_vars]
-                f.write("".join(f_ % v for f_, v in zip(fmt, row)) + "\n")
+                f.write(
+                    "".join(f_ % v for f_, v in zip(fmt, row, strict=True))
+                    + "\n"
+                )
         for field in self.log_vars:
             getattr(self, field).zero_()
 

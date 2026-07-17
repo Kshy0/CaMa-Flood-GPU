@@ -1,52 +1,77 @@
 # LICENSE HEADER MANAGED BY add-license-header
 # Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
-# http://www.apache.org/licenses/LICENSE-2.0
-#
 
-"""Unified outflow / inflow interface — backend-agnostic."""
+"""Registered main-channel outflow and inflow implementations."""
 
-from hydroforge.runtime.backend import KERNEL_BACKEND
+from hydroforge.runtime.backend import BackendRegistry, make_batched_dispatcher
 
-if KERNEL_BACKEND == "metal":
-    from cmfgpu.phys.metal import compute_inflow_batched_kernel as _inflow_b
-    from cmfgpu.phys.metal import compute_inflow_kernel as _inflow_nb
-    from cmfgpu.phys.metal import compute_outflow_batched_kernel as _outflow_b
-    from cmfgpu.phys.metal import compute_outflow_kernel as _outflow_nb
 
-    def compute_outflow(**kw):
-        nt = kw.get("num_trials")
-        if nt is not None and nt > 1:
-            kw["_grid_size"] = kw["num_catchments"] * nt
-            _outflow_b(**kw)
-        else:
-            _outflow_nb(**kw)
+def _metal_outflow():
+    from cmfgpu.phys.metal import (
+        compute_outflow_batched_kernel, compute_outflow_kernel,
+    )
+    return make_batched_dispatcher(
+        compute_outflow_kernel, compute_outflow_batched_kernel,
+    )
 
-    def compute_inflow(**kw):
-        nt = kw.get("num_trials")
-        if nt is not None and nt > 1:
-            kw["_grid_size"] = kw["num_catchments"] * nt
-            _inflow_b(**kw)
-        else:
-            _inflow_nb(**kw)
 
-elif KERNEL_BACKEND == "cuda":
-    from cmfgpu.phys.cuda import compute_inflow, compute_outflow
+def _metal_inflow():
+    from cmfgpu.phys.metal import (
+        compute_inflow_batched_kernel, compute_inflow_kernel,
+    )
+    return make_batched_dispatcher(
+        compute_inflow_kernel, compute_inflow_batched_kernel,
+    )
 
-elif KERNEL_BACKEND == "triton":
+
+def _cuda_outflow():
+    from cmfgpu.phys.cuda import compute_outflow
+    return compute_outflow
+
+
+def _cuda_inflow():
+    from cmfgpu.phys.cuda import compute_inflow
+    return compute_inflow
+
+
+def _triton_outflow():
     from hydroforge.runtime.backend import make_triton_dispatcher
-
-    from cmfgpu.phys.triton.outflow import (compute_inflow_batched_kernel,
-                                            compute_inflow_kernel,
-                                            compute_outflow_batched_kernel,
-                                            compute_outflow_kernel)
-    compute_outflow = make_triton_dispatcher(
+    from cmfgpu.phys.triton.outflow import (
+        compute_outflow_batched_kernel, compute_outflow_kernel,
+    )
+    return make_triton_dispatcher(
         compute_outflow_kernel, batched_kernel=compute_outflow_batched_kernel,
         batched_drop=("is_dam_upstream_ptr", "HAS_RESERVOIR", "MIN_KINEMATIC_SLOPE"),
-    )
-    compute_inflow = make_triton_dispatcher(
-        compute_inflow_kernel, batched_kernel=compute_inflow_batched_kernel,
+        non_batched_drop=("num_sea_level_boundaries",),
+        optional_buffers={
+            "global_bifurcation_outflow_ptr": "HAS_BIFURCATION",
+            "is_dam_upstream_ptr": "HAS_RESERVOIR",
+            "sea_surface_elevation_ptr": "HAS_SEA_LEVEL",
+            "catchment_sea_level_idx_ptr": "HAS_SEA_LEVEL",
+        },
     )
 
-else:
-    raise ValueError(f"Unsupported cmfgpu backend: {KERNEL_BACKEND!r}")
+
+def _triton_inflow():
+    from hydroforge.runtime.backend import make_triton_dispatcher
+    from cmfgpu.phys.triton.outflow import (
+        compute_inflow_batched_kernel, compute_inflow_kernel,
+    )
+    return make_triton_dispatcher(
+        compute_inflow_kernel, batched_kernel=compute_inflow_batched_kernel,
+        optional_buffers={
+            "reservoir_total_inflow_ptr": "HAS_RESERVOIR",
+            "is_reservoir_ptr": "HAS_RESERVOIR",
+        },
+    )
+
+
+compute_outflow = BackendRegistry(
+    {"metal": _metal_outflow, "cuda": _cuda_outflow, "triton": _triton_outflow},
+    name="compute_outflow",
+).selected
+compute_inflow = BackendRegistry(
+    {"metal": _metal_inflow, "cuda": _cuda_inflow, "triton": _triton_inflow},
+    name="compute_inflow",
+).selected

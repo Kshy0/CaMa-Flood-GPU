@@ -54,6 +54,9 @@ def compute_outflow_kernel(
     is_dam_upstream_ptr=None,               # *bool  upstream-of-dam mask (catchment-indexed)
     HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
     MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
+    sea_surface_elevation_ptr=None,
+    catchment_sea_level_idx_ptr=None,
+    HAS_SEA_LEVEL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -109,11 +112,22 @@ def compute_outflow_kernel(
     river_elevation_downstream = catchment_elevation_downstream - river_height_downstream
     water_surface_elevation_downstream = river_depth_downstream + river_elevation_downstream
     
-    # (3) Compute maximum water surface elevation
-    max_water_surface_elevation = tl.maximum(water_surface_elevation, water_surface_elevation_downstream)
-    
-    # For river mouth, treat downstream water surface as sea level or fixed boundary
     water_surface_elevation_downstream = tl.where(is_river_mouth, catchment_elevation, water_surface_elevation_downstream)
+    if HAS_SEA_LEVEL:
+        sea_level_idx = tl.load(
+            catchment_sea_level_idx_ptr + offs, mask=mask, other=-1,
+        )
+        prescribed_level = tl.load(
+            sea_surface_elevation_ptr + sea_level_idx,
+            mask=mask & (sea_level_idx >= 0), other=0.0,
+        )
+        water_surface_elevation_downstream = tl.where(
+            sea_level_idx >= 0, prescribed_level,
+            water_surface_elevation_downstream,
+        )
+    max_water_surface_elevation = tl.maximum(
+        water_surface_elevation, water_surface_elevation_downstream,
+    )
     
     #----------------------------------------------------------------------
     # (4) Longitudinal water surface slope & truncated flood slope
@@ -373,6 +387,10 @@ def compute_outflow_batched_kernel(
     batched_river_height: tl.constexpr,
     batched_catchment_elevation: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    sea_surface_elevation_ptr=None,
+    catchment_sea_level_idx_ptr=None,
+    num_sea_level_boundaries: tl.constexpr = 0,
+    HAS_SEA_LEVEL: tl.constexpr = False,
 ):
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -435,11 +453,23 @@ def compute_outflow_batched_kernel(
     river_elevation_downstream = catchment_elevation_downstream - river_height_downstream
     water_surface_elevation_downstream = river_depth_downstream + river_elevation_downstream
     
-    # (3) Compute maximum water surface elevation
-    max_water_surface_elevation = tl.maximum(water_surface_elevation, water_surface_elevation_downstream)
-    
-    # For river mouth, treat downstream water surface as sea level or fixed boundary
     water_surface_elevation_downstream = tl.where(is_river_mouth, catchment_elevation, water_surface_elevation_downstream)
+    if HAS_SEA_LEVEL:
+        sea_level_idx = tl.load(
+            catchment_sea_level_idx_ptr + catchment_idx, mask=mask, other=-1,
+        )
+        sea_trial_offset = (idx // num_catchments) * num_sea_level_boundaries
+        prescribed_level = tl.load(
+            sea_surface_elevation_ptr + sea_trial_offset + sea_level_idx,
+            mask=mask & (sea_level_idx >= 0), other=0.0,
+        )
+        water_surface_elevation_downstream = tl.where(
+            sea_level_idx >= 0, prescribed_level,
+            water_surface_elevation_downstream,
+        )
+    max_water_surface_elevation = tl.maximum(
+        water_surface_elevation, water_surface_elevation_downstream,
+    )
     
     #----------------------------------------------------------------------
     # (4) Longitudinal water surface slope & truncated flood slope

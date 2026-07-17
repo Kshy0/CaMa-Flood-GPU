@@ -19,6 +19,7 @@ __global__ void k_flood_stage(
     const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
     const float* __restrict__ river_outflow, const float* __restrict__ flood_outflow,
     const STO* __restrict__ global_bif_outflow, const float* __restrict__ runoff,
+    const float* __restrict__ inflow, const int* __restrict__ catchment_inflow_idx,
     const float* __restrict__ time_step_ptr,
     STO* __restrict__ outgoing_storage,
     STO* __restrict__ river_storage, STO* __restrict__ flood_storage,
@@ -28,7 +29,7 @@ __global__ void k_flood_stage(
     const float* __restrict__ river_height, const float* __restrict__ flood_depth_table,
     const float* __restrict__ catchment_area, const float* __restrict__ river_width,
     const float* __restrict__ river_length,
-    long num_catchments, int num_flood_levels, int has_bifurcation)
+    long num_catchments, int num_flood_levels, int has_bifurcation, int has_inflow)
 {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     if (t >= num_catchments) return;
@@ -43,6 +44,11 @@ __global__ void k_flood_stage(
     float rout = __ldg(river_outflow + t);
     float fout = __ldg(flood_outflow + t);
     float ro = __ldg(runoff + t);
+    float prescribed_inflow = 0.f;
+    if (has_inflow) {
+        int inflow_idx = __ldg(catchment_inflow_idx + t);
+        if (inflow_idx >= 0) prescribed_inflow = __ldg(inflow + inflow_idx);
+    }
 
     STO river_su = rsto + (rinf - rout) * ts;
     STO flood_su = fsto
@@ -54,7 +60,7 @@ __global__ void k_flood_stage(
         river_su = tt > (STO)0 ? tt : (STO)0;
     }
     flood_su = flood_su > (STO)0 ? flood_su : (STO)0;
-    STO total_s = river_su + flood_su + prot + ro * ts;
+    STO total_s = river_su + flood_su + prot + (ro + prescribed_inflow) * ts;
     total_s = total_s > (STO)0 ? total_s : (STO)0;
     float total_storage = (float)total_s;
 
@@ -141,64 +147,81 @@ __global__ void k_flood_stage(
 
 template <typename STO>
 static void launch_t(const at::Tensor& ri, const at::Tensor& fi,
-    const at::Tensor& ro, const at::Tensor& fo, const at::Tensor& gb,
-    const at::Tensor& run, const at::Tensor& tsp, const at::Tensor& outs,
+    const at::Tensor& ro, const at::Tensor& fo,
+    const c10::optional<at::Tensor>& gb, const at::Tensor& run,
+    const c10::optional<at::Tensor>& inflow,
+    const c10::optional<at::Tensor>& catchment_inflow_idx,
+    const at::Tensor& tsp,
+    const at::Tensor& outs,
     const at::Tensor& rs, const at::Tensor& fs, const at::Tensor& ps,
     const at::Tensor& rd, const at::Tensor& fd, const at::Tensor& pd, const at::Tensor& ff,
     const at::Tensor& rh, const at::Tensor& tbl, const at::Tensor& ca,
     const at::Tensor& rw, const at::Tensor& rl,
-    long n, int nl, int has_bif, int block)
+    long n, int nl, int has_bif, int has_inflow, int block)
 {
     int grid = (int)((n + block - 1) / block);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    const STO* gbp = gb.numel() ? gb.data_ptr<STO>() : nullptr;
+    const STO* gbp = gb ? gb->data_ptr<STO>() : nullptr;
+    const float* inflow_p = inflow ? inflow->data_ptr<float>() : nullptr;
+    const int* inflow_idx_p = catchment_inflow_idx
+        ? catchment_inflow_idx->data_ptr<int>() : nullptr;
     k_flood_stage<STO><<<grid, block, 0, stream>>>(
         ri.data_ptr<STO>(), fi.data_ptr<STO>(),
-        ro.data_ptr<float>(), fo.data_ptr<float>(), gbp, run.data_ptr<float>(), tsp.data_ptr<float>(),
+        ro.data_ptr<float>(), fo.data_ptr<float>(), gbp, run.data_ptr<float>(),
+        inflow_p, inflow_idx_p, tsp.data_ptr<float>(),
         outs.data_ptr<STO>(), rs.data_ptr<STO>(), fs.data_ptr<STO>(), ps.data_ptr<STO>(),
         rd.data_ptr<float>(), fd.data_ptr<float>(), pd.data_ptr<float>(), ff.data_ptr<float>(),
         rh.data_ptr<float>(), tbl.data_ptr<float>(), ca.data_ptr<float>(), rw.data_ptr<float>(), rl.data_ptr<float>(),
-        n, nl, has_bif);
+        n, nl, has_bif, has_inflow);
 }
 
 static void launch(
     at::Tensor river_inflow, at::Tensor flood_inflow, at::Tensor river_outflow,
-    at::Tensor flood_outflow, at::Tensor global_bif_outflow, at::Tensor runoff,
-    at::Tensor time_step, at::Tensor outgoing_storage, at::Tensor river_storage,
+    at::Tensor flood_outflow, c10::optional<at::Tensor> global_bif_outflow,
+    at::Tensor runoff, c10::optional<at::Tensor> inflow,
+    c10::optional<at::Tensor> catchment_inflow_idx, at::Tensor time_step,
+    at::Tensor outgoing_storage, at::Tensor river_storage,
     at::Tensor flood_storage, at::Tensor protected_storage, at::Tensor river_depth,
     at::Tensor flood_depth, at::Tensor protected_depth, at::Tensor flood_fraction,
     at::Tensor river_height, at::Tensor flood_depth_table, at::Tensor catchment_area,
     at::Tensor river_width, at::Tensor river_length,
-    long n, int nl, int has_bif, int block)
+    long n, int nl, int has_bif, int has_inflow, int block)
 {
     if (river_storage.scalar_type() == at::kDouble) {
         launch_t<double>(river_inflow, flood_inflow, river_outflow, flood_outflow,
-            global_bif_outflow, runoff, time_step, outgoing_storage, river_storage,
+            global_bif_outflow, runoff, inflow, catchment_inflow_idx, time_step,
+            outgoing_storage, river_storage,
             flood_storage, protected_storage, river_depth, flood_depth, protected_depth,
             flood_fraction, river_height, flood_depth_table, catchment_area, river_width,
-            river_length, n, nl, has_bif, block);
+            river_length, n, nl, has_bif, has_inflow, block);
     } else {
         launch_t<float>(river_inflow, flood_inflow, river_outflow, flood_outflow,
-            global_bif_outflow, runoff, time_step, outgoing_storage, river_storage,
+            global_bif_outflow, runoff, inflow, catchment_inflow_idx, time_step,
+            outgoing_storage, river_storage,
             flood_storage, protected_storage, river_depth, flood_depth, protected_depth,
             flood_fraction, river_height, flood_depth_table, catchment_area, river_width,
-            river_length, n, nl, has_bif, block);
+            river_length, n, nl, has_bif, has_inflow, block);
     }
 }
 
 void launch_flood_stage(
     at::Tensor river_inflow, at::Tensor flood_inflow, at::Tensor river_outflow,
-    at::Tensor flood_outflow, at::Tensor global_bif_outflow, at::Tensor runoff,
-    at::Tensor time_step, at::Tensor outgoing_storage, at::Tensor river_storage,
+    at::Tensor flood_outflow, c10::optional<at::Tensor> global_bif_outflow,
+    at::Tensor runoff, c10::optional<at::Tensor> inflow,
+    c10::optional<at::Tensor> catchment_inflow_idx, at::Tensor time_step,
+    at::Tensor outgoing_storage, at::Tensor river_storage,
     at::Tensor flood_storage, at::Tensor protected_storage, at::Tensor river_depth,
     at::Tensor flood_depth, at::Tensor protected_depth, at::Tensor flood_fraction,
     at::Tensor river_height, at::Tensor flood_depth_table, at::Tensor catchment_area,
     at::Tensor river_width, at::Tensor river_length,
-    long num_catchments, long num_flood_levels, long has_bifurcation, long block)
+    long num_catchments, long num_flood_levels, long has_bifurcation,
+    long has_inflow, long block)
 {
     launch(river_inflow, flood_inflow, river_outflow, flood_outflow,
-        global_bif_outflow, runoff, time_step, outgoing_storage, river_storage,
+        global_bif_outflow, runoff, inflow, catchment_inflow_idx, time_step,
+        outgoing_storage, river_storage,
         flood_storage, protected_storage, river_depth, flood_depth, protected_depth,
         flood_fraction, river_height, flood_depth_table, catchment_area, river_width,
-        river_length, num_catchments, (int)num_flood_levels, (int)has_bifurcation, (int)block);
+        river_length, num_catchments, (int)num_flood_levels,
+        (int)has_bifurcation, (int)has_inflow, (int)block);
 }

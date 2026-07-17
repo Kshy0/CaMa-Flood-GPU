@@ -5,6 +5,14 @@
 
 #include <metal_stdlib>
 using namespace metal;
+constant bool batched_river_length_flag [[function_constant(0)]];
+constant bool batched_river_width_flag [[function_constant(1)]];
+constant bool batched_river_height_flag [[function_constant(2)]];
+constant bool batched_catchment_area_flag [[function_constant(3)]];
+constant bool batched_levee_crown_height_flag [[function_constant(4)]];
+constant bool batched_levee_fraction_flag [[function_constant(5)]];
+constant bool batched_levee_base_height_flag [[function_constant(6)]];
+constant bool batched_flood_depth_table_flag [[function_constant(7)]];
 
 // log_sums layout  (row major, stride = log_buffer_size):
 //   row  6 = total_storage_stage_sum
@@ -17,27 +25,48 @@ static inline void atomic_add_float(device atomic_float* addr, float val) {
     atomic_fetch_add_explicit(addr, val, memory_order_relaxed);
 }
 
+struct compute_levee_stage_args {
+    device int* levee_catchment_idx_buf [[id(0)]];
+    device float* river_storage_buf [[id(1)]];
+    device float* flood_storage_buf [[id(2)]];
+    device float* protected_storage_buf [[id(3)]];
+    device float* river_depth_buf [[id(4)]];
+    device float* flood_depth_buf [[id(5)]];
+    device float* protected_depth_buf [[id(6)]];
+    device float* river_height_buf [[id(7)]];
+    device float* flood_depth_table_buf [[id(8)]];
+    device float* catchment_area_buf [[id(9)]];
+    device float* river_width_buf [[id(10)]];
+    device float* river_length_buf [[id(11)]];
+    device float* levee_base_height_buf [[id(12)]];
+    device float* levee_crown_height_buf [[id(13)]];
+    device float* levee_fraction_buf [[id(14)]];
+    device float* flood_fraction_buf [[id(15)]];
+    constant int* num_levees [[id(16)]];
+};
+
 kernel void compute_levee_stage(
-    device int*   levee_catchment_idx_buf   [[buffer(0)]],
-    device float* river_storage_buf         [[buffer(1)]],
-    device float* flood_storage_buf         [[buffer(2)]],
-    device float* protected_storage_buf     [[buffer(3)]],
-    device float* river_depth_buf           [[buffer(4)]],
-    device float* flood_depth_buf           [[buffer(5)]],
-    device float* protected_depth_buf       [[buffer(6)]],
-    device float* river_height_buf          [[buffer(7)]],
-    device float* flood_depth_table_buf     [[buffer(8)]],
-    device float* catchment_area_buf        [[buffer(9)]],
-    device float* river_width_buf           [[buffer(10)]],
-    device float* river_length_buf          [[buffer(11)]],
-    device float* levee_base_height_buf     [[buffer(12)]],
-    device float* levee_crown_height_buf    [[buffer(13)]],
-    device float* levee_fraction_buf        [[buffer(14)]],
-    device float* flood_fraction_buf        [[buffer(15)]],
-    constant int& num_levees                [[buffer(16)]],
+    constant compute_levee_stage_args& args [[buffer(0)]],
     uint idx [[thread_position_in_grid]]
 )
 {
+    device int* levee_catchment_idx_buf = args.levee_catchment_idx_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* protected_storage_buf = args.protected_storage_buf;
+    device float* river_depth_buf = args.river_depth_buf;
+    device float* flood_depth_buf = args.flood_depth_buf;
+    device float* protected_depth_buf = args.protected_depth_buf;
+    device float* river_height_buf = args.river_height_buf;
+    device float* flood_depth_table_buf = args.flood_depth_table_buf;
+    device float* catchment_area_buf = args.catchment_area_buf;
+    device float* river_width_buf = args.river_width_buf;
+    device float* river_length_buf = args.river_length_buf;
+    device float* levee_base_height_buf = args.levee_base_height_buf;
+    device float* levee_crown_height_buf = args.levee_crown_height_buf;
+    device float* levee_fraction_buf = args.levee_fraction_buf;
+    device float* flood_fraction_buf = args.flood_fraction_buf;
+    const int num_levees = *args.num_levees;
     const int NUM_FLOOD_LEVELS = __NUM_FLOOD_LEVELS__;
 
     if ((int)idx >= num_levees) return;
@@ -235,37 +264,52 @@ kernel void compute_levee_stage(
 // =====================================================================
 // Batched levee stage kernel — loop-based: grid=num_levees, loops trials
 // =====================================================================
+struct compute_levee_stage_batched_args {
+    device int* levee_catchment_idx_buf [[id(0)]];
+    device float* river_storage_buf [[id(1)]];
+    device float* flood_storage_buf [[id(2)]];
+    device float* protected_storage_buf [[id(3)]];
+    device float* river_depth_buf [[id(4)]];
+    device float* flood_depth_buf [[id(5)]];
+    device float* protected_depth_buf [[id(6)]];
+    device float* river_height_buf [[id(7)]];
+    device float* flood_depth_table_buf [[id(8)]];
+    device float* catchment_area_buf [[id(9)]];
+    device float* river_width_buf [[id(10)]];
+    device float* river_length_buf [[id(11)]];
+    device float* levee_base_height_buf [[id(12)]];
+    device float* levee_crown_height_buf [[id(13)]];
+    device float* levee_fraction_buf [[id(14)]];
+    device float* flood_fraction_buf [[id(15)]];
+    constant int* num_levees [[id(16)]];
+    constant int* num_catchments [[id(17)]];
+    constant int* num_trials [[id(18)]];
+};
+
 kernel void compute_levee_stage_batched(
-    device int*   levee_catchment_idx_buf   [[buffer(0)]],
-    device float* river_storage_buf         [[buffer(1)]],
-    device float* flood_storage_buf         [[buffer(2)]],
-    device float* protected_storage_buf     [[buffer(3)]],
-    device float* river_depth_buf           [[buffer(4)]],
-    device float* flood_depth_buf           [[buffer(5)]],
-    device float* protected_depth_buf       [[buffer(6)]],
-    device float* river_height_buf          [[buffer(7)]],
-    device float* flood_depth_table_buf     [[buffer(8)]],
-    device float* catchment_area_buf        [[buffer(9)]],
-    device float* river_width_buf           [[buffer(10)]],
-    device float* river_length_buf          [[buffer(11)]],
-    device float* levee_base_height_buf     [[buffer(12)]],
-    device float* levee_crown_height_buf    [[buffer(13)]],
-    device float* levee_fraction_buf        [[buffer(14)]],
-    device float* flood_fraction_buf        [[buffer(15)]],
-    constant int& num_levees                [[buffer(16)]],
-    constant int& num_catchments            [[buffer(17)]],
-    constant int& num_trials                [[buffer(18)]],
-    constant int& batched_river_length_flag     [[buffer(19)]],
-    constant int& batched_river_width_flag      [[buffer(20)]],
-    constant int& batched_river_height_flag     [[buffer(21)]],
-    constant int& batched_catchment_area_flag   [[buffer(22)]],
-    constant int& batched_levee_crown_height_flag [[buffer(23)]],
-    constant int& batched_levee_fraction_flag   [[buffer(24)]],
-    constant int& batched_levee_base_height_flag [[buffer(25)]],
-    constant int& batched_flood_depth_table_flag [[buffer(26)]],
+    constant compute_levee_stage_batched_args& args [[buffer(0)]],
     uint gid [[thread_position_in_grid]]
 )
 {
+    device int* levee_catchment_idx_buf = args.levee_catchment_idx_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* protected_storage_buf = args.protected_storage_buf;
+    device float* river_depth_buf = args.river_depth_buf;
+    device float* flood_depth_buf = args.flood_depth_buf;
+    device float* protected_depth_buf = args.protected_depth_buf;
+    device float* river_height_buf = args.river_height_buf;
+    device float* flood_depth_table_buf = args.flood_depth_table_buf;
+    device float* catchment_area_buf = args.catchment_area_buf;
+    device float* river_width_buf = args.river_width_buf;
+    device float* river_length_buf = args.river_length_buf;
+    device float* levee_base_height_buf = args.levee_base_height_buf;
+    device float* levee_crown_height_buf = args.levee_crown_height_buf;
+    device float* levee_fraction_buf = args.levee_fraction_buf;
+    device float* flood_fraction_buf = args.flood_fraction_buf;
+    const int num_levees = *args.num_levees;
+    const int num_catchments = *args.num_catchments;
+    const int num_trials = *args.num_trials;
     const int NF = __NUM_FLOOD_LEVELS__;
 
     if ((int)gid >= num_levees) return;
@@ -450,31 +494,56 @@ kernel void compute_levee_stage_batched(
     }
 }
 
-kernel void compute_levee_stage_log(
-    device int*   levee_catchment_idx_buf   [[buffer(0)]],
-    device float* river_storage_buf         [[buffer(1)]],
-    device float* flood_storage_buf         [[buffer(2)]],
-    device float* protected_storage_buf     [[buffer(3)]],
-    device float* river_depth_buf           [[buffer(4)]],
-    device float* flood_depth_buf           [[buffer(5)]],
-    device float* protected_depth_buf       [[buffer(6)]],
-    device float* river_height_buf          [[buffer(7)]],
-    device float* flood_depth_table_buf     [[buffer(8)]],
-    device float* catchment_area_buf        [[buffer(9)]],
-    device float* river_width_buf           [[buffer(10)]],
-    device float* river_length_buf          [[buffer(11)]],
-    device float* levee_base_height_buf     [[buffer(12)]],
-    device float* levee_crown_height_buf    [[buffer(13)]],
-    device float* levee_fraction_buf        [[buffer(14)]],
-    device float* flood_fraction_buf        [[buffer(15)]],
+struct compute_levee_stage_log_args {
+    device int* levee_catchment_idx_buf [[id(0)]];
+    device float* river_storage_buf [[id(1)]];
+    device float* flood_storage_buf [[id(2)]];
+    device float* protected_storage_buf [[id(3)]];
+    device float* river_depth_buf [[id(4)]];
+    device float* flood_depth_buf [[id(5)]];
+    device float* protected_depth_buf [[id(6)]];
+    device float* river_height_buf [[id(7)]];
+    device float* flood_depth_table_buf [[id(8)]];
+    device float* catchment_area_buf [[id(9)]];
+    device float* river_width_buf [[id(10)]];
+    device float* river_length_buf [[id(11)]];
+    device float* levee_base_height_buf [[id(12)]];
+    device float* levee_crown_height_buf [[id(13)]];
+    device float* levee_fraction_buf [[id(14)]];
+    device float* flood_fraction_buf [[id(15)]];
     // Packed log sums — (11, log_buffer_size) contiguous
-    device atomic_float* log_sums_buf       [[buffer(16)]],
-    constant int& num_levees                [[buffer(17)]],
-    device int*   current_step_buf          [[buffer(18)]],
-    constant int& log_buffer_size           [[buffer(19)]],
+    device atomic_float* log_sums_buf [[id(16)]];
+    constant int* num_levees [[id(17)]];
+    device int* current_step_buf [[id(18)]];
+    constant int* log_buffer_size [[id(19)]];
+};
+
+kernel void compute_levee_stage_log(
+    constant compute_levee_stage_log_args& args [[buffer(0)]],
     uint idx [[thread_position_in_grid]]
 )
 {
+    device int* levee_catchment_idx_buf = args.levee_catchment_idx_buf;
+    device float* river_storage_buf = args.river_storage_buf;
+    device float* flood_storage_buf = args.flood_storage_buf;
+    device float* protected_storage_buf = args.protected_storage_buf;
+    device float* river_depth_buf = args.river_depth_buf;
+    device float* flood_depth_buf = args.flood_depth_buf;
+    device float* protected_depth_buf = args.protected_depth_buf;
+    device float* river_height_buf = args.river_height_buf;
+    device float* flood_depth_table_buf = args.flood_depth_table_buf;
+    device float* catchment_area_buf = args.catchment_area_buf;
+    device float* river_width_buf = args.river_width_buf;
+    device float* river_length_buf = args.river_length_buf;
+    device float* levee_base_height_buf = args.levee_base_height_buf;
+    device float* levee_crown_height_buf = args.levee_crown_height_buf;
+    device float* levee_fraction_buf = args.levee_fraction_buf;
+    device float* flood_fraction_buf = args.flood_fraction_buf;
+    // Packed log sums — (11, log_buffer_size) contiguous
+    device atomic_float* log_sums_buf = args.log_sums_buf;
+    const int num_levees = *args.num_levees;
+    device int* current_step_buf = args.current_step_buf;
+    const int log_buffer_size = *args.log_buffer_size;
     const int NUM_FLOOD_LEVELS = __NUM_FLOOD_LEVELS__;
 
     if ((int)idx >= num_levees) return;

@@ -1059,9 +1059,10 @@ def export_inpmat(
 
     expected_size = 3 * inpn * record_bytes
     actual_size = inpmat_path.stat().st_size
-    assert actual_size == expected_size, (
-        f"inpmat size mismatch: expected {expected_size}, got {actual_size}"
-    )
+    if actual_size != expected_size:
+        raise RuntimeError(
+            f"inpmat size mismatch: expected {expected_size}, got {actual_size}"
+        )
     print(f"  Wrote {inpmat_name}  ({actual_size / 1e6:.1f} MB,  "
           f"{3 * inpn} records of {record_bytes} bytes)")
 

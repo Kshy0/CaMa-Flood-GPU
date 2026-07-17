@@ -14,9 +14,9 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from hydroforge.modeling.distributed import find_indices_in_torch
-from hydroforge.modeling.module import (AbstractModule, TensorField,
-                                        computed_tensor_field)
+from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+                                        ReferenceField, ReferenceIndexField,
+                                        TensorField, computed_tensor_field)
 from pydantic import Field, computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
@@ -24,10 +24,9 @@ from cmfgpu.modules.base import BaseModule
 
 def LeveeField(
     description: str,
-    shape: Tuple[str, ...] = ("base.num_levees",),
+    shape: Tuple[str, ...] = ("num_levees",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    group_by: Optional[str] = "levee_basin_id",
-    dim_coords: Optional[str] = "base.levee_catchment_id",
+    dim_coords: Optional[str] = "levee_id",
     category: Literal["topology", "param", "init_state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs,
@@ -36,9 +35,6 @@ def LeveeField(
         description=description,
         shape=shape,
         dtype=dtype,
-        group_by=group_by,
-        save_idx=None,
-        save_coord=None,
         dim_coords=dim_coords,
         category=category,
         mode=mode,
@@ -48,9 +44,9 @@ def LeveeField(
 
 def computed_levee_field(
     description: str,
-    shape: Tuple[str, ...] = ("base.num_levees",),
+    shape: Tuple[str, ...] = ("num_levees",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "base.levee_catchment_id",
+    dim_coords: Optional[str] = "levee_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
     **kwargs,
@@ -59,8 +55,6 @@ def computed_levee_field(
         description=description,
         shape=shape,
         dtype=dtype,
-        save_idx=None,
-        save_coord=None,
         dim_coords=dim_coords,
         category=category,
         expr=expr,
@@ -75,8 +69,7 @@ class LeveeModule(AbstractModule):
     description: ClassVar[str] = "Levee protection module with protected storage states"
     dependencies: ClassVar[list[str]] = ["base"]
 
-    base: Optional[BaseModule] = Field(
-        default=None,
+    base: BaseModule = Field(
         exclude=True,
         description="Reference to BaseModule",
     )
@@ -85,12 +78,19 @@ class LeveeModule(AbstractModule):
     # Levee metadata and topology
     # ------------------------------------------------------------------ #
 
-    levee_id: torch.Tensor = LeveeField(
+    levee_catchment_id: torch.Tensor = ReferenceField(
+        description="Catchment ID hosting each levee",
+        dtype="int",
+        shape=("num_levees",),
+        dim_coords="levee_id",
+        references="catchment_id",
+    )
+
+    levee_id: torch.Tensor = CoordinateField(
         description="Unique ID for each levee",
         dtype="int",
-        category="topology",
-        mode="cpu",
-        is_key=True,
+        shape=("num_levees",),
+        partition_by="levee_catchment_id",
     )
 
     # ------------------------------------------------------------------ #
@@ -109,14 +109,31 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed tensors (levee-aligned)
     # ------------------------------------------------------------------ #
-    @computed_levee_field(description="Indices of catchments hosting each levee", dtype="idx", category="topology")
+    @computed_field(description="Total number of levees")
     @cached_property
-    def levee_catchment_idx(self) -> torch.Tensor:
-        assert self.base is not None
-        return find_indices_in_torch(self.base.levee_catchment_id, self.base.catchment_id)
+    def num_levees(self) -> int:
+        return self.levee_catchment_id.shape[0]
+
+    levee_catchment_idx = ReferenceIndexField("levee_catchment_id")
+
+    @computed_tensor_field(
+        description="Boolean mask for catchments governed by levee physics",
+        shape=("base.num_catchments",),
+        dtype="bool",
+        dim_coords="base.catchment_id",
+        category="topology",
+    )
+    @cached_property
+    def is_levee(self) -> torch.Tensor:
+        mask = torch.zeros(
+            self.base.num_catchments,
+            dtype=torch.bool,
+            device=self.base.catchment_id.device,
+        )
+        mask[self.levee_catchment_idx] = True
+        return mask
 
     def _interp_lookup(self, table: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
-        assert self.base is not None
         # table: (N, M) or (T, N, M)
         # position: (L,) or (T, L)
         
@@ -178,13 +195,11 @@ class LeveeModule(AbstractModule):
     @computed_levee_field(description="Levee base height above river bed (m)", category="derived_param")
     @cached_property
     def levee_base_height(self) -> torch.Tensor:
-        assert self.base is not None
         return self._interp_lookup(self.base.flood_depth_table, self.levee_fraction * self.base.num_flood_levels)
     
     @computed_levee_field(description="Storage when water first touches levee base (m³)", category="derived_param")
     @cached_property
     def levee_base_storage(self) -> torch.Tensor:
-        assert self.base is not None
         # Gather parameters for levee catchments
         idx = self.levee_catchment_idx
         river_length = self.gather_tensor(self.base.river_length, idx)
@@ -324,12 +339,6 @@ class LeveeModule(AbstractModule):
         return self
 
     @model_validator(mode="after")
-    def validate_levee_catchment_idx(self) -> Self:
-        if torch.any(self.levee_catchment_idx < 0):
-            raise ValueError("levee_catchment_id contains entries absent from catchment_id")
-        return self
-
-    @model_validator(mode="after")
     def validate_levee_height(self) -> Self:
         invalid = self.levee_base_height >= self.levee_crown_height
         num_invalid = invalid.sum().item()
@@ -340,21 +349,3 @@ class LeveeModule(AbstractModule):
             )
             self.levee_crown_height = torch.maximum(self.levee_crown_height, self.levee_base_height)
         return self
-
-    # ------------------------------------------------------------------ #
-    # Batched flags
-    # ------------------------------------------------------------------ #
-    @computed_field
-    @cached_property
-    def batched_levee_base_height(self) -> bool:
-        return self._is_batched(self.levee_base_height)
-
-    @computed_field
-    @cached_property
-    def batched_levee_crown_height(self) -> bool:
-        return self._is_batched(self.levee_crown_height)
-
-    @computed_field
-    @cached_property
-    def batched_levee_fraction(self) -> bool:
-        return self._is_batched(self.levee_fraction)

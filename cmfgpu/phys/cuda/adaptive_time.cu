@@ -38,13 +38,13 @@ __global__ void k_adaptive_time(
 
 void launch_adaptive_time(
     at::Tensor river_depth, at::Tensor downstream_distance,
-    at::Tensor is_dam_related, at::Tensor max_sub_steps,
+    c10::optional<at::Tensor> is_dam_related, at::Tensor max_sub_steps,
     double time_step, double adaptive_time_factor, double gravity,
     long num_catchments, long has_reservoir, long block)
 {
     int grid = (int)((num_catchments + block - 1) / block);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    const bool* dam = is_dam_related.numel() ? is_dam_related.data_ptr<bool>() : nullptr;
+    const bool* dam = is_dam_related ? is_dam_related->data_ptr<bool>() : nullptr;
     k_adaptive_time<<<grid, (int)block, 0, stream>>>(
         river_depth.data_ptr<float>(), downstream_distance.data_ptr<float>(),
         dam, max_sub_steps.data_ptr<int>(),
