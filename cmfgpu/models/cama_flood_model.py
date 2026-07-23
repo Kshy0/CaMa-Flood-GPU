@@ -54,6 +54,7 @@ class CaMaFlood(AbstractModel):
     }
     partition_key: ClassVar[str] = "catchment_id"
     partition_group: ClassVar[str] = "catchment_basin_id"
+    cuda_extension_modules: ClassVar[tuple[str, ...]] = ("cmfgpu.phys.cuda",)
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {
         "cuda": BackendRequirement(trials=False),
     }

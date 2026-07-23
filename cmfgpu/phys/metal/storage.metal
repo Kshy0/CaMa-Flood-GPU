@@ -126,6 +126,22 @@ long num_catchments = *args.num_catchments;
         }
     }
 
+    // A completely dry, balanced cell is already in the exact state written
+    // by the dry branch below.  Avoid geometry/table reads and eight redundant
+    // global stores, which dominate the common no-water path.
+    const bool dry_balanced = river_storage == 0.0f
+        && flood_storage == 0.0f && protected_storage == 0.0f
+        && river_inflow - river_outflow == 0.0f
+        && flood_inflow - flood_outflow - bifurcation_outflow == 0.0f
+        && runoff + prescribed_inflow == 0.0f;
+    if (dry_balanced && args.outgoing_storage_ptr[cell] == 0.0f
+        && args.river_depth_ptr[cell] == 0.0f
+        && args.flood_depth_ptr[cell] == 0.0f
+        && args.protected_depth_ptr[cell] == 0.0f
+        && args.flood_fraction_ptr[cell] == 0.0f) {
+        return;
+    }
+
     float updated_river_storage = river_storage
         + (river_inflow - river_outflow) * time_step;
     float updated_flood_storage = flood_storage

@@ -54,11 +54,11 @@ __global__ void k_flood_stage(
     STO prot = protected_storage[t];
     REAL rinf = (REAL)river_inflow[t];
     REAL finf = (REAL)flood_inflow[t];
-    REAL gbif = has_bifurcation ? (REAL)global_bif_outflow[t] : 0.;
+    REAL gbif = has_bifurcation ? (REAL)global_bif_outflow[t] : (REAL)0;
     REAL rout = __ldg(river_outflow + t);
     REAL fout = __ldg(flood_outflow + t);
     REAL ro = __ldg(runoff + t);
-    REAL prescribed_inflow = 0.;
+    REAL prescribed_inflow = (REAL)0;
     if (has_inflow) {
         int inflow_idx = __ldg(catchment_inflow_idx + t);
         if (inflow_idx >= 0) prescribed_inflow = __ldg(inflow + inflow_idx);
@@ -72,17 +72,20 @@ __global__ void k_flood_stage(
                   (REAL)total_stage_pre * (REAL)1e-9);
     }
 
-    STO river_su = rsto + (rinf - rout) * ts;
+    REAL river_delta = (rinf - rout) * ts;
+    STO river_su = rsto + (STO)river_delta;
+    REAL flood_delta = (finf - fout - gbif) * ts;
     STO flood_su = fsto
         + (river_su < (STO)0 ? river_su : (STO)0)
-        + (finf - fout - gbif) * ts;
+        + (STO)flood_delta;
     river_su = river_su > (STO)0 ? river_su : (STO)0;
     if (flood_su < (STO)0) {
         STO tt = river_su + flood_su;
         river_su = tt > (STO)0 ? tt : (STO)0;
     }
     flood_su = flood_su > (STO)0 ? flood_su : (STO)0;
-    STO total_next = river_su + flood_su + prot + (ro + prescribed_inflow) * ts;
+    REAL external_delta = (ro + prescribed_inflow) * ts;
+    STO total_next = river_su + flood_su + prot + (STO)external_delta;
     if constexpr (LOG) {
         if (non_levee) {
             atomicAdd(total_storage_next_sum + current_step,
@@ -127,9 +130,9 @@ __global__ void k_flood_stage(
         flood_storage[t] = (STO)0;
         protected_storage[t] = (STO)0;
         river_depth[t] = river_depth_dry;
-        flood_depth[t] = 0.;
-        protected_depth[t] = 0.;
-        flood_fraction[t] = 0.;
+        flood_depth[t] = (REAL)0;
+        protected_depth[t] = (REAL)0;
+        flood_fraction[t] = (REAL)0;
         return;
     }
 
@@ -138,11 +141,11 @@ __global__ void k_flood_stage(
     REAL width_increment = catchment_width / num_flood_levels;
     int level = 0;
     REAL S_accum = river_max_storage;
-    REAL prev_H = 0.;
+    REAL prev_H = (REAL)0;
     REAL prev_W = rw;
     REAL prev_total_storage = river_max_storage;
-    REAL prev_flood_depth = 0.;
-    REAL next_flood_depth = 0.;
+    REAL prev_flood_depth = (REAL)0;
+    REAL next_flood_depth = (REAL)0;
 
     for (int i = 0; i < num_flood_levels; ++i) {
         REAL H_curr = __ldg(flood_depth_table + t * num_flood_levels + i);
@@ -164,14 +167,14 @@ __global__ void k_flood_stage(
     }
 
     REAL prev_total_width = rw + level * width_increment;
-    REAL diff_width = 0.;
+    REAL diff_width = (REAL)0;
     REAL fdep;
     if (level == num_flood_levels) {
         fdep = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * rl);
     } else {
         REAL flood_grad = (next_flood_depth - prev_flood_depth) / width_increment;
         diff_width = sqrt(prev_total_width * prev_total_width
-            + 2. * (total_storage - prev_total_storage) / (flood_grad * rl)) - prev_total_width;
+            + (REAL)2 * (total_storage - prev_total_storage) / (flood_grad * rl)) - prev_total_width;
         fdep = prev_flood_depth + diff_width * flood_grad;
     }
 
@@ -179,10 +182,10 @@ __global__ void k_flood_stage(
     REAL river_storage_final = cap < total_storage ? cap : total_storage;
     REAL rdep = river_storage_final / (rl * rw);
     REAL ff_mid = (prev_total_width + diff_width - rw) * rl / ca;
-    ff_mid = ff_mid < 0. ? 0. : (ff_mid > 1. ? 1. : ff_mid);
-    REAL ffr = (level == num_flood_levels) ? 1. : ff_mid;
+    ff_mid = ff_mid < (REAL)0 ? (REAL)0 : (ff_mid > (REAL)1 ? (REAL)1 : ff_mid);
+    REAL ffr = (level == num_flood_levels) ? (REAL)1 : ff_mid;
     REAL flood_storage_final = total_storage - river_storage_final;
-    if (flood_storage_final < 0.) flood_storage_final = 0.;
+    if (flood_storage_final < (REAL)0) flood_storage_final = (REAL)0;
 
     if constexpr (LOG) {
         REAL total_stage_new = river_storage_final + flood_storage_final;

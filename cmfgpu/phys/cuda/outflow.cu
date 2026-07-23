@@ -18,7 +18,7 @@
 // ----------------------------------------------------------------------------
 // (1) compute_outflow_kernel
 // ----------------------------------------------------------------------------
-template <typename REAL, typename STO>
+template <bool BASE_ONLY, typename REAL, typename STO>
 __global__ void k_outflow(
     const int* __restrict__ downstream_idx,
     STO* __restrict__ river_inflow, REAL* __restrict__ river_outflow,
@@ -82,9 +82,11 @@ __global__ void k_outflow(
     REAL wse_dn = r_dep_dn + river_elevation_dn;
 
     if (is_river_mouth) wse_dn = c_elv;
-    if (has_sea_level) {
-        int sea_idx = __ldg(catchment_sea_level_idx + t);
-        if (sea_idx >= 0) wse_dn = __ldg(sea_surface_elevation + sea_idx);
+    if constexpr (!BASE_ONLY) {
+        if (has_sea_level) {
+            int sea_idx = __ldg(catchment_sea_level_idx + t);
+            if (sea_idx >= 0) wse_dn = __ldg(sea_surface_elevation + sea_idx);
+        }
     }
     REAL max_wse = fmax(wse, wse_dn);
 
@@ -127,21 +129,23 @@ __global__ void k_outflow(
         is_negative_flow ? (REAL)0.05 * total_storage_f / total_negative_flow : (REAL)1.0, (REAL)1.0);
     if (is_negative_flow) { upd_r_out *= limit_rate; upd_f_out *= limit_rate; }
 
-    if (has_reservoir) {
-        bool is_dam_up = is_dam_upstream && is_dam_upstream[t];
-        REAL bed_slope = (c_elv - c_elv_dn) / dn_dist;
-        bed_slope = fmax(bed_slope, min_kinematic_slope);
-        REAL kin_riv_vel = ((REAL)1.0 / r_man) * sqrt(bed_slope) * cbrt(r_dep * r_dep);
-        REAL kin_riv = r_wid * r_dep * kin_riv_vel;
-        kin_riv = fmin(kin_riv, rs / time_step);
-        kin_riv = fmax(kin_riv, (REAL)0.0);
-        REAL bed_slope_f = fmin(bed_slope, (REAL)0.005);
-        REAL kin_fld_vel = ((REAL)1.0 / f_man) * sqrt(bed_slope_f) * cbrt(f_dep * f_dep);
-        REAL kin_fld_area = fmax(fs / r_len - f_dep * r_wid, (REAL)0.0);
-        REAL kin_fld = kin_fld_area * kin_fld_vel;
-        kin_fld = fmin(kin_fld, fs / time_step);
-        kin_fld = fmax(kin_fld, (REAL)0.0);
-        if (is_dam_up) { upd_r_out = kin_riv; upd_f_out = kin_fld; }
+    if constexpr (!BASE_ONLY) {
+        if (has_reservoir) {
+            bool is_dam_up = is_dam_upstream && is_dam_upstream[t];
+            REAL bed_slope = (c_elv - c_elv_dn) / dn_dist;
+            bed_slope = fmax(bed_slope, min_kinematic_slope);
+            REAL kin_riv_vel = ((REAL)1.0 / r_man) * sqrt(bed_slope) * cbrt(r_dep * r_dep);
+            REAL kin_riv = r_wid * r_dep * kin_riv_vel;
+            kin_riv = fmin(kin_riv, rs / time_step);
+            kin_riv = fmax(kin_riv, (REAL)0.0);
+            REAL bed_slope_f = fmin(bed_slope, (REAL)0.005);
+            REAL kin_fld_vel = ((REAL)1.0 / f_man) * sqrt(bed_slope_f) * cbrt(f_dep * f_dep);
+            REAL kin_fld_area = fmax(fs / r_len - f_dep * r_wid, (REAL)0.0);
+            REAL kin_fld = kin_fld_area * kin_fld_vel;
+            kin_fld = fmin(kin_fld, fs / time_step);
+            kin_fld = fmax(kin_fld, (REAL)0.0);
+            if (is_dam_up) { upd_r_out = kin_riv; upd_f_out = kin_fld; }
+        }
     }
 
     river_outflow[t] = upd_r_out;
@@ -240,13 +244,17 @@ static void launch_outflow_t(
 {
     int grid = (int)((n + block - 1) / block);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    k_outflow<REAL, STO><<<grid, block, 0, stream>>>(
-        PI(di), PS<STO>(ri), PR<REAL>(ro), PR<REAL>(rman), PR<REAL>(rd), PR<REAL>(rw), PR<REAL>(rl), PR<REAL>(rh), PS<STO>(rs),
-        PS<STO>(fi), PR<REAL>(fo), PR<REAL>(fman), PR<REAL>(fd), PR<REAL>(pd), PR<REAL>(ce), PR<REAL>(dd), PS<STO>(fsto), PS<STO>(psto),
-        PR<REAL>(rcsd), PR<REAL>(fcsd), PR<REAL>(fcsa),
-        PSO<STO>(gb), PS<STO>(ts_out), PS<STO>(outs), PR<REAL>(wse), PR<REAL>(pwse),
-        gravity, PR<REAL>(tsp), n, has_bif, PBO(dam), has_res, minslope,
-        PRO<REAL>(sea), PIO(sea_idx), has_sea);
+#define LAUNCH_OUTFLOW(BASE_ONLY) \
+    k_outflow<BASE_ONLY, REAL, STO><<<grid, block, 0, stream>>>( \
+        PI(di), PS<STO>(ri), PR<REAL>(ro), PR<REAL>(rman), PR<REAL>(rd), PR<REAL>(rw), PR<REAL>(rl), PR<REAL>(rh), PS<STO>(rs), \
+        PS<STO>(fi), PR<REAL>(fo), PR<REAL>(fman), PR<REAL>(fd), PR<REAL>(pd), PR<REAL>(ce), PR<REAL>(dd), PS<STO>(fsto), PS<STO>(psto), \
+        PR<REAL>(rcsd), PR<REAL>(fcsd), PR<REAL>(fcsa), \
+        PSO<STO>(gb), PS<STO>(ts_out), PS<STO>(outs), PR<REAL>(wse), PR<REAL>(pwse), \
+        gravity, PR<REAL>(tsp), n, has_bif, PBO(dam), has_res, minslope, \
+        PRO<REAL>(sea), PIO(sea_idx), has_sea)
+    if (!has_res && !has_sea) LAUNCH_OUTFLOW(true);
+    else LAUNCH_OUTFLOW(false);
+#undef LAUNCH_OUTFLOW
 }
 
 void launch_outflow(

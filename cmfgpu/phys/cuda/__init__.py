@@ -11,6 +11,16 @@ from hydroforge.kernels.backends.cuda.dispatcher import (
 )
 from hydroforge.kernels.backends.cuda.spec import CudaExtensionSpec
 _DIR = Path(__file__).resolve().parent
+_MODULE_EXTENSIONS = {
+    "base": {"storage", "outflow"},
+    "inflow": {"outflow"},
+    "adaptive_time": {"adaptive"},
+    "bifurcation": {"bifurcation"},
+    "reservoir": {"reservoir"},
+    "levee": {"levee"},
+    "log": {"storage"},
+    "sea_level": set(),
+}
 _CUDA = CudaExtensionGroup(
     __name__,
     {
@@ -34,6 +44,7 @@ _CUDA = CudaExtensionGroup(
         ),
     },
     binary_prefix="cmfgpu_cuda",
+    module_extensions=_MODULE_EXTENSIONS,
 )
 
 
