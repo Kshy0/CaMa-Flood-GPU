@@ -1,654 +1,284 @@
-// LICENSE HEADER MANAGED BY add-license-header
-// Copyright (c) 2025 Shengyu Kang (Wuhan University)
-// Licensed under the Apache License, Version 2.0
-// http://www.apache.org/licenses/LICENSE-2.0
-
-#include <metal_stdlib>
-using namespace metal;
-
-constant bool has_bifurcation [[function_constant(0)]];
-constant bool has_inflow [[function_constant(1)]];
-constant bool has_levee [[function_constant(2)]];
-constant bool batched_runoff_flag [[function_constant(3)]];
-constant bool batched_river_height_flag [[function_constant(4)]];
-constant bool batched_flood_depth_table_flag [[function_constant(5)]];
-constant bool batched_catchment_area_flag [[function_constant(6)]];
-constant bool batched_river_width_flag [[function_constant(7)]];
-constant bool batched_river_length_flag [[function_constant(8)]];
-
-#define NUM_FLOOD_LEVELS __NUM_FLOOD_LEVELS__
-
-// log_sums layout  (row major, stride = log_buffer_size):
-//   row  0 = total_storage_pre_sum
-//   row  1 = total_storage_next_sum
-//   row  2 = total_storage_new_sum
-//   row  3 = total_inflow_error_sum
-//   row  4 = total_inflow_sum
-//   row  5 = total_outflow_sum
-//   row  6 = total_storage_stage_sum
-//   row  7 = total_stage_error_sum
-//   row  8 = river_storage_sum
-//   row  9 = flood_storage_sum
-//   row 10 = flood_area_sum
-
-static inline void atomic_add_float(device atomic_float* addr, float val) {
-    atomic_fetch_add_explicit(addr, val, memory_order_relaxed);
-}
-
-struct compute_flood_stage_args {
-    // Storage update inputs
-    device float* river_inflow_buf [[id(0)]];
-    device float* flood_inflow_buf [[id(1)]];
-    device float* river_outflow_buf [[id(2)]];
-    device float* flood_outflow_buf [[id(3)]];
-    device float* bif_outflow_buf [[id(4)]];
-    device float* runoff_buf [[id(5)]];
-    // Storage in/out
-    device float* outgoing_storage_buf [[id(6)]];
-    device float* river_storage_buf [[id(7)]];
-    device float* flood_storage_buf [[id(8)]];
-    device float* protected_storage_buf [[id(9)]];
-    // Depth/fraction outputs
-    device float* river_depth_buf [[id(10)]];
-    device float* flood_depth_buf [[id(11)]];
-    device float* protected_depth_buf [[id(12)]];
-    device float* flood_fraction_buf [[id(13)]];
-    // Reference tables
-    device float* river_height_buf [[id(14)]];
-    device float* flood_depth_table_buf [[id(15)]];
-    device float* catchment_area_buf [[id(16)]];
-    device float* river_width_buf [[id(17)]];
-    device float* river_length_buf [[id(18)]];
-    // Scalars
-    constant float* time_step [[id(19)]];
-    constant int* num_catchments [[id(20)]];
-    device float* inflow_buf [[id(21)]];
-    device int* catchment_inflow_idx_buf [[id(22)]];
+struct FloodStageResult {
+    float river_storage;
+    float flood_storage;
+    float river_depth;
+    float flood_depth;
+    float flood_fraction;
 };
 
-kernel void compute_flood_stage(
-    constant compute_flood_stage_args& args [[buffer(0)]],
-    uint idx [[thread_position_in_grid]]
-)
-{
-    // Storage update inputs
-    device float* river_inflow_buf = args.river_inflow_buf;
-    device float* flood_inflow_buf = args.flood_inflow_buf;
-    device float* river_outflow_buf = args.river_outflow_buf;
-    device float* flood_outflow_buf = args.flood_outflow_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device float* runoff_buf = args.runoff_buf;
-    // Storage in/out
-    device float* outgoing_storage_buf = args.outgoing_storage_buf;
-    device float* river_storage_buf = args.river_storage_buf;
-    device float* flood_storage_buf = args.flood_storage_buf;
-    device float* protected_storage_buf = args.protected_storage_buf;
-    // Depth/fraction outputs
-    device float* river_depth_buf = args.river_depth_buf;
-    device float* flood_depth_buf = args.flood_depth_buf;
-    device float* protected_depth_buf = args.protected_depth_buf;
-    device float* flood_fraction_buf = args.flood_fraction_buf;
-    // Reference tables
-    device float* river_height_buf = args.river_height_buf;
-    device float* flood_depth_table_buf = args.flood_depth_table_buf;
-    device float* catchment_area_buf = args.catchment_area_buf;
-    device float* river_width_buf = args.river_width_buf;
-    device float* river_length_buf = args.river_length_buf;
-    // Scalars
-    const float time_step = *args.time_step;
-    const int num_catchments = *args.num_catchments;
-    device float* inflow_buf = args.inflow_buf;
-    device int* catchment_inflow_idx_buf = args.catchment_inflow_idx_buf;
-    if ((int)idx >= num_catchments) return;
+static inline FloodStageResult flood_stage_inline(
+    float total_storage,
+    float river_height,
+    float catchment_area,
+    float river_width,
+    float river_length,
+    device const float* flood_depth_table,
+    int num_flood_levels
+) {
+    FloodStageResult result;
+    float maximum_river_storage =
+        river_length * river_width * river_height;
+    if (total_storage <= maximum_river_storage) {
+        result.river_storage = total_storage;
+        result.flood_storage = 0.0f;
+        result.river_depth = total_storage / (river_length * river_width);
+        result.flood_depth = 0.0f;
+        result.flood_fraction = 0.0f;
+        return result;
+    }
 
-    // ---- 1. Storage update ----
-    float riv_sto  = river_storage_buf[idx];
-    float fld_sto  = flood_storage_buf[idx];
-    float prot_sto = protected_storage_buf[idx];
-    float riv_in   = river_inflow_buf[idx];
-    float fld_in   = flood_inflow_buf[idx];
-    float riv_out  = river_outflow_buf[idx];
-    float fld_out  = flood_outflow_buf[idx];
-    float bif_out  = has_bifurcation ? bif_outflow_buf[idx] : 0.0f;
-    float runoff   = runoff_buf[idx];
+    float width_increment =
+        (catchment_area / river_length) / (float)num_flood_levels;
+    int level = 0;
+    float accumulated_storage = maximum_river_storage;
+    float previous_height = 0.0f;
+    float previous_width = river_width;
+    float previous_total_storage = maximum_river_storage;
+    float previous_flood_depth = 0.0f;
+    float next_flood_depth = 0.0f;
+
+    for (int level_idx = 0; level_idx < num_flood_levels; ++level_idx) {
+        float current_height = flood_depth_table[level_idx];
+        float current_width = river_width
+            + (float)(level_idx + 1) * width_increment;
+        float storage_increment = river_length * 0.5f
+            * (previous_width + current_width)
+            * (current_height - previous_height);
+        float current_storage = accumulated_storage + storage_increment;
+        if (total_storage > current_storage) {
+            ++level;
+            previous_total_storage = current_storage;
+            previous_flood_depth = current_height;
+            accumulated_storage = current_storage;
+            previous_height = current_height;
+            previous_width = current_width;
+        } else {
+            next_flood_depth = current_height;
+            break;
+        }
+    }
+
+    float previous_total_width =
+        river_width + (float)level * width_increment;
+    float width_difference = 0.0f;
+    if (level == num_flood_levels) {
+        result.flood_depth = previous_flood_depth
+            + (total_storage - previous_total_storage)
+                / (previous_total_width * river_length);
+    } else {
+        float flood_gradient =
+            (next_flood_depth - previous_flood_depth) / width_increment;
+        width_difference = sqrt(
+            previous_total_width * previous_total_width
+            + 2.0f * (total_storage - previous_total_storage)
+                / (flood_gradient * river_length)
+        ) - previous_total_width;
+        result.flood_depth =
+            previous_flood_depth + width_difference * flood_gradient;
+    }
+
+    result.river_storage = min(
+        maximum_river_storage
+            + river_length * river_width * result.flood_depth,
+        total_storage);
+    result.flood_storage = max(
+        total_storage - result.river_storage, 0.0f);
+    result.river_depth =
+        result.river_storage / (river_length * river_width);
+    float middle_fraction = clamp(
+        (previous_total_width + width_difference - river_width)
+            * river_length / catchment_area,
+        0.0f, 1.0f);
+    result.flood_fraction = level == num_flood_levels
+        ? 1.0f : middle_fraction;
+    return result;
+}
+
+// HYDROFORGE METAL KERNEL BODY: compute_flood_stage
+long num_catchments = *args.num_catchments;
+    long num_trials = *args.num_trials;
+    long total = num_catchments * num_trials;
+    if ((long)i >= total) return;
+
+    long catchment = (long)i % num_catchments;
+    long trial = (long)i / num_catchments;
+    long trial_offset = trial * num_catchments;
+    long cell = trial_offset + catchment;
+    float time_step = args.time_step_ptr[0];
+
+    float river_storage = args.river_storage_ptr[cell];
+    float flood_storage = args.flood_storage_ptr[cell];
+    float protected_storage = args.protected_storage_ptr[cell];
+    float river_inflow = args.river_inflow_ptr[cell];
+    float flood_inflow = args.flood_inflow_ptr[cell];
+    float river_outflow = args.river_outflow_ptr[cell];
+    float flood_outflow = args.flood_outflow_ptr[cell];
+    float bifurcation_outflow = HAS_BIFURCATION
+        ? args.global_bifurcation_outflow_ptr[cell] : 0.0f;
+    long runoff_idx = batched_runoff ? cell : catchment;
+    float runoff = args.runoff_ptr[runoff_idx];
     float prescribed_inflow = 0.0f;
-    if (has_inflow) {
-        int inflow_idx = catchment_inflow_idx_buf[idx];
-        if (inflow_idx >= 0) prescribed_inflow = inflow_buf[inflow_idx];
+    if (HAS_INFLOW) {
+        int inflow_idx = args.catchment_inflow_idx_ptr[catchment];
+        if (inflow_idx >= 0) {
+            prescribed_inflow = args.inflow_ptr[
+                trial * (long)(*args.num_inflow_gauges) + inflow_idx];
+        }
     }
 
-    float riv_sto_upd = riv_sto + (riv_in - riv_out) * time_step;
-    float fld_sto_upd = fld_sto
-        + (riv_sto_upd < 0.0f ? riv_sto_upd : 0.0f)
-        + (fld_in - fld_out - bif_out) * time_step;
-    riv_sto_upd = max(riv_sto_upd, 0.0f);
-    if (fld_sto_upd < 0.0f) {
-        riv_sto_upd = max(riv_sto_upd + fld_sto_upd, 0.0f);
+    float updated_river_storage = river_storage
+        + (river_inflow - river_outflow) * time_step;
+    float updated_flood_storage = flood_storage
+        + (updated_river_storage < 0.0f ? updated_river_storage : 0.0f)
+        + (flood_inflow - flood_outflow - bifurcation_outflow) * time_step;
+    updated_river_storage = max(updated_river_storage, 0.0f);
+    if (updated_flood_storage < 0.0f) {
+        updated_river_storage = max(
+            updated_river_storage + updated_flood_storage, 0.0f);
     }
-    fld_sto_upd = max(fld_sto_upd, 0.0f);
-    float total_sto = max(
-        riv_sto_upd + fld_sto_upd + prot_sto
-        + (runoff + prescribed_inflow) * time_step,
+    updated_flood_storage = max(updated_flood_storage, 0.0f);
+    float total_storage = max(
+        updated_river_storage + updated_flood_storage + protected_storage
+            + (runoff + prescribed_inflow) * time_step,
         0.0f);
 
-    // ---- 2. Flood stage via table scan ----
-    float riv_height = river_height_buf[idx];
-    float catch_area = catchment_area_buf[idx];
-    float riv_width  = river_width_buf[idx];
-    float riv_length = river_length_buf[idx];
+    long river_height_idx = batched_river_height ? cell : catchment;
+    long catchment_area_idx = batched_catchment_area ? cell : catchment;
+    long river_width_idx = batched_river_width ? cell : catchment;
+    long river_length_idx = batched_river_length ? cell : catchment;
+    float river_height = args.river_height_ptr[river_height_idx];
+    float catchment_area = args.catchment_area_ptr[catchment_area_idx];
+    float river_width = args.river_width_ptr[river_width_idx];
+    float river_length = args.river_length_ptr[river_length_idx];
+    long table_trial_offset = batched_flood_depth_table
+        ? trial_offset * (long)num_flood_levels : 0;
+    long table_cell_offset =
+        table_trial_offset + catchment * (long)num_flood_levels;
+    FloodStageResult stage = flood_stage_inline(
+        total_storage, river_height, catchment_area,
+        river_width, river_length,
+        args.flood_depth_table_ptr + table_cell_offset,
+        num_flood_levels);
 
-    float riv_max_sto  = riv_length * riv_width * riv_height;
-    float catch_width  = catch_area / riv_length;
-    float width_inc    = catch_width / (float)NUM_FLOOD_LEVELS;
+    args.outgoing_storage_ptr[cell] = 0.0f;
+    args.river_storage_ptr[cell] = stage.river_storage;
+    args.flood_storage_ptr[cell] = stage.flood_storage;
+    args.protected_storage_ptr[cell] = 0.0f;
+    args.river_depth_ptr[cell] = stage.river_depth;
+    args.flood_depth_ptr[cell] = stage.flood_depth;
+    args.protected_depth_ptr[cell] = stage.flood_depth;
+    args.flood_fraction_ptr[cell] = stage.flood_fraction;
+// HYDROFORGE METAL KERNEL BODY: compute_flood_stage_log
+long num_catchments = *args.num_catchments;
+    if ((long)i >= num_catchments) return;
 
-    if (total_sto <= riv_max_sto) {
-        float riv_depth_dry = total_sto / (riv_length * riv_width);
-        outgoing_storage_buf[idx]   = 0.0f;
-        river_storage_buf[idx]      = total_sto;
-        flood_storage_buf[idx]      = 0.0f;
-        protected_storage_buf[idx]  = 0.0f;
-        river_depth_buf[idx]        = riv_depth_dry;
-        flood_depth_buf[idx]        = 0.0f;
-        protected_depth_buf[idx]    = 0.0f;
-        flood_fraction_buf[idx]     = 0.0f;
-        return;
-    }
+    long cell = (long)i;
+    int current_step = args.current_step_ptr[0];
+    float time_step = args.time_step_ptr[0];
+    bool non_levee =
+        !HAS_LEVEE || args.is_levee_ptr[cell] == 0;
 
-    int   level = 0;
-    float S_accum = riv_max_sto;
-    float prev_H = 0.0f;
-    float prev_W = riv_width;
-    float prev_total_sto = riv_max_sto;
-    float prev_fld_depth = 0.0f;
-    float next_fld_depth = 0.0f;
-
-    for (int i = 0; i < NUM_FLOOD_LEVELS; i++) {
-        float H_curr = flood_depth_table_buf[idx * NUM_FLOOD_LEVELS + i];
-        float W_curr = riv_width + (float)(i + 1) * width_inc;
-        float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
-        float S_curr = S_accum + dS;
-
-        if (total_sto > S_curr) {
-            level += 1;
-            prev_total_sto = S_curr;
-            prev_fld_depth = H_curr;
-            S_accum = S_curr;
-            prev_H = H_curr;
-            prev_W = W_curr;
-        } else {
-            next_fld_depth = H_curr;
-            break;
-        }
-    }
-
-    float prev_total_W = riv_width + (float)level * width_inc;
-    float diff_W = 0.0f;
-    float fld_depth;
-    if (level == NUM_FLOOD_LEVELS) {
-        fld_depth = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
-    } else {
-        float flood_grad = (next_fld_depth - prev_fld_depth) / width_inc;
-        diff_W = sqrt(
-            prev_total_W * prev_total_W
-            + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
-        ) - prev_total_W;
-        fld_depth = prev_fld_depth + diff_W * flood_grad;
-    }
-
-    float riv_sto_final = min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
-    float riv_depth = riv_sto_final / (riv_length * riv_width);
-
-    float fld_frac_mid = clamp(
-        (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
-    float fld_frac = (level == NUM_FLOOD_LEVELS) ? 1.0f : fld_frac_mid;
-
-    float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
-
-    // ---- 3. Store ----
-    outgoing_storage_buf[idx]   = 0.0f;
-    river_storage_buf[idx]      = riv_sto_final;
-    flood_storage_buf[idx]      = fld_sto_final;
-    protected_storage_buf[idx]  = 0.0f;
-    river_depth_buf[idx]        = riv_depth;
-    flood_depth_buf[idx]        = fld_depth;
-    protected_depth_buf[idx]    = fld_depth;
-    flood_fraction_buf[idx]     = fld_frac;
-}
-
-
-// =====================================================================
-// Batched flood stage kernel — loop-based: grid=num_catchments, loops trials
-// =====================================================================
-struct compute_flood_stage_batched_args {
-    device float* river_inflow_buf [[id(0)]];
-    device float* flood_inflow_buf [[id(1)]];
-    device float* river_outflow_buf [[id(2)]];
-    device float* flood_outflow_buf [[id(3)]];
-    device float* bif_outflow_buf [[id(4)]];
-    device float* runoff_buf [[id(5)]];
-    device float* outgoing_storage_buf [[id(6)]];
-    device float* river_storage_buf [[id(7)]];
-    device float* flood_storage_buf [[id(8)]];
-    device float* protected_storage_buf [[id(9)]];
-    device float* river_depth_buf [[id(10)]];
-    device float* flood_depth_buf [[id(11)]];
-    device float* protected_depth_buf [[id(12)]];
-    device float* flood_fraction_buf [[id(13)]];
-    device float* river_height_buf [[id(14)]];
-    device float* flood_depth_table_buf [[id(15)]];
-    device float* catchment_area_buf [[id(16)]];
-    device float* river_width_buf [[id(17)]];
-    device float* river_length_buf [[id(18)]];
-    constant float* time_step [[id(19)]];
-    constant int* num_catchments [[id(20)]];
-    constant int* num_trials [[id(21)]];
-    device float* inflow_buf [[id(22)]];
-    device int* catchment_inflow_idx_buf [[id(23)]];
-    constant int* num_inflow_gauges [[id(24)]];
-};
-
-kernel void compute_flood_stage_batched(
-    constant compute_flood_stage_batched_args& args [[buffer(0)]],
-    uint idx [[thread_position_in_grid]]
-)
-{
-    device float* river_inflow_buf = args.river_inflow_buf;
-    device float* flood_inflow_buf = args.flood_inflow_buf;
-    device float* river_outflow_buf = args.river_outflow_buf;
-    device float* flood_outflow_buf = args.flood_outflow_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device float* runoff_buf = args.runoff_buf;
-    device float* outgoing_storage_buf = args.outgoing_storage_buf;
-    device float* river_storage_buf = args.river_storage_buf;
-    device float* flood_storage_buf = args.flood_storage_buf;
-    device float* protected_storage_buf = args.protected_storage_buf;
-    device float* river_depth_buf = args.river_depth_buf;
-    device float* flood_depth_buf = args.flood_depth_buf;
-    device float* protected_depth_buf = args.protected_depth_buf;
-    device float* flood_fraction_buf = args.flood_fraction_buf;
-    device float* river_height_buf = args.river_height_buf;
-    device float* flood_depth_table_buf = args.flood_depth_table_buf;
-    device float* catchment_area_buf = args.catchment_area_buf;
-    device float* river_width_buf = args.river_width_buf;
-    device float* river_length_buf = args.river_length_buf;
-    const float time_step = *args.time_step;
-    const int num_catchments = *args.num_catchments;
-    const int num_trials = *args.num_trials;
-    device float* inflow_buf = args.inflow_buf;
-    device int* catchment_inflow_idx_buf = args.catchment_inflow_idx_buf;
-    const int num_inflow_gauges = *args.num_inflow_gauges;
-    if ((int)idx >= num_catchments) return;
-
-    // ---- Load shared (non-trial) params once ----
-    float riv_height_s = batched_river_height_flag     ? 0.0f : river_height_buf[idx];
-    float catch_area_s = batched_catchment_area_flag   ? 0.0f : catchment_area_buf[idx];
-    float riv_width_s  = batched_river_width_flag      ? 0.0f : river_width_buf[idx];
-    float riv_length_s = batched_river_length_flag     ? 0.0f : river_length_buf[idx];
-    float runoff_s     = batched_runoff_flag            ? 0.0f : runoff_buf[idx];
-
-    // Pre-compute derived constants
-    float riv_max_sto_s = 0.0f, width_inc_s = 0.0f;
-    if (!batched_river_height_flag && !batched_river_width_flag && !batched_river_length_flag)
-        riv_max_sto_s = riv_length_s * riv_width_s * riv_height_s;
-    if (!batched_catchment_area_flag && !batched_river_length_flag)
-        width_inc_s = (catch_area_s / riv_length_s) / (float)NUM_FLOOD_LEVELS;
-
-    // ---- Loop over trials ----
-    for (int t = 0; t < num_trials; t++) {
-        int to = t * num_catchments;
-        int s = to + (int)idx;
-
-        // ---- 1. Storage update ----
-        float riv_sto  = river_storage_buf[s];
-        float fld_sto  = flood_storage_buf[s];
-        float prot_sto = protected_storage_buf[s];
-        float riv_in   = river_inflow_buf[s];
-        float fld_in   = flood_inflow_buf[s];
-        float riv_out  = river_outflow_buf[s];
-        float fld_out  = flood_outflow_buf[s];
-        float bif_out  = has_bifurcation ? bif_outflow_buf[s] : 0.0f;
-        float runoff   = batched_runoff_flag ? runoff_buf[s] : runoff_s;
-        float prescribed_inflow = 0.0f;
-        if (has_inflow) {
-            int inflow_idx = catchment_inflow_idx_buf[idx];
-            if (inflow_idx >= 0)
-                prescribed_inflow = inflow_buf[t * num_inflow_gauges + inflow_idx];
-        }
-
-        float riv_sto_upd = riv_sto + (riv_in - riv_out) * time_step;
-        float fld_sto_upd = fld_sto
-            + (riv_sto_upd < 0.0f ? riv_sto_upd : 0.0f)
-            + (fld_in - fld_out - bif_out) * time_step;
-        riv_sto_upd = max(riv_sto_upd, 0.0f);
-        if (fld_sto_upd < 0.0f) {
-            riv_sto_upd = max(riv_sto_upd + fld_sto_upd, 0.0f);
-        }
-        fld_sto_upd = max(fld_sto_upd, 0.0f);
-        float total_sto = max(
-            riv_sto_upd + fld_sto_upd + prot_sto
-            + (runoff + prescribed_inflow) * time_step,
-            0.0f);
-
-        // ---- 2. Flood stage via table scan ----
-        float riv_height = batched_river_height_flag ? river_height_buf[s] : riv_height_s;
-        float catch_area = batched_catchment_area_flag ? catchment_area_buf[s] : catch_area_s;
-        float riv_width  = batched_river_width_flag ? river_width_buf[s] : riv_width_s;
-        float riv_length = batched_river_length_flag ? river_length_buf[s] : riv_length_s;
-
-        float riv_max_sto = (batched_river_height_flag || batched_river_width_flag || batched_river_length_flag)
-            ? riv_length * riv_width * riv_height : riv_max_sto_s;
-        float width_inc = (batched_catchment_area_flag || batched_river_length_flag)
-            ? (catch_area / riv_length) / (float)NUM_FLOOD_LEVELS : width_inc_s;
-
-        if (total_sto <= riv_max_sto) {
-            float riv_depth_dry = total_sto / (riv_length * riv_width);
-            outgoing_storage_buf[s]   = 0.0f;
-            river_storage_buf[s]      = total_sto;
-            flood_storage_buf[s]      = 0.0f;
-            protected_storage_buf[s]  = 0.0f;
-            river_depth_buf[s]        = riv_depth_dry;
-            flood_depth_buf[s]        = 0.0f;
-            protected_depth_buf[s]    = 0.0f;
-            flood_fraction_buf[s]     = 0.0f;
-            continue;
-        }
-
-        int   level = 0;
-        float S_accum = riv_max_sto;
-        float prev_H = 0.0f;
-        float prev_W = riv_width;
-        float prev_total_sto = riv_max_sto;
-        float prev_fld_depth = 0.0f;
-        float next_fld_depth = 0.0f;
-
-        int table_base = batched_flood_depth_table_flag ? (to * NUM_FLOOD_LEVELS) : 0;
-
-        for (int i = 0; i < NUM_FLOOD_LEVELS; i++) {
-            float H_curr = flood_depth_table_buf[table_base + (int)idx * NUM_FLOOD_LEVELS + i];
-            float W_curr = riv_width + (float)(i + 1) * width_inc;
-            float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
-            float S_curr = S_accum + dS;
-
-            if (total_sto > S_curr) {
-                level += 1;
-                prev_total_sto = S_curr;
-                prev_fld_depth = H_curr;
-                S_accum = S_curr;
-                prev_H = H_curr;
-                prev_W = W_curr;
-            } else {
-                next_fld_depth = H_curr;
-                break;
-            }
-        }
-
-        float prev_total_W = riv_width + (float)level * width_inc;
-        float diff_W = 0.0f;
-        float fld_depth;
-        if (level == NUM_FLOOD_LEVELS) {
-            fld_depth = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
-        } else {
-            float flood_grad = (next_fld_depth - prev_fld_depth) / width_inc;
-            diff_W = sqrt(
-                prev_total_W * prev_total_W
-                + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
-            ) - prev_total_W;
-            fld_depth = prev_fld_depth + diff_W * flood_grad;
-        }
-
-        float riv_sto_final = min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
-        float riv_depth = riv_sto_final / (riv_length * riv_width);
-
-        float fld_frac_mid = clamp(
-            (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
-        float fld_frac = (level == NUM_FLOOD_LEVELS) ? 1.0f : fld_frac_mid;
-
-        float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
-
-        // ---- 3. Store ----
-        outgoing_storage_buf[s]   = 0.0f;
-        river_storage_buf[s]      = riv_sto_final;
-        flood_storage_buf[s]      = fld_sto_final;
-        protected_storage_buf[s]  = 0.0f;
-        river_depth_buf[s]        = riv_depth;
-        flood_depth_buf[s]        = fld_depth;
-        protected_depth_buf[s]    = fld_depth;
-        flood_fraction_buf[s]     = fld_frac;
-    }
-}
-
-
-struct compute_flood_stage_log_args {
-    // Storage update inputs  (buffer binding order matches __init__.py args)
-    device float* river_inflow_buf [[id(0)]];
-    device float* flood_inflow_buf [[id(1)]];
-    device float* river_outflow_buf [[id(2)]];
-    device float* flood_outflow_buf [[id(3)]];
-    device float* bif_outflow_buf [[id(4)]];
-    device float* runoff_buf [[id(5)]];
-    // Storage in/out
-    device float* outgoing_storage_buf [[id(6)]];
-    device float* river_storage_buf [[id(7)]];
-    device float* flood_storage_buf [[id(8)]];
-    device float* protected_storage_buf [[id(9)]];
-    // Depth/fraction outputs
-    device float* river_depth_buf [[id(10)]];
-    device float* flood_depth_buf [[id(11)]];
-    device float* protected_depth_buf [[id(12)]];
-    device float* flood_fraction_buf [[id(13)]];
-    // Reference tables
-    device float* river_height_buf [[id(14)]];
-    device float* flood_depth_table_buf [[id(15)]];
-    device float* catchment_area_buf [[id(16)]];
-    device float* river_width_buf [[id(17)]];
-    device float* river_length_buf [[id(18)]];
-    // Levee mask
-    device int* is_levee_buf [[id(19)]];
-    // Packed log sums — (11, log_buffer_size) contiguous
-    device atomic_float* log_sums_buf [[id(20)]];
-    // Scalars
-    constant float* time_step [[id(21)]];
-    constant int* num_catchments [[id(22)]];
-    device int* current_step_buf [[id(23)]];
-    constant int* log_buffer_size [[id(24)]];
-    device float* inflow_buf [[id(25)]];
-    device int* catchment_inflow_idx_buf [[id(26)]];
-};
-
-kernel void compute_flood_stage_log(
-    constant compute_flood_stage_log_args& args [[buffer(0)]],
-    uint idx [[thread_position_in_grid]]
-)
-{
-    // Storage update inputs  (buffer binding order matches __init__.py args)
-    device float* river_inflow_buf = args.river_inflow_buf;
-    device float* flood_inflow_buf = args.flood_inflow_buf;
-    device float* river_outflow_buf = args.river_outflow_buf;
-    device float* flood_outflow_buf = args.flood_outflow_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device float* runoff_buf = args.runoff_buf;
-    // Storage in/out
-    device float* outgoing_storage_buf = args.outgoing_storage_buf;
-    device float* river_storage_buf = args.river_storage_buf;
-    device float* flood_storage_buf = args.flood_storage_buf;
-    device float* protected_storage_buf = args.protected_storage_buf;
-    // Depth/fraction outputs
-    device float* river_depth_buf = args.river_depth_buf;
-    device float* flood_depth_buf = args.flood_depth_buf;
-    device float* protected_depth_buf = args.protected_depth_buf;
-    device float* flood_fraction_buf = args.flood_fraction_buf;
-    // Reference tables
-    device float* river_height_buf = args.river_height_buf;
-    device float* flood_depth_table_buf = args.flood_depth_table_buf;
-    device float* catchment_area_buf = args.catchment_area_buf;
-    device float* river_width_buf = args.river_width_buf;
-    device float* river_length_buf = args.river_length_buf;
-    // Levee mask
-    device int* is_levee_buf = args.is_levee_buf;
-    // Packed log sums — (11, log_buffer_size) contiguous
-    device atomic_float* log_sums_buf = args.log_sums_buf;
-    // Scalars
-    const float time_step = *args.time_step;
-    const int num_catchments = *args.num_catchments;
-    device int* current_step_buf = args.current_step_buf;
-    const int log_buffer_size = *args.log_buffer_size;
-    device float* inflow_buf = args.inflow_buf;
-    device int* catchment_inflow_idx_buf = args.catchment_inflow_idx_buf;
-    if ((int)idx >= num_catchments) return;
-
-    int current_step = current_step_buf[0];
-    int lbs = log_buffer_size;          // stride between rows
-    bool non_levee = !has_levee || (is_levee_buf[idx] == 0);
-
-    // ---- 1. Storage update ----
-    float riv_sto  = river_storage_buf[idx];
-    float fld_sto  = flood_storage_buf[idx];
-    float prot_sto = protected_storage_buf[idx];
-    float riv_in   = river_inflow_buf[idx];
-    float fld_in   = flood_inflow_buf[idx];
-    float riv_out  = river_outflow_buf[idx];
-    float fld_out  = flood_outflow_buf[idx];
-    float bif_out  = has_bifurcation ? bif_outflow_buf[idx] : 0.0f;
-    float runoff   = runoff_buf[idx];
+    float river_storage = args.river_storage_ptr[cell];
+    float flood_storage = args.flood_storage_ptr[cell];
+    float protected_storage = args.protected_storage_ptr[cell];
+    float river_inflow = args.river_inflow_ptr[cell];
+    float flood_inflow = args.flood_inflow_ptr[cell];
+    float river_outflow = args.river_outflow_ptr[cell];
+    float flood_outflow = args.flood_outflow_ptr[cell];
+    float bifurcation_outflow = HAS_BIFURCATION
+        ? args.global_bifurcation_outflow_ptr[cell] : 0.0f;
+    float runoff = args.runoff_ptr[cell];
     float prescribed_inflow = 0.0f;
-    if (has_inflow) {
-        int inflow_idx = catchment_inflow_idx_buf[idx];
-        if (inflow_idx >= 0) prescribed_inflow = inflow_buf[inflow_idx];
+    if (HAS_INFLOW) {
+        int inflow_idx = args.catchment_inflow_idx_ptr[cell];
+        if (inflow_idx >= 0) {
+            prescribed_inflow = args.inflow_ptr[inflow_idx];
+        }
     }
 
-    // Pre-log: total storage before routing
-    float total_stage_pre = riv_sto + fld_sto + prot_sto;
-    atomic_add_float(&log_sums_buf[0 * lbs + current_step], total_stage_pre * 1e-9f);
+    float storage_before =
+        river_storage + flood_storage + protected_storage;
+    atomic_fetch_add_explicit(
+        args.total_storage_pre_sum_ptr + current_step,
+        storage_before * 1e-9f, memory_order_relaxed);
 
-    float riv_sto_upd = riv_sto + (riv_in - riv_out) * time_step;
-    float fld_sto_upd = fld_sto
-        + (riv_sto_upd < 0.0f ? riv_sto_upd : 0.0f)
-        + (fld_in - fld_out - bif_out) * time_step;
-    riv_sto_upd = max(riv_sto_upd, 0.0f);
-    if (fld_sto_upd < 0.0f) {
-        riv_sto_upd = max(riv_sto_upd + fld_sto_upd, 0.0f);
+    float updated_river_storage = river_storage
+        + (river_inflow - river_outflow) * time_step;
+    float updated_flood_storage = flood_storage
+        + (updated_river_storage < 0.0f ? updated_river_storage : 0.0f)
+        + (flood_inflow - flood_outflow - bifurcation_outflow) * time_step;
+    updated_river_storage = max(updated_river_storage, 0.0f);
+    if (updated_flood_storage < 0.0f) {
+        updated_river_storage = max(
+            updated_river_storage + updated_flood_storage, 0.0f);
     }
-    fld_sto_upd = max(fld_sto_upd, 0.0f);
-
-    float total_sto_next = riv_sto_upd + fld_sto_upd + prot_sto
+    updated_flood_storage = max(updated_flood_storage, 0.0f);
+    float storage_after_routing =
+        updated_river_storage + updated_flood_storage + protected_storage
         + (runoff + prescribed_inflow) * time_step;
-    float total_sto = max(total_sto_next, 0.0f);
+    float total_storage = max(storage_after_routing, 0.0f);
 
-    // Mid-log: storage after routing, inflow/outflow, error  (non-levee only)
     if (non_levee) {
-        atomic_add_float(&log_sums_buf[1 * lbs + current_step], total_sto_next * 1e-9f);
-        atomic_add_float(&log_sums_buf[2 * lbs + current_step], total_sto * 1e-9f);
-        atomic_add_float(&log_sums_buf[4 * lbs + current_step],
-            (riv_in + fld_in + prescribed_inflow) * time_step * 1e-9f);
-        atomic_add_float(&log_sums_buf[5 * lbs + current_step],
-            (riv_out + fld_out) * time_step * 1e-9f);
-        float inflow_error = total_stage_pre - total_sto_next
-            + (riv_in + fld_in + runoff + prescribed_inflow
-               - riv_out - fld_out - bif_out) * time_step;
-        atomic_add_float(&log_sums_buf[3 * lbs + current_step], inflow_error * 1e-9f);
+        atomic_fetch_add_explicit(
+            args.total_storage_next_sum_ptr + current_step,
+            storage_after_routing * 1e-9f, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            args.total_storage_new_sum_ptr + current_step,
+            total_storage * 1e-9f, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            args.total_inflow_sum_ptr + current_step,
+            (river_inflow + flood_inflow + prescribed_inflow)
+                * time_step * 1e-9f,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            args.total_outflow_sum_ptr + current_step,
+            (river_outflow + flood_outflow) * time_step * 1e-9f,
+            memory_order_relaxed);
+        float inflow_error = storage_before - storage_after_routing
+            + (river_inflow + flood_inflow + runoff + prescribed_inflow
+                - river_outflow - flood_outflow - bifurcation_outflow)
+                * time_step;
+        atomic_fetch_add_explicit(
+            args.total_inflow_error_sum_ptr + current_step,
+            inflow_error * 1e-9f, memory_order_relaxed);
     }
 
-    // ---- 2. Flood stage via table scan ----
-    float riv_height = river_height_buf[idx];
-    float catch_area = catchment_area_buf[idx];
-    float riv_width  = river_width_buf[idx];
-    float riv_length = river_length_buf[idx];
+    float river_height = args.river_height_ptr[cell];
+    float catchment_area = args.catchment_area_ptr[cell];
+    float river_width = args.river_width_ptr[cell];
+    float river_length = args.river_length_ptr[cell];
+    FloodStageResult stage = flood_stage_inline(
+        total_storage, river_height, catchment_area,
+        river_width, river_length,
+        args.flood_depth_table_ptr + cell * (long)num_flood_levels,
+        num_flood_levels);
 
-    float riv_max_sto  = riv_length * riv_width * riv_height;
-    float catch_width  = catch_area / riv_length;
-    float width_inc    = catch_width / (float)NUM_FLOOD_LEVELS;
-
-    if (total_sto <= riv_max_sto) {
-        float riv_depth_dry = total_sto / (riv_length * riv_width);
-        float total_storage_stage_new = total_sto;
-        atomic_add_float(&log_sums_buf[6 * lbs + current_step], total_storage_stage_new * 1e-9f);
-        if (non_levee) {
-            atomic_add_float(&log_sums_buf[8  * lbs + current_step], total_sto * 1e-9f);
-            atomic_add_float(&log_sums_buf[9  * lbs + current_step], 0.0f);
-            atomic_add_float(&log_sums_buf[10 * lbs + current_step], 0.0f);
-            atomic_add_float(&log_sums_buf[7  * lbs + current_step],
-                (total_storage_stage_new - total_sto) * 1e-9f);
-        }
-
-        outgoing_storage_buf[idx]   = 0.0f;
-        river_storage_buf[idx]      = total_sto;
-        flood_storage_buf[idx]      = 0.0f;
-        protected_storage_buf[idx]  = 0.0f;
-        river_depth_buf[idx]        = riv_depth_dry;
-        flood_depth_buf[idx]        = 0.0f;
-        protected_depth_buf[idx]    = 0.0f;
-        flood_fraction_buf[idx]     = 0.0f;
-        return;
-    }
-
-    int   level = 0;
-    float S_accum = riv_max_sto;
-    float prev_H = 0.0f;
-    float prev_W = riv_width;
-    float prev_total_sto = riv_max_sto;
-    float prev_fld_depth = 0.0f;
-    float next_fld_depth = 0.0f;
-
-    for (int i = 0; i < NUM_FLOOD_LEVELS; i++) {
-        float H_curr = flood_depth_table_buf[idx * NUM_FLOOD_LEVELS + i];
-        float W_curr = riv_width + (float)(i + 1) * width_inc;
-        float dS = riv_length * 0.5f * (prev_W + W_curr) * (H_curr - prev_H);
-        float S_curr = S_accum + dS;
-
-        if (total_sto > S_curr) {
-            level += 1;
-            prev_total_sto = S_curr;
-            prev_fld_depth = H_curr;
-            S_accum = S_curr;
-            prev_H = H_curr;
-            prev_W = W_curr;
-        } else {
-            next_fld_depth = H_curr;
-            break;
-        }
-    }
-
-    float prev_total_W = riv_width + (float)level * width_inc;
-    float diff_W = 0.0f;
-    float fld_depth;
-    if (level == NUM_FLOOD_LEVELS) {
-        fld_depth = prev_fld_depth + (total_sto - prev_total_sto) / (prev_total_W * riv_length);
-    } else {
-        float flood_grad = (next_fld_depth - prev_fld_depth) / width_inc;
-        diff_W = sqrt(
-            prev_total_W * prev_total_W
-            + 2.0f * (total_sto - prev_total_sto) / (flood_grad * riv_length)
-        ) - prev_total_W;
-        fld_depth = prev_fld_depth + diff_W * flood_grad;
-    }
-
-    float riv_sto_final = min(riv_max_sto + riv_length * riv_width * fld_depth, total_sto);
-    float riv_depth = riv_sto_final / (riv_length * riv_width);
-
-    float fld_frac_mid = clamp(
-        (prev_total_W + diff_W - riv_width) * riv_length / catch_area, 0.0f, 1.0f);
-    float fld_frac = (level == NUM_FLOOD_LEVELS) ? 1.0f : fld_frac_mid;
-
-    float fld_sto_final = max(total_sto - riv_sto_final, 0.0f);
-
-    // Post-log: stage results
-    float total_storage_stage_new = riv_sto_final + fld_sto_final;
-    atomic_add_float(&log_sums_buf[6 * lbs + current_step], total_storage_stage_new * 1e-9f);
+    float stage_storage = stage.river_storage + stage.flood_storage;
+    atomic_fetch_add_explicit(
+        args.total_storage_stage_sum_ptr + current_step,
+        stage_storage * 1e-9f, memory_order_relaxed);
     if (non_levee) {
-        atomic_add_float(&log_sums_buf[8  * lbs + current_step], riv_sto_final * 1e-9f);
-        atomic_add_float(&log_sums_buf[9  * lbs + current_step], fld_sto_final * 1e-9f);
-        atomic_add_float(&log_sums_buf[10 * lbs + current_step], fld_frac * catch_area * 1e-9f);
-        atomic_add_float(&log_sums_buf[7  * lbs + current_step],
-            (total_storage_stage_new - total_sto) * 1e-9f);
+        atomic_fetch_add_explicit(
+            args.river_storage_sum_ptr + current_step,
+            stage.river_storage * 1e-9f, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            args.flood_storage_sum_ptr + current_step,
+            stage.flood_storage * 1e-9f, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            args.flood_area_sum_ptr + current_step,
+            stage.flood_fraction * catchment_area * 1e-9f,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            args.total_stage_error_sum_ptr + current_step,
+            (stage_storage - total_storage) * 1e-9f,
+            memory_order_relaxed);
     }
 
-    // ---- 3. Store ----
-    outgoing_storage_buf[idx]   = 0.0f;
-    river_storage_buf[idx]      = riv_sto_final;
-    flood_storage_buf[idx]      = fld_sto_final;
-    protected_storage_buf[idx]  = 0.0f;
-    river_depth_buf[idx]        = riv_depth;
-    flood_depth_buf[idx]        = fld_depth;
-    protected_depth_buf[idx]    = fld_depth;
-    flood_fraction_buf[idx]     = fld_frac;
-}
+    args.outgoing_storage_ptr[cell] = 0.0f;
+    args.river_storage_ptr[cell] = stage.river_storage;
+    args.flood_storage_ptr[cell] = stage.flood_storage;
+    args.protected_storage_ptr[cell] = 0.0f;
+    args.river_depth_ptr[cell] = stage.river_depth;
+    args.flood_depth_ptr[cell] = stage.flood_depth;
+    args.protected_depth_ptr[cell] = stage.flood_depth;
+    args.flood_fraction_ptr[cell] = stage.flood_fraction;

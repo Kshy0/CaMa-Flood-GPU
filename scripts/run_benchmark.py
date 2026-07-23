@@ -10,9 +10,10 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.io.datasets import DailyBinDataset
-from hydroforge.modeling.distributed import setup_distributed
-from hydroforge.modeling.input_proxy import InputProxy
+from hydroforge.contracts.temporal import SimulationSchedule
+from hydroforge.data.datasets import DailyBinDataset
+from hydroforge.data.distributed import setup_distributed
+from hydroforge.data.input import InputProxy
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -21,7 +22,7 @@ BLOCK_SIZE_LIST = [64, 128, 256, 512, 1024]
 
 def benchmark_block_sizes():
     ### Benchmark Configuration ###
-    experiment_name = f"benchmark_run"
+    experiment_name = "benchmark_run"
     resolution = "glb_15min"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
@@ -55,21 +56,6 @@ def benchmark_block_sizes():
 
     input_proxy = InputProxy.from_nc(input_file)
 
-    model = CaMaFlood(
-        rank=rank,
-        world_size=world_size,
-        device=device,
-        experiment_name=experiment_name,
-        input_proxy=input_proxy,
-        output_dir=output_dir,
-        opened_modules=opened_modules,
-        variables_to_save=variables_to_save,
-        output_workers=0,
-        output_complevel=0,
-        BLOCK_SIZE=BLOCK_SIZE_LIST[0], 
-        output_split_by_year=output_split_by_year
-    )
-
     dataset = DailyBinDataset(
         base_dir=runoff_dir,
         shape=runoff_shape,
@@ -80,14 +66,9 @@ def benchmark_block_sizes():
         prefix=prefix,
         suffix=suffix,
     )
-    model.set_total_steps(dataset.total_steps)
-
-    local_mapping = dataset.build_local_mapping(
-        mapping_file=runoff_mapping_file,
-        desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
-        device=device,
+    schedule = SimulationSchedule.from_contract(
+        dataset.temporal_contract(), step=timedelta(seconds=time_step),
     )
-
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -102,8 +83,30 @@ def benchmark_block_sizes():
         print("Benchmarking BLOCK_SIZE...")
 
     for block_size in BLOCK_SIZE_LIST:
-        model.BLOCK_SIZE = block_size
+        # BLOCK_SIZE is part of the compiled model specialization.  A fresh
+        # model also guarantees identical hydrological initial state for every
+        # benchmark candidate.
+        model = CaMaFlood(
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            experiment_name=f"{experiment_name}_bs{block_size}",
+            input_proxy=input_proxy,
+            output_dir=output_dir,
+            opened_modules=opened_modules,
+            variables_to_save=variables_to_save,
+            output_workers=0,
+            output_netcdf_options={},
+            BLOCK_SIZE=block_size,
+            output_split_by_year=output_split_by_year,
+            simulation_schedule=schedule,
+        )
         model.set_total_steps(dataset.total_steps)
+        local_mapping = dataset.build_local_mapping(
+            mapping_file=runoff_mapping_file,
+            desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
+            device=device,
+        )
         current_time = start_date
         last_valid_time = start_date
         if rank == 0:
@@ -136,8 +139,9 @@ def benchmark_block_sizes():
 
         elapsed_ms = (end - start) * 1000
         results.append((block_size, elapsed_ms))
-    if save_state:  
-        model.save_state(last_valid_time + timedelta(seconds=time_step))
+        if save_state and block_size == BLOCK_SIZE_LIST[-1]:
+            model.save_state(last_valid_time + timedelta(seconds=time_step))
+        model.close()
     if world_size > 1:
         dist.destroy_process_group()
     if rank == 0:

@@ -9,9 +9,14 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.io.datasets import ERA5LandAccumDataset
-from hydroforge.modeling.distributed import setup_distributed
-from hydroforge.modeling.input_proxy import InputProxy
+from hydroforge.data.datasets import ERA5LandAccumDataset
+from hydroforge.data.distributed import setup_distributed
+from hydroforge.data.input import InputProxy
+from hydroforge.contracts.temporal import (
+    CalendarWindow,
+    SimulationSchedule,
+    StatisticsPlan,
+)
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -77,6 +82,13 @@ def main():
         spin_up_start_date=spin_up_start_date,
         spin_up_end_date=spin_up_end_date,
     )
+    schedule = SimulationSchedule.from_contract(
+        dataset.temporal_contract(), step=timedelta(seconds=time_step),
+    )
+    statistics_plan = StatisticsPlan(
+        schedule=schedule,
+        inner=CalendarWindow("day"),
+    )
 
     model = CaMaFlood(
         rank=rank,
@@ -87,8 +99,10 @@ def main():
         output_dir=output_dir,
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
+        simulation_schedule=schedule,
+        statistics_plan=statistics_plan,
         output_workers=output_workers,
-        output_complevel=4,
+        output_netcdf_options={"compression": "zlib", "complevel": 4},
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year
     )
@@ -125,12 +139,11 @@ def main():
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=current_time,
-                    stat_is_first=(current_time.hour == 0),
-                    stat_is_last=(current_time.hour == 23),
                     output_enabled=not is_spin_up
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))
+    model.close()
     if world_size > 1:
         dist.destroy_process_group()
 

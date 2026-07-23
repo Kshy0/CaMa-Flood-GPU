@@ -10,7 +10,7 @@ from functools import cached_property
 from typing import ClassVar, List, Literal, Optional, Self
 
 import torch
-from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceIndexField, TensorField)
 from pydantic import Field, computed_field, model_validator
 
@@ -95,7 +95,7 @@ class InflowModule(AbstractModule):
             if placement == "same":
                 expected = gauge_id
             else:
-                from hydroforge.modeling.distributed import find_indices_in_torch
+                from hydroforge.data.distributed import find_indices_in_torch
                 gauge_idx = find_indices_in_torch(gauge_id, self.base.catchment_id)
                 if torch.any(gauge_idx < 0):
                     missing = gauge_id[gauge_idx < 0][:5].detach().cpu().tolist()
@@ -130,7 +130,7 @@ class InflowModule(AbstractModule):
                     f"{violations[:10]}"
                 )
 
-    gauge_inflow: torch.Tensor = TensorField(
+    inflow: torch.Tensor = TensorField(
         description="Current compact prescribed inflow forcing",
         shape=("num_inflow_gauges",),
         dtype="float",

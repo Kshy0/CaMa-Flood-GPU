@@ -16,7 +16,7 @@ IS_HIP_BUILD = torch.version.hip is not None
 
 
 @triton.jit
-def to_compute_dtype(hp_value, ref_value):
+def hpfloat_to_compute_inline(hp_value, ref_value):
     """Downcast a high-precision (hpfloat) value to match the base computation dtype.
 
     In the GPU code, ``hp_value`` is loaded from an hpfloat pointer (e.g. float64
@@ -30,13 +30,19 @@ def to_compute_dtype(hp_value, ref_value):
     return hp_value.to(ref_value.dtype)
 
 
+@triton.jit
+def nonnegative_to_index_inline(value):
+    """Quantize an already integral, non-negative algorithmic count."""
+    return value.to(tl.int32)
+
+
 if IS_HIP_BUILD:
     @triton.jit
-    def cbrt_compat(x):
+    def cbrt_compat_inline(x):
         # HIP libdevice may not expose cbrt; use pow(x, 1/3) with dtype-matched exponent.
         one_third = tl.zeros_like(x) + (1.0 / 3.0)
         return libdevice.pow(x, one_third)
 else:
     @triton.jit
-    def cbrt_compat(x):
+    def cbrt_compat_inline(x):
         return libdevice.cbrt(x)

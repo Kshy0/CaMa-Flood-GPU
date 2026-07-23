@@ -5,16 +5,7 @@
 #
 
 """
-Log module for CaMa-Flood-GPU using TensorField / computed_tensor_field helpers.
-
-The 11 per-step log accumulators are packed into a single 2D tensor
-``log_sums`` of shape ``(NUM_LOG_VARS, log_buffer_size)`` so that every
-backend (including Metal, which caps buffer bindings at 31) can pass one
-pointer instead of 11 separate ones.
-
-Individual properties (``total_storage_pre_sum``, …) return **row views**
-into ``log_sums``, keeping backward-compatibility with ``gather_results``,
-``write_step``, and ``zero_()`` operations.
+Log module for CaMa-Flood-GPU using independent computed log buffers.
 """
 
 from __future__ import annotations
@@ -27,26 +18,9 @@ from typing import ClassVar, List, Literal, Optional, Tuple, Union
 import cftime
 import numpy as np
 import torch
-import torch.distributed as dist
-from hydroforge.modeling.module import AbstractModule, computed_tensor_field
+from hydroforge.execution import reduce_
+from hydroforge.model.module import AbstractModule, computed_tensor_field
 from pydantic import Field, PrivateAttr
-
-# ------------------------------------------------------------------ #
-# Log variable indices inside the packed ``log_sums`` tensor.
-# The order MUST match ``write_header`` column order.
-# ------------------------------------------------------------------ #
-LOG_STORAGE_PRE: int = 0
-LOG_STORAGE_NEXT: int = 1
-LOG_STORAGE_NEW: int = 2
-LOG_INFLOW_ERROR: int = 3
-LOG_INFLOW: int = 4
-LOG_OUTFLOW: int = 5
-LOG_STORAGE_STAGE: int = 6
-LOG_STAGE_ERROR: int = 7
-LOG_RIVER_STORAGE: int = 8
-LOG_FLOOD_STORAGE: int = 9
-LOG_FLOOD_AREA: int = 10
-NUM_LOG_VARS: int = 11
 
 
 def computed_log_field(
@@ -130,7 +104,7 @@ class LogModule(AbstractModule):
         This method should be called after each time step to collect data.
         """
         for field in self.log_vars:
-            dist.reduce(getattr(self, field), dst=0, op=dist.ReduceOp.SUM)
+            reduce_(getattr(self, field), destination=0, reduction="sum")
 
     def write_step(self, log_path: Path) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,93 +137,103 @@ class LogModule(AbstractModule):
             getattr(self, field).zero_()
 
     # ------------------------------------------------------------------ #
-    # Packed log tensor — all 11 accumulators in one (11, buf) tensor
-    # ------------------------------------------------------------------ #
-    @cached_property
-    def log_sums(self) -> torch.Tensor:
-        """Packed ``(NUM_LOG_VARS, log_buffer_size)`` accumulator tensor."""
-        return torch.zeros(
-            (NUM_LOG_VARS, self.log_buffer_size),
-            dtype=self.precision,
-            device=self.device,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Computed tensor fields — each is a contiguous row view into log_sums
+    # Computed tensor fields (independent log buffers)
     # ------------------------------------------------------------------ #
     @computed_log_field(
         description="Running sum of storage before routing step",
     )
     @cached_property
     def total_storage_pre_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_STORAGE_PRE]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of storage after routing step",
     )
     @cached_property
     def total_storage_next_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_STORAGE_NEXT]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of new storage",
     )
     @cached_property
     def total_storage_new_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_STORAGE_NEW]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of inflow errors",
     )
     @cached_property
     def total_inflow_error_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_INFLOW_ERROR]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of inflow",
     )
     @cached_property
     def total_inflow_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_INFLOW]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of outflow",
     )
     @cached_property
     def total_outflow_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_OUTFLOW]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of storage stage",
     )
     @cached_property
     def total_storage_stage_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_STORAGE_STAGE]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of stage error",
     )
     @cached_property
     def total_stage_error_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_STAGE_ERROR]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of river storage",
     )
     @cached_property
     def river_storage_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_RIVER_STORAGE]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of flood storage",
     )
     @cached_property
     def flood_storage_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_FLOOD_STORAGE]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )
 
     @computed_log_field(
         description="Running sum of flood area",
     )
     @cached_property
     def flood_area_sum(self) -> torch.Tensor:
-        return self.log_sums[LOG_FLOOD_AREA]
+        return torch.zeros(
+            self.log_buffer_size, dtype=self.precision, device=self.device,
+        )

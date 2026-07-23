@@ -9,7 +9,10 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import cbrt_compat, to_compute_dtype
+from cmfgpu.phys.triton.utils import (
+    cbrt_compat_inline, hpfloat_to_compute_inline,
+    nonnegative_to_index_inline,
+)
 
 
 @triton.jit
@@ -33,7 +36,9 @@ def compute_levee_stage_kernel(
     num_levees: tl.constexpr,
     num_flood_levels: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    num_catchments: tl.constexpr,
 ):
+    _ = num_catchments
     pid = tl.program_id(0)
     levee_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = levee_offs < num_levees
@@ -59,8 +64,8 @@ def compute_levee_stage_kernel(
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
     # Downcast hpfloat storage to the active computation dtype.
-    river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
-    flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
+    river_storage_curr = hpfloat_to_compute_inline(river_storage_curr, river_length)
+    flood_storage_curr = hpfloat_to_compute_inline(flood_storage_curr, river_length)
 
     total_storage = river_storage_curr + flood_storage_curr
     
@@ -81,7 +86,7 @@ def compute_levee_stage_kernel(
     found_fill = 0
     
     # --- Logic for Case 3 (Search B) ---
-    ilev = (levee_fraction * num_flood_levels).to(tl.int32)
+    ilev = nonnegative_to_index_inline(levee_fraction * num_flood_levels)
     
     dsto_fil_B = 0.0
     dwth_fil_B = 0.0
@@ -261,13 +266,14 @@ def compute_levee_stage_log_kernel(
     levee_crown_height_ptr,
     levee_fraction_ptr,
     flood_fraction_ptr,
-    # Packed log sums: (NUM_LOG_VARS, log_buffer_size) contiguous tensor
-    # row 6=stage, 7=stage_err, 8=riv_sto, 9=fld_sto, 10=fld_area
-    log_sums_ptr,
+    total_storage_stage_sum_ptr,
+    river_storage_sum_ptr,
+    flood_storage_sum_ptr,
+    flood_area_sum_ptr,
+    total_stage_error_sum_ptr,
     current_step_ptr,
     num_levees: tl.constexpr,
     num_flood_levels: tl.constexpr,
-    log_buffer_size: tl.constexpr = 1000,
     BLOCK_SIZE: tl.constexpr = 128,
 ):
     pid = tl.program_id(0)
@@ -296,8 +302,8 @@ def compute_levee_stage_log_kernel(
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
     # Downcast hpfloat storage to the active computation dtype.
-    river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
-    flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
+    river_storage_curr = hpfloat_to_compute_inline(river_storage_curr, river_length)
+    flood_storage_curr = hpfloat_to_compute_inline(flood_storage_curr, river_length)
 
     total_storage = river_storage_curr + flood_storage_curr
     
@@ -318,7 +324,7 @@ def compute_levee_stage_log_kernel(
     found_fill = 0
     
     # --- Logic for Case 3 (Search B) ---
-    ilev = (levee_fraction * num_flood_levels).to(tl.int32)
+    ilev = nonnegative_to_index_inline(levee_fraction * num_flood_levels)
     
     dsto_fil_B = 0.0
     dwth_fil_B = 0.0
@@ -472,11 +478,11 @@ def compute_levee_stage_log_kernel(
 
     # Log variables
     total_storage_stage_new = r_sto + f_sto + p_sto
-    tl.atomic_add(log_sums_ptr + 6 * log_buffer_size + current_step, tl.sum(total_storage_stage_new) * 1e-9)
-    tl.atomic_add(log_sums_ptr + 8 * log_buffer_size + current_step, tl.sum(r_sto) * 1e-9)
-    tl.atomic_add(log_sums_ptr + 9 * log_buffer_size + current_step, tl.sum(f_sto) * 1e-9)
-    tl.atomic_add(log_sums_ptr + 10 * log_buffer_size + current_step, tl.sum(f_frc * catchment_area) * 1e-9)
-    tl.atomic_add(log_sums_ptr + 7 * log_buffer_size + current_step, tl.sum(total_storage_stage_new - total_storage) * 1e-9)
+    tl.atomic_add(total_storage_stage_sum_ptr + current_step, tl.sum(total_storage_stage_new) * 1e-9)
+    tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(r_sto) * 1e-9)
+    tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(f_sto) * 1e-9)
+    tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(f_frc * catchment_area) * 1e-9)
+    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(total_storage_stage_new - total_storage) * 1e-9)
 
     # Store results
     tl.store(river_storage_ptr + levee_catchment_idx, r_sto, mask=mask)
@@ -507,8 +513,10 @@ def compute_levee_bifurcation_outflow_kernel(
     time_step_ptr,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
-    BLOCK_SIZE: tl.constexpr                    # Block size
+    BLOCK_SIZE: tl.constexpr,                   # Block size
+    num_catchments: tl.constexpr,
 ):
+    _ = num_catchments
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_bifurcation_paths
@@ -537,8 +545,8 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = to_compute_dtype(tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
-    bifurcation_total_storage_downstream = to_compute_dtype(tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage = hpfloat_to_compute_inline(tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     for level in tl.static_range(num_bifurcation_levels):
@@ -581,7 +589,7 @@ def compute_levee_bifurcation_outflow_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat(bifurcation_semi_implicit_flow_depth)))
+                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat_inline(bifurcation_semi_implicit_flow_depth)))
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
@@ -670,7 +678,7 @@ def compute_levee_stage_batched_kernel(
     if not batched_levee_fraction and not batched_catchment_area and not batched_river_length:
         levee_distance_shared = levee_fraction_shared * (catchment_area_shared / river_length_shared)
     if not batched_levee_fraction:
-        ilev_shared = (levee_fraction_shared * num_flood_levels).to(tl.int32)
+        ilev_shared = nonnegative_to_index_inline(levee_fraction_shared * num_flood_levels)
 
     # ---- Loop over trials ----
     for t in tl.static_range(num_trials):
@@ -692,8 +700,8 @@ def compute_levee_stage_batched_kernel(
         flood_depth_curr = tl.load(flood_depth_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
 
         # Downcast hpfloat storage to computation dtype
-        river_storage_curr = to_compute_dtype(river_storage_curr, river_length)
-        flood_storage_curr = to_compute_dtype(flood_storage_curr, river_length)
+        river_storage_curr = hpfloat_to_compute_inline(river_storage_curr, river_length)
+        flood_storage_curr = hpfloat_to_compute_inline(flood_storage_curr, river_length)
 
         total_storage = river_storage_curr + flood_storage_curr
 
@@ -724,7 +732,7 @@ def compute_levee_stage_batched_kernel(
 
         # --- Logic for Case 3 (Search B) ---
         if batched_levee_fraction:
-            ilev = (levee_fraction * num_flood_levels).to(tl.int32)
+            ilev = nonnegative_to_index_inline(levee_fraction * num_flood_levels)
         else:
             ilev = ilev_shared
 
@@ -955,8 +963,8 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = to_compute_dtype(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
-    bifurcation_total_storage_downstream = to_compute_dtype(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage = hpfloat_to_compute_inline(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     # Base offsets for level-dependent arrays
@@ -1004,7 +1012,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat(bifurcation_semi_implicit_flow_depth)))
+                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat_inline(bifurcation_semi_implicit_flow_depth)))
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)

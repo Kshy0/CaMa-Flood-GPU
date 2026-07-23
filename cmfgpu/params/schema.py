@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from hydroforge.modeling.schema import ModuleFieldSchema, parse_module_schema
+from hydroforge.contracts.fields import ModuleFieldSchema, parse_module_schema
 
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule

@@ -1,420 +1,120 @@
 # LICENSE HEADER MANAGED BY add-license-header
 # Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
-# http://www.apache.org/licenses/LICENSE-2.0
-#
 
-"""CUDA backend for cmfgpu physics kernels.
+"""Lazy compiled-CUDA implementation catalog for CaMa-Flood."""
 
-JIT-compiles the hand-written CUDA kernels and exposes dispatch functions
-using the unified hydroforge kwargs convention.  Storage uses the per-lane
-early-exit implementation only.
-"""
-
-import functools
 from pathlib import Path
 
-from hydroforge.runtime.cuda_kernel import (
-    load_inline_cu_module as _load_inline_module,
-    precompile_extension_builders,
+from hydroforge.kernels.backends.cuda.dispatcher import (
+    CudaExtensionGroup, CudaNativeProjection,
 )
-
+from hydroforge.kernels.backends.cuda.spec import CudaExtensionSpec
 _DIR = Path(__file__).resolve().parent
-_MODULE_PREFIX = "cmfgpu_cuda"
-
-
-def _load_or_build(name, cpp, src, cflags, funcs):
-    return _load_inline_module(
-        name,
-        cpp_sources=cpp,
-        cuda_sources=src,
-        functions=funcs,
-        extra_cuda_cflags=cflags,
-    )
-
-
-@functools.lru_cache(maxsize=1)
-def _ext():
-    cpp = (
-        "void launch_flood_stage(at::Tensor,at::Tensor,at::Tensor,at::Tensor,c10::optional<at::Tensor>,"
-        "at::Tensor,c10::optional<at::Tensor>,c10::optional<at::Tensor>,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "long,long,long,long,long);\n"
-    )
-    src = (_DIR / "storage.cu").read_text()
-    return _load_or_build(f"{_MODULE_PREFIX}_storage", cpp, src, ["-O3", "--use_fast_math"],
-                          ["launch_flood_stage"])
-
-
-@functools.lru_cache(maxsize=1)
-def _ext_outflow():
-    """Compile the outflow / inflow kernels.
-
-    Built **without** ``--use_fast_math`` so that ``/`` and ``sqrt`` keep IEEE
-    round-to-nearest behavior in division / sqrt / cbrt heavy sections.
-    """
-    src = (_DIR / "outflow.cu").read_text()
-    cpp = (
-        "void launch_outflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,c10::optional<at::Tensor>,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "double,at::Tensor,long,long,c10::optional<at::Tensor>,long,double,c10::optional<at::Tensor>,c10::optional<at::Tensor>,long,long);\n"
-        "void launch_inflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,c10::optional<at::Tensor>,c10::optional<at::Tensor>,long,long,long);\n"
-    )
-    return _load_or_build(f"{_MODULE_PREFIX}_outflow", cpp, src, ["-O3", "--use_fast_math"],
-                          ["launch_outflow", "launch_inflow"])
-
-
-@functools.lru_cache(maxsize=1)
-def _ext_adaptive():
-    src = (_DIR / "adaptive_time.cu").read_text()
-    cpp = (
-        "void launch_adaptive_time(at::Tensor,at::Tensor,c10::optional<at::Tensor>,at::Tensor,"
-        "double,double,double,long,long,long);\n"
-    )
-    return _load_or_build(f"{_MODULE_PREFIX}_adaptive", cpp, src, ["-O3", "--use_fast_math"],
-                          ["launch_adaptive_time"])
-
-
-@functools.lru_cache(maxsize=1)
-def _ext_bifurcation():
-    """Bifurcation outflow/inflow — precise math (slope div may yield inf)."""
-    src = (_DIR / "bifurcation.cu").read_text()
-    cpp = (
-        "void launch_bif_outflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,double,at::Tensor,"
-        "long,long,long);\n"
-        "void launch_bif_inflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "long,long,long);\n"
-    )
-    return _load_or_build(f"{_MODULE_PREFIX}_bifurcation", cpp, src, ["-O3", "--use_fast_math"],
-                          ["launch_bif_outflow", "launch_bif_inflow"])
-
-
-@functools.lru_cache(maxsize=1)
-def _ext_reservoir():
-    """Reservoir outflow — precise math (sqrt/exp/log regime selection)."""
-    src = (_DIR / "reservoir.cu").read_text()
-    cpp = (
-        "void launch_reservoir_outflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,long,long);\n"
-    )
-    return _load_or_build(f"{_MODULE_PREFIX}_reservoir", cpp, src, ["-O3", "--use_fast_math"],
-                          ["launch_reservoir_outflow"])
-
-
-@functools.lru_cache(maxsize=1)
-def _ext_levee():
-    """Levee stage + levee bifurcation outflow CUDA kernels."""
-    src = (_DIR / "levee.cu").read_text()
-    cpp = (
-        "void launch_levee_stage(at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "long,long,long);\n"
-        "void launch_levee_bif_outflow(at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,"
-        "at::Tensor,at::Tensor,double,at::Tensor,long,long,long);\n"
-    )
-    return _load_or_build(f"{_MODULE_PREFIX}_levee", cpp, src, ["-O3", "--use_fast_math"],
-                          ["launch_levee_stage", "launch_levee_bif_outflow"])
-
-
-@functools.lru_cache(maxsize=1)
-def _ext_march():
-    """Device-side sub-step march bookkeeping kernel."""
-    src = (_DIR / "device_march.cu").read_text()
-    cpp = "void launch_march_step(at::Tensor,at::Tensor,at::Tensor,at::Tensor,long);\n"
-    return _load_or_build(f"{_MODULE_PREFIX}_march", cpp, src, ["-O3"],
-                          ["launch_march_step"])
-
-
-_EXTENSION_BUILDERS = (
-    ("storage", "_ext"),
-    ("outflow", "_ext_outflow"),
-    ("adaptive", "_ext_adaptive"),
-    ("bifurcation", "_ext_bifurcation"),
-    ("reservoir", "_ext_reservoir"),
-    ("levee", "_ext_levee"),
-    ("march", "_ext_march"),
+_CUDA = CudaExtensionGroup(
+    __name__,
+    {
+        "storage": CudaExtensionSpec(
+            _DIR / "storage.cu",
+        ),
+        "outflow": CudaExtensionSpec(
+            _DIR / "outflow.cu",
+        ),
+        "adaptive": CudaExtensionSpec(
+            _DIR / "adaptive_time.cu",
+        ),
+        "bifurcation": CudaExtensionSpec(
+            _DIR / "bifurcation.cu",
+        ),
+        "reservoir": CudaExtensionSpec(
+            _DIR / "reservoir.cu",
+        ),
+        "levee": CudaExtensionSpec(
+            _DIR / "levee.cu",
+        ),
+    },
+    binary_prefix="cmfgpu_cuda",
 )
 
 
-_precompiled = False
-
-
-def _ensure_precompiled() -> None:
-    """Build every extension in parallel on first dispatch (idempotent).
-
-    Without this, a script that never called :func:`precompile_cuda_extensions`
-    would compile the six extensions one at a time as each kernel is first
-    touched.  Hooked at the dispatch layer rather than inside the per-extension
-    ``_ext_*`` builders, because the worker subprocesses spawned by
-    ``precompile_extension_builders`` invoke those builders directly and must
-    not re-enter here.
-    """
-    global _precompiled
-    if _precompiled:
-        return
-    _precompiled = True
-    precompile_extension_builders(__name__, _EXTENSION_BUILDERS)
-
-
-def precompile_cuda_extensions():
-    """Precompile all cmfgpu CUDA extensions via hydroforge's shared loader."""
-    global _precompiled
-    _precompiled = True
-    return precompile_extension_builders(__name__, _EXTENSION_BUILDERS)
-
-
-def compute_flood_stage(**kw):
-    """Dispatch the fused storage-update + flood-stage CUDA kernel.
-
-    Accepts the same kwargs as the Triton ``compute_flood_stage`` dispatcher.
-    Optional pointers (``global_bifurcation_outflow_ptr`` when bifurcation is
-    off) may be ``None`` and is passed as a native optional tensor.
-    """
-    _ensure_precompiled()
-    ext = _ext()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_catchments = int(kw["num_catchments"])
-    num_flood_levels = int(kw["num_flood_levels"])
-    has_bif = 1 if kw.get("HAS_BIFURCATION", True) else 0
-
-    river_outflow = kw["river_outflow_ptr"]
-    gbif = kw.get("global_bifurcation_outflow_ptr")
-    if has_bif and gbif is None:
-        raise ValueError("HAS_BIFURCATION requires global_bifurcation_outflow_ptr")
-    runoff = kw["runoff_ptr"]
-    has_inflow = 1 if kw.get("HAS_INFLOW", False) else 0
-    inflow = kw.get("inflow_ptr")
-    catchment_inflow_idx = kw.get("catchment_inflow_idx_ptr")
-    if has_inflow and (inflow is None or catchment_inflow_idx is None):
-        raise ValueError("HAS_INFLOW requires inflow_ptr and catchment_inflow_idx_ptr")
-
-    ext.launch_flood_stage(
-        kw["river_inflow_ptr"], kw["flood_inflow_ptr"],
-        river_outflow, kw["flood_outflow_ptr"],
-        gbif, runoff, inflow, catchment_inflow_idx, kw["time_step_ptr"],
-        kw["outgoing_storage_ptr"],
-        kw["river_storage_ptr"], kw["flood_storage_ptr"], kw["protected_storage_ptr"],
-        kw["river_depth_ptr"], kw["flood_depth_ptr"], kw["protected_depth_ptr"],
-        kw["flood_fraction_ptr"],
-        kw["river_height_ptr"], kw["flood_depth_table_ptr"],
-        kw["catchment_area_ptr"], kw["river_width_ptr"], kw["river_length_ptr"],
-        num_catchments, num_flood_levels, has_bif, has_inflow, block,
+def _shared(
+    disabled: tuple[str, ...] = (),
+) -> CudaNativeProjection:
+    """Declare only the non-inferable single-trial preconditions."""
+    return CudaNativeProjection(
+        fixed={"num_trials": 1, **dict.fromkeys(disabled, False)},
     )
 
 
-# The log / batched variants are not implemented in CUDA.
-compute_flood_stage_log = None
-
-
-def compute_outflow(**kw):
-    """Dispatch the fused outflow + outgoing-storage CUDA kernel.
-
-    Accepts the same kwargs as the Triton ``compute_outflow`` dispatcher.
-    ``global_bifurcation_outflow_ptr`` may be ``None`` (bifurcation off) and
-    ``is_dam_upstream_ptr`` may be ``None`` when its module is disabled.
-    """
-    _ensure_precompiled()
-    ext = _ext_outflow()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_catchments = int(kw["num_catchments"])
-    has_bif = 1 if kw.get("HAS_BIFURCATION", True) else 0
-    has_res = 1 if kw.get("HAS_RESERVOIR", False) else 0
-    has_sea = 1 if kw.get("HAS_SEA_LEVEL", False) else 0
-
-    river_outflow = kw["river_outflow_ptr"]
-    gbif = kw.get("global_bifurcation_outflow_ptr")
-    if has_bif and gbif is None:
-        raise ValueError("HAS_BIFURCATION requires global_bifurcation_outflow_ptr")
-    is_dam_up = kw.get("is_dam_upstream_ptr")
-    if has_res and is_dam_up is None:
-        raise ValueError("HAS_RESERVOIR requires is_dam_upstream_ptr")
-    sea_surface = kw.get("sea_surface_elevation_ptr")
-    sea_idx = kw.get("catchment_sea_level_idx_ptr")
-    if has_sea and (sea_surface is None or sea_idx is None):
-        raise ValueError(
-            "HAS_SEA_LEVEL requires sea_surface_elevation_ptr and "
-            "catchment_sea_level_idx_ptr"
-        )
-
-    ext.launch_outflow(
-        kw["downstream_idx_ptr"],
-        kw["river_inflow_ptr"], river_outflow, kw["river_manning_ptr"],
-        kw["river_depth_ptr"], kw["river_width_ptr"], kw["river_length_ptr"],
-        kw["river_height_ptr"], kw["river_storage_ptr"],
-        kw["flood_inflow_ptr"], kw["flood_outflow_ptr"], kw["flood_manning_ptr"],
-        kw["flood_depth_ptr"], kw["protected_depth_ptr"], kw["catchment_elevation_ptr"],
-        kw["downstream_distance_ptr"], kw["flood_storage_ptr"], kw["protected_storage_ptr"],
-        kw["river_cross_section_depth_ptr"], kw["flood_cross_section_depth_ptr"],
-        kw["flood_cross_section_area_ptr"],
-        gbif, kw["total_storage_ptr"],
-        kw["outgoing_storage_ptr"], kw["water_surface_elevation_ptr"],
-        kw["protected_water_surface_elevation_ptr"],
-        kw["gravity"], kw["time_step_ptr"],
-        num_catchments, has_bif,
-        is_dam_up, has_res, kw.get("MIN_KINEMATIC_SLOPE", 1.0e-5),
-        sea_surface, sea_idx,
-        has_sea,
-        block,
-    )
-
-
-def compute_inflow(**kw):
-    """Dispatch the inflow-limiting + scatter CUDA kernel.
-
-    Accepts the same kwargs as the Triton ``compute_inflow`` dispatcher.
-    ``reservoir_total_inflow_ptr`` / ``is_reservoir_ptr`` may be ``None`` when
-    the reservoir module is inactive.
-    """
-    _ensure_precompiled()
-    ext = _ext_outflow()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_catchments = int(kw["num_catchments"])
-    has_res = 1 if kw.get("HAS_RESERVOIR", False) else 0
-
-    river_outflow = kw["river_outflow_ptr"]
-    res_inflow = kw.get("reservoir_total_inflow_ptr")
-    is_res = kw.get("is_reservoir_ptr")
-    if has_res and (res_inflow is None or is_res is None):
-        raise ValueError(
-            "HAS_RESERVOIR requires reservoir_total_inflow_ptr and is_reservoir_ptr"
-        )
-
-    ext.launch_inflow(
-        kw["downstream_idx_ptr"],
-        river_outflow, kw["flood_outflow_ptr"],
-        kw["river_storage_ptr"], kw["flood_storage_ptr"], kw["outgoing_storage_ptr"],
-        kw["river_inflow_ptr"], kw["flood_inflow_ptr"], kw["limit_rate_ptr"],
-        res_inflow, is_res,
-        num_catchments, has_res, block,
-    )
-
-
-def compute_adaptive_time_step(**kw):
-    """Dispatch the CFL adaptive-time-step CUDA kernel (per-thread atomicMax).
-
-    ``time_step`` is passed as a runtime scalar, not a pointer.
-    ``is_dam_related_ptr`` may be ``None`` when reservoir is off.
-    """
-    _ensure_precompiled()
-    ext = _ext_adaptive()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_catchments = int(kw["num_catchments"])
-    has_res = 1 if kw.get("HAS_RESERVOIR", False) else 0
-    river_depth = kw["river_depth_ptr"]
-    is_dam = kw.get("is_dam_related_ptr")
-    if has_res and is_dam is None:
-        raise ValueError("HAS_RESERVOIR requires is_dam_related_ptr")
-    ext.launch_adaptive_time(
-        river_depth, kw["downstream_distance_ptr"], is_dam, kw["max_sub_steps_ptr"],
-        kw["time_step"], kw["adaptive_time_factor"], kw["gravity"],
-        num_catchments, has_res, block,
-    )
-
-
-def compute_bifurcation_outflow(**kw):
-    """Dispatch the bifurcation outflow CUDA kernel."""
-    _ensure_precompiled()
-    ext = _ext_bifurcation()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_paths = int(kw["num_bifurcation_paths"])
-    num_levels = int(kw["num_bifurcation_levels"])
-    ext.launch_bif_outflow(
-        kw["bifurcation_catchment_idx_ptr"], kw["bifurcation_downstream_idx_ptr"],
-        kw["bifurcation_manning_ptr"], kw["bifurcation_outflow_ptr"],
-        kw["bifurcation_width_ptr"], kw["bifurcation_length_ptr"],
-        kw["bifurcation_elevation_ptr"], kw["bifurcation_cross_section_depth_ptr"],
-        kw["water_surface_elevation_ptr"], kw["total_storage_ptr"],
-        kw["outgoing_storage_ptr"],
-        kw["gravity"], kw["time_step_ptr"],
-        num_paths, num_levels, block,
-    )
-
-
-def compute_bifurcation_inflow(**kw):
-    """Dispatch the bifurcation inflow (limiter + global scatter) CUDA kernel."""
-    _ensure_precompiled()
-    ext = _ext_bifurcation()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_paths = int(kw["num_bifurcation_paths"])
-    num_levels = int(kw["num_bifurcation_levels"])
-    ext.launch_bif_inflow(
-        kw["bifurcation_catchment_idx_ptr"], kw["bifurcation_downstream_idx_ptr"],
-        kw["limit_rate_ptr"], kw["bifurcation_outflow_ptr"],
-        kw["global_bifurcation_outflow_ptr"],
-        num_paths, num_levels, block,
-    )
-
-
-def compute_reservoir_outflow(**kw):
-    """Dispatch the reservoir outflow CUDA kernel.
-
-    ``runoff_ptr`` is supplied at call time (like flood-stage); the reservoir
-    parameter arrays are reservoir-indexed.
-    """
-    _ensure_precompiled()
-    ext = _ext_reservoir()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    num_reservoirs = int(kw["num_reservoirs"])
-    runoff = kw["runoff_ptr"]
-    ext.launch_reservoir_outflow(
-        kw["reservoir_catchment_idx_ptr"], kw["downstream_idx_ptr"],
-        kw["reservoir_total_inflow_ptr"], kw["river_outflow_ptr"], kw["flood_outflow_ptr"],
-        kw["river_storage_ptr"], kw["flood_storage_ptr"],
-        kw["conservation_volume_ptr"], kw["emergency_volume_ptr"], kw["adjustment_volume_ptr"],
-        kw["normal_outflow_ptr"], kw["adjustment_outflow_ptr"], kw["flood_control_outflow_ptr"],
-        runoff, kw["total_storage_ptr"], kw["outgoing_storage_ptr"],
-        kw["time_step_ptr"], num_reservoirs, block,
-    )
-
-
-def compute_levee_stage(**kw):
-    """Dispatch the levee-aware flood-stage CUDA kernel."""
-    _ensure_precompiled()
-    ext = _ext_levee()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    ext.launch_levee_stage(
-        kw["levee_catchment_idx_ptr"],
-        kw["river_storage_ptr"], kw["flood_storage_ptr"], kw["protected_storage_ptr"],
-        kw["river_depth_ptr"], kw["flood_depth_ptr"], kw["protected_depth_ptr"],
-        kw["river_height_ptr"], kw["flood_depth_table_ptr"],
-        kw["catchment_area_ptr"], kw["river_width_ptr"], kw["river_length_ptr"],
-        kw["levee_base_height_ptr"], kw["levee_crown_height_ptr"],
-        kw["levee_fraction_ptr"], kw["flood_fraction_ptr"],
-        int(kw["num_levees"]), int(kw["num_flood_levels"]), block,
-    )
-
-
-# Log / batched levee variants are not implemented in CUDA.
-compute_levee_stage_log = None
-
-
-def compute_levee_bifurcation_outflow(**kw):
-    """Dispatch the levee-aware bifurcation outflow CUDA kernel."""
-    _ensure_precompiled()
-    ext = _ext_levee()
-    block = int(kw.get("BLOCK_SIZE", 256))
-    ext.launch_levee_bif_outflow(
-        kw["bifurcation_catchment_idx_ptr"], kw["bifurcation_downstream_idx_ptr"],
-        kw["bifurcation_manning_ptr"], kw["bifurcation_outflow_ptr"],
-        kw["bifurcation_width_ptr"], kw["bifurcation_length_ptr"],
-        kw["bifurcation_elevation_ptr"], kw["bifurcation_cross_section_depth_ptr"],
-        kw["water_surface_elevation_ptr"], kw["protected_water_surface_elevation_ptr"],
-        kw["total_storage_ptr"], kw["outgoing_storage_ptr"],
-        kw["gravity"], kw["time_step_ptr"],
-        int(kw["num_bifurcation_paths"]), int(kw["num_bifurcation_levels"]), block,
-    )
-
-
-def compute_march_step(*, num_sub_steps, counter, current_step, continue_flag, stream):
-    """Per-sub-step device march bookkeeping (see ``device_march.cu``)."""
-    _ensure_precompiled()
-    ext = _ext_march()
-    ext.launch_march_step(num_sub_steps, counter, current_step, continue_flag, stream)
+flood_stage = _CUDA.route(
+    "storage", "launch_flood_stage",
+    projection=_shared(
+        disabled=(
+            "batched_catchment_area", "batched_flood_depth_table",
+            "batched_river_height", "batched_river_length",
+            "batched_river_width", "batched_runoff",
+        ),
+    ),
+)
+flood_stage_log = _CUDA.route(
+    "storage", "launch_flood_stage_log",
+)
+outflow = _CUDA.route(
+    "outflow", "launch_outflow",
+    projection=_shared(
+        disabled=(
+            "batched_catchment_elevation", "batched_flood_manning",
+            "batched_river_height", "batched_river_length",
+            "batched_river_manning", "batched_river_width",
+        ),
+    ),
+)
+inflow = _CUDA.route(
+    "outflow", "launch_inflow",
+    projection=_shared(),
+)
+adaptive_time = _CUDA.route(
+    "adaptive", "launch_adaptive_time",
+    projection=_shared(disabled=("batched_downstream_distance",)),
+)
+bifurcation_outflow = _CUDA.route(
+    "bifurcation", "launch_bif_outflow",
+    projection=_shared(
+        disabled=(
+            "batched_bifurcation_elevation", "batched_bifurcation_length",
+            "batched_bifurcation_manning", "batched_bifurcation_width",
+        ),
+    ),
+)
+bifurcation_inflow = _CUDA.route(
+    "bifurcation", "launch_bif_inflow",
+    projection=_shared(),
+)
+reservoir_outflow = _CUDA.route(
+    "reservoir", "launch_reservoir_outflow",
+    projection=_shared(),
+)
+levee_stage = _CUDA.route(
+    "levee", "launch_levee_stage",
+    projection=_shared(
+        disabled=(
+            "batched_catchment_area", "batched_flood_depth_table",
+            "batched_levee_base_height", "batched_levee_crown_height",
+            "batched_levee_fraction", "batched_river_height",
+            "batched_river_length", "batched_river_width",
+        ),
+    ),
+)
+levee_stage_log = _CUDA.route(
+    "levee", "launch_levee_stage_log",
+)
+levee_bifurcation_outflow = _CUDA.route(
+    "levee", "launch_levee_bif_outflow",
+    projection=_shared(
+        disabled=(
+            "batched_bifurcation_elevation", "batched_bifurcation_length",
+            "batched_bifurcation_manning", "batched_bifurcation_width",
+        ),
+    ),
+)
+__all__ = []

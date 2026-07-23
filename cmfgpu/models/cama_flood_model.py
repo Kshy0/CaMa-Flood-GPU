@@ -8,16 +8,16 @@
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
 """
 from datetime import datetime
-from functools import cached_property, partial
-from typing import Any, ClassVar, Dict, Optional, Self, Type, Union
+from typing import ClassVar, Dict, Mapping, Optional, Type, Union
 
 import cftime
 import torch
-from hydroforge.modeling.model import AbstractModel
-from hydroforge.runtime.backend import KERNEL_BACKEND
-from hydroforge.runtime.cuda_graph import CUDAGraphMixin
-from pydantic import PrivateAttr, computed_field, model_validator
-from torch import distributed as dist
+from hydroforge.model.model import AbstractModel
+from hydroforge.contracts.events import emit
+from hydroforge.contracts import BackendRequirement, ModuleRequirement
+from hydroforge.execution import all_reduce_
+from hydroforge.execution.inputs import copy_input
+from hydroforge.execution.step import managed_step
 
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
@@ -37,7 +37,7 @@ from cmfgpu.phys.reservoir import compute_reservoir_outflow
 from cmfgpu.phys.storage import compute_flood_stage, compute_flood_stage_log
 
 
-class CaMaFlood(CUDAGraphMixin, AbstractModel):
+class CaMaFlood(AbstractModel):
     """
     CaMa-Flood GPU model master controller class
     """
@@ -54,640 +54,29 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
     }
     partition_key: ClassVar[str] = "catchment_id"
     partition_group: ClassVar[str] = "catchment_basin_id"
-    _stats_elapsed_time: float = PrivateAttr(default=0.0)
-    _stats_start_time: Optional[Union[datetime, cftime.datetime]] = PrivateAttr(default=None)
-    _stats_macro_step: int = PrivateAttr(default=0)
-    _pending_outer_first: bool = PrivateAttr(default=False)
-    _stats_cg: Optional[Any] = PrivateAttr(default=None)
-    _device_march_enabled: bool = PrivateAttr(default=False)
-    _metal_substep_graphs: dict[Any, Any] = PrivateAttr(default_factory=dict)
-
-    def model_post_init(self, __context: Any) -> None:
-        super().model_post_init(__context)
-        # Auto-enable CUDA graphs for the triton / cuda backends (both launch
-        # kernels onto the current CUDA stream, so stream capture works).
-        if KERNEL_BACKEND in ("triton", "cuda") and torch.cuda.is_available():
-            self.enable_cuda_graph()
-        if KERNEL_BACKEND == "cuda" and torch.cuda.is_available():
-            self.enable_conditional_graph()
-
-    @cached_property
-    def base(self) -> BaseModule:
-        return self.get_module("base")
-
-    @cached_property
-    def inflow(self) -> Optional[InflowModule]:
-        return self.get_module("inflow")
-
-    @cached_property
-    def sea_level(self) -> Optional[SeaLevelModule]:
-        return self.get_module("sea_level")
-    
-    @cached_property
-    def bifurcation(self) -> Optional[BifurcationModule]:
-        return self.get_module("bifurcation")
-
-    @cached_property
-    def levee(self) -> Optional[LeveeModule]:
-        return self.get_module("levee")
-
-    @cached_property
-    def log(self) -> Optional[LogModule]:
-        return self.get_module("log")
-
-    @cached_property
-    def adaptive_time(self) -> Optional[AdaptiveTimeModule]:
-        return self.get_module("adaptive_time")
-
-    @cached_property
-    def reservoir(self) -> Optional[ReservoirModule]:
-        return self.get_module("reservoir")
-    
-    @computed_field
-    @cached_property
-    def bifurcation_flag(self) -> bool:
-        return self.bifurcation is not None
-
-    @computed_field
-    @cached_property
-    def levee_flag(self) -> bool:
-        return self.levee is not None
-
-    @computed_field
-    @cached_property
-    def reservoir_flag(self) -> bool:
-        return self.reservoir is not None
-    
-    @model_validator(mode="after")
-    def validate_log_compatibility(self) -> Self:
-        if self.num_trials is not None and self.num_trials > 1 and "log" in self.opened_modules:
-            raise ValueError("The 'log' module cannot be used when num_trials > 1.")
-        return self
-
-    @model_validator(mode='after')
-    def validate_backend_precision(self) -> Self:
-        """Backend precision constraints.
-
-        The hand-written CUDA / Metal kernels hard-code ``float`` (f32) for all
-        flux / depth tensors, so the *base* precision must be float32.  Storage
-        variables are ``hpfloat`` and the CUDA backend additionally supports
-        ``mixed_precision`` (f64 storage + f32 compute); Metal does not.
-        """
-        if KERNEL_BACKEND != "triton":
-            if self.precision != "float32":
-                raise ValueError(
-                    f"Backend '{KERNEL_BACKEND}' only supports float32 base precision, "
-                    f"got '{self.precision}'. Use the triton backend for float64."
+    backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {
+        "cuda": BackendRequirement(trials=False),
+    }
+    module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {
+        "log": ModuleRequirement(trials=False),
+    }
+    def initialize_model_state(self) -> None:
+        if self.has_module("reservoir"):
+            fixed = self.reservoir.initialize_dam_storage()
+            if fixed:
+                emit(
+                    self, "info", "reservoir.storage_initialized",
+                    "Initialized dam cells to conservation storage", cells=fixed,
                 )
-            if self.mixed_precision and KERNEL_BACKEND != "cuda":
-                raise ValueError(
-                    f"Backend '{KERNEL_BACKEND}' does not support mixed precision. "
-                    f"Set mixed_precision=False or use the triton/cuda backend."
-                )
-        if KERNEL_BACKEND == "cuda" and self.num_trials is not None:
-            raise ValueError(
-                "The hand-written CUDA backend does not implement batched kernels; "
-                "num_trials would otherwise use incorrect tensor strides. "
-                "Use the Triton backend for ensemble trials."
-            )
-        return self
+            if self.has_module("bifurcation"):
+                masked = self.reservoir.mask_bifurcation_paths(self.bifurcation)
+                if masked:
+                    emit(
+                        self, "info", "reservoir.bifurcation_masked",
+                        "Masked dam-related bifurcation paths", paths=masked,
+                    )
 
-    @model_validator(mode="after")
-    def init_dam_cell_storage(self) -> Self:
-        """
-        At cold start, bump river_storage at dam cells to conservation_volume,
-        using the dam-cell initialization rule:
-          P2DAMSTO(ISEQ) = MAX(P2RIVSTO(ISEQ)+P2FLDSTO(ISEQ), DamVol_cons)
-          P2RIVSTO(ISEQ) = P2DAMSTO(ISEQ)
-          P2FLDSTO(ISEQ) = 0
-        """
-        if not self.reservoir_flag:
-            return self
-        res_idx = self.reservoir.reservoir_catchment_idx   # (num_reservoirs,)
-        con_vol = self.reservoir.conservation_volume        # (num_reservoirs,)
-        current = self.base.river_storage[res_idx]          # (num_reservoirs,)
-        need_fix = current < con_vol.to(current.dtype)
-        if need_fix.any():
-            n_fixed = int(need_fix.sum().item())
-            self.base.river_storage[res_idx] = torch.where(
-                need_fix,
-                con_vol.to(self.base.river_storage.dtype),
-                current,
-            )
-            # Also zero out flood_storage at fixed dam cells.
-            flood_current = self.base.flood_storage[res_idx]
-            self.base.flood_storage[res_idx] = torch.where(
-                need_fix,
-                torch.zeros_like(flood_current),
-                flood_current,
-            )
-            print(f"  [init_dam_cell_storage] Clamped {n_fixed}/{len(con_vol)} dam-cell "
-                  f"river_storage to conservation_volume")
-        return self
-
-    @model_validator(mode="after")
-    def mask_bifurcation_at_dam_cells(self) -> Self:
-        """
-        Disable bifurcation at dam and upstream-of-dam cells by setting
-        bifurcation elevation to 1E20:
-          IF( I1DAM(ISEQP)>0 .or. I1DAM(JSEQP)>0 ) PTH_ELV(IPTH,:)=1.E20
-        """
-        if not self.reservoir_flag or not self.bifurcation_flag:
-            return self
-        is_dam = self.reservoir.is_dam_related
-        # Check each bifurcation path: if upstream or downstream touches a dam-related cell
-        up_idx = self.bifurcation.bifurcation_catchment_idx
-        dn_idx = self.bifurcation.bifurcation_downstream_idx
-        up_is_dam = is_dam[up_idx]
-        dn_is_dam = is_dam[dn_idx]
-        mask_paths = up_is_dam | dn_is_dam  # (num_paths,)
-        if mask_paths.any():
-            n_masked = int(mask_paths.sum().item())
-            self.bifurcation.bifurcation_elevation[mask_paths] = 1.0e20
-            print(f"  Masked {n_masked} bifurcation paths at dam-related cells (elevation → 1E20)")
-        return self
-
-    # ------------------------------------------------------------------ #
-    # Bound kernel callables (built once via partial; only dynamic args at call-time)
-    # ------------------------------------------------------------------ #
-    @cached_property
-    def _call_outflow(self):
-        return partial(compute_outflow,
-            downstream_idx_ptr=self.base.downstream_idx,
-            river_inflow_ptr=self.base.river_inflow,
-            flood_inflow_ptr=self.base.flood_inflow,
-            global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            river_manning_ptr=self.base.river_manning,
-            flood_manning_ptr=self.base.flood_manning,
-            river_depth_ptr=self.base.river_depth,
-            river_width_ptr=self.base.river_width,
-            river_length_ptr=self.base.river_length,
-            river_height_ptr=self.base.river_height,
-            river_storage_ptr=self.base.river_storage,
-            flood_depth_ptr=self.base.flood_depth,
-            protected_depth_ptr=self.base.protected_depth,
-            catchment_elevation_ptr=self.base.catchment_elevation,
-            downstream_distance_ptr=self.base.downstream_distance,
-            flood_storage_ptr=self.base.flood_storage,
-            protected_storage_ptr=self.base.protected_storage,
-            river_cross_section_depth_ptr=self.base.river_cross_section_depth,
-            flood_cross_section_depth_ptr=self.base.flood_cross_section_depth,
-            flood_cross_section_area_ptr=self.base.flood_cross_section_area,
-            total_storage_ptr=self.base.total_storage,
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            water_surface_elevation_ptr=self.base.water_surface_elevation,
-            protected_water_surface_elevation_ptr=self.base.protected_water_surface_elevation,
-            gravity=self.base.gravity,
-            time_step_ptr=self.base.time_step,
-            num_catchments=self.base.num_catchments,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            HAS_BIFURCATION=self.bifurcation_flag,
-            is_dam_upstream_ptr=(
-                self.reservoir.is_dam_upstream if self.reservoir_flag else None
-            ),
-            HAS_RESERVOIR=self.reservoir_flag,
-            MIN_KINEMATIC_SLOPE=self.base.min_kinematic_slope,
-            sea_surface_elevation_ptr=(
-                self.sea_level.sea_surface_elevation
-                if self.sea_level is not None else None
-            ),
-            catchment_sea_level_idx_ptr=(
-                self.sea_level.catchment_sea_level_idx
-                if self.sea_level is not None else None
-            ),
-            HAS_SEA_LEVEL=self.sea_level is not None,
-            num_sea_level_boundaries=(
-                self.sea_level.num_sea_level_boundaries
-                if self.sea_level is not None else 0
-            ),
-            num_trials=self.num_trials,
-            batched_river_manning=self.base.is_batched('river_manning'),
-            batched_flood_manning=self.base.is_batched('flood_manning'),
-            batched_river_width=self.base.is_batched('river_width'),
-            batched_river_length=self.base.is_batched('river_length'),
-            batched_river_height=self.base.is_batched('river_height'),
-            batched_catchment_elevation=self.base.is_batched('catchment_elevation'),
-        )
-
-    @cached_property
-    def _call_reservoir_outflow(self):
-        return partial(compute_reservoir_outflow,
-            reservoir_catchment_idx_ptr=self.reservoir.reservoir_catchment_idx,
-            downstream_idx_ptr=self.base.downstream_idx,
-            reservoir_total_inflow_ptr=self.reservoir.reservoir_total_inflow,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            river_storage_ptr=self.base.river_storage,
-            flood_storage_ptr=self.base.flood_storage,
-            conservation_volume_ptr=self.reservoir.conservation_volume,
-            emergency_volume_ptr=self.reservoir.emergency_volume,
-            adjustment_volume_ptr=self.reservoir.adjustment_volume,
-            normal_outflow_ptr=self.reservoir.effective_normal_outflow,
-            adjustment_outflow_ptr=self.reservoir.adjustment_outflow,
-            flood_control_outflow_ptr=self.reservoir.flood_control_outflow,
-            total_storage_ptr=self.base.total_storage,
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            num_reservoirs=self.reservoir.num_reservoirs,
-            time_step_ptr=self.base.time_step,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-        )
-
-    @cached_property
-    def _call_bif_outflow(self):
-        kw = dict(
-            bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
-            bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
-            bifurcation_manning_ptr=self.bifurcation.bifurcation_manning,
-            bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
-            bifurcation_width_ptr=self.bifurcation.bifurcation_width,
-            bifurcation_length_ptr=self.bifurcation.bifurcation_length,
-            bifurcation_elevation_ptr=self.bifurcation.bifurcation_elevation,
-            bifurcation_cross_section_depth_ptr=self.bifurcation.bifurcation_cross_section_depth,
-            water_surface_elevation_ptr=self.base.water_surface_elevation,
-            total_storage_ptr=self.base.total_storage,
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            gravity=self.base.gravity,
-            time_step_ptr=self.base.time_step,
-            num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
-            num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            num_trials=self.num_trials,
-            num_catchments=self.base.num_catchments,
-            batched_bifurcation_manning=self.bifurcation.is_batched('bifurcation_manning'),
-            batched_bifurcation_width=self.bifurcation.is_batched('bifurcation_width'),
-            batched_bifurcation_length=self.bifurcation.is_batched('bifurcation_length'),
-            batched_bifurcation_elevation=self.bifurcation.is_batched('bifurcation_elevation'),
-        )
-        if self.levee_flag:
-            kw['protected_water_surface_elevation_ptr'] = self.base.protected_water_surface_elevation
-            return partial(compute_levee_bifurcation_outflow, **kw)
-        return partial(compute_bifurcation_outflow, **kw)
-
-    @cached_property
-    def _call_inflow(self):
-        return partial(compute_inflow,
-            downstream_idx_ptr=self.base.downstream_idx,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            river_storage_ptr=self.base.river_storage,
-            flood_storage_ptr=self.base.flood_storage,
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            river_inflow_ptr=self.base.river_inflow,
-            flood_inflow_ptr=self.base.flood_inflow,
-            limit_rate_ptr=self.base.limit_rate,
-            reservoir_total_inflow_ptr=(
-                self.reservoir.reservoir_total_inflow if self.reservoir_flag else None
-            ),
-            is_reservoir_ptr=(
-                self.reservoir.is_reservoir if self.reservoir_flag else None
-            ),
-            num_catchments=self.base.num_catchments,
-            HAS_RESERVOIR=self.reservoir_flag,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            num_trials=self.num_trials,
-        )
-
-    @cached_property
-    def _call_bif_inflow(self):
-        return partial(compute_bifurcation_inflow,
-            bifurcation_catchment_idx_ptr=self.bifurcation.bifurcation_catchment_idx,
-            bifurcation_downstream_idx_ptr=self.bifurcation.bifurcation_downstream_idx,
-            limit_rate_ptr=self.base.limit_rate,
-            bifurcation_outflow_ptr=self.bifurcation.bifurcation_outflow,
-            global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
-            num_bifurcation_paths=self.bifurcation.num_bifurcation_paths,
-            num_bifurcation_levels=self.bifurcation.num_bifurcation_levels,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            num_trials=self.num_trials,
-            num_catchments=self.base.num_catchments,
-        )
-
-    @cached_property
-    def _call_flood_stage(self):
-        return partial(compute_flood_stage,
-            river_inflow_ptr=self.base.river_inflow,
-            flood_inflow_ptr=self.base.flood_inflow,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
-            inflow_ptr=(
-                self.inflow.gauge_inflow
-                if self.inflow is not None else None
-            ),
-            catchment_inflow_idx_ptr=(
-                self.inflow.catchment_inflow_idx
-                if self.inflow is not None else None
-            ),
-            num_inflow_gauges=(
-                self.inflow.num_inflow_gauges if self.inflow is not None else 0
-            ),
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            river_storage_ptr=self.base.river_storage,
-            flood_storage_ptr=self.base.flood_storage,
-            protected_storage_ptr=self.base.protected_storage,
-            river_depth_ptr=self.base.river_depth,
-            flood_depth_ptr=self.base.flood_depth,
-            protected_depth_ptr=self.base.protected_depth,
-            flood_fraction_ptr=self.base.flood_fraction,
-            river_height_ptr=self.base.river_height,
-            flood_depth_table_ptr=self.base.flood_depth_table,
-            catchment_area_ptr=self.base.catchment_area,
-            river_width_ptr=self.base.river_width,
-            river_length_ptr=self.base.river_length,
-            num_catchments=self.base.num_catchments,
-            time_step_ptr=self.base.time_step,
-            num_flood_levels=self.base.num_flood_levels,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            HAS_BIFURCATION=self.bifurcation_flag,
-            HAS_INFLOW=self.inflow is not None,
-            num_trials=self.num_trials,
-            batched_river_height=self.base.is_batched('river_height'),
-            batched_flood_depth_table=self.base.is_batched('flood_depth_table'),
-            batched_catchment_area=self.base.is_batched('catchment_area'),
-            batched_river_width=self.base.is_batched('river_width'),
-            batched_river_length=self.base.is_batched('river_length'),
-        )
-
-    @cached_property
-    def _call_flood_stage_log(self):
-        return partial(compute_flood_stage_log,
-            river_inflow_ptr=self.base.river_inflow,
-            flood_inflow_ptr=self.base.flood_inflow,
-            river_outflow_ptr=self.base.river_outflow,
-            flood_outflow_ptr=self.base.flood_outflow,
-            global_bifurcation_outflow_ptr=self.base.global_bifurcation_outflow,
-            inflow_ptr=(
-                self.inflow.gauge_inflow
-                if self.inflow is not None else None
-            ),
-            catchment_inflow_idx_ptr=(
-                self.inflow.catchment_inflow_idx
-                if self.inflow is not None else None
-            ),
-            num_inflow_gauges=(
-                self.inflow.num_inflow_gauges if self.inflow is not None else 0
-            ),
-            outgoing_storage_ptr=self.base.outgoing_storage,
-            river_storage_ptr=self.base.river_storage,
-            flood_storage_ptr=self.base.flood_storage,
-            protected_storage_ptr=self.base.protected_storage,
-            river_depth_ptr=self.base.river_depth,
-            flood_depth_ptr=self.base.flood_depth,
-            protected_depth_ptr=self.base.protected_depth,
-            flood_fraction_ptr=self.base.flood_fraction,
-            river_height_ptr=self.base.river_height,
-            flood_depth_table_ptr=self.base.flood_depth_table,
-            catchment_area_ptr=self.base.catchment_area,
-            river_width_ptr=self.base.river_width,
-            river_length_ptr=self.base.river_length,
-            is_levee_ptr=(
-                self.levee.is_levee
-                if self.levee_flag else None
-            ),
-            log_sums_ptr=self.log.log_sums,
-            num_catchments=self.base.num_catchments,
-            time_step_ptr=self.base.time_step,
-            current_step_ptr=self.base.current_step,
-            num_flood_levels=self.base.num_flood_levels,
-            log_buffer_size=self.log.log_buffer_size,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            HAS_BIFURCATION=self.bifurcation_flag,
-            HAS_INFLOW=self.inflow is not None,
-            HAS_LEVEE=self.levee_flag,
-        )
-
-    @cached_property
-    def _call_levee_stage(self):
-        return partial(compute_levee_stage,
-            levee_catchment_idx_ptr=self.levee.levee_catchment_idx,
-            river_storage_ptr=self.base.river_storage,
-            flood_storage_ptr=self.base.flood_storage,
-            protected_storage_ptr=self.base.protected_storage,
-            river_depth_ptr=self.base.river_depth,
-            flood_depth_ptr=self.base.flood_depth,
-            protected_depth_ptr=self.base.protected_depth,
-            river_height_ptr=self.base.river_height,
-            flood_depth_table_ptr=self.base.flood_depth_table,
-            catchment_area_ptr=self.base.catchment_area,
-            river_width_ptr=self.base.river_width,
-            river_length_ptr=self.base.river_length,
-            levee_base_height_ptr=self.levee.levee_base_height,
-            levee_crown_height_ptr=self.levee.levee_crown_height,
-            levee_fraction_ptr=self.levee.levee_fraction,
-            flood_fraction_ptr=self.base.flood_fraction,
-            num_levees=self.levee.num_levees,
-            num_flood_levels=self.base.num_flood_levels,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            num_trials=self.num_trials,
-            num_catchments=self.base.num_catchments,
-            batched_river_height=self.base.is_batched('river_height'),
-            batched_flood_depth_table=self.base.is_batched('flood_depth_table'),
-            batched_catchment_area=self.base.is_batched('catchment_area'),
-            batched_river_width=self.base.is_batched('river_width'),
-            batched_river_length=self.base.is_batched('river_length'),
-            batched_levee_base_height=self.levee.is_batched('levee_base_height'),
-            batched_levee_crown_height=self.levee.is_batched('levee_crown_height'),
-            batched_levee_fraction=self.levee.is_batched('levee_fraction'),
-        )
-
-    @cached_property
-    def _call_levee_stage_log(self):
-        return partial(compute_levee_stage_log,
-            levee_catchment_idx_ptr=self.levee.levee_catchment_idx,
-            river_storage_ptr=self.base.river_storage,
-            flood_storage_ptr=self.base.flood_storage,
-            protected_storage_ptr=self.base.protected_storage,
-            river_depth_ptr=self.base.river_depth,
-            flood_depth_ptr=self.base.flood_depth,
-            protected_depth_ptr=self.base.protected_depth,
-            river_height_ptr=self.base.river_height,
-            flood_depth_table_ptr=self.base.flood_depth_table,
-            catchment_area_ptr=self.base.catchment_area,
-            river_width_ptr=self.base.river_width,
-            river_length_ptr=self.base.river_length,
-            levee_base_height_ptr=self.levee.levee_base_height,
-            levee_crown_height_ptr=self.levee.levee_crown_height,
-            levee_fraction_ptr=self.levee.levee_fraction,
-            flood_fraction_ptr=self.base.flood_fraction,
-            log_sums_ptr=self.log.log_sums,
-            num_levees=self.levee.num_levees,
-            current_step_ptr=self.base.current_step,
-            num_flood_levels=self.base.num_flood_levels,
-            log_buffer_size=self.log.log_buffer_size,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-        )
-
-    @cached_property
-    def _call_adaptive_time(self):
-        return partial(compute_adaptive_time_step,
-            river_depth_ptr=self.base.river_depth,
-            downstream_distance_ptr=self.base.downstream_distance,
-            is_dam_related_ptr=(
-                self.reservoir.is_dam_related if self.reservoir_flag else None
-            ),
-            max_sub_steps_ptr=self.adaptive_time.max_sub_steps,
-            adaptive_time_factor=self.adaptive_time.adaptive_time_factor,
-            gravity=self.base.gravity,
-            num_catchments=self.base.num_catchments,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            HAS_RESERVOIR=self.reservoir_flag,
-            num_trials=self.num_trials,
-            batched_downstream_distance=self.base.is_batched('downstream_distance'),
-        )
-
-    # ------------------------------------------------------------------ #
-    # CUDA Graph support (via CUDAGraphMixin)
-    # ------------------------------------------------------------------ #
-    def cuda_graph_target(self, **kw):
-        """The kernel sequence captured into a CUDA Graph."""
-        self.do_one_sub_step(output_enabled=(self.log is not None))
-
-    # ------------------------------------------------------------------ #
-    # Device-side sub-step march (CUDAGraphMixin conditional-graph helpers)
-    # ------------------------------------------------------------------ #
-    def enable_device_march(self) -> None:
-        """Opt into the device-side conditional-graph sub-step march.
-
-        Folds the whole uniform sub-step loop (and the per-sub-step statistics
-        accumulation) into one CUDA conditional-``WHILE`` launch per interval,
-        eliminating the per-sub-step host launches.  Requires the CUDA backend
-        and the ``adaptive_time`` module.  Multi-GPU is supported: the sub-step
-        count is agreed across ranks (``all_reduce`` MAX on ``max_sub_steps``)
-        before the march, and CaMa's catchment-basin partitioning keeps each
-        rank's sub-steps independent (no per-sub-step halo exchange)."""
-        if KERNEL_BACKEND != "cuda" or not torch.cuda.is_available():
-            raise RuntimeError("device_march requires the CUDA backend")
-        self._device_march_enabled = True
-
-    @cached_property
-    def _is_cuda_backend(self) -> bool:
-        return KERNEL_BACKEND == "cuda" and torch.cuda.is_available()
-
-    def _device_march_body(self, graph, stream_ptr: int, fold_stats: bool) -> None:
-        """One captured sub-step: bookkeeping (sets ``current_step`` / counter /
-        ``continue_flag``), the physics sub-step on the persistent runoff buffer,
-        then (when ``fold_stats``) the per-sub-step statistics accumulation."""
-        from cmfgpu.phys.cuda import compute_march_step
-        s = self._dm
-        compute_march_step(
-            num_sub_steps=s["num_sub_steps"], counter=s["counter"],
-            current_step=self.base.current_step, continue_flag=s["continue_flag"],
-            stream=stream_ptr,
-        )
-        self.do_one_sub_step(output_enabled=(self.log is not None))
-        if fold_stats:
-            self.conditional_stats_body(
-                self._statistics_aggregator,
-                graph=graph,
-                weight_src=self.base.time_step,
-                counter=s["counter"],
-                continue_flag=s["continue_flag"],
-                BLOCK_SIZE=self.BLOCK_SIZE,
-                stream_ptr=stream_ptr,
-            )
-
-    def _get_device_march(self, fold: bool):
-        """Lazily allocate the march scalars + capture the per-interval graph.
-
-        State lives in the model's ``_dm`` dict (no wrapper object):
-        ``num_sub_steps`` (filled per interval), the loop ``counter`` /
-        ``continue_flag``. Runoff lives in ``BaseModule.runoff``.
-        """
-        graph = self.__dict__.get("_device_march_graph")
-        if graph is not None:
-            return graph
-        dev = self.device
-        s = {
-            "num_sub_steps": torch.zeros(1, device=dev, dtype=torch.int32),
-            "counter": torch.zeros(1, device=dev, dtype=torch.int32),
-            "continue_flag": torch.zeros(1, device=dev, dtype=torch.int32),
-        }
-        self.__dict__["_dm"] = s
-
-        def reset_fn():
-            s["counter"].zero_()
-
-        extra = (self.conditional_stats_accumulators(self._statistics_aggregator)
-                 if fold else None)
-        graph = self.build_conditional_graph(
-            body_fn=lambda g, set_cond, sp: self._device_march_body(g, sp, fold),
-            reset_fn=reset_fn,
-            continue_flag=s["continue_flag"],
-            extra_snapshot=extra,
-        )
-        self.__dict__["_device_march_graph"] = graph
-        return graph
-
-    def _run_device_march(self, num_sub_steps, flags, total_weight,
-                          time_sub_step, output_enabled) -> None:
-        """March the whole interval on-device in one conditional-graph launch."""
-        agg = self._statistics_aggregator
-        run_stats = (output_enabled and agg is not None
-                     and getattr(agg, "_aggregator_generated", False))
-        fold = run_stats and self.conditional_stats_should_fold(agg)
-        graph = self._get_device_march(fold)
-        s = self._dm
-        s["num_sub_steps"].fill_(num_sub_steps)
-        s["counter"].zero_()
-        if fold:
-            self.conditional_stats_prelaunch(agg, flags, total_weight)
-        graph.launch(torch.cuda.current_stream(self.device).cuda_stream)
-        if run_stats and not fold:
-            # Single end-of-interval finalize covers the ``last`` outputs.
-            self.update_statistics(
-                sub_step=0, num_sub_steps=1, flags=flags,
-                weight=num_sub_steps * time_sub_step, total_weight=total_weight,
-                BLOCK_SIZE=self.BLOCK_SIZE)
-        self._stats_elapsed_time += num_sub_steps * time_sub_step
-
-    def disable_cuda_graph(self) -> None:
-        """Disable CUDA Graph and release all cached graphs including statistics."""
-        self._stats_cg = None
-        super().disable_cuda_graph()
-
-    def _stats_graph_replay(self, sub_step, num_sub_steps, flags, weight,
-                            total_weight, num_macro_steps, macro_step_index,
-                            BLOCK_SIZE):
-        """Replay or capture a CUDA graph for the statistics aggregator kernel.
-
-        All varying scalars are stored as 1-element device tensors in
-        ``_kernel_states`` so the graph is address-stable and a single
-        capture can be replayed for *every* combination of values.
-        """
-        agg = self._statistics_aggregator
-        states = agg._kernel_states
-
-        # Fill scalar tensors — graph loads from fixed addresses
-        states['__weight'].fill_(weight)
-        states['__total_weight'].fill_(total_weight)
-        states['__num_macro_steps'].fill_(num_macro_steps)
-        states['__sub_step'].fill_(sub_step)
-        states['__num_sub_steps'].fill_(num_sub_steps)
-        states['__flags'].fill_(flags)
-        states['__macro_step_index'].fill_(macro_step_index)
-
-        if self._stats_cg is None:
-            pool = self.__dict__.get("_cg_pool")
-            # Snapshot accumulators so warmup launches don't corrupt them
-            snapshot = {
-                k: v.clone()
-                for k, v in states.items()
-                if isinstance(v, torch.Tensor) and not k.startswith('__')
-            }
-            # Warmup
-            for _ in range(3):
-                agg._aggregator_function(states, BLOCK_SIZE)
-            for k, saved in snapshot.items():
-                states[k].copy_(saved)
-            # Capture
-            self._stats_cg = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._stats_cg, pool=pool):
-                agg._aggregator_function(states, BLOCK_SIZE)
-
-        self._stats_cg.replay()
-
+    @managed_step
     @torch.inference_mode()
     def step_advance(
         self,
@@ -697,20 +86,11 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
         current_time: Optional[Union[datetime, cftime.datetime]],
         inflow: Optional[torch.Tensor] = None,
         sea_surface_elevation: Optional[torch.Tensor] = None,
-        stat_is_first: bool = True,
-        stat_is_last: bool = True,
-        stat_is_outer_first: Optional[bool] = None,
-        stat_is_outer_last: Optional[bool] = None,
         output_enabled: bool = True) -> None:
         """
         Advance the model by one time step using the provided runoff input.
 
-        Notes on time-weighted statistics:
-          - Time-weighted accumulation is performed every sub-step with weight = dt (seconds).
-          - If stat_is_first is True, the accumulation window is reset at the first sub-step.
-          - If stat_is_last is True, the window is finalized at the last sub-step.
-          - By default (stat_is_first=True, stat_is_last=True), each call to step_advance forms an
-            independent window and is saved once at the end of this call.
+        Statistics windows are inferred from the model's configured intervals.
 
         Args:
             runoff (torch.Tensor): Input runoff tensor for this time step.
@@ -722,67 +102,31 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             time_step (float): Duration of the time step (seconds).
             default_num_sub_steps (int): Default sub-steps if adaptive time stepping is disabled.
             current_time (Optional[datetime]): Current simulation time. Used for logging.
-            stat_is_first (bool): Whether this call starts a new statistics window (resets accumulation).
-            stat_is_last (bool): Whether this call ends the current statistics window (finalize average).
-            stat_is_outer_first (bool, optional): Explicit start of outer window. Defaults to None.
-            stat_is_outer_last (bool, optional): Explicit end of outer window. Defaults to None.
         """
-        self.execute_parameter_change_plan(current_time)
-
-        if runoff.shape != self.base.runoff.shape:
-            if not (
-                self.num_trials is not None
-                and runoff.shape == self.base.runoff.shape[1:]
-            ):
-                raise ValueError(
-                    f"runoff shape {tuple(runoff.shape)} does not match model forcing "
-                    f"shape {tuple(self.base.runoff.shape)}"
-                )
-        self.base.runoff.copy_(runoff)
-
-        # Bind dynamic forcing into the module-owned, address-stable buffer.
-        # The storage kernel injects it through catchment_inflow_idx; keeping
-        # the address fixed makes this safe for CUDA Graph capture/replay.
-        if self.inflow is not None:
-            if inflow is None:
-                self.inflow.gauge_inflow.zero_()
-            else:
-                self.inflow.gauge_inflow.copy_(inflow)
-        elif inflow is not None:
-            raise ValueError(
-                "inflow forcing was provided but InflowModule is not opened"
-            )
-
-        if self.sea_level is not None:
-            if sea_surface_elevation is None:
-                raise ValueError(
-                    "SeaLevelModule is opened but sea_surface_elevation was not provided"
-                )
-            self.sea_level.sea_surface_elevation.copy_(sea_surface_elevation)
-        elif sea_surface_elevation is not None:
-            raise ValueError(
-                "sea_surface_elevation was provided but SeaLevelModule is not opened"
-            )
-
-        # Handle defaults for outer stats (default to False, only running inner stats)
-        if stat_is_outer_first is None:
-            stat_is_outer_first = False
-        if stat_is_outer_last is None:
-            stat_is_outer_last = False
-
-        # Latch outer_first: if signaled on a non-last step, defer to next last step
-        if stat_is_outer_first and not stat_is_last:
-            self._pending_outer_first = True
-            stat_is_outer_first = False
-        if self._pending_outer_first and stat_is_last:
-            stat_is_outer_first = True
-            self._pending_outer_first = False
-
-        if self.adaptive_time is not None:
+        copy_input(
+            self.base.runoff, runoff, when_none="required", name="runoff",
+            trial_broadcast=self.num_trials is not None,
+        )
+        copy_input(
+            self.inflow.inflow if self.has_module("inflow") else None,
+            inflow, name="inflow",
+            trial_broadcast=self.num_trials is not None,
+        )
+        copy_input(
+            (
+                self.sea_level.sea_surface_elevation
+                if self.has_module("sea_level") else None
+            ),
+            sea_surface_elevation,
+            when_none="required" if self.has_module("sea_level") else "keep",
+            name="sea_surface_elevation",
+            trial_broadcast=self.num_trials is not None,
+        )
+        if self.has_module("adaptive_time"):
             self.adaptive_time.max_sub_steps.fill_(0)
-            self._call_adaptive_time(time_step=time_step)
+            compute_adaptive_time_step(outer_time_step=time_step)
             if self.world_size > 1:
-                dist.all_reduce(self.adaptive_time.max_sub_steps, op=dist.ReduceOp.MAX)
+                all_reduce_(self.adaptive_time.max_sub_steps, reduction="max")
             
             # Take the maximum across all trials if batched
             num_sub_steps = int(self.adaptive_time.max_sub_steps.max().item())
@@ -791,237 +135,53 @@ class CaMaFlood(CUDAGraphMixin, AbstractModel):
             time_sub_step = time_step / num_sub_steps
         else:
             num_sub_steps = int(default_num_sub_steps)
+            if num_sub_steps < 1:
+                raise ValueError("default_num_sub_steps must be positive")
             time_sub_step = time_step / num_sub_steps
-        if self.log is not None:
+        if self.has_module("log"):
             self.log.set_time(time_sub_step, num_sub_steps, current_time)
-
-        if stat_is_first:
-            # Reset elapsed time counter at the beginning of a stats window
-            self._stats_elapsed_time = 0.0
-            self._stats_start_time = current_time
-            # Keep _stats_macro_step cumulative across inner windows
-            
-        if stat_is_outer_first:
-            self._stats_macro_step = 0
-
-        # Check if output is enabled
-        if self.output_start_time is not None and current_time is not None:
-            if current_time < self.output_start_time:
-                output_enabled = False
-
-        # Pre-compute constants for the sub-step loop
-        flags = (int(stat_is_first) | (int(stat_is_last) << 1) |
-                 (int(stat_is_outer_first) << 2) | (int(stat_is_outer_last) << 3))
-        total_weight = ((0.0 if stat_is_first else self._stats_elapsed_time)
-                        + num_sub_steps * time_sub_step)
-
-        # Determine if stats CUDA graph is safe to use:
-        # only when no outer windowing (num_macro_steps/macro_step_index don't affect output)
-        agg = self._statistics_aggregator
-        use_stats_cg = (self.cuda_graph_enabled
-                        and output_enabled and agg is not None and agg._aggregator_generated)
 
         self.base.time_step.fill_(time_sub_step)
 
-        device_march = (self._device_march_enabled and self._is_cuda_backend
-                        and self.adaptive_time is not None
-                        and self.conditional_stats_device_compatible(
-                            self._statistics_aggregator))
-        if device_march:
-            self._run_device_march(num_sub_steps, flags, total_weight,
-                                   time_sub_step, output_enabled)
-        else:
-            # ------------------------------------------------------------------ #
-            # Sub-step 0: use standard code paths (handles first-time capture)
-            # ------------------------------------------------------------------ #
-            self.base.current_step.fill_(0)
-            if self.cuda_graph_enabled:
-                self.cuda_graph_replay(cache_key=0)
+        for sub_step in self.substeps.fixed(count=num_sub_steps):
+            # Tensor expressions are captured together with the registered
+            # kernels; no backend/march code belongs in the model.
+            if self.has_module("log"):
+                self.base.current_step.copy_(sub_step.index)
+            compute_outflow()
+
+            if self.has_module("reservoir"):
+                compute_reservoir_outflow()
+
+            if self.has_module("bifurcation"):
+                if self.has_module("levee"):
+                    compute_levee_bifurcation_outflow()
+                else:
+                    compute_bifurcation_outflow()
+
+            compute_inflow()
+
+            if self.has_module("bifurcation"):
+                compute_bifurcation_inflow()
+
+            if self.has_module("log"):
+                compute_flood_stage_log()
             else:
-                self.do_one_sub_step(output_enabled=output_enabled)
-            self._stats_elapsed_time += time_sub_step
+                compute_flood_stage()
 
-            if output_enabled:
-                if use_stats_cg:
-                    if num_sub_steps == 1:
-                        is_inner_last_0 = bool(flags & 2)
-                        is_outer_first_0 = bool(flags & 4) and is_inner_last_0
-                        is_outer_last_0 = bool(flags & 8) and is_inner_last_0
-                        if is_outer_first_0:
-                            agg._macro_step_index = 0
-                            agg._current_macro_step_count = 0.0
-                            agg._outer_flags_ever_seen = True
-                        if is_inner_last_0 or is_outer_last_0:
-                            for out_name, out_is_outer in agg._output_is_outer.items():
-                                if (not out_is_outer and is_inner_last_0) or (out_is_outer and is_outer_last_0):
-                                    agg._dirty_outputs.add(out_name)
-                        if is_inner_last_0:
-                            agg._current_macro_step_count += 1.0
-                    self._stats_graph_replay(
-                        sub_step=0,
-                        num_sub_steps=num_sub_steps,
-                        flags=flags,
-                        weight=time_sub_step,
-                        total_weight=total_weight,
-                        num_macro_steps=agg._current_macro_step_count,
-                        macro_step_index=agg._macro_step_index,
-                        BLOCK_SIZE=self.BLOCK_SIZE,
-                    )
+            if self.has_module("levee"):
+                if self.has_module("log"):
+                    compute_levee_stage_log()
                 else:
-                    self.update_statistics(
-                        sub_step=0,
-                        num_sub_steps=num_sub_steps,
-                        flags=flags,
-                        weight=time_sub_step,
-                        total_weight=total_weight,
-                        BLOCK_SIZE=self.BLOCK_SIZE
-                    )
+                    compute_levee_stage()
 
-            # ------------------------------------------------------------------ #
-            # Sub-steps 1..N-1
-            # ------------------------------------------------------------------ #
-            if num_sub_steps > 1:
-                if use_stats_cg:
-                    # === FAST PATH ===
-                    phys_graph = self.__dict__["_cg_cache"][0][0]
-                    stats_graph = self._stats_cg
-                    states = agg._kernel_states
-                    sub_step_t = states['__sub_step']
-                    current_step_t = self.base.current_step
-                    last_sub = num_sub_steps - 1
-                    is_stat_last = bool(flags & 2)
-                    is_stat_outer_first = bool(flags & 4) and is_stat_last
-                    is_stat_outer_last = bool(flags & 8) and is_stat_last
+        # Keep the historical public state without adding scalar work to each
+        # compiled physics iteration when per-substep logging is disabled.
+        if not self.has_module("log"):
+            self.base.current_step.fill_(num_sub_steps - 1)
 
-                    for sub_step in range(1, num_sub_steps):
-                        current_step_t.fill_(sub_step)
-                        phys_graph.replay()
-                        sub_step_t.fill_(sub_step)
-                        if sub_step == last_sub:
-                            if is_stat_outer_first:
-                                agg._macro_step_index = 0
-                                agg._current_macro_step_count = 0.0
-                                agg._outer_flags_ever_seen = True
-                            if is_stat_last or is_stat_outer_last:
-                                for out_name, out_is_outer in agg._output_is_outer.items():
-                                    if (not out_is_outer and is_stat_last) or (out_is_outer and is_stat_outer_last):
-                                        agg._dirty_outputs.add(out_name)
-                            if is_stat_last:
-                                agg._current_macro_step_count += 1.0
-                                states['__num_macro_steps'].fill_(agg._current_macro_step_count)
-                        stats_graph.replay()
-
-                    self._stats_elapsed_time += (num_sub_steps - 1) * time_sub_step
-                else:
-                    # Standard path for remaining sub-steps
-                    for sub_step in range(1, num_sub_steps):
-                        self.base.current_step.fill_(sub_step)
-                        if self.cuda_graph_enabled:
-                            self.cuda_graph_replay(cache_key=0)
-                        else:
-                            self.do_one_sub_step(output_enabled=output_enabled)
-                        self._stats_elapsed_time += time_sub_step
-                        if output_enabled:
-                            self.update_statistics(
-                                sub_step=sub_step,
-                                num_sub_steps=num_sub_steps,
-                                flags=flags,
-                                weight=time_sub_step,
-                                total_weight=total_weight,
-                                BLOCK_SIZE=self.BLOCK_SIZE
-                            )
-
-
-        # Reset elapsed counter after closing a window
-        if stat_is_last:
-            if output_enabled:
-                self.finalize_time_step(self._stats_start_time if self._stats_start_time is not None else current_time)
-            self._stats_elapsed_time = 0.0
-            self._stats_start_time = None
-            self._stats_macro_step += 1
-        
-        if self.log is not None:
+        if self.has_module("log"):
             if self.world_size > 1:
                 self.log.gather_results()
             if self.rank == 0 and output_enabled:
                 self.log.write_step(self.log_path)
-        if self.rank == 0:
-            self.progress_tick()
-            progress = self.format_progress()
-            if progress:
-                msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps} | {progress}"
-            else:
-                msg = f"Processed step at {current_time}, adaptive_time_step={num_sub_steps}"
-            print(f"\r\033[K{msg}", end="", flush=True)
-            
-    def do_one_sub_step(self, output_enabled: bool = True) -> None:
-        """Execute one sub time step calculation."""
-        if KERNEL_BACKEND == "metal":
-            self._replay_metal_sub_step(output_enabled)
-            return
-        self._do_one_sub_step_impl(output_enabled)
-
-    def _replay_metal_sub_step(
-        self, output_enabled: bool,
-    ) -> None:
-        """Replay the fixed-address Metal sub-step ICB."""
-        from hydroforge.runtime.metal_kernel import (
-            MetalCommandSequence,
-            record_metal_commands,
-        )
-
-        key = bool(output_enabled)
-
-        graph = self._metal_substep_graphs.get(key)
-        if graph is None:
-            sequence = MetalCommandSequence()
-            with record_metal_commands(sequence):
-                self._do_one_sub_step_impl(output_enabled)
-            graph = sequence.capture()
-            self._metal_substep_graphs[key] = graph
-        graph.replay()
-
-    def _do_one_sub_step_impl(
-        self, output_enabled: bool = True,
-    ) -> None:
-        """Encode the backend kernels forming one sub time step."""
-        def stage_barrier() -> None:
-            if KERNEL_BACKEND == "metal":
-                from hydroforge.runtime.metal_kernel import mark_metal_barrier
-                mark_metal_barrier()
-
-        self._call_outflow()
-        stage_barrier()
-
-        if self.reservoir_flag:
-            self._call_reservoir_outflow(runoff_ptr=self.base.runoff)
-
-        if self.bifurcation_flag:
-            self._call_bif_outflow()
-
-        if self.reservoir_flag or self.bifurcation_flag:
-            stage_barrier()
-
-        self._call_inflow()
-
-        if self.bifurcation_flag:
-            self._call_bif_inflow()
-
-        stage_barrier()
-
-        if self.log is not None and output_enabled and compute_flood_stage_log is not None and self.num_trials is None:
-            self._call_flood_stage_log(runoff_ptr=self.base.runoff)
-        else:
-            self._call_flood_stage(
-                runoff_ptr=self.base.runoff,
-                batched_runoff=self.num_trials is not None,
-            )
-
-        if self.levee_flag:
-            if self.log is not None and output_enabled and compute_levee_stage_log is not None and self.num_trials is None:
-                self._call_levee_stage_log()
-            else:
-                self._call_levee_stage()
-
-        # Separate the final state writes from the next ICB replay.
-        stage_barrier()

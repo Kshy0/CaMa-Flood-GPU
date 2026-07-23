@@ -21,6 +21,7 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cmfgpu*"]
+exclude = ["cmfgpu.phys.grad*", "cmfgpu.phys.cuda.grad*", "cmfgpu.phys.triton.grad*"]
 
 [project.optional-dependencies]
 dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "meson", "ninja"]

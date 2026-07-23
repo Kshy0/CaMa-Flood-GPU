@@ -8,7 +8,7 @@ from functools import cached_property
 from typing import ClassVar
 
 import torch
-from hydroforge.modeling.module import AbstractModule, computed_tensor_field
+from hydroforge.model.module import AbstractModule, computed_tensor_field
 from pydantic import Field
 
 

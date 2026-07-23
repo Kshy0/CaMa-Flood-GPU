@@ -14,7 +14,7 @@ from functools import cached_property
 from typing import ClassVar, List, Literal, Optional, Self, Tuple
 
 import torch
-from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceField, ReferenceIndexField,
                                         SelectionField, TensorField,
                                         computed_tensor_field)
@@ -306,12 +306,10 @@ class BaseModule(AbstractModule):
         description="Total outflow via all bifurcation paths (m³ s⁻¹)",
         category="state",
         dtype="hpfloat",
-        depends_on="bifurcation",
     )
     @cached_property
-    def global_bifurcation_outflow(self) -> Optional[torch.Tensor]:
-        if "bifurcation" not in self.opened_modules:
-            return None
+    def global_bifurcation_outflow(self) -> torch.Tensor:
+        """Always-valid buffer; non-bifurcation kernels simply leave it zero."""
         return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
 
     @computed_base_field(

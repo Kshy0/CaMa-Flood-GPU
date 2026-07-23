@@ -21,7 +21,7 @@ import os
 from datetime import datetime
 
 import numpy as np
-from hydroforge.io.datasets import DailyBinDataset
+from hydroforge.data.datasets import DailyBinDataset
 from netCDF4 import Dataset
 
 from cmfgpu.params import estimate_river_geometry

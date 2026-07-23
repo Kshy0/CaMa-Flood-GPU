@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
 
 import numpy as np
-from hydroforge.modeling.distributed import binread, read_map
+from hydroforge.data.distributed import binread, read_map
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)
 

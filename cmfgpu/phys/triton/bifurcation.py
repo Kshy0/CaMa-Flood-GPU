@@ -7,7 +7,7 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import cbrt_compat, to_compute_dtype
+from cmfgpu.phys.triton.utils import cbrt_compat_inline, hpfloat_to_compute_inline
 
 
 @triton.jit
@@ -28,8 +28,10 @@ def compute_bifurcation_outflow_kernel(
     time_step_ptr,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
-    BLOCK_SIZE: tl.constexpr                    # Block size
+    BLOCK_SIZE: tl.constexpr,                   # Block size
+    num_catchments: tl.constexpr,
 ):
+    _ = num_catchments
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_bifurcation_paths
@@ -53,8 +55,8 @@ def compute_bifurcation_outflow_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = to_compute_dtype(tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
-    bifurcation_total_storage_downstream = to_compute_dtype(tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage = hpfloat_to_compute_inline(tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     for level in tl.static_range(num_bifurcation_levels):
@@ -80,7 +82,7 @@ def compute_bifurcation_outflow_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat(bifurcation_semi_implicit_flow_depth)))
+                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat_inline(bifurcation_semi_implicit_flow_depth)))
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
@@ -111,8 +113,10 @@ def compute_bifurcation_inflow_kernel(
     global_bifurcation_outflow_ptr,            # *f64: Global bifurcation outflow
     num_bifurcation_paths: tl.constexpr,                    # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels
-    BLOCK_SIZE: tl.constexpr                     # Block size
+    BLOCK_SIZE: tl.constexpr,                    # Block size
+    num_catchments: tl.constexpr,
 ):
+    _ = num_catchments
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_bifurcation_paths
@@ -195,8 +199,8 @@ def compute_bifurcation_outflow_batched_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = to_compute_dtype(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
-    bifurcation_total_storage_downstream = to_compute_dtype(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage = hpfloat_to_compute_inline(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
     
     # Base offsets for level-dependent arrays
@@ -228,7 +232,7 @@ def compute_bifurcation_outflow_batched_kernel(
             * bifurcation_semi_implicit_flow_depth * bifurcation_slope
         )
         denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat(bifurcation_semi_implicit_flow_depth)))
+                    * (1.0 / (bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * cbrt_compat_inline(bifurcation_semi_implicit_flow_depth)))
         
         updated_bifurcation_outflow = numerator / denominator
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)

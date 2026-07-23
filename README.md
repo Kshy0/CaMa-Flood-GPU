@@ -186,7 +186,7 @@ Regardless of this setting, the system always computes and reports GPU load assi
   
   In order to use external runoff datasets with CaMa-Flood-GPU, we first need to **generate a mapping table** that links **runoff grid cells** to the corresponding **catchments**.
   
-  The [Hydroforge](https://github.com/Kshy0/hydroforge) dependency includes dataset classes for both binary (`.bin`) and NetCDF (`.nc`) input formats. Each dataset type is defined in its own module under `hydroforge.io.datasets` (e.g., `hydroforge/io/datasets/daily_bin_dataset.py`), and often includes example usage in the `if __name__ == "__main__":` block.
+The [Hydroforge](https://github.com/Kshy0/hydroforge) dependency includes dataset classes for both binary (`.bin`) and NetCDF (`.nc`) input formats. Each dataset type is defined in its own module under `hydroforge.data.datasets` (e.g., `hydroforge/datasets/daily_bin.py`).
   
   For convenience, we provide a script `scripts_user/make_runoff_map.py` to generate the mapping table using `DailyBinDataset`. You can modify it to use other dataset classes (like `NetCDFDataset` or `ERA5LandAccumDataset`) if needed.
 

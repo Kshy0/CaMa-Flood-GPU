@@ -7,6 +7,8 @@
 import triton
 import triton.language as tl
 
+from cmfgpu.phys.triton.utils import nonnegative_to_index_inline
+
 
 @triton.jit
 def compute_adaptive_time_step_kernel(
@@ -14,7 +16,7 @@ def compute_adaptive_time_step_kernel(
     downstream_distance_ptr,                # *f32 distance to downstream unit
     is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
     max_sub_steps_ptr,                      # *i64 max sub steps
-    time_step,
+    outer_time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
@@ -33,19 +35,21 @@ def compute_adaptive_time_step_kernel(
     #----------------------------------------------------------------------
     # (1) Load input variables
     #----------------------------------------------------------------------
-    downstream_distance = tl.load(downstream_distance_ptr + offs, mask=mask, other=float('inf'))
+    downstream_distance = tl.load(
+        downstream_distance_ptr + offs, mask=mask, other=1.0e30,
+    )
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
     depth = tl.maximum(river_depth, 0.01)
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
-    dt_clamped = tl.minimum(dt, time_step)
+    dt_clamped = tl.minimum(dt, outer_time_step)
     
     min_dt = tl.min(dt_clamped)
     
     # Calculate num_sub_steps
-    # Align with int(round(time_step / min_dt - 0.01) + 1)
-    n_steps_float = tl.floor(time_step / min_dt + 0.49) + 1.0
-    n_steps = n_steps_float.to(tl.int32)
+    # Align with int(round(outer_time_step / min_dt - 0.01) + 1)
+    n_steps_float = tl.floor(outer_time_step / min_dt + 0.49) + 1.0
+    n_steps = nonnegative_to_index_inline(n_steps_float)
     
     tl.atomic_max(max_sub_steps_ptr, n_steps)
 
@@ -56,7 +60,7 @@ def compute_adaptive_time_step_batched_kernel(
     downstream_distance_ptr,                # *f32 distance to downstream unit
     is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
     max_sub_steps_ptr,                      # *i32 (size 1, shared_state)
-    time_step,
+    outer_time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
@@ -85,24 +89,28 @@ def compute_adaptive_time_step_batched_kernel(
     #----------------------------------------------------------------------
     # (1) Load input variables
     #----------------------------------------------------------------------
-    downstream_distance = tl.load(downstream_distance_ptr + (trial_offset if batched_downstream_distance else 0) + offs, mask=mask, other=float('inf'))
+    downstream_distance = tl.load(
+        downstream_distance_ptr
+        + (trial_offset if batched_downstream_distance else 0) + offs,
+        mask=mask, other=1.0e30,
+    )
     # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + trial_offset + offs, mask=mask, other=0)
 
     # Upcast to fp32 for intermediate computation:
-    # time_step (86400) exceeds fp16 max (65504), so fp16 would overflow.
-    downstream_distance = downstream_distance.to(tl.float32)
-    river_depth = river_depth.to(tl.float32)
+    # outer_time_step (86400) exceeds fp16 max (65504), so fp16 would overflow.
+    downstream_distance = downstream_distance
+    river_depth = river_depth
 
     depth = tl.maximum(river_depth, 0.01)
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
-    dt_clamped = tl.minimum(dt, time_step)
+    dt_clamped = tl.minimum(dt, outer_time_step)
     
     min_dt = tl.min(dt_clamped)
     
     # Calculate num_sub_steps
-    # Align with int(round(time_step / min_dt - 0.01) + 1)
-    n_steps_float = tl.floor(time_step / min_dt + 0.49) + 1.0
-    n_steps = n_steps_float.to(tl.int32)
+    # Align with int(round(outer_time_step / min_dt - 0.01) + 1)
+    n_steps_float = tl.floor(outer_time_step / min_dt + 0.49) + 1.0
+    n_steps = nonnegative_to_index_inline(n_steps_float)
     
     tl.atomic_max(max_sub_steps_ptr, n_steps)

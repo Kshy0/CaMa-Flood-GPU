@@ -4,25 +4,23 @@
 
 """Registered adaptive-time implementations."""
 
-from hydroforge.runtime.backend import BackendRegistry, make_batched_dispatcher
+from hydroforge.kernels.registry import BackendRegistry
+from cmfgpu.phys.specs import ADAPTIVE_TIME
 
 
 def _metal():
-    from cmfgpu.phys.metal import (
-        compute_adaptive_time_step_batched_kernel as batched,
-        compute_adaptive_time_step_kernel as shared,
-    )
+    from cmfgpu.phys import metal
 
-    return make_batched_dispatcher(shared, batched)
+    return metal.adaptive_time()
 
 
 def _cuda():
-    from cmfgpu.phys.cuda import compute_adaptive_time_step
-    return compute_adaptive_time_step
+    from cmfgpu.phys import cuda
+    return cuda.adaptive_time()
 
 
 def _triton():
-    from hydroforge.runtime.backend import make_triton_dispatcher
+    from hydroforge.kernels.registry import make_triton_dispatcher
     from cmfgpu.phys.triton.adaptive_time import (
         compute_adaptive_time_step_batched_kernel,
         compute_adaptive_time_step_kernel,
@@ -30,11 +28,11 @@ def _triton():
     return make_triton_dispatcher(
         compute_adaptive_time_step_kernel,
         batched_kernel=compute_adaptive_time_step_batched_kernel,
-        optional_buffers={"is_dam_related_ptr": "HAS_RESERVOIR"},
     )
 
 
 compute_adaptive_time_step = BackendRegistry(
     {"metal": _metal, "cuda": _cuda, "triton": _triton},
     name="compute_adaptive_time_step",
+    spec=ADAPTIVE_TIME,
 ).selected

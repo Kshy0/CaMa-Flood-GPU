@@ -11,30 +11,36 @@ Script to generate model parameters from CaMa-Flood map data.
 
 from cmfgpu.params import MERITMap
 
-print("=== Generating Map Parameters ===")
 
-# --- Configuration Start ---
-map_resolution = "glb_15min"
-map_dir = f"/home/eat/cmf_v420_pkg/map/{map_resolution}"
-out_dir = f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"
+def main():
+    print("=== Generating Map Parameters ===")
 
-# Optional files
-bifori_file = f"{map_dir}/bifori.txt"
-gauge_file = f"{map_dir}/GRDC_alloc.txt"
+    # --- Configuration Start ---
+    map_resolution = "glb_15min"
+    map_dir = f"/home/eat/cmf_v420_pkg/map/{map_resolution}"
+    out_dir = f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"
 
-# Settings
-target_gpus = 1
-visualized = True
-# --- Configuration End ---
+    # Optional files
+    bifori_file = f"{map_dir}/bifori.txt"
+    gauge_file = f"{map_dir}/GRDC_alloc.txt"
 
-merit_map = MERITMap(
-    map_dir=map_dir,
-    out_dir=out_dir,
-    bifori_file=bifori_file, # Set to None if not available
-    gauge_file=gauge_file,   # Set to None if not available
-    visualized=visualized,
-    bif_levels_to_keep=5,
-    target_gpus=target_gpus,
-    out_file="parameters.nc",
-)
-merit_map.build_input()
+    # Settings
+    target_gpus = 1
+    visualized = True
+    # --- Configuration End ---
+
+    merit_map = MERITMap(
+        map_dir=map_dir,
+        out_dir=out_dir,
+        bifori_file=bifori_file,  # Set to None if not available
+        gauge_file=gauge_file,  # Set to None if not available
+        visualized=visualized,
+        bif_levels_to_keep=5,
+        target_gpus=target_gpus,
+        out_file="parameters.nc",
+    )
+    merit_map.build_input()
+
+
+if __name__ == "__main__":
+    main()

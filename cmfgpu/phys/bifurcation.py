@@ -4,25 +4,30 @@
 
 """Registered bifurcation implementations."""
 
-from hydroforge.runtime.backend import (
-    BackendRegistry, make_batched_dispatcher, make_triton_dispatcher,
+from hydroforge.kernels.registry import (
+    BackendRegistry, make_triton_dispatcher,
 )
+from cmfgpu.phys.specs import BIFURCATION_INFLOW, BIFURCATION_OUTFLOW
 
 
-def _metal(which):
-    def factory():
-        from cmfgpu.phys import metal
-        shared = getattr(metal, f"compute_bifurcation_{which}_kernel")
-        batched = getattr(metal, f"compute_bifurcation_{which}_batched_kernel")
-        return make_batched_dispatcher(shared, batched)
-    return factory
+def _metal_outflow():
+    from cmfgpu.phys import metal
+    return metal.bifurcation_outflow()
 
 
-def _cuda(which):
-    def factory():
-        from cmfgpu.phys import cuda
-        return getattr(cuda, f"compute_bifurcation_{which}")
-    return factory
+def _metal_inflow():
+    from cmfgpu.phys import metal
+    return metal.bifurcation_inflow()
+
+
+def _cuda_outflow():
+    from cmfgpu.phys import cuda
+    return cuda.bifurcation_outflow()
+
+
+def _cuda_inflow():
+    from cmfgpu.phys import cuda
+    return cuda.bifurcation_inflow()
 
 
 def _triton(which):
@@ -33,18 +38,25 @@ def _triton(which):
             batched_kernel=getattr(
                 bifurcation, f"compute_bifurcation_{which}_batched_kernel",
             ),
-            size_key="num_bifurcation_paths",
-            non_batched_drop=("num_catchments",),
         )
     return factory
 
 
-def _registered(which):
-    return BackendRegistry(
-        {"metal": _metal(which), "cuda": _cuda(which), "triton": _triton(which)},
-        name=f"compute_bifurcation_{which}",
-    ).selected
-
-
-compute_bifurcation_outflow = _registered("outflow")
-compute_bifurcation_inflow = _registered("inflow")
+compute_bifurcation_outflow = BackendRegistry(
+    {
+        "metal": _metal_outflow,
+        "cuda": _cuda_outflow,
+        "triton": _triton("outflow"),
+    },
+    name="compute_bifurcation_outflow",
+    spec=BIFURCATION_OUTFLOW,
+).selected
+compute_bifurcation_inflow = BackendRegistry(
+    {
+        "metal": _metal_inflow,
+        "cuda": _cuda_inflow,
+        "triton": _triton("inflow"),
+    },
+    name="compute_bifurcation_inflow",
+    spec=BIFURCATION_INFLOW,
+).selected

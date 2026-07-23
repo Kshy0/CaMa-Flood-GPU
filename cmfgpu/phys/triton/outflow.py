@@ -7,7 +7,9 @@
 import triton
 import triton.language as tl
 
-from cmfgpu.phys.triton.utils import cbrt_compat, to_compute_dtype
+from cmfgpu.phys.triton.utils import (
+    cbrt_compat_inline, hpfloat_to_compute_inline,
+)
 
 
 @triton.jit
@@ -56,8 +58,10 @@ def compute_outflow_kernel(
     MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
     sea_surface_elevation_ptr=None,
     catchment_sea_level_idx_ptr=None,
+    num_sea_level_boundaries: tl.constexpr = 0,
     HAS_SEA_LEVEL: tl.constexpr = False,
 ):
+    _ = num_sea_level_boundaries
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
@@ -94,9 +98,9 @@ def compute_outflow_kernel(
     flood_cross_section_area = tl.load(flood_cross_section_area_ptr + offs, mask=mask, other=0.0)
 
     # Downcast hpfloat storage to the active computation dtype.
-    river_storage = to_compute_dtype(river_storage, river_outflow)
-    flood_storage = to_compute_dtype(flood_storage, river_outflow)
-    protected_storage = to_compute_dtype(protected_storage, river_outflow)
+    river_storage = hpfloat_to_compute_inline(river_storage, river_outflow)
+    flood_storage = hpfloat_to_compute_inline(flood_storage, river_outflow)
+    protected_storage = hpfloat_to_compute_inline(protected_storage, river_outflow)
 
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
@@ -179,7 +183,7 @@ def compute_outflow_kernel(
     
     # Use libdevice.pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * (1.0 / (river_semi_implicit_flow_depth * river_semi_implicit_flow_depth * cbrt_compat(river_semi_implicit_flow_depth)))
+                      * (1.0 / (river_semi_implicit_flow_depth * river_semi_implicit_flow_depth * cbrt_compat_inline(river_semi_implicit_flow_depth)))
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -193,7 +197,7 @@ def compute_outflow_kernel(
     
     # Use libdevice.pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * (1.0 / (flood_semi_implicit_flow_depth * cbrt_compat(flood_semi_implicit_flow_depth))) / flood_implicit_area
+                      * (1.0 / (flood_semi_implicit_flow_depth * cbrt_compat_inline(flood_semi_implicit_flow_depth))) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
@@ -218,18 +222,20 @@ def compute_outflow_kernel(
     #      Uses bed slope (catchment elevation gradient) instead of water-surface slope.
     #----------------------------------------------------------------------
     if HAS_RESERVOIR:
-        is_dam_up = tl.load(is_dam_upstream_ptr + offs, mask=mask, other=0).to(tl.int1)
+        is_dam_up = tl.load(
+            is_dam_upstream_ptr + offs, mask=mask, other=0,
+        ) != 0
         # Bed slope
         bed_slope = (catchment_elevation - tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0)) / downstream_distance
         bed_slope = tl.maximum(bed_slope, MIN_KINEMATIC_SLOPE)
         # River kinematic: Q = W * n^{-1} * S^{0.5} * d^{5/3}
-        kin_riv_vel = (1.0 / river_manning) * tl.sqrt(bed_slope) * cbrt_compat(river_depth * river_depth)
+        kin_riv_vel = (1.0 / river_manning) * tl.sqrt(bed_slope) * cbrt_compat_inline(river_depth * river_depth)
         kin_riv = river_width * river_depth * kin_riv_vel
         kin_riv = tl.minimum(kin_riv, river_storage / time_step)
         kin_riv = tl.maximum(kin_riv, 0.0)
         # Flood kinematic: slope clamped to 0.005
         bed_slope_f = tl.minimum(bed_slope, 0.005)
-        kin_fld_vel = (1.0 / flood_manning) * tl.sqrt(bed_slope_f) * cbrt_compat(flood_depth * flood_depth)
+        kin_fld_vel = (1.0 / flood_manning) * tl.sqrt(bed_slope_f) * cbrt_compat_inline(flood_depth * flood_depth)
         kin_fld_area = tl.maximum(flood_storage / river_length - flood_depth * river_width, 0.0)
         kin_fld = kin_fld_area * kin_fld_vel
         kin_fld = tl.minimum(kin_fld, flood_storage / time_step)
@@ -295,10 +301,10 @@ def compute_inflow_kernel(
     # -------- Load for limiting --------
     river_outflow   = tl.load(river_outflow_ptr      + offs, mask=mask, other=0.0)
     flood_outflow   = tl.load(flood_outflow_ptr      + offs, mask=mask, other=0.0)
-    outgoing_storage = to_compute_dtype(tl.load(outgoing_storage_ptr + offs, mask=mask, other=0.0), river_outflow)
+    outgoing_storage = hpfloat_to_compute_inline(tl.load(outgoing_storage_ptr + offs, mask=mask, other=0.0), river_outflow)
 
     # Convert storage terms to the same dtype before applying the limiter.
-    rate_storage = to_compute_dtype(
+    rate_storage = hpfloat_to_compute_inline(
         tl.load(river_storage_ptr + offs, mask=mask, other=0.0) + tl.load(flood_storage_ptr + offs, mask=mask, other=0.0),
         river_outflow
     )
@@ -308,8 +314,8 @@ def compute_inflow_kernel(
 
     # Downstream limiting
     downstream_idx   = tl.load(downstream_idx_ptr        + offs, mask=mask, other=0)
-    outgoing_storage_downstream = to_compute_dtype(tl.load(outgoing_storage_ptr + downstream_idx, mask=mask, other=0.0), river_outflow)
-    rate_storage_downstream = to_compute_dtype(
+    outgoing_storage_downstream = hpfloat_to_compute_inline(tl.load(outgoing_storage_ptr + downstream_idx, mask=mask, other=0.0), river_outflow)
+    rate_storage_downstream = hpfloat_to_compute_inline(
         tl.load(river_storage_ptr + downstream_idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx, mask=mask, other=0.0),
         river_outflow
     )
@@ -387,6 +393,9 @@ def compute_outflow_batched_kernel(
     batched_river_height: tl.constexpr,
     batched_catchment_elevation: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    is_dam_upstream_ptr=None,
+    HAS_RESERVOIR: tl.constexpr = False,
+    MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,
     sea_surface_elevation_ptr=None,
     catchment_sea_level_idx_ptr=None,
     num_sea_level_boundaries: tl.constexpr = 0,
@@ -431,9 +440,9 @@ def compute_outflow_batched_kernel(
     flood_cross_section_area = tl.load(flood_cross_section_area_ptr + idx, mask=mask, other=0.0)
 
     # Downcast hpfloat storage to the active computation dtype.
-    river_storage = to_compute_dtype(river_storage, river_outflow)
-    flood_storage = to_compute_dtype(flood_storage, river_outflow)
-    protected_storage = to_compute_dtype(protected_storage, river_outflow)
+    river_storage = hpfloat_to_compute_inline(river_storage, river_outflow)
+    flood_storage = hpfloat_to_compute_inline(flood_storage, river_outflow)
+    protected_storage = hpfloat_to_compute_inline(protected_storage, river_outflow)
 
     #----------------------------------------------------------------------
     # (2) Compute current river water surface elevation & downstream water surface elevation
@@ -521,7 +530,7 @@ def compute_outflow_batched_kernel(
     
     # Use libdevice.pow() for power calculation
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
-                      * (1.0 / (river_semi_implicit_flow_depth * river_semi_implicit_flow_depth * cbrt_compat(river_semi_implicit_flow_depth)))
+                      * (1.0 / (river_semi_implicit_flow_depth * river_semi_implicit_flow_depth * cbrt_compat_inline(river_semi_implicit_flow_depth)))
 
     updated_river_outflow = numerator_river / denominator_river
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
@@ -535,7 +544,7 @@ def compute_outflow_batched_kernel(
     
     # Use libdevice.pow() for power calculation
     denominator_flood = 1.0 + gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow) \
-                      * (1.0 / (flood_semi_implicit_flow_depth * cbrt_compat(flood_semi_implicit_flow_depth))) / flood_implicit_area
+                      * (1.0 / (flood_semi_implicit_flow_depth * cbrt_compat_inline(flood_semi_implicit_flow_depth))) / flood_implicit_area
                       
     updated_flood_outflow = numerator_flood / denominator_flood
     updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
@@ -554,6 +563,40 @@ def compute_outflow_batched_kernel(
                    1.0), 1.0)
     updated_river_outflow = tl.where(is_negative_flow, updated_river_outflow * limit_rate, updated_river_outflow)
     updated_flood_outflow = tl.where(is_negative_flow, updated_flood_outflow * limit_rate, updated_flood_outflow)
+
+    # Match the shared kernel's kinematic-wave override at dam-upstream cells.
+    if HAS_RESERVOIR:
+        is_dam_up = tl.load(
+            is_dam_upstream_ptr + catchment_idx, mask=mask, other=0,
+        ) != 0
+        downstream_elevation = tl.load(
+            catchment_elevation_ptr
+            + (downstream_idx_global if batched_catchment_elevation else downstream_idx),
+            mask=mask, other=0.0,
+        )
+        bed_slope = (catchment_elevation - downstream_elevation) / downstream_distance
+        bed_slope = tl.maximum(bed_slope, MIN_KINEMATIC_SLOPE)
+        kin_riv_vel = (
+            tl.sqrt(bed_slope) * cbrt_compat_inline(river_depth * river_depth)
+            / river_manning
+        )
+        kin_riv = tl.clamp(
+            river_width * river_depth * kin_riv_vel,
+            0.0, river_storage / time_step,
+        )
+        bed_slope_f = tl.minimum(bed_slope, 0.005)
+        kin_fld_vel = (
+            tl.sqrt(bed_slope_f) * cbrt_compat_inline(flood_depth * flood_depth)
+            / flood_manning
+        )
+        kin_fld_area = tl.maximum(
+            flood_storage / river_length - flood_depth * river_width, 0.0,
+        )
+        kin_fld = tl.clamp(
+            kin_fld_area * kin_fld_vel, 0.0, flood_storage / time_step,
+        )
+        updated_river_outflow = tl.where(is_dam_up, kin_riv, updated_river_outflow)
+        updated_flood_outflow = tl.where(is_dam_up, kin_fld, updated_flood_outflow)
 
     #----------------------------------------------------------------------
     # (10) Store results - in-place update
@@ -614,10 +657,10 @@ def compute_inflow_batched_kernel(
     # -------- Load for limiting --------
     river_outflow   = tl.load(river_outflow_ptr      + idx, mask=mask, other=0.0)
     flood_outflow   = tl.load(flood_outflow_ptr      + idx, mask=mask, other=0.0)
-    outgoing_storage = to_compute_dtype(tl.load(outgoing_storage_ptr + idx, mask=mask, other=0.0), river_outflow)
+    outgoing_storage = hpfloat_to_compute_inline(tl.load(outgoing_storage_ptr + idx, mask=mask, other=0.0), river_outflow)
 
     # Convert storage terms to the same dtype before applying the limiter.
-    rate_storage = to_compute_dtype(
+    rate_storage = hpfloat_to_compute_inline(
         tl.load(river_storage_ptr + idx, mask=mask, other=0.0) + tl.load(flood_storage_ptr + idx, mask=mask, other=0.0),
         river_outflow
     )
@@ -633,8 +676,8 @@ def compute_inflow_batched_kernel(
     trial_offset = (idx // num_catchments) * num_catchments
     downstream_idx_global = trial_offset + downstream_idx
     
-    outgoing_storage_downstream = to_compute_dtype(tl.load(outgoing_storage_ptr + downstream_idx_global, mask=mask, other=0.0), river_outflow)
-    rate_storage_downstream = to_compute_dtype(
+    outgoing_storage_downstream = hpfloat_to_compute_inline(tl.load(outgoing_storage_ptr + downstream_idx_global, mask=mask, other=0.0), river_outflow)
+    rate_storage_downstream = hpfloat_to_compute_inline(
         tl.load(river_storage_ptr + downstream_idx_global, mask=mask, other=0.0) + tl.load(flood_storage_ptr + downstream_idx_global, mask=mask, other=0.0),
         river_outflow
     )

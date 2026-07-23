@@ -14,7 +14,7 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceField, ReferenceIndexField,
                                         TensorField, computed_tensor_field)
 from pydantic import Field, computed_field, model_validator
@@ -219,7 +219,12 @@ class LeveeModule(AbstractModule):
         
         # Compute widths at each level
         # levels 1 to M
-        levels = torch.arange(1, num_flood_levels + 1, device=self.device, dtype=torch.float32)
+        levels = torch.arange(
+            1,
+            num_flood_levels + 1,
+            device=self.device,
+            dtype=self.precision,
+        )
         # W shape: (num_levees, num_flood_levels)
         
         # Check if any input is batched
@@ -343,9 +348,8 @@ class LeveeModule(AbstractModule):
         invalid = self.levee_base_height >= self.levee_crown_height
         num_invalid = invalid.sum().item()
         if num_invalid > 0:
-            print(
-                f"[rank {self.rank}][LeveeModule] Found {num_invalid} levees with invalid height (base >= crown). "
-                "Fixing by setting crown = max(crown, base)."
+            raise ValueError(
+                f"{num_invalid} levees have base height greater than or equal "
+                "to crown height"
             )
-            self.levee_crown_height = torch.maximum(self.levee_crown_height, self.levee_base_height)
         return self

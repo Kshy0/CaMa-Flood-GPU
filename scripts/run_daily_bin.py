@@ -9,9 +9,10 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.io.datasets import DailyBinDataset
-from hydroforge.modeling.distributed import setup_distributed
-from hydroforge.modeling.input_proxy import InputProxy
+from hydroforge.contracts.temporal import SimulationSchedule
+from hydroforge.data.datasets import DailyBinDataset
+from hydroforge.data.distributed import setup_distributed
+from hydroforge.data.input import InputProxy
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -30,7 +31,7 @@ def main():
     
     loader_workers = 2
     output_workers = 2
-    output_complevel = 4 
+    output_netcdf_options = {"compression": "zlib", "complevel": 4}
     prefetch_factor = 2
     BLOCK_SIZE = 128
     save_state = False
@@ -81,6 +82,9 @@ def main():
         lat_south_to_north=lat_south_to_north,
         lon_0_to_360=lon_0_to_360,
     )
+    schedule = SimulationSchedule.from_contract(
+        dataset.temporal_contract(), step=timedelta(seconds=time_step),
+    )
 
     model = CaMaFlood(
         rank=rank,
@@ -92,9 +96,10 @@ def main():
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
         output_workers=output_workers,
-        output_complevel=output_complevel,
+        output_netcdf_options=output_netcdf_options,
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year,
+        simulation_schedule=schedule,
     )
     model.set_total_steps(dataset.total_steps)
 
@@ -133,6 +138,7 @@ def main():
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))
+    model.close()
     if world_size > 1:
         dist.destroy_process_group()
 

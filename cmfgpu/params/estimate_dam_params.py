@@ -25,7 +25,7 @@ pipeline:
    (``GRanD_allocated.csv``) and *catchment_id* from a dam allocation
    result (produced by :class:`HiResMap`'s ``build_dams`` pipeline).
 2. Use a pre-aggregated statistics NetCDF (produced by
-   :class:`StatisticsAggregator` with ``max_mean`` and ``mean_mean`` ops)
+   :class:`StatisticsRuntime` with ``max_mean`` and ``mean_mean`` ops)
    to read annual-max peaks and mean discharge at dam cells.
 3. Fit Gumbel → Q100 → ``Qf = 0.3 * Q100`` (with Qf < Qn adjustment).
 4. Compute flood-control / conservation storage (GRSAD + ReGeom **or**
@@ -57,7 +57,7 @@ from typing import Optional, Union
 
 import numba
 import numpy as np
-from hydroforge.modeling.distributed import find_indices_in
+from hydroforge.data.distributed import find_indices_in
 from netCDF4 import Dataset
 
 # ---------------------------------------------------------------------------
@@ -746,7 +746,7 @@ def _find_nc_with_var(
 ) -> Path:
     """Find the NC file containing *var_name*.
 
-    The :class:`StatisticsAggregator` may write each statistic into a
+    The :class:`StatisticsRuntime` may write each statistic into a
     separate file (e.g. ``total_outflow_max_mean_rank0.nc``).  If
     *base_path* is a file that already contains the variable, return it.
     Otherwise search the directory of *base_path* (or *base_path* itself
@@ -786,7 +786,7 @@ def compute_dam_discharge_from_timeseries(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Read pre-aggregated annual-max and mean discharge at dam cells.
 
-    Expects NetCDF file(s) produced by :class:`StatisticsAggregator` with
+    Expects NetCDF file(s) produced by :class:`StatisticsRuntime` with
     yearly ``max_mean`` and ``mean_mean`` operations, e.g.::
 
         variables_to_save = {
@@ -1000,7 +1000,7 @@ def estimate_dam_params(
     """Estimate dam / reservoir parameters and write CSV and/or NetCDF.
 
     Reads pre-aggregated yearly outflow statistics from a
-    :class:`StatisticsAggregator` output NetCDF and runs the Gumbel 100-yr
+    :class:`StatisticsRuntime` output NetCDF and runs the Gumbel 100-yr
     pipeline to compute Qn (mean discharge) and Qf (flood-control
     discharge) at each dam grid cell.
 

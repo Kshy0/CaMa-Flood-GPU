@@ -14,7 +14,7 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Tuple
 
 import torch
-from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceField, ReferenceIndexField,
                                         SelectionField, TensorField,
                                         computed_tensor_field)

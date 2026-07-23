@@ -1,337 +1,143 @@
-// LICENSE HEADER MANAGED BY add-license-header
-// Copyright (c) 2025 Shengyu Kang (Wuhan University)
-// Licensed under the Apache License, Version 2.0
-// http://www.apache.org/licenses/LICENSE-2.0
-
-#include <metal_stdlib>
-using namespace metal;
-constant bool batched_bif_manning_flag [[function_constant(0)]];
-constant bool batched_bif_width_flag [[function_constant(1)]];
-constant bool batched_bif_length_flag [[function_constant(2)]];
-constant bool batched_bif_elevation_flag [[function_constant(3)]];
-
-struct compute_bifurcation_outflow_args {
-    device int* bif_catchment_idx_buf [[id(0)]];
-    device int* bif_downstream_idx_buf [[id(1)]];
-    device float* bif_manning_buf [[id(2)]];
-    device float* bif_outflow_buf [[id(3)]];
-    device float* bif_width_buf [[id(4)]];
-    device float* bif_length_buf [[id(5)]];
-    device float* bif_elevation_buf [[id(6)]];
-    device float* bif_cross_section_depth_buf [[id(7)]];
-    device float* water_surface_elevation_buf [[id(8)]];
-    device float* total_storage_buf [[id(9)]];
-    device atomic_float* outgoing_storage_buf [[id(10)]];
-    constant float* gravity [[id(11)]];
-    constant float* time_step [[id(12)]];
-    constant int* num_bifurcation_paths [[id(13)]];
+struct BifurcationLevelResult {
+    float outflow;
+    float cross_section_depth;
 };
 
-kernel void compute_bifurcation_outflow(
-    constant compute_bifurcation_outflow_args& args [[buffer(0)]],
-    uint idx [[thread_position_in_grid]]
-)
-{
-    device int* bif_catchment_idx_buf = args.bif_catchment_idx_buf;
-    device int* bif_downstream_idx_buf = args.bif_downstream_idx_buf;
-    device float* bif_manning_buf = args.bif_manning_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device float* bif_width_buf = args.bif_width_buf;
-    device float* bif_length_buf = args.bif_length_buf;
-    device float* bif_elevation_buf = args.bif_elevation_buf;
-    device float* bif_cross_section_depth_buf = args.bif_cross_section_depth_buf;
-    device float* water_surface_elevation_buf = args.water_surface_elevation_buf;
-    device float* total_storage_buf = args.total_storage_buf;
-    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
-    const float gravity = *args.gravity;
-    const float time_step = *args.time_step;
-    const int num_bifurcation_paths = *args.num_bifurcation_paths;
-    if ((int)idx >= num_bifurcation_paths) return;
-
-    int catch_idx = bif_catchment_idx_buf[idx];
-    int ds_idx    = bif_downstream_idx_buf[idx];
-
-    float bif_length = bif_length_buf[idx];
-
-    float wse      = water_surface_elevation_buf[catch_idx];
-    float wse_ds   = water_surface_elevation_buf[ds_idx];
-    float max_wse  = max(wse, wse_ds);
-
-    float bif_slope = (wse - wse_ds) / bif_length;
-    bif_slope = clamp(bif_slope, -0.005f, 0.005f);
-
-    float total_sto    = total_storage_buf[catch_idx];
-    float total_sto_ds = total_storage_buf[ds_idx];
-
-    float sum_outflow = 0.0f;
-
-    // Unrolled loop over bifurcation levels
-    for (int level = 0; level < __NUM_BIF_LEVELS__; level++) {
-        int level_idx = (int)idx * __NUM_BIF_LEVELS__ + level;
-
-        float manning   = bif_manning_buf[level_idx];
-        float csd       = bif_cross_section_depth_buf[level_idx];
-        float elevation = bif_elevation_buf[level_idx];
-
-        float updated_csd = max(max_wse - elevation, 0.0f);
-
-        float semi_d = max(
-            sqrt(updated_csd * csd),
-            sqrt(updated_csd * 0.01f)
-        );
-
-        bool flow_cond = semi_d > 1e-5f;
-        float updated_outflow = 0.0f;
-        if (flow_cond) {
-            float width   = bif_width_buf[level_idx];
-            float outflow = bif_outflow_buf[level_idx];
-            float unit_q  = outflow / width;
-
-            float num = width * (
-                unit_q + gravity * time_step * semi_d * bif_slope
-            );
-            float den = 1.0f + gravity * time_step * (manning * manning) * fabs(unit_q)
-                        * pow(semi_d, -7.0f / 3.0f);
-            updated_outflow = num / den;
-        }
-
-        sum_outflow += updated_outflow;
-        bif_cross_section_depth_buf[level_idx] = updated_csd;
-        bif_outflow_buf[level_idx] = updated_outflow;
+static inline BifurcationLevelResult bifurcation_level_inline(
+    float previous_outflow,
+    float previous_cross_section_depth,
+    float maximum_water_surface,
+    float elevation,
+    float width,
+    float manning,
+    float slope,
+    float gravity,
+    float time_step,
+    bool semi_implicit_depth
+) {
+    BifurcationLevelResult result;
+    result.cross_section_depth = max(
+        maximum_water_surface - elevation, 0.0f);
+    float flow_depth = semi_implicit_depth
+        ? max(
+            sqrt(result.cross_section_depth * previous_cross_section_depth),
+            sqrt(result.cross_section_depth * 0.01f))
+        : result.cross_section_depth;
+    result.outflow = 0.0f;
+    if (flow_depth > 1e-5f) {
+        float unit_outflow = previous_outflow / width;
+        float numerator = width * (
+            unit_outflow + gravity * time_step * flow_depth * slope);
+        float denominator = 1.0f
+            + gravity * time_step * manning * manning
+                * fabs(unit_outflow) * pow(flow_depth, -7.0f / 3.0f);
+        result.outflow = numerator / denominator;
     }
-
-    // Limit rate
-    float limit_rate = min(
-        0.05f * min(total_sto, total_sto_ds) / (fabs(sum_outflow) * time_step),
-        1.0f
-    );
-    sum_outflow *= limit_rate;
-
-    // Apply limit rate to per-level outflow
-    for (int level = 0; level < __NUM_BIF_LEVELS__; level++) {
-        int level_idx = (int)idx * __NUM_BIF_LEVELS__ + level;
-        bif_outflow_buf[level_idx] *= limit_rate;
-    }
-
-    // Scatter to outgoing storage
-    float pos_flow = max(sum_outflow, 0.0f);
-    float neg_flow = min(sum_outflow, 0.0f);
-    atomic_fetch_add_explicit(&outgoing_storage_buf[catch_idx],  pos_flow * time_step, memory_order_relaxed);
-    atomic_fetch_add_explicit(&outgoing_storage_buf[ds_idx],    -neg_flow * time_step, memory_order_relaxed);
+    return result;
 }
 
-struct compute_bifurcation_inflow_args {
-    device int* bif_catchment_idx_buf [[id(0)]];
-    device int* bif_downstream_idx_buf [[id(1)]];
-    device float* limit_rate_buf [[id(2)]];
-    device float* bif_outflow_buf [[id(3)]];
-    device atomic_float* global_bif_outflow_buf [[id(4)]];
-    constant int* num_bifurcation_paths [[id(5)]];
-};
+// HYDROFORGE METAL KERNEL BODY: compute_bifurcation_outflow
+long num_paths = *args.num_bifurcation_paths;
+    long num_trials = *args.num_trials;
+    long total = num_paths * num_trials;
+    if ((long)i >= total) return;
 
-kernel void compute_bifurcation_inflow(
-    constant compute_bifurcation_inflow_args& args [[buffer(0)]],
-    uint idx [[thread_position_in_grid]]
-)
-{
-    device int* bif_catchment_idx_buf = args.bif_catchment_idx_buf;
-    device int* bif_downstream_idx_buf = args.bif_downstream_idx_buf;
-    device float* limit_rate_buf = args.limit_rate_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device atomic_float* global_bif_outflow_buf = args.global_bif_outflow_buf;
-    const int num_bifurcation_paths = *args.num_bifurcation_paths;
-    if ((int)idx >= num_bifurcation_paths) return;
+    long path = (long)i % num_paths;
+    long trial = (long)i / num_paths;
+    long path_offset = trial * num_paths;
+    long catchment_offset = trial * *args.num_catchments;
+    long level_offset = path_offset * (long)num_bifurcation_levels;
+    long path_level = path * (long)num_bifurcation_levels;
 
-    int catch_idx = bif_catchment_idx_buf[idx];
-    int ds_idx    = bif_downstream_idx_buf[idx];
+    int catchment = args.bifurcation_catchment_idx_ptr[path];
+    int downstream = args.bifurcation_downstream_idx_ptr[path];
+    long catchment_cell = catchment_offset + catchment;
+    long downstream_cell = catchment_offset + downstream;
+    long length_idx = batched_bifurcation_length
+        ? path_offset + path : path;
+    float length = args.bifurcation_length_ptr[length_idx];
+    float water_surface = args.water_surface_elevation_ptr[catchment_cell];
+    float downstream_surface =
+        args.water_surface_elevation_ptr[downstream_cell];
+    float maximum_surface = max(water_surface, downstream_surface);
+    float slope = clamp(
+        (water_surface - downstream_surface) / length, -0.005f, 0.005f);
+    float gravity = *args.gravity;
+    float time_step = args.time_step_ptr[0];
 
-    float lr    = limit_rate_buf[catch_idx];
-    float lr_ds = limit_rate_buf[ds_idx];
-
-    float sum_outflow = 0.0f;
-
-    for (int level = 0; level < __NUM_BIF_LEVELS__; level++) {
-        int level_idx = (int)idx * __NUM_BIF_LEVELS__ + level;
-        float outflow = bif_outflow_buf[level_idx];
-        outflow = (outflow >= 0.0f) ? outflow * lr : outflow * lr_ds;
-        sum_outflow += outflow;
-        bif_outflow_buf[level_idx] = outflow;
+    long manning_offset = batched_bifurcation_manning ? level_offset : 0;
+    long width_offset = batched_bifurcation_width ? level_offset : 0;
+    long elevation_offset = batched_bifurcation_elevation ? level_offset : 0;
+    float total_outflow = 0.0f;
+    for (int level = 0; level < num_bifurcation_levels; ++level) {
+        long local_level = path_level + level;
+        long state_level = level_offset + local_level;
+        BifurcationLevelResult result = bifurcation_level_inline(
+            args.bifurcation_outflow_ptr[state_level],
+            args.bifurcation_cross_section_depth_ptr[state_level],
+            maximum_surface,
+            args.bifurcation_elevation_ptr[elevation_offset + local_level],
+            args.bifurcation_width_ptr[width_offset + local_level],
+            args.bifurcation_manning_ptr[manning_offset + local_level],
+            slope, gravity, time_step, true);
+        args.bifurcation_cross_section_depth_ptr[state_level] =
+            result.cross_section_depth;
+        args.bifurcation_outflow_ptr[state_level] = result.outflow;
+        total_outflow += result.outflow;
     }
 
-    atomic_fetch_add_explicit(&global_bif_outflow_buf[catch_idx],  sum_outflow, memory_order_relaxed);
-    atomic_fetch_add_explicit(&global_bif_outflow_buf[ds_idx],    -sum_outflow, memory_order_relaxed);
-}
-
-
-// =====================================================================
-// Batched bifurcation outflow — flat grid num_bif_paths * num_trials
-// =====================================================================
-struct compute_bifurcation_outflow_batched_args {
-    device int* bif_catchment_idx_buf [[id(0)]];
-    device int* bif_downstream_idx_buf [[id(1)]];
-    device float* bif_manning_buf [[id(2)]];
-    device float* bif_outflow_buf [[id(3)]];
-    device float* bif_width_buf [[id(4)]];
-    device float* bif_length_buf [[id(5)]];
-    device float* bif_elevation_buf [[id(6)]];
-    device float* bif_cross_section_depth_buf [[id(7)]];
-    device float* water_surface_elevation_buf [[id(8)]];
-    device float* total_storage_buf [[id(9)]];
-    device atomic_float* outgoing_storage_buf [[id(10)]];
-    constant float* gravity [[id(11)]];
-    constant float* time_step [[id(12)]];
-    constant int* num_bifurcation_paths [[id(13)]];
-    constant int* num_catchments [[id(14)]];
-    constant int* num_trials [[id(15)]];
-};
-
-kernel void compute_bifurcation_outflow_batched(
-    constant compute_bifurcation_outflow_batched_args& args [[buffer(0)]],
-    uint gid [[thread_position_in_grid]]
-)
-{
-    device int* bif_catchment_idx_buf = args.bif_catchment_idx_buf;
-    device int* bif_downstream_idx_buf = args.bif_downstream_idx_buf;
-    device float* bif_manning_buf = args.bif_manning_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device float* bif_width_buf = args.bif_width_buf;
-    device float* bif_length_buf = args.bif_length_buf;
-    device float* bif_elevation_buf = args.bif_elevation_buf;
-    device float* bif_cross_section_depth_buf = args.bif_cross_section_depth_buf;
-    device float* water_surface_elevation_buf = args.water_surface_elevation_buf;
-    device float* total_storage_buf = args.total_storage_buf;
-    device atomic_float* outgoing_storage_buf = args.outgoing_storage_buf;
-    const float gravity = *args.gravity;
-    const float time_step = *args.time_step;
-    const int num_bifurcation_paths = *args.num_bifurcation_paths;
-    const int num_catchments = *args.num_catchments;
-    const int num_trials = *args.num_trials;
-    int total = num_bifurcation_paths * num_trials;
-    if ((int)gid >= total) return;
-
-    int pi = (int)gid % num_bifurcation_paths;  // path index
-    int trial_idx = (int)gid / num_bifurcation_paths;
-    int to_paths = trial_idx * num_bifurcation_paths;
-    int to_catch = trial_idx * num_catchments;
-    int to_levels = trial_idx * num_bifurcation_paths * __NUM_BIF_LEVELS__;
-
-    int catch_idx = bif_catchment_idx_buf[pi];
-    int ds_idx    = bif_downstream_idx_buf[pi];
-
-    float bif_length = bif_length_buf[(batched_bif_length_flag ? to_paths : 0) + pi];
-
-    float wse      = water_surface_elevation_buf[to_catch + catch_idx];
-    float wse_ds   = water_surface_elevation_buf[to_catch + ds_idx];
-    float max_wse  = max(wse, wse_ds);
-
-    float bif_slope = clamp((wse - wse_ds) / bif_length, -0.005f, 0.005f);
-
-    float total_sto    = total_storage_buf[to_catch + catch_idx];
-    float total_sto_ds = total_storage_buf[to_catch + ds_idx];
-
-    int manning_base   = batched_bif_manning_flag   ? to_levels : 0;
-    int width_base     = batched_bif_width_flag     ? to_levels : 0;
-    int elevation_base = batched_bif_elevation_flag ? to_levels : 0;
-
-    float sum_outflow = 0.0f;
-
-    for (int level = 0; level < __NUM_BIF_LEVELS__; level++) {
-        int level_idx = pi * __NUM_BIF_LEVELS__ + level;
-
-        float manning   = bif_manning_buf[manning_base + level_idx];
-        float csd       = bif_cross_section_depth_buf[to_levels + level_idx];
-        float elevation = bif_elevation_buf[elevation_base + level_idx];
-
-        float updated_csd = max(max_wse - elevation, 0.0f);
-        float semi_d = max(sqrt(updated_csd * csd), sqrt(updated_csd * 0.01f));
-
-        bool flow_cond = semi_d > 1e-5f;
-        float updated_outflow = 0.0f;
-        if (flow_cond) {
-            float width   = bif_width_buf[width_base + level_idx];
-            float outflow = bif_outflow_buf[to_levels + level_idx];
-            float unit_q  = outflow / width;
-
-            float num = width * (unit_q + gravity * time_step * semi_d * bif_slope);
-            float den = 1.0f + gravity * time_step * (manning * manning) * fabs(unit_q)
-                        * pow(semi_d, -7.0f / 3.0f);
-            updated_outflow = num / den;
-        }
-
-        sum_outflow += updated_outflow;
-        bif_cross_section_depth_buf[to_levels + level_idx] = updated_csd;
-        bif_outflow_buf[to_levels + level_idx] = updated_outflow;
+    float available_storage = min(
+        args.total_storage_ptr[catchment_cell],
+        args.total_storage_ptr[downstream_cell]);
+    float limit = min(
+        0.05f * available_storage / (fabs(total_outflow) * time_step),
+        1.0f);
+    total_outflow *= limit;
+    for (int level = 0; level < num_bifurcation_levels; ++level) {
+        long state_level = level_offset + path_level + level;
+        args.bifurcation_outflow_ptr[state_level] *= limit;
     }
 
-    float limit_rate = min(
-        0.05f * min(total_sto, total_sto_ds) / (fabs(sum_outflow) * time_step),
-        1.0f
-    );
-    sum_outflow *= limit_rate;
+    atomic_fetch_add_explicit(
+        args.outgoing_storage_ptr + catchment_cell,
+        max(total_outflow, 0.0f) * time_step, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        args.outgoing_storage_ptr + downstream_cell,
+        -min(total_outflow, 0.0f) * time_step, memory_order_relaxed);
 
-    for (int level = 0; level < __NUM_BIF_LEVELS__; level++) {
-        int level_idx = pi * __NUM_BIF_LEVELS__ + level;
-        bif_outflow_buf[to_levels + level_idx] *= limit_rate;
+// HYDROFORGE METAL KERNEL BODY: compute_bifurcation_inflow
+long num_paths = *args.num_bifurcation_paths;
+    long num_trials = *args.num_trials;
+    long total = num_paths * num_trials;
+    if ((long)i >= total) return;
+
+    long path = (long)i % num_paths;
+    long trial = (long)i / num_paths;
+    long catchment_offset = trial * *args.num_catchments;
+    long level_offset =
+        trial * num_paths * (long)num_bifurcation_levels;
+
+    int catchment = args.bifurcation_catchment_idx_ptr[path];
+    int downstream = args.bifurcation_downstream_idx_ptr[path];
+    float local_limit =
+        args.limit_rate_ptr[catchment_offset + (long)catchment];
+    float downstream_limit =
+        args.limit_rate_ptr[catchment_offset + (long)downstream];
+    float sum = 0.0f;
+
+    for (int level = 0; level < num_bifurcation_levels; ++level) {
+        long item = path * (long)num_bifurcation_levels + level;
+        float outflow = args.bifurcation_outflow_ptr[level_offset + item];
+        outflow *= outflow >= 0.0f ? local_limit : downstream_limit;
+        sum += outflow;
+        args.bifurcation_outflow_ptr[level_offset + item] = outflow;
     }
 
-    float pos_flow = max(sum_outflow, 0.0f);
-    float neg_flow = min(sum_outflow, 0.0f);
-    atomic_fetch_add_explicit(&outgoing_storage_buf[to_catch + catch_idx],  pos_flow * time_step, memory_order_relaxed);
-    atomic_fetch_add_explicit(&outgoing_storage_buf[to_catch + ds_idx],    -neg_flow * time_step, memory_order_relaxed);
-}
-
-
-// =====================================================================
-// Batched bifurcation inflow — flat grid num_bif_paths * num_trials
-// =====================================================================
-struct compute_bifurcation_inflow_batched_args {
-    device int* bif_catchment_idx_buf [[id(0)]];
-    device int* bif_downstream_idx_buf [[id(1)]];
-    device float* limit_rate_buf [[id(2)]];
-    device float* bif_outflow_buf [[id(3)]];
-    device atomic_float* global_bif_outflow_buf [[id(4)]];
-    constant int* num_bifurcation_paths [[id(5)]];
-    constant int* num_catchments [[id(6)]];
-    constant int* num_trials [[id(7)]];
-};
-
-kernel void compute_bifurcation_inflow_batched(
-    constant compute_bifurcation_inflow_batched_args& args [[buffer(0)]],
-    uint gid [[thread_position_in_grid]]
-)
-{
-    device int* bif_catchment_idx_buf = args.bif_catchment_idx_buf;
-    device int* bif_downstream_idx_buf = args.bif_downstream_idx_buf;
-    device float* limit_rate_buf = args.limit_rate_buf;
-    device float* bif_outflow_buf = args.bif_outflow_buf;
-    device atomic_float* global_bif_outflow_buf = args.global_bif_outflow_buf;
-    const int num_bifurcation_paths = *args.num_bifurcation_paths;
-    const int num_catchments = *args.num_catchments;
-    const int num_trials = *args.num_trials;
-    int total = num_bifurcation_paths * num_trials;
-    if ((int)gid >= total) return;
-
-    int pi = (int)gid % num_bifurcation_paths;
-    int trial_idx = (int)gid / num_bifurcation_paths;
-    int to_catch = trial_idx * num_catchments;
-    int to_levels = trial_idx * num_bifurcation_paths * __NUM_BIF_LEVELS__;
-
-    int catch_idx = bif_catchment_idx_buf[pi];
-    int ds_idx    = bif_downstream_idx_buf[pi];
-
-    float lr    = limit_rate_buf[to_catch + catch_idx];
-    float lr_ds = limit_rate_buf[to_catch + ds_idx];
-
-    float sum_outflow = 0.0f;
-
-    for (int level = 0; level < __NUM_BIF_LEVELS__; level++) {
-        int level_idx = pi * __NUM_BIF_LEVELS__ + level;
-        float outflow = bif_outflow_buf[to_levels + level_idx];
-        outflow = (outflow >= 0.0f) ? outflow * lr : outflow * lr_ds;
-        sum_outflow += outflow;
-        bif_outflow_buf[to_levels + level_idx] = outflow;
-    }
-
-    atomic_fetch_add_explicit(&global_bif_outflow_buf[to_catch + catch_idx],  sum_outflow, memory_order_relaxed);
-    atomic_fetch_add_explicit(&global_bif_outflow_buf[to_catch + ds_idx],    -sum_outflow, memory_order_relaxed);
-}
+    atomic_fetch_add_explicit(
+        args.global_bifurcation_outflow_ptr
+            + catchment_offset + (long)catchment,
+        sum, memory_order_relaxed);
+    atomic_fetch_add_explicit(
+        args.global_bifurcation_outflow_ptr
+            + catchment_offset + (long)downstream,
+        -sum, memory_order_relaxed);

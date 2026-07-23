@@ -9,9 +9,15 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.io.datasets import NetCDFDataset
-from hydroforge.modeling.distributed import setup_distributed
-from hydroforge.modeling.input_proxy import InputProxy
+from hydroforge.data.datasets import NetCDFDataset
+from hydroforge.data.distributed import setup_distributed
+from hydroforge.data.input import InputProxy
+from hydroforge.contracts.temporal import (
+    DatasetTemporalContract,
+    EveryStep,
+    SimulationSchedule,
+    StatisticsPlan,
+)
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -47,7 +53,7 @@ def main():
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_nc.npz"
     runoff_time_interval = timedelta(days=1)
     prefix0 = "baseflow_"
-    prefix1 = f"runoff_"
+    prefix1 = "runoff_"
     suffix = ".nc"
     var_name0 = "baseflow"
     var_name1 = "runoff"
@@ -95,6 +101,13 @@ def main():
         spin_up_end_date=spin_up_end_date,
         clip_negative=True,
     )
+    forcing_contract = DatasetTemporalContract.combine({
+        "baseflow": dataset0.temporal_contract(),
+        "runoff": dataset1.temporal_contract(),
+    })
+    schedule = SimulationSchedule.from_contract(
+        forcing_contract, step=timedelta(seconds=time_step),
+    )
 
     model = CaMaFlood(
         rank=rank,
@@ -106,11 +119,12 @@ def main():
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
         output_workers=output_workers,
-        output_complevel=4,
+        output_netcdf_options={"compression": "zlib", "complevel": 4},
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year,
         output_start_time=start_date,
-        calendar=dataset0.calendar,
+        simulation_schedule=schedule,
+        statistics_plan=StatisticsPlan(schedule=schedule, inner=EveryStep()),
     )
     model.set_total_steps(dataset0.total_steps)
     if dataset0.total_steps != dataset1.total_steps:
@@ -171,6 +185,7 @@ def main():
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))
+    model.close()
     if world_size > 1:
         dist.destroy_process_group()
 

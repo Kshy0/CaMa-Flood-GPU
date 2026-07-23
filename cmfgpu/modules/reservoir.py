@@ -10,15 +10,18 @@ Reservoir module for CaMa-Flood-GPU using TensorField / computed_tensor_field he
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Self, Tuple
+from typing import TYPE_CHECKING, ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceField, ReferenceIndexField,
                                         TensorField, computed_tensor_field)
 from pydantic import Field, computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
+
+if TYPE_CHECKING:
+    from cmfgpu.modules.bifurcation import BifurcationModule
 
 
 def ReservoirField(
@@ -81,6 +84,7 @@ class ReservoirModule(AbstractModule):
         shape=("num_reservoirs",),
         dim_coords="reservoir_id",
         references="catchment_id",
+        is_key=True,
     )
 
     reservoir_id: torch.Tensor = CoordinateField(
@@ -210,6 +214,32 @@ class ReservoirModule(AbstractModule):
     @cached_property
     def adjustment_outflow(self) -> torch.Tensor:
         return (self.effective_normal_outflow + self.flood_control_outflow) * 0.5
+
+    def initialize_dam_storage(self) -> int:
+        """Apply the CPU cold-start conservation-volume rule at dam cells."""
+        idx = self.reservoir_catchment_idx
+        current = self.base.river_storage[idx]
+        conservation = self.conservation_volume.to(current.dtype)
+        update = current < conservation
+        if not update.any():
+            return 0
+        self.base.river_storage[idx] = torch.where(
+            update, conservation, current,
+        )
+        flood = self.base.flood_storage[idx]
+        self.base.flood_storage[idx] = torch.where(
+            update, torch.zeros_like(flood), flood,
+        )
+        return int(update.sum().item())
+
+    def mask_bifurcation_paths(self, bifurcation: "BifurcationModule") -> int:
+        """Disable paths whose upstream or downstream cell is dam-related."""
+        masked = (
+            self.is_dam_related[bifurcation.bifurcation_catchment_idx]
+            | self.is_dam_related[bifurcation.bifurcation_downstream_idx]
+        )
+        bifurcation.bifurcation_elevation[masked] = 1.0e20
+        return int(masked.sum().item())
 
     # ------------------------------------------------------------------ #
     # Validators

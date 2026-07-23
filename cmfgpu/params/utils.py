@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from hydroforge.modeling.distributed import find_indices_in
+from hydroforge.data.distributed import find_indices_in
 from netCDF4 import Dataset
 from numba import njit
 

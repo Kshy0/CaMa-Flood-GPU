@@ -10,7 +10,7 @@ from functools import cached_property
 from typing import ClassVar, List
 
 import torch
-from hydroforge.modeling.module import (AbstractModule, CoordinateField,
+from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceIndexField, TensorField)
 from pydantic import Field, computed_field, model_validator
 
