@@ -296,7 +296,7 @@ class BaseModule(AbstractModule):
         description="Total water storage per catchment (m³)",
         category="state",
         dtype="hpfloat",
-        depends_on_any=("bifurcation", "reservoir"),
+        required_by=("bifurcation", "reservoir"),
         output="disabled",
     )
     @cached_property
