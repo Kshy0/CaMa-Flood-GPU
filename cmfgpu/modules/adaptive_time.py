@@ -24,15 +24,6 @@ class AdaptiveTimeModule(AbstractModule):
     adaptive_time_factor: float = Field(0.7, description="Factor to adjust adaptive time step calculation", gt=0.0)
     
     @computed_tensor_field(
-        description="Minimum time step across all processes",
-        shape=(1,),
-        category="shared_state",
-    )
-    @cached_property
-    def min_time_sub_step(self) -> torch.Tensor:
-        return torch.zeros((1,), dtype=self.precision, device=self.device)
-
-    @computed_tensor_field(
         description="Maximum number of sub-steps across all processes",
         shape=(1,),
         category="shared_state",

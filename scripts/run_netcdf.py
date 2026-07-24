@@ -45,7 +45,7 @@ def main():
     suffix = ".nc"
     var_name = "Runoff"
     output_split_by_year = False
-    
+
     # Spin-up configuration
     do_spin_up = False
     spin_up_start_date = datetime(2000, 1, 1)
@@ -116,23 +116,23 @@ def main():
     )
 
     stream_ctx = torch.cuda.stream(torch.cuda.Stream(device=device)) if device.type == "cuda" else nullcontext()
-    time_iter = dataset.time_iter()
+    step_iter = dataset.step_iter()
     last_valid_time = start_date
     for batch_runoff in loader:
         with stream_ctx:
             batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_mapping)
             for runoff in batch_runoff:
-                current_time, is_valid, is_spin_up = next(time_iter)
-                if not is_valid:
+                step = next(step_iter)
+                if not step.valid:
                     continue
-                last_valid_time = current_time
+                last_valid_time = step.model_time
                 
                 model.step_advance(
                     runoff=runoff,
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
-                    current_time=current_time,
-                    output_enabled=not is_spin_up
+                    current_time=step.model_time,
+                    output_enabled=not step.is_spin_up
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))

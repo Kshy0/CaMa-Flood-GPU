@@ -19,8 +19,13 @@ import cftime
 import numpy as np
 import torch
 from hydroforge.execution import reduce_
-from hydroforge.model.module import AbstractModule, computed_tensor_field
+from hydroforge.model.module import (
+    AbstractModule,
+    computed_tensor_field,
+)
 from pydantic import Field, PrivateAttr
+
+from cmfgpu.modules.base import BaseModule
 
 
 def computed_log_field(
@@ -29,7 +34,7 @@ def computed_log_field(
     dtype: Literal["float", "int", "bool"] = "float",
     category: Literal["topology", "derived_param", "state", "virtual"] = "state",
     expr: Optional[str] = None,
-    **kwargs
+    **kwargs,
 ):
     return computed_tensor_field(
         description=description,
@@ -37,7 +42,7 @@ def computed_log_field(
         dtype=dtype,
         category=category,
         expr=expr,
-        **kwargs
+        **kwargs,
     )
 
 
@@ -48,6 +53,10 @@ class LogModule(AbstractModule):
     module_name: ClassVar[str] = "log"
     description: ClassVar[str] = "Log module for storing and managing simulation data"
     dependencies: ClassVar[list] = ["base"]
+    base: BaseModule = Field(
+        exclude=True,
+        description="Reference to BaseModule",
+    )
 
     log_buffer_size: int = Field(
         default=20000,
@@ -70,10 +79,18 @@ class LogModule(AbstractModule):
 
     def write_header(self, log_path: Path) -> None:
         headers = [
-            "StepStartTime", "StoragePre", "StorageNext",
-            "StorageNew", "InflowError", "Inflow",
-            "Outflow", "StorageStage", "StageError",
-            "RiverStorage", "FloodStorage", "FloodArea",
+            "StepStartTime",
+            "StoragePre",
+            "StorageNext",
+            "StorageNew",
+            "InflowError",
+            "Inflow",
+            "Outflow",
+            "StorageStage",
+            "StageError",
+            "RiverStorage",
+            "FloodStorage",
+            "FloodArea",
         ]
         widths = [18] + [16] * (len(headers) - 1)
         with log_path.open("w") as f:
@@ -85,19 +102,25 @@ class LogModule(AbstractModule):
                 + "\n"
             )
 
-    def set_time(self, time_step: float, num_steps: int, current_time: Union[datetime, cftime.datetime]) -> None:
+    def set_time(
+        self,
+        time_step: float,
+        num_steps: int,
+        current_time: Union[datetime, cftime.datetime],
+    ) -> None:
         self._time_step = time_step
         self._num_steps = num_steps
         self._current_time = current_time
         self._times = [
-            self._current_time + timedelta(seconds=time_step * i) for i in range(num_steps)
+            self._current_time + timedelta(seconds=time_step * i)
+            for i in range(num_steps)
         ]
         if num_steps > self.log_buffer_size:
             raise ValueError(
                 f"num_steps ({num_steps}) exceeds log_buffer_size ({self.log_buffer_size}). "
                 f"Increase log_buffer_size in the log module configuration."
             )
-    
+
     def gather_results(self) -> None:
         """
         Gathers results from the model and prepares them for logging.
@@ -121,18 +144,23 @@ class LogModule(AbstractModule):
             [t.strftime("%Y-%m-%d %H:%M") for t in self._times[:num_steps]], dtype=str
         )
         data_arrays = {
-            field: getattr(self, field).cpu().numpy()[:num_steps] for field in self.log_vars
+            field: getattr(self, field).cpu().numpy()[:num_steps]
+            for field in self.log_vars
         }
-        fmt = ["%-18s"] + ["%16.6g"] * 3 + ["%16.3e"] + ["%16.6g"] * 3 + ["%16.3e"] + [
-            "%16.6g"
-        ] * 3
+        fmt = (
+            ["%-18s"]
+            + ["%16.6g"] * 3
+            + ["%16.3e"]
+            + ["%16.6g"] * 3
+            + ["%16.3e"]
+            + ["%16.6g"] * 3
+        )
         with log_path.open("a") as f:
             for i in range(num_steps):
-                row = [time_strs[i]] + [data_arrays[field][i] for field in self.log_vars]
-                f.write(
-                    "".join(f_ % v for f_, v in zip(fmt, row, strict=True))
-                    + "\n"
-                )
+                row = [time_strs[i]] + [
+                    data_arrays[field][i] for field in self.log_vars
+                ]
+                f.write("".join(f_ % v for f_, v in zip(fmt, row, strict=True)) + "\n")
         for field in self.log_vars:
             getattr(self, field).zero_()
 
@@ -145,7 +173,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_storage_pre_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -154,7 +184,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_storage_next_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -163,7 +195,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_storage_new_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -172,7 +206,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_inflow_error_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -181,7 +217,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_inflow_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -190,7 +228,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_outflow_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -199,7 +239,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_storage_stage_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -208,7 +250,9 @@ class LogModule(AbstractModule):
     @cached_property
     def total_stage_error_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -217,7 +261,9 @@ class LogModule(AbstractModule):
     @cached_property
     def river_storage_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -226,7 +272,9 @@ class LogModule(AbstractModule):
     @cached_property
     def flood_storage_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )
 
     @computed_log_field(
@@ -235,5 +283,7 @@ class LogModule(AbstractModule):
     @cached_property
     def flood_area_sum(self) -> torch.Tensor:
         return torch.zeros(
-            self.log_buffer_size, dtype=self.precision, device=self.device,
+            self.log_buffer_size,
+            dtype=self.precision,
+            device=self.device,
         )

@@ -51,7 +51,7 @@ class SeaLevelModule(AbstractModule):
         shape=("num_sea_level_boundaries",),
         dtype="float",
         dim_coords="sea_level_catchment_id",
-        category="init_state",
+        category="state",
         output="disabled",
         default=0,
     )

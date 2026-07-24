@@ -7,7 +7,8 @@ the active BackendRegistry when a factory returned by :func:`route` is called.
 from pathlib import Path
 
 from hydroforge.kernels.registry import (
-    make_spec_metal_dispatcher, registry_factory,
+    make_spec_metal_dispatcher,
+    registry_factory,
 )
 
 _DIR = Path(__file__).parent
@@ -27,10 +28,12 @@ def _template(filename: str, *, parallel_axes: tuple[str, ...] = ()):
 
 
 outflow = _template(
-    "outflow.metal", parallel_axes=("num_trials",),
+    "outflow.metal",
+    parallel_axes=("num_trials",),
 )
 inflow = _template(
-    "outflow.metal", parallel_axes=("num_trials",),
+    "outflow.metal",
+    parallel_axes=("num_trials",),
 )
 flood_stage = _template(
     "storage.metal",
@@ -40,17 +43,20 @@ flood_stage_log = _template(
     "storage.metal",
 )
 adaptive_time = _template(
-    "adaptive_time.metal", parallel_axes=("num_trials",),
+    "adaptive_time.metal",
+    parallel_axes=("num_trials",),
 )
 bifurcation_outflow = _template(
     "bifurcation.metal",
     parallel_axes=("num_trials",),
 )
 bifurcation_inflow = _template(
-    "bifurcation.metal", parallel_axes=("num_trials",),
+    "bifurcation.metal",
+    parallel_axes=("num_trials",),
 )
 reservoir_outflow = _template(
-    "reservoir.metal", parallel_axes=("num_trials",),
+    "reservoir.metal",
+    parallel_axes=("num_trials",),
 )
 levee_stage = _template(
     "levee.metal",
@@ -63,6 +69,4 @@ levee_bifurcation_outflow = _template(
     "levee.metal",
     parallel_axes=("num_trials",),
 )
-
-
 __all__ = []

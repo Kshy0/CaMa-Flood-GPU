@@ -135,7 +135,7 @@ class InflowModule(AbstractModule):
         shape=("num_inflow_gauges",),
         dtype="float",
         dim_coords="inflow_catchment_id",
-        category="init_state",
+        category="state",
         output="disabled",
         default=0,
     )

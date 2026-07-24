@@ -7,6 +7,7 @@
 """
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
 """
+
 from datetime import datetime
 from typing import ClassVar, Dict, Mapping, Optional, Type, Union
 
@@ -28,10 +29,15 @@ from cmfgpu.modules.log import LogModule
 from cmfgpu.modules.reservoir import ReservoirModule
 from cmfgpu.modules.sea_level import SeaLevelModule
 from cmfgpu.phys.adaptive_time import compute_adaptive_time_step
-from cmfgpu.phys.bifurcation import (compute_bifurcation_inflow,
-                                     compute_bifurcation_outflow)
-from cmfgpu.phys.levee import (compute_levee_bifurcation_outflow,
-                               compute_levee_stage, compute_levee_stage_log)
+from cmfgpu.phys.bifurcation import (
+    compute_bifurcation_inflow,
+    compute_bifurcation_outflow,
+)
+from cmfgpu.phys.levee import (
+    compute_levee_bifurcation_outflow,
+    compute_levee_stage,
+    compute_levee_stage_log,
+)
 from cmfgpu.phys.outflow import compute_inflow, compute_outflow
 from cmfgpu.phys.reservoir import compute_reservoir_outflow
 from cmfgpu.phys.storage import compute_flood_stage, compute_flood_stage_log
@@ -55,26 +61,44 @@ class CaMaFlood(AbstractModel):
     partition_key: ClassVar[str] = "catchment_id"
     partition_group: ClassVar[str] = "catchment_basin_id"
     cuda_extension_modules: ClassVar[tuple[str, ...]] = ("cmfgpu.phys.cuda",)
+    feature_rules: ClassVar[Mapping[str, object]] = {
+        "total_storage": lambda model: (
+            model.has_module("bifurcation")
+            or model.has_module("reservoir")
+        ),
+        "water_surface": lambda model: model.has_module("bifurcation"),
+        "protected_water_surface": lambda model: (
+            model.has_module("bifurcation")
+            and model.has_module("levee")
+        ),
+    }
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {
         "cuda": BackendRequirement(trials=False),
     }
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {
         "log": ModuleRequirement(trials=False),
     }
+
     def initialize_model_state(self) -> None:
         if self.has_module("reservoir"):
             fixed = self.reservoir.initialize_dam_storage()
             if fixed:
                 emit(
-                    self, "info", "reservoir.storage_initialized",
-                    "Initialized dam cells to conservation storage", cells=fixed,
+                    self,
+                    "info",
+                    "reservoir.storage_initialized",
+                    "Initialized dam cells to conservation storage",
+                    cells=fixed,
                 )
             if self.has_module("bifurcation"):
                 masked = self.reservoir.mask_bifurcation_paths(self.bifurcation)
                 if masked:
                     emit(
-                        self, "info", "reservoir.bifurcation_masked",
-                        "Masked dam-related bifurcation paths", paths=masked,
+                        self,
+                        "info",
+                        "reservoir.bifurcation_masked",
+                        "Masked dam-related bifurcation paths",
+                        paths=masked,
                     )
 
     @managed_step
@@ -87,7 +111,8 @@ class CaMaFlood(AbstractModel):
         current_time: Optional[Union[datetime, cftime.datetime]],
         inflow: Optional[torch.Tensor] = None,
         sea_surface_elevation: Optional[torch.Tensor] = None,
-        output_enabled: bool = True) -> None:
+        output_enabled: bool = True,
+    ) -> None:
         """
         Advance the model by one time step using the provided runoff input.
 
@@ -105,18 +130,23 @@ class CaMaFlood(AbstractModel):
             current_time (Optional[datetime]): Current simulation time. Used for logging.
         """
         copy_input(
-            self.base.runoff, runoff, when_none="required", name="runoff",
+            self.base.runoff,
+            runoff,
+            when_none="required",
+            name="runoff",
             trial_broadcast=self.num_trials is not None,
         )
         copy_input(
             self.inflow.inflow if self.has_module("inflow") else None,
-            inflow, name="inflow",
+            inflow,
+            name="inflow",
             trial_broadcast=self.num_trials is not None,
         )
         copy_input(
             (
                 self.sea_level.sea_surface_elevation
-                if self.has_module("sea_level") else None
+                if self.has_module("sea_level")
+                else None
             ),
             sea_surface_elevation,
             when_none="required" if self.has_module("sea_level") else "keep",
@@ -128,7 +158,7 @@ class CaMaFlood(AbstractModel):
             compute_adaptive_time_step(outer_time_step=time_step)
             if self.world_size > 1:
                 all_reduce_(self.adaptive_time.max_sub_steps, reduction="max")
-            
+
             # Take the maximum across all trials if batched
             num_sub_steps = int(self.adaptive_time.max_sub_steps.max().item())
             if num_sub_steps < 1:

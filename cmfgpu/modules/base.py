@@ -26,7 +26,7 @@ def BaseField(
     shape: Tuple[str, ...] = ("num_catchments",),
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     dim_coords: Optional[str] = "catchment_id",
-    category: Literal["topology", "param", "init_state"] = "param",
+    category: Literal["topology", "param", "init_state", "state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
 ):
@@ -150,7 +150,7 @@ class BaseModule(AbstractModule):
 
     runoff: torch.Tensor = BaseField(
         description="Current external runoff forcing (m³/s)",
-        category="init_state",
+        category="state",
         output="disabled",
         default=0,
     )
@@ -296,33 +296,18 @@ class BaseModule(AbstractModule):
         description="Total water storage per catchment (m³)",
         category="state",
         dtype="hpfloat",
+        depends_on_any=("bifurcation", "reservoir"),
+        output="disabled",
     )
     @cached_property
-    def total_storage(self) -> torch.Tensor:
+    def total_storage(self) -> Optional[torch.Tensor]:
+        if not {"bifurcation", "reservoir"}.intersection(
+            self.opened_modules,
+        ):
+            return None
         return self.river_storage + self.flood_storage + self.protected_storage
 
     # ---------------- Hidden / intermediate states ------------------- #
-    @computed_base_field(
-        description="Total outflow via all bifurcation paths (m³ s⁻¹)",
-        category="state",
-        dtype="hpfloat",
-    )
-    @cached_property
-    def global_bifurcation_outflow(self) -> torch.Tensor:
-        """Always-valid buffer; non-bifurcation kernels simply leave it zero."""
-        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
-
-    @computed_base_field(
-        description="Levee surface elevation (m a.s.l.)",
-        category="state",
-        depends_on="levee",
-    )
-    @cached_property
-    def global_levee_surface_elevation(self) -> Optional[torch.Tensor]:
-        if "levee" not in self.opened_modules:
-            return None
-        return torch.zeros_like(self.river_outflow)
-    
     @computed_base_field(
         description=("Total outgoing storage from each catchment (m³)"
                      "Can not be saved, as it is a temporary state."),
@@ -337,25 +322,25 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Water-surface elevation (m a.s.l.)",
         category="state",
+        depends_on="bifurcation",
+        output="disabled",
     )
     @cached_property
-    def water_surface_elevation(self) -> torch.Tensor:
+    def water_surface_elevation(self) -> Optional[torch.Tensor]:
+        if "bifurcation" not in self.opened_modules:
+            return None
         return torch.zeros_like(self.river_outflow)
 
     @computed_base_field(
         description="Protected water-surface elevation (m a.s.l.)",
         category="state",
+        depends_on=("bifurcation", "levee"),
+        output="disabled",
     )
     @cached_property
-    def protected_water_surface_elevation(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
-
-    @computed_base_field(
-        description="Maximum flow-rate limit per catchment (m³ s⁻¹)",
-        category="state",
-    )
-    @cached_property
-    def limit_rate(self) -> torch.Tensor:
+    def protected_water_surface_elevation(self) -> Optional[torch.Tensor]:
+        if not {"bifurcation", "levee"}.issubset(self.opened_modules):
+            return None
         return torch.zeros_like(self.river_outflow)
 
     @computed_base_field(

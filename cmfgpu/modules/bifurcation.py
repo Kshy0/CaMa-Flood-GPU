@@ -45,7 +45,7 @@ def BifurcationField(
 def computed_bifurcation_field(
     description: str,
     shape: Tuple[str, ...] = ("num_bifurcation_paths",),
-    dtype: Literal["float", "int", "idx", "bool"] = "float",
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     dim_coords: Optional[str] = "bifurcation_path_id",
     category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
@@ -165,6 +165,32 @@ class BifurcationModule(AbstractModule):
     bifurcation_downstream_idx = ReferenceIndexField(
         "bifurcation_downstream_id",
     )
+
+    @computed_bifurcation_field(
+        description="Total outflow via all bifurcation paths (m³ s⁻¹)",
+        shape=("base.num_catchments",),
+        dtype="hpfloat",
+        dim_coords="base.catchment_id",
+        category="state",
+        output="disabled",
+    )
+    @cached_property
+    def global_bifurcation_outflow(self) -> torch.Tensor:
+        return torch.zeros_like(
+            self.base.river_outflow,
+            dtype=self.high_precision,
+        )
+
+    @computed_bifurcation_field(
+        description="Maximum flow-rate limit per catchment (m³ s⁻¹)",
+        shape=("base.num_catchments",),
+        dim_coords="base.catchment_id",
+        category="state",
+        output="disabled",
+    )
+    @cached_property
+    def limit_rate(self) -> torch.Tensor:
+        return torch.zeros_like(self.base.river_outflow)
 
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions

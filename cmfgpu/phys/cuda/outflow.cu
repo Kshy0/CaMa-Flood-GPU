@@ -36,7 +36,8 @@ __global__ void k_outflow(
     STO* __restrict__ outgoing_storage, REAL* __restrict__ water_surface_elevation,
     REAL* __restrict__ protected_water_surface_elevation,
     REAL gravity, const REAL* __restrict__ time_step_ptr,
-    long num_catchments, int has_bifurcation,
+    long num_catchments, int has_bifurcation, int has_total_storage,
+    int has_water_surface, int has_protected_water_surface,
     const bool* __restrict__ is_dam_upstream, int has_reservoir, REAL min_kinematic_slope,
     const REAL* __restrict__ sea_surface_elevation,
     const int* __restrict__ catchment_sea_level_idx, int has_sea_level)
@@ -150,12 +151,13 @@ __global__ void k_outflow(
 
     river_outflow[t] = upd_r_out;
     flood_outflow[t] = upd_f_out;
-    water_surface_elevation[t] = wse;
-    protected_water_surface_elevation[t] = pwse;
+    if (has_water_surface) water_surface_elevation[t] = wse;
+    if (has_protected_water_surface)
+        protected_water_surface_elevation[t] = pwse;
     river_cross_section_depth[t] = upd_r_cs_dep;
     flood_cross_section_depth[t] = upd_f_cs_dep;
     flood_cross_section_area[t] = upd_f_cs_area;
-    total_storage[t] = (STO)total_storage_f;
+    if (has_total_storage) total_storage[t] = (STO)total_storage_f;
 
     river_inflow[t] = (STO)0;
     flood_inflow[t] = (STO)0;
@@ -171,7 +173,7 @@ __global__ void k_outflow(
 // ----------------------------------------------------------------------------
 // (2) compute_inflow_kernel
 // ----------------------------------------------------------------------------
-template <typename REAL, typename STO>
+template <bool HAS_BIFURCATION, typename REAL, typename STO>
 __global__ void k_inflow(
     const int* __restrict__ downstream_idx,
     REAL* __restrict__ river_outflow, REAL* __restrict__ flood_outflow,
@@ -179,7 +181,8 @@ __global__ void k_inflow(
     const STO* __restrict__ outgoing_storage,
     STO* __restrict__ river_inflow, STO* __restrict__ flood_inflow,
     REAL* __restrict__ limit_rate_out, STO* __restrict__ reservoir_total_inflow,
-    const bool* __restrict__ is_reservoir, long num_catchments, int has_reservoir)
+    const bool* __restrict__ is_reservoir, long num_catchments,
+    int has_reservoir)
 {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     if (t >= num_catchments) return;
@@ -200,7 +203,7 @@ __global__ void k_inflow(
 
     river_outflow[t] = upd_r_out;
     flood_outflow[t] = upd_f_out;
-    limit_rate_out[t] = limit_rate;
+    if constexpr (HAS_BIFURCATION) limit_rate_out[t] = limit_rate;
 
     bool is_river_mouth = (dn == (int)t);
     if (!is_river_mouth) {
@@ -235,9 +238,11 @@ static void launch_outflow_t(
     at::Tensor& fi, at::Tensor& fo, at::Tensor& fman, at::Tensor& fd, at::Tensor& pd,
     at::Tensor& ce, at::Tensor& dd, at::Tensor& fsto, at::Tensor& psto,
     at::Tensor& rcsd, at::Tensor& fcsd, at::Tensor& fcsa,
-    c10::optional<at::Tensor>& gb, at::Tensor& ts_out, at::Tensor& outs,
-    at::Tensor& wse, at::Tensor& pwse,
-    REAL gravity, at::Tensor& tsp, long n, int has_bif,
+    c10::optional<at::Tensor>& gb, c10::optional<at::Tensor>& ts_out,
+    at::Tensor& outs, c10::optional<at::Tensor>& wse,
+    c10::optional<at::Tensor>& pwse,
+    REAL gravity, at::Tensor& tsp, long n, int has_bif, int has_total,
+    int has_water_surface, int has_protected_surface,
     c10::optional<at::Tensor>& dam, int has_res, REAL minslope,
     c10::optional<at::Tensor>& sea, c10::optional<at::Tensor>& sea_idx,
     int has_sea, int block)
@@ -249,8 +254,10 @@ static void launch_outflow_t(
         PI(di), PS<STO>(ri), PR<REAL>(ro), PR<REAL>(rman), PR<REAL>(rd), PR<REAL>(rw), PR<REAL>(rl), PR<REAL>(rh), PS<STO>(rs), \
         PS<STO>(fi), PR<REAL>(fo), PR<REAL>(fman), PR<REAL>(fd), PR<REAL>(pd), PR<REAL>(ce), PR<REAL>(dd), PS<STO>(fsto), PS<STO>(psto), \
         PR<REAL>(rcsd), PR<REAL>(fcsd), PR<REAL>(fcsa), \
-        PSO<STO>(gb), PS<STO>(ts_out), PS<STO>(outs), PR<REAL>(wse), PR<REAL>(pwse), \
-        gravity, PR<REAL>(tsp), n, has_bif, PBO(dam), has_res, minslope, \
+        PSO<STO>(gb), PSO<STO>(ts_out), PS<STO>(outs), PRO<REAL>(wse), PRO<REAL>(pwse), \
+        gravity, PR<REAL>(tsp), n, has_bif, has_total, has_water_surface, \
+        has_protected_surface, \
+        PBO(dam), has_res, minslope, \
         PRO<REAL>(sea), PIO(sea_idx), has_sea)
     if (!has_res && !has_sea) LAUNCH_OUTFLOW(true);
     else LAUNCH_OUTFLOW(false);
@@ -271,11 +278,13 @@ void launch_outflow(
     at::Tensor flood_cross_section_depth_ptr,
     at::Tensor flood_cross_section_area_ptr,
     c10::optional<at::Tensor> global_bifurcation_outflow_ptr,
-    at::Tensor total_storage_ptr, at::Tensor outgoing_storage_ptr,
-    at::Tensor water_surface_elevation_ptr,
-    at::Tensor protected_water_surface_elevation_ptr,
+    c10::optional<at::Tensor> total_storage_ptr,
+    at::Tensor outgoing_storage_ptr,
+    c10::optional<at::Tensor> water_surface_elevation_ptr,
+    c10::optional<at::Tensor> protected_water_surface_elevation_ptr,
     float gravity, at::Tensor time_step_ptr, long num_catchments,
-    bool HAS_BIFURCATION,
+    bool HAS_BIFURCATION, bool HAS_TOTAL_STORAGE,
+    bool HAS_WATER_SURFACE, bool HAS_PROTECTED_WATER_SURFACE,
     c10::optional<at::Tensor> is_dam_upstream_ptr, bool HAS_RESERVOIR,
     float MIN_KINEMATIC_SLOPE,
     c10::optional<at::Tensor> sea_surface_elevation_ptr,
@@ -297,6 +306,9 @@ void launch_outflow(
             water_surface_elevation_ptr,
             protected_water_surface_elevation_ptr, (double)gravity,
             time_step_ptr, num_catchments, (int)HAS_BIFURCATION,
+            (int)HAS_TOTAL_STORAGE,
+            (int)HAS_WATER_SURFACE,
+            (int)HAS_PROTECTED_WATER_SURFACE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
             (double)MIN_KINEMATIC_SLOPE, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
@@ -315,6 +327,9 @@ void launch_outflow(
             water_surface_elevation_ptr,
             protected_water_surface_elevation_ptr, gravity,
             time_step_ptr, num_catchments, (int)HAS_BIFURCATION,
+            (int)HAS_TOTAL_STORAGE,
+            (int)HAS_WATER_SURFACE,
+            (int)HAS_PROTECTED_WATER_SURFACE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
             MIN_KINEMATIC_SLOPE, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
@@ -333,6 +348,9 @@ void launch_outflow(
             water_surface_elevation_ptr,
             protected_water_surface_elevation_ptr, gravity,
             time_step_ptr, num_catchments, (int)HAS_BIFURCATION,
+            (int)HAS_TOTAL_STORAGE,
+            (int)HAS_WATER_SURFACE,
+            (int)HAS_PROTECTED_WATER_SURFACE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
             MIN_KINEMATIC_SLOPE, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
@@ -342,15 +360,21 @@ void launch_outflow(
 template <typename REAL, typename STO>
 static void launch_inflow_t(
     at::Tensor& di, at::Tensor& ro, at::Tensor& fo, at::Tensor& rs, at::Tensor& fs,
-    at::Tensor& outs, at::Tensor& ri, at::Tensor& fi, at::Tensor& lr,
+    at::Tensor& outs, at::Tensor& ri, at::Tensor& fi,
+    c10::optional<at::Tensor>& lr,
     c10::optional<at::Tensor>& rti, c10::optional<at::Tensor>& isres,
-    long n, int has_res, int block)
+    long n, int has_bif, int has_res, int block)
 {
     int grid = (int)((n + block - 1) / block);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    k_inflow<REAL, STO><<<grid, block, 0, stream>>>(
-        PI(di), PR<REAL>(ro), PR<REAL>(fo), PS<STO>(rs), PS<STO>(fs), PS<STO>(outs),
-        PS<STO>(ri), PS<STO>(fi), PR<REAL>(lr), PSO<STO>(rti), PBO(isres), n, has_res);
+#define LAUNCH_INFLOW(HAS_BIFURCATION) \
+    k_inflow<HAS_BIFURCATION, REAL, STO><<<grid, block, 0, stream>>>( \
+        PI(di), PR<REAL>(ro), PR<REAL>(fo), PS<STO>(rs), PS<STO>(fs), \
+        PS<STO>(outs), PS<STO>(ri), PS<STO>(fi), PRO<REAL>(lr), \
+        PSO<STO>(rti), PBO(isres), n, has_res)
+    if (has_bif) LAUNCH_INFLOW(true);
+    else LAUNCH_INFLOW(false);
+#undef LAUNCH_INFLOW
 }
 
 void launch_inflow(
@@ -358,10 +382,12 @@ void launch_inflow(
     at::Tensor river_outflow_ptr, at::Tensor flood_outflow_ptr,
     at::Tensor river_storage_ptr, at::Tensor flood_storage_ptr,
     at::Tensor outgoing_storage_ptr, at::Tensor river_inflow_ptr,
-    at::Tensor flood_inflow_ptr, at::Tensor limit_rate_ptr,
+    at::Tensor flood_inflow_ptr,
+    c10::optional<at::Tensor> limit_rate_ptr,
     c10::optional<at::Tensor> reservoir_total_inflow_ptr,
     c10::optional<at::Tensor> is_reservoir_ptr,
-    long num_catchments, bool HAS_RESERVOIR, long BLOCK_SIZE)
+    long num_catchments, bool HAS_BIFURCATION, bool HAS_RESERVOIR,
+    long BLOCK_SIZE)
 {
     if (river_outflow_ptr.scalar_type() == at::kDouble)
         launch_inflow_t<double, double>(
@@ -369,19 +395,19 @@ void launch_inflow(
             river_storage_ptr, flood_storage_ptr, outgoing_storage_ptr,
             river_inflow_ptr, flood_inflow_ptr, limit_rate_ptr,
             reservoir_total_inflow_ptr, is_reservoir_ptr, num_catchments,
-            (int)HAS_RESERVOIR, (int)BLOCK_SIZE);
+            (int)HAS_BIFURCATION, (int)HAS_RESERVOIR, (int)BLOCK_SIZE);
     else if (river_storage_ptr.scalar_type() == at::kDouble)
         launch_inflow_t<float, double>(
             downstream_idx_ptr, river_outflow_ptr, flood_outflow_ptr,
             river_storage_ptr, flood_storage_ptr, outgoing_storage_ptr,
             river_inflow_ptr, flood_inflow_ptr, limit_rate_ptr,
             reservoir_total_inflow_ptr, is_reservoir_ptr, num_catchments,
-            (int)HAS_RESERVOIR, (int)BLOCK_SIZE);
+            (int)HAS_BIFURCATION, (int)HAS_RESERVOIR, (int)BLOCK_SIZE);
     else
         launch_inflow_t<float, float>(
             downstream_idx_ptr, river_outflow_ptr, flood_outflow_ptr,
             river_storage_ptr, flood_storage_ptr, outgoing_storage_ptr,
             river_inflow_ptr, flood_inflow_ptr, limit_rate_ptr,
             reservoir_total_inflow_ptr, is_reservoir_ptr, num_catchments,
-            (int)HAS_RESERVOIR, (int)BLOCK_SIZE);
+            (int)HAS_BIFURCATION, (int)HAS_RESERVOIR, (int)BLOCK_SIZE);
 }

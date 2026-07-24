@@ -53,6 +53,9 @@ def compute_outflow_kernel(
     num_catchments: tl.constexpr,           # total number of elements
     BLOCK_SIZE: tl.constexpr,               # block size
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    HAS_TOTAL_STORAGE: tl.constexpr = True, # whether auxiliary storage is active
+    HAS_WATER_SURFACE: tl.constexpr = True,
+    HAS_PROTECTED_WATER_SURFACE: tl.constexpr = True,
     is_dam_upstream_ptr=None,               # *bool  upstream-of-dam mask (catchment-indexed)
     HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
     MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
@@ -249,12 +252,23 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
-    tl.store(water_surface_elevation_ptr + offs, water_surface_elevation, mask=mask)
-    tl.store(protected_water_surface_elevation_ptr + offs, protected_water_surface_elevation, mask=mask)
+    if HAS_WATER_SURFACE:
+        tl.store(
+            water_surface_elevation_ptr + offs,
+            water_surface_elevation,
+            mask=mask,
+        )
+    if HAS_PROTECTED_WATER_SURFACE:
+        tl.store(
+            protected_water_surface_elevation_ptr + offs,
+            protected_water_surface_elevation,
+            mask=mask,
+        )
     tl.store(river_cross_section_depth_ptr + offs, updated_river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_ptr + offs, updated_flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)
-    tl.store(total_storage_ptr + offs, total_storage, mask=mask)
+    if HAS_TOTAL_STORAGE:
+        tl.store(total_storage_ptr + offs, total_storage, mask=mask)
     
     tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
@@ -291,6 +305,7 @@ def compute_inflow_kernel(
     reservoir_total_inflow_ptr,    # *f64: Reservoir total inflow (catchment-sized, atomic add)
     is_reservoir_ptr,              # *i1:  Boolean mask for reservoir catchments
     num_catchments: tl.constexpr,  # Total number of units
+    HAS_BIFURCATION: tl.constexpr, # Whether bifurcation module is active
     HAS_RESERVOIR: tl.constexpr,   # Whether reservoir module is active
     BLOCK_SIZE: tl.constexpr       # Block size
 ):
@@ -328,7 +343,8 @@ def compute_inflow_kernel(
     # Write back limited values
     tl.store(river_outflow_ptr + offs, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
-    tl.store(limit_rate_ptr + offs, limit_rate, mask=mask)
+    if HAS_BIFURCATION:
+        tl.store(limit_rate_ptr + offs, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
     is_river_mouth = downstream_idx == offs
@@ -393,6 +409,9 @@ def compute_outflow_batched_kernel(
     batched_river_height: tl.constexpr,
     batched_catchment_elevation: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
+    HAS_TOTAL_STORAGE: tl.constexpr = True, # whether auxiliary storage is active
+    HAS_WATER_SURFACE: tl.constexpr = True,
+    HAS_PROTECTED_WATER_SURFACE: tl.constexpr = True,
     is_dam_upstream_ptr=None,
     HAS_RESERVOIR: tl.constexpr = False,
     MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,
@@ -603,12 +622,23 @@ def compute_outflow_batched_kernel(
     #----------------------------------------------------------------------
     tl.store(river_outflow_ptr + idx, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + idx, updated_flood_outflow, mask=mask)
-    tl.store(water_surface_elevation_ptr + idx, water_surface_elevation, mask=mask)
-    tl.store(protected_water_surface_elevation_ptr + idx, protected_water_surface_elevation, mask=mask)
+    if HAS_WATER_SURFACE:
+        tl.store(
+            water_surface_elevation_ptr + idx,
+            water_surface_elevation,
+            mask=mask,
+        )
+    if HAS_PROTECTED_WATER_SURFACE:
+        tl.store(
+            protected_water_surface_elevation_ptr + idx,
+            protected_water_surface_elevation,
+            mask=mask,
+        )
     tl.store(river_cross_section_depth_ptr + idx, updated_river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_ptr + idx, updated_flood_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_area_ptr + idx, updated_flood_cross_section_area, mask=mask)
-    tl.store(total_storage_ptr + idx, total_storage, mask=mask)
+    if HAS_TOTAL_STORAGE:
+        tl.store(total_storage_ptr + idx, total_storage, mask=mask)
     
     tl.store(river_inflow_ptr + idx, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + idx, 0.0, mask=mask)
@@ -645,6 +675,7 @@ def compute_inflow_batched_kernel(
     is_reservoir_ptr,              # *i1:  Boolean mask for reservoir catchments
     num_catchments: tl.constexpr,  # Total number of units
     num_trials: tl.constexpr,
+    HAS_BIFURCATION: tl.constexpr, # Whether bifurcation module is active
     HAS_RESERVOIR: tl.constexpr,   # Whether reservoir module is active
     BLOCK_SIZE: tl.constexpr       # Block size
 ):
@@ -690,7 +721,8 @@ def compute_inflow_batched_kernel(
     # Write back limited values
     tl.store(river_outflow_ptr + idx, updated_river_outflow, mask=mask)
     tl.store(flood_outflow_ptr + idx, updated_flood_outflow, mask=mask)
-    tl.store(limit_rate_ptr + idx, limit_rate, mask=mask)
+    if HAS_BIFURCATION:
+        tl.store(limit_rate_ptr + idx, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
     is_river_mouth = downstream_idx == catchment_idx

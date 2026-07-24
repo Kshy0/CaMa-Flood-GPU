@@ -140,12 +140,18 @@ long num_catchments = *args.num_catchments;
 
     args.river_outflow_ptr[cell] = updated_river_outflow;
     args.flood_outflow_ptr[cell] = updated_flood_outflow;
-    args.water_surface_elevation_ptr[cell] = water_surface;
-    args.protected_water_surface_elevation_ptr[cell] = protected_surface;
+    if (HAS_WATER_SURFACE) {
+        args.water_surface_elevation_ptr[cell] = water_surface;
+    }
+    if (HAS_PROTECTED_WATER_SURFACE) {
+        args.protected_water_surface_elevation_ptr[cell] = protected_surface;
+    }
     args.river_cross_section_depth_ptr[cell] = updated_river_xs;
     args.flood_cross_section_depth_ptr[cell] = updated_flood_xs;
     args.flood_cross_section_area_ptr[cell] = updated_flood_area;
-    args.total_storage_ptr[cell] = total_storage;
+    if (HAS_TOTAL_STORAGE) {
+        args.total_storage_ptr[cell] = total_storage;
+    }
     args.river_inflow_ptr[cell] = 0.0f;
     args.flood_inflow_ptr[cell] = 0.0f;
     if (HAS_BIFURCATION) {
@@ -203,7 +209,9 @@ long num_catchments = *args.num_catchments;
 
     args.river_outflow_ptr[cell] = updated_river;
     args.flood_outflow_ptr[cell] = updated_flood;
-    args.limit_rate_ptr[cell] = local_limit;
+    if (HAS_BIFURCATION) {
+        args.limit_rate_ptr[cell] = local_limit;
+    }
 
     if (downstream != (int)catchment) {
         atomic_fetch_add_explicit(
