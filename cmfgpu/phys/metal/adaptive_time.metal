@@ -1,4 +1,4 @@
-// HYDROFORGE METAL KERNEL BODY
+// HYDROFORGE METAL KERNEL BODY: compute_adaptive_time_step
     threadgroup float shared_min[HF_BLOCK_SIZE];
 
     long num_catchments = *args.num_catchments;

@@ -180,7 +180,8 @@ def main():
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=step.model_time,
-                    output_enabled=not step.is_spin_up
+                    output_enabled=not step.is_spin_up,
+                    spinup=step.is_spin_up,
                 )
     if save_state:  
         model.save_state(last_valid_time + timedelta(seconds=time_step))
