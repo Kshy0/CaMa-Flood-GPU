@@ -98,8 +98,6 @@ def main():
         output_split_by_year=output_split_by_year,
         simulation_schedule=schedule,
     )
-    model.set_total_steps(dataset.total_steps)
-
     local_mapping = dataset.build_local_mapping(
         mapping_file=runoff_mapping_file,
         desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),

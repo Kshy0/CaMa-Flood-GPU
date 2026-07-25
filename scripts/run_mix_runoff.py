@@ -126,7 +126,6 @@ def main():
         simulation_schedule=schedule,
         statistics_plan=StatisticsPlan(schedule=schedule, inner=EveryStep()),
     )
-    model.set_total_steps(dataset0.total_steps)
     if dataset0.total_steps != dataset1.total_steps:
         raise ValueError(
             f"dataset0 total_steps ({dataset0.total_steps}) != "
