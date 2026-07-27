@@ -962,18 +962,6 @@ class MERITMap(BaseModel):
             )
             del lonlat_data
 
-        if self.levee_flag:
-            levee_crown_height = _read_2d_map("levhgt.bin")
-            levee_fraction = _read_2d_map("levfrc.bin")
-            levee_mask = (levee_fraction >= 0) & (levee_fraction < 1.0) & (levee_crown_height > 0)
-            self.num_levees = int(np.sum(levee_mask))
-            self.levee_id = np.arange(self.num_levees, dtype=np.int64)
-            self.levee_catchment_id = self.catchment_id[levee_mask]
-            self.levee_catchment_x = self.catchment_x[levee_mask]
-            self.levee_catchment_y = self.catchment_y[levee_mask]
-            self.levee_crown_height = levee_crown_height[levee_mask]
-            self.levee_fraction = levee_fraction[levee_mask]
-
         if self.reservoir_flag:
             self._load_reservoir_parameters()
 
@@ -986,6 +974,91 @@ class MERITMap(BaseModel):
             dtype=self.numpy_precision,
         )
         del data
+        if not np.all(np.isfinite(self.flood_depth_table)):
+            num_invalid = int(np.sum(~np.isfinite(self.flood_depth_table)))
+            raise ValueError(
+                "fldhgt.bin contains non-finite flood-depth values at "
+                f"{num_invalid} entries"
+            )
+        if np.any(self.flood_depth_table < 0):
+            num_invalid = int(np.sum(self.flood_depth_table < 0))
+            raise ValueError(
+                "fldhgt.bin contains negative flood-depth values at "
+                f"{num_invalid} entries"
+            )
+        flood_depth_diffs = np.diff(self.flood_depth_table, axis=-1)
+        num_regressions = int(np.sum(flood_depth_diffs < 0))
+        if num_regressions:
+            affected_catchments = int(
+                np.sum(np.any(flood_depth_diffs < 0, axis=-1))
+            )
+            self.flood_depth_table = np.maximum.accumulate(
+                self.flood_depth_table, axis=-1
+            )
+            print(
+                f"Corrected {num_regressions} decreasing flood-depth entries "
+                f"across {affected_catchments} catchments"
+            )
+
+        if self.levee_flag:
+            levee_crown_height = _read_2d_map("levhgt.bin")
+            levee_fraction = _read_2d_map("levfrc.bin")
+
+            # Derive the base height with the same interpolation used by
+            # LeveeModule.  Base height is a derived value, not an input.
+            safe_fraction = np.where(np.isfinite(levee_fraction), levee_fraction, 0)
+            position = np.clip(
+                safe_fraction * self.num_flood_levels,
+                0.0,
+                float(self.num_flood_levels),
+            )
+            lower = np.floor(position).astype(np.int64)
+            upper = np.minimum(lower + 1, self.num_flood_levels)
+            row = np.arange(len(self.catchment_id))
+            lower_value = np.zeros(
+                len(self.catchment_id), dtype=self.numpy_precision
+            )
+            has_lower_level = lower > 0
+            lower_value[has_lower_level] = self.flood_depth_table[
+                row[has_lower_level], lower[has_lower_level] - 1
+            ]
+            upper_value = self.flood_depth_table[
+                row, np.maximum(upper - 1, 0)
+            ]
+            levee_base_height = lower_value + (
+                position - lower
+            ) * (upper_value - lower_value)
+
+            levee_mask = (
+                np.isfinite(levee_fraction)
+                & np.isfinite(levee_base_height)
+                & np.isfinite(levee_crown_height)
+                & (levee_fraction >= 0)
+                & (levee_fraction < 1.0)
+                & (levee_base_height >= 0)
+                & (levee_base_height < levee_crown_height)
+            )
+
+            candidate_mask = (
+                np.isfinite(levee_fraction)
+                & np.isfinite(levee_crown_height)
+                & (levee_fraction >= 0)
+                & (levee_fraction < 1.0)
+                & (levee_crown_height > 0)
+            )
+            num_rejected = int(np.sum(candidate_mask & ~levee_mask))
+            if num_rejected:
+                print(
+                    f"Filtered {num_rejected} invalid levees whose derived "
+                    "base/crown heights do not satisfy 0 <= base < crown"
+                )
+            self.num_levees = int(np.sum(levee_mask))
+            self.levee_id = np.arange(self.num_levees, dtype=np.int64)
+            self.levee_catchment_id = self.catchment_id[levee_mask]
+            self.levee_catchment_x = self.catchment_x[levee_mask]
+            self.levee_catchment_y = self.catchment_y[levee_mask]
+            self.levee_crown_height = levee_crown_height[levee_mask]
+            self.levee_fraction = levee_fraction[levee_mask]
 
     def check_flow_direction(self) -> None:
         """Validate flow direction consistency."""

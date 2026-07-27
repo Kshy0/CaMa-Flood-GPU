@@ -531,15 +531,15 @@ class BaseModule(AbstractModule):
     @model_validator(mode="after")
     def validate_flood_depth_table_monotonicity(self) -> Self:
         if self.num_flood_levels > 1:
-            diffs = torch.diff(self.flood_depth_table, dim=1)
-            if not torch.all(diffs >= 0):
-                # Check if violations are within fixable tolerance
+            diffs = torch.diff(self.flood_depth_table, dim=-1)
+            invalid = diffs < 0
+            num_invalid = int(invalid.sum().item())
+            if num_invalid:
                 min_diff = diffs.min().item()
-                if min_diff < -0.1:
-                    raise ValueError(
-                        f"flood_depth_table has non-monotonic entries with diff={min_diff:.6f}, "
-                        "exceeding the fixable tolerance of 0.1"
-                    )
-                # Fix tiny floating-point regressions via cumulative max
-                self.flood_depth_table = torch.cummax(self.flood_depth_table, dim=1).values
+                raise ValueError(
+                    "flood_depth_table must be monotonically non-decreasing; "
+                    f"found {num_invalid} decreasing intervals "
+                    f"(minimum diff={min_diff:.6f}). Regenerate the parameter "
+                    "file with MERITMap."
+                )
         return self
