@@ -141,7 +141,7 @@ def _power_law(
     width = np.empty(n, dtype=np.float32)
     height = np.empty(n, dtype=np.float32)
     for i in numba.prange(n):
-        q = abs(discharge[i])
+        q = discharge[i] if discharge[i] > 0.0 else 0.0
         if q > 0.0:
             height[i] = max(HMIN, HC * q ** HP + HO)
             width[i] = max(WMIN, WC * q ** WP + WO)

@@ -32,6 +32,7 @@ def compute_outflow_kernel(
     flood_manning_ptr,                      # *f32 flood Manning coefficient
     flood_depth_ptr,                        # *f32 flood depth
     protected_depth_ptr,                    # *f32 protected depth
+    is_levee_ptr,                           # *bool levee-catchment mask
     catchment_elevation_ptr,                # *f32 catchment ground elevation
     downstream_distance_ptr,                # *f32 distance to downstream unit
     flood_storage_ptr,                      # *f64 flood storage
@@ -56,6 +57,7 @@ def compute_outflow_kernel(
     HAS_TOTAL_STORAGE: tl.constexpr = True, # whether auxiliary storage is active
     HAS_WATER_SURFACE: tl.constexpr = True,
     HAS_PROTECTED_WATER_SURFACE: tl.constexpr = True,
+    HAS_LEVEE: tl.constexpr = False,
     is_dam_upstream_ptr=None,               # *bool  upstream-of-dam mask (catchment-indexed)
     HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
     MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
@@ -110,7 +112,17 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     river_elevation = catchment_elevation - river_height
     water_surface_elevation = river_depth + river_elevation
-    protected_water_surface_elevation = tl.minimum(catchment_elevation + protected_depth, water_surface_elevation)
+    protected_water_surface_elevation = water_surface_elevation
+    if HAS_LEVEE:
+        is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=False)
+        protected_water_surface_elevation = tl.where(
+            is_levee,
+            tl.minimum(
+                catchment_elevation + protected_depth,
+                water_surface_elevation,
+            ),
+            water_surface_elevation,
+        )
     total_storage = river_storage + flood_storage + protected_storage
     # Downstream water surface elevation
     river_depth_downstream = tl.load(river_depth_ptr + downstream_idx, mask=mask, other=0.0)
@@ -145,13 +157,25 @@ def compute_outflow_kernel(
     #----------------------------------------------------------------------
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
-    updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
+    # CaMa-Flood applies a separate river-mouth boundary: the prescribed
+    # downstream level controls slope, but the local channel flow depth remains
+    # the actual river depth (rather than max(river_depth, bankfull depth)).
+    updated_river_cross_section_depth = tl.where(
+        is_river_mouth,
+        river_depth,
+        max_water_surface_elevation - river_elevation,
+    )
     river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
         updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
+    flood_cross_section_surface = tl.where(
+        is_river_mouth,
+        water_surface_elevation,
+        max_water_surface_elevation,
+    )
     updated_flood_cross_section_depth = tl.maximum(
-        max_water_surface_elevation - catchment_elevation,
+        flood_cross_section_surface - catchment_elevation,
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(
@@ -379,6 +403,7 @@ def compute_outflow_batched_kernel(
     flood_manning_ptr,                      # *f32 flood Manning coefficient
     flood_depth_ptr,                        # *f32 flood depth
     protected_depth_ptr,                    # *f32 protected depth
+    is_levee_ptr,                           # *bool levee-catchment mask
     catchment_elevation_ptr,                # *f32 catchment ground elevation
     downstream_distance_ptr,                # *f32 distance to downstream unit
     flood_storage_ptr,                      # *f64 flood storage
@@ -408,10 +433,12 @@ def compute_outflow_batched_kernel(
     batched_river_length: tl.constexpr,
     batched_river_height: tl.constexpr,
     batched_catchment_elevation: tl.constexpr,
+    batched_downstream_distance: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
     HAS_TOTAL_STORAGE: tl.constexpr = True, # whether auxiliary storage is active
     HAS_WATER_SURFACE: tl.constexpr = True,
     HAS_PROTECTED_WATER_SURFACE: tl.constexpr = True,
+    HAS_LEVEE: tl.constexpr = False,
     is_dam_upstream_ptr=None,
     HAS_RESERVOIR: tl.constexpr = False,
     MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,
@@ -449,7 +476,12 @@ def compute_outflow_batched_kernel(
     flood_depth = tl.load(flood_depth_ptr + idx, mask=mask, other=0.0)
     protected_depth = tl.load(protected_depth_ptr + idx, mask=mask, other=0.0)
     catchment_elevation = tl.load(catchment_elevation_ptr + (idx if batched_catchment_elevation else catchment_idx), mask=mask, other=0.0)
-    downstream_distance = tl.load(downstream_distance_ptr + catchment_idx, mask=mask, other=1.0)
+    downstream_distance = tl.load(
+        downstream_distance_ptr
+        + (idx if batched_downstream_distance else catchment_idx),
+        mask=mask,
+        other=1.0,
+    )
     flood_storage = tl.load(flood_storage_ptr + idx, mask=mask, other=0.0)
     protected_storage = tl.load(protected_storage_ptr + idx, mask=mask, other=0.0)
 
@@ -468,7 +500,19 @@ def compute_outflow_batched_kernel(
     #----------------------------------------------------------------------
     river_elevation = catchment_elevation - river_height
     water_surface_elevation = river_depth + river_elevation
-    protected_water_surface_elevation = tl.minimum(catchment_elevation + protected_depth, water_surface_elevation)
+    protected_water_surface_elevation = water_surface_elevation
+    if HAS_LEVEE:
+        is_levee = tl.load(
+            is_levee_ptr + catchment_idx, mask=mask, other=False,
+        )
+        protected_water_surface_elevation = tl.where(
+            is_levee,
+            tl.minimum(
+                catchment_elevation + protected_depth,
+                water_surface_elevation,
+            ),
+            water_surface_elevation,
+        )
     total_storage = river_storage + flood_storage + protected_storage
     
     # Downstream water surface elevation
@@ -508,13 +552,22 @@ def compute_outflow_batched_kernel(
     #----------------------------------------------------------------------
     # (5) Current river/flood cross-section depth + semi-implicit flow depth
     #----------------------------------------------------------------------
-    updated_river_cross_section_depth = max_water_surface_elevation - river_elevation
+    updated_river_cross_section_depth = tl.where(
+        is_river_mouth,
+        river_depth,
+        max_water_surface_elevation - river_elevation,
+    )
     river_semi_implicit_flow_depth = tl.maximum(tl.sqrt(
         updated_river_cross_section_depth * river_cross_section_depth
     ), 1e-6)
 
+    flood_cross_section_surface = tl.where(
+        is_river_mouth,
+        water_surface_elevation,
+        max_water_surface_elevation,
+    )
     updated_flood_cross_section_depth = tl.maximum(
-        max_water_surface_elevation - catchment_elevation,
+        flood_cross_section_surface - catchment_elevation,
         0.0
     )
     flood_semi_implicit_flow_depth = tl.maximum(

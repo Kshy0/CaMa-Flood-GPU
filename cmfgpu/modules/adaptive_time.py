@@ -21,7 +21,12 @@ class AdaptiveTimeModule(AbstractModule):
     module_name: ClassVar[str] = "adaptive_time"
     description: ClassVar[str] = "Adaptive time step calculation module for river networks"
     dependencies: ClassVar[list] = ["base"]
-    adaptive_time_factor: float = Field(0.7, description="Factor to adjust adaptive time step calculation", gt=0.0)
+    adaptive_time_factor: float = Field(
+        0.7,
+        description="Factor to adjust adaptive time step calculation",
+        gt=0.0,
+        allow_inf_nan=False,
+    )
     
     @computed_tensor_field(
         description="Maximum number of sub-steps across all processes",

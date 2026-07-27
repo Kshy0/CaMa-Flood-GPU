@@ -29,7 +29,9 @@ def nse(pred: np.ndarray, obs: np.ndarray) -> float:
         return float("nan")
     ss_res = float(((p - o) ** 2).sum())
     ss_tot = float(((o - o.mean()) ** 2).sum())
-    return 1.0 - ss_res / max(ss_tot, 1e-10)
+    if ss_tot == 0.0:
+        return float("nan")
+    return 1.0 - ss_res / ss_tot
 
 
 def kge(pred: np.ndarray, obs: np.ndarray) -> float:

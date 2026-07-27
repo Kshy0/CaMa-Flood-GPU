@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import matplotlib.pyplot as plt
 import netCDF4 as nc
 import numpy as np
 
@@ -59,11 +58,14 @@ class TopologyReader:
         self.c_x = self.catchment_data.get('catchment_x')
         self.c_y = self.catchment_data.get('catchment_y')
 
-        # Build ID -> Index map (flat array)
-        max_cid = int(self.c_ids.max())
-        self.grid_to_idx = np.full(max_cid + 1, -1, dtype=np.int64)
-        self.grid_to_idx[self.c_ids] = np.arange(len(self.c_ids), dtype=np.int64)
-        self._max_cid = max_cid
+        # Build ID -> index lookup.  catchment_id is x*ny + y, so a dense table
+        # would be O(nx*ny) regardless of how few catchments exist -- 1.8 GiB on
+        # a 1-arcmin map.  Sort once instead and binary-search: O(n) memory.
+        self._sorted_cids = np.ascontiguousarray(self.c_ids, dtype=np.int64)
+        order = np.argsort(self._sorted_cids, kind="stable")
+        self._sorted_cids = self._sorted_cids[order]
+        self._sorted_positions = order.astype(np.int64, copy=False)
+        self._max_cid = int(self.c_ids.max()) if len(self.c_ids) else -1
         
         # Build Upstream Adjacency via CSR
         self._csr_indptr = None
@@ -88,13 +90,16 @@ class TopologyReader:
 
     def _has_cid(self, cid: int) -> bool:
         """Check if catchment ID exists in the dataset."""
-        return 0 <= cid <= self._max_cid and self.grid_to_idx[cid] >= 0
+        return self._idx_of(cid) >= 0
 
     def _idx_of(self, cid: int) -> int:
         """Get array index for catchment ID. Returns -1 if not found."""
-        if 0 <= cid <= self._max_cid:
-            return int(self.grid_to_idx[cid])
-        return -1
+        if not 0 <= cid <= self._max_cid:
+            return -1
+        pos = int(np.searchsorted(self._sorted_cids, cid))
+        if pos >= len(self._sorted_cids) or self._sorted_cids[pos] != cid:
+            return -1
+        return int(self._sorted_positions[pos])
 
     def _get_upstream(self, cid: int) -> List[int]:
         """Get upstream catchment IDs from CSR adjacency."""
@@ -150,6 +155,7 @@ class TopologyReader:
         Visualize the basin containing the specified catchment using a grid view.
         Highlights the mainstream (longest/largest) and the path from the target.
         """
+        import matplotlib.pyplot as plt
         from matplotlib.collections import LineCollection
 
         info = self.get_catchment_info(cid, xy)
@@ -448,7 +454,7 @@ class TopologyReader:
                         max_area = area
                         best_up = up
             
-            if best_up and best_up not in visited_up:
+            if best_up is not None and best_up not in visited_up:
                 up_path.append(best_up)
                 visited_up.add(best_up)
                 curr = best_up

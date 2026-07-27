@@ -15,7 +15,7 @@ def compute_adaptive_time_step_kernel(
     river_depth_ptr,                        # *f32 river depth
     downstream_distance_ptr,                # *f32 distance to downstream unit
     is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
-    max_sub_steps_ptr,                      # *i64 max sub steps
+    max_sub_steps_ptr,                      # *i32 max sub steps
     outer_time_step,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
@@ -32,26 +32,35 @@ def compute_adaptive_time_step_kernel(
         is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
         mask = mask & (~is_dam)
 
-    #----------------------------------------------------------------------
-    # (1) Load input variables
-    #----------------------------------------------------------------------
+    # Compute a per-cell step count instead of reducing a padded minimum dt.
+    # This leaves max_sub_steps untouched when every cell is dam-related and
+    # lets the host apply the intentional one-step fallback for that case.
     downstream_distance = tl.load(
-        downstream_distance_ptr + offs, mask=mask, other=1.0e30,
+        downstream_distance_ptr + offs, mask=mask, other=1.0,
     )
-    # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
     depth = tl.maximum(river_depth, 0.01)
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, outer_time_step)
-    
-    min_dt = tl.min(dt_clamped)
-    
-    # Calculate num_sub_steps
-    # Align with int(round(outer_time_step / min_dt - 0.01) + 1)
-    n_steps_float = tl.floor(outer_time_step / min_dt + 0.49) + 1.0
-    n_steps = nonnegative_to_index_inline(n_steps_float)
-    
-    tl.atomic_max(max_sub_steps_ptr, n_steps)
+
+    # ``x - x == 0`` is true only for finite x, avoiding backend-specific
+    # isfinite helpers while rejecting both NaN and infinities.
+    valid_dt = (
+        (river_depth - river_depth == 0.0)
+        & (downstream_distance - downstream_distance == 0.0)
+        & (dt_clamped > 0.0)
+        & (dt_clamped == dt_clamped)
+    )
+    n_steps_float = tl.floor(outer_time_step / dt_clamped - 0.01) + 1.0
+    # max_sub_steps has an int32 ABI. Reserve INT_MAX as the failure marker;
+    # the next smaller representable fp32 value is safe to cast to int32.
+    valid_count = valid_dt & (n_steps_float < 2147483647.0)
+    bounded = tl.where(valid_count, n_steps_float, 0.0)
+    n_steps = nonnegative_to_index_inline(bounded)
+    n_steps = tl.where(valid_count, n_steps, 2147483647)
+    n_steps = tl.where(mask, n_steps, 0)
+
+    tl.atomic_max(max_sub_steps_ptr, tl.max(n_steps))
 
 
 @triton.jit
@@ -86,15 +95,11 @@ def compute_adaptive_time_step_batched_kernel(
 
     trial_offset = trial_idx * num_catchments
 
-    #----------------------------------------------------------------------
-    # (1) Load input variables
-    #----------------------------------------------------------------------
     downstream_distance = tl.load(
         downstream_distance_ptr
         + (trial_offset if batched_downstream_distance else 0) + offs,
-        mask=mask, other=1.0e30,
+        mask=mask, other=1.0,
     )
-    # Clamp river depth to minimum 0.01 for stability
     river_depth = tl.load(river_depth_ptr + trial_offset + offs, mask=mask, other=0)
 
     # Upcast to fp32 for intermediate computation:
@@ -105,12 +110,18 @@ def compute_adaptive_time_step_batched_kernel(
     depth = tl.maximum(river_depth, 0.01)
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, outer_time_step)
-    
-    min_dt = tl.min(dt_clamped)
-    
-    # Calculate num_sub_steps
-    # Align with int(round(outer_time_step / min_dt - 0.01) + 1)
-    n_steps_float = tl.floor(outer_time_step / min_dt + 0.49) + 1.0
-    n_steps = nonnegative_to_index_inline(n_steps_float)
-    
-    tl.atomic_max(max_sub_steps_ptr, n_steps)
+
+    valid_dt = (
+        (river_depth - river_depth == 0.0)
+        & (downstream_distance - downstream_distance == 0.0)
+        & (dt_clamped > 0.0)
+        & (dt_clamped == dt_clamped)
+    )
+    n_steps_float = tl.floor(outer_time_step / dt_clamped - 0.01) + 1.0
+    valid_count = valid_dt & (n_steps_float < 2147483647.0)
+    bounded = tl.where(valid_count, n_steps_float, 0.0)
+    n_steps = nonnegative_to_index_inline(bounded)
+    n_steps = tl.where(valid_count, n_steps, 2147483647)
+    n_steps = tl.where(mask, n_steps, 0)
+
+    tl.atomic_max(max_sub_steps_ptr, tl.max(n_steps))

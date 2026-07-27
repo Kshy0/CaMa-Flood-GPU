@@ -14,6 +14,11 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include "block_reduce.cuh"
+
+// Global water-balance counters the levee LOG path accumulates.
+#define CMF_LEVEE_LOG_SUMS 5
+
 template <typename REAL>
 __device__ __forceinline__ REAL pow73(REAL x) { return x * x * cbrt(x); }
 template <typename REAL>
@@ -44,184 +49,215 @@ __global__ void k_levee_stage(
     long num_levees, int num_flood_levels)
 {
     long li = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    if (li >= num_levees) return;
-
-    int ci = __ldg(levee_catchment_idx + li);
-    REAL rl = __ldg(river_length + ci);
-    REAL rw = __ldg(river_width + ci);
-    REAL rh = __ldg(river_height + ci);
-    REAL ca = __ldg(catchment_area + ci);
-
-    REAL l_crown = __ldg(levee_crown_height + li);
-    REAL l_frac = __ldg(levee_fraction + li);
-    REAL l_base_h = __ldg(levee_base_height + li);
-
-    REAL riv_sto_curr = (REAL)river_storage[ci];
-    REAL fld_sto_curr = (REAL)flood_storage[ci];
-    REAL fld_depth_curr = __ldg(flood_depth + ci);
-    REAL total_sto = riv_sto_curr + fld_sto_curr;
-
-    REAL riv_max_sto = rl * rw * rh;
-
-    // Below bank, no levee case can change river/flood state.  Still zero the
-    // protected side to keep outputs deterministic.
-    bool possible_levee_case = total_sto >= riv_max_sto;
-    if (!possible_levee_case) {
-        if constexpr (LOG) {
-            int step = __ldg(current_step_ptr);
-            atomicAdd(total_storage_stage_sum + step, total_sto * (REAL)1e-9);
-            atomicAdd(river_storage_sum + step, riv_sto_curr * (REAL)1e-9);
-            atomicAdd(flood_storage_sum + step, fld_sto_curr * (REAL)1e-9);
-            atomicAdd(flood_area_sum + step,
-                      __ldg(flood_fraction + ci) * ca * (REAL)1e-9);
-        }
-        river_storage[ci] = (STO)riv_sto_curr;
-        flood_storage[ci] = (STO)fld_sto_curr;
-        protected_storage[ci] = (STO)0;
-        protected_depth[ci] = (REAL)0.0;
-        return;
+    REAL log_sum[CMF_LEVEE_LOG_SUMS];
+    if constexpr (LOG) {
+        // Out-of-range lanes stay alive with zero contributions so every
+        // thread reaches the block reduction below.
+#pragma unroll
+        for (int i = 0; i < CMF_LEVEE_LOG_SUMS; ++i) log_sum[i] = (REAL)0;
+    } else {
+        if (li >= num_levees) return;
     }
+    int step = LOG ? __ldg(current_step_ptr) : 0;
 
-    REAL dwth_inc = (ca / rl) / (REAL)num_flood_levels;
-    REAL levee_dist = l_frac * (ca / rl);
+    if (li < num_levees) {
 
-    REAL s_curr = riv_max_sto;
-    REAL dhgt_pre = (REAL)0.0;
-    REAL dwth_pre = rw;
-    REAL levee_base_sto = riv_max_sto;
-    REAL levee_fill_sto = riv_max_sto;
-    bool found_base = false;
-    bool found_fill = false;
+        int ci = __ldg(levee_catchment_idx + li);
+        REAL rl = __ldg(river_length + ci);
+        REAL rw = __ldg(river_width + ci);
+        REAL rh = __ldg(river_height + ci);
+        REAL ca = __ldg(catchment_area + ci);
 
-    int ilev = (int)(l_frac * (REAL)num_flood_levels);
-    REAL dsto_fil_B = (REAL)0.0;
-    REAL dwth_fil_B = (REAL)0.0;
-    REAL ddph_fil_B = (REAL)0.0;
-    REAL gradient_B = (REAL)0.0;
-    bool found_B = false;
+        REAL l_crown = __ldg(levee_crown_height + li);
+        REAL l_frac = __ldg(levee_fraction + li);
+        REAL l_base_h = __ldg(levee_base_height + li);
 
-    bool scan_needed = true;
-    for (int i = 0; i < num_flood_levels; ++i) {
-        if (!scan_needed) break;
+        STO riv_sto_curr_hp = river_storage[ci];
+        STO fld_sto_curr_hp = flood_storage[ci];
+        STO total_sto_hp = riv_sto_curr_hp + fld_sto_curr_hp;
+        REAL riv_sto_curr = (REAL)riv_sto_curr_hp;
+        REAL fld_sto_curr = (REAL)fld_sto_curr_hp;
+        REAL fld_depth_curr = __ldg(flood_depth + ci);
+        REAL total_sto = (REAL)total_sto_hp;
 
-        REAL depth_val = __ldg(flood_depth_table + (long)ci * num_flood_levels + i);
-        REAL dhgt_seg = fmax(depth_val - dhgt_pre, (REAL)1e-6);
-        REAL dwth_mid = dwth_pre + (REAL)0.5 * dwth_inc;
-        REAL dsto_seg = rl * dwth_mid * dhgt_seg;
-        REAL s_next = s_curr + dsto_seg;
-        REAL gradient = dhgt_seg / dwth_inc;
+        REAL riv_max_sto = rl * rw * rh;
 
-        bool cond_base = (l_base_h > dhgt_pre) && (l_base_h <= depth_val);
-        REAL ratio_base = (l_base_h - dhgt_pre) / dhgt_seg;
-        REAL dsto_base_p = rl * (dwth_pre + (REAL)0.5 * ratio_base * dwth_inc) * (ratio_base * dhgt_seg);
-        if (cond_base && !found_base) levee_base_sto = s_curr + dsto_base_p;
-        found_base = found_base || cond_base;
-
-        bool cond_fill = (l_crown > dhgt_pre) && (l_crown <= depth_val);
-        REAL ratio_fill = (l_crown - dhgt_pre) / dhgt_seg;
-        REAL dsto_fill_p = rl * (dwth_pre + (REAL)0.5 * ratio_fill * dwth_inc) * (ratio_fill * dhgt_seg);
-        if (cond_fill && !found_fill) levee_fill_sto = s_curr + dsto_fill_p;
-        found_fill = found_fill || cond_fill;
-
-        REAL dhgt_dif_loop = l_crown - l_base_h;
-        REAL s_top_loop = levee_base_sto + (levee_dist + rw) * dhgt_dif_loop * rl;
-        REAL dsto_add_wedge = (levee_dist + rw) * (l_crown - depth_val) * rl;
-        REAL threshold = s_next + dsto_add_wedge;
-
-        bool cond_check = (i >= ilev) && !found_B;
-        bool cond_found = cond_check && (total_sto < threshold);
-        REAL current_lb = (i == ilev) ? s_top_loop : dsto_fil_B;
-        if (cond_check && !cond_found) {
-            dsto_fil_B = threshold;
-            dwth_fil_B = dwth_inc * (REAL)(i + 1) - levee_dist;
-            ddph_fil_B = depth_val - l_base_h;
+        // Below bank, no levee case can change river/flood state.  Still zero the
+        // protected side to keep outputs deterministic.
+        bool possible_levee_case = total_sto >= riv_max_sto;
+        if (!possible_levee_case) {
+            if constexpr (LOG) {
+                log_sum[0] += total_sto * (REAL)1e-9;
+                log_sum[2] += riv_sto_curr * (REAL)1e-9;
+                log_sum[3] += fld_sto_curr * (REAL)1e-9;
+                log_sum[4] += __ldg(flood_fraction + ci) * ca * (REAL)1e-9;
+            }
+            river_storage[ci] = riv_sto_curr_hp;
+            flood_storage[ci] = fld_sto_curr_hp;
+            protected_storage[ci] = (STO)0;
+            protected_depth[ci] = (REAL)0.0;
         } else {
-            dsto_fil_B = current_lb;
+
+        REAL dwth_inc = (ca / rl) / (REAL)num_flood_levels;
+        REAL levee_dist = l_frac * (ca / rl);
+
+        REAL s_curr = riv_max_sto;
+        REAL dhgt_pre = (REAL)0.0;
+        REAL dwth_pre = rw;
+        REAL levee_base_sto = riv_max_sto;
+        REAL levee_fill_sto = riv_max_sto;
+        bool found_base = false;
+        bool found_fill = false;
+
+        int ilev = (int)(l_frac * (REAL)num_flood_levels);
+        REAL dsto_fil_B = (REAL)0.0;
+        REAL dwth_fil_B = (REAL)0.0;
+        REAL ddph_fil_B = (REAL)0.0;
+        REAL gradient_B = (REAL)0.0;
+        bool found_B = false;
+
+        bool scan_needed = true;
+        for (int i = 0; i < num_flood_levels; ++i) {
+            if (!scan_needed) break;
+
+            REAL depth_val = __ldg(flood_depth_table + (long)ci * num_flood_levels + i);
+            REAL dhgt_seg = fmax(depth_val - dhgt_pre, (REAL)1e-6);
+            REAL dwth_mid = dwth_pre + (REAL)0.5 * dwth_inc;
+            REAL dsto_seg = rl * dwth_mid * dhgt_seg;
+            REAL s_next = s_curr + dsto_seg;
+            REAL gradient = dhgt_seg / dwth_inc;
+
+            bool cond_base = (l_base_h > dhgt_pre) && (l_base_h <= depth_val);
+            REAL ratio_base = (l_base_h - dhgt_pre) / dhgt_seg;
+            REAL dsto_base_p = rl * (dwth_pre + (REAL)0.5 * ratio_base * dwth_inc) * (ratio_base * dhgt_seg);
+            if (cond_base && !found_base) levee_base_sto = s_curr + dsto_base_p;
+            found_base = found_base || cond_base;
+
+            bool cond_fill = (l_crown > dhgt_pre) && (l_crown <= depth_val);
+            REAL ratio_fill = (l_crown - dhgt_pre) / dhgt_seg;
+            REAL dsto_fill_p = rl * (dwth_pre + (REAL)0.5 * ratio_fill * dwth_inc) * (ratio_fill * dhgt_seg);
+            if (cond_fill && !found_fill) levee_fill_sto = s_curr + dsto_fill_p;
+            found_fill = found_fill || cond_fill;
+
+            REAL dhgt_dif_loop = l_crown - l_base_h;
+            REAL s_top_loop = levee_base_sto + (levee_dist + rw) * dhgt_dif_loop * rl;
+            REAL dsto_add_wedge = (levee_dist + rw) * (l_crown - depth_val) * rl;
+            REAL threshold = s_next + dsto_add_wedge;
+
+            bool cond_check = (i >= ilev) && !found_B;
+            bool cond_found = cond_check && (total_sto < threshold);
+            REAL current_lb = (i == ilev) ? s_top_loop : dsto_fil_B;
+            if (cond_check && !cond_found) {
+                dsto_fil_B = threshold;
+                dwth_fil_B = dwth_inc * (REAL)(i + 1) - levee_dist;
+                ddph_fil_B = depth_val - l_base_h;
+            } else {
+                dsto_fil_B = current_lb;
+            }
+            if (cond_found) gradient_B = gradient;
+            found_B = found_B || cond_found;
+
+            s_curr = s_next;
+            dhgt_pre = depth_val;
+            dwth_pre += dwth_inc;
+            scan_needed = !(found_base && found_fill && found_B);
         }
-        if (cond_found) gradient_B = gradient;
-        found_B = found_B || cond_found;
 
-        s_curr = s_next;
-        dhgt_pre = depth_val;
-        dwth_pre += dwth_inc;
-        scan_needed = !(found_base && found_fill && found_B);
-    }
+        REAL s_base_extra = s_curr + rl * dwth_pre * (l_base_h - dhgt_pre);
+        if (!found_base) levee_base_sto = (l_base_h > dhgt_pre) ? s_base_extra : riv_max_sto;
+        REAL s_fill_extra = s_curr + rl * dwth_pre * (l_crown - dhgt_pre);
+        if (!found_fill) levee_fill_sto = (l_crown > dhgt_pre) ? s_fill_extra : riv_max_sto;
 
-    REAL s_base_extra = s_curr + rl * dwth_pre * (l_base_h - dhgt_pre);
-    if (!found_base) levee_base_sto = (l_base_h > dhgt_pre) ? s_base_extra : riv_max_sto;
-    REAL s_fill_extra = s_curr + rl * dwth_pre * (l_crown - dhgt_pre);
-    if (!found_fill) levee_fill_sto = (l_crown > dhgt_pre) ? s_fill_extra : riv_max_sto;
+        REAL dhgt_dif = l_crown - l_base_h;
+        REAL s_top = levee_base_sto + (levee_dist + rw) * dhgt_dif * rl;
 
-    REAL dhgt_dif = l_crown - l_base_h;
-    REAL s_top = levee_base_sto + (levee_dist + rw) * dhgt_dif * rl;
+        bool is_case4 = total_sto >= levee_fill_sto;
+        bool is_case3 = (!is_case4) && (total_sto >= s_top);
+        bool is_case2 = (!is_case4) && (!is_case3) && (total_sto >= levee_base_sto);
 
-    bool is_case4 = total_sto >= levee_fill_sto;
-    bool is_case3 = (!is_case4) && (total_sto >= s_top);
-    bool is_case2 = (!is_case4) && (!is_case3) && (total_sto >= levee_base_sto);
+        REAL dsto_add_c2 = total_sto - levee_base_sto;
+        REAL dwth_add_c2 = levee_dist + rw;
+        REAL f_dph_c2 = l_base_h + dsto_add_c2 / dwth_add_c2 / rl;
+        REAL r_sto_c2 = riv_max_sto + rl * rw * f_dph_c2;
+        REAL r_dph_c2 = r_sto_c2 / rl / rw;
+        REAL f_sto_c2 = fmax(total_sto - r_sto_c2, (REAL)0.0);
+        REAL f_frc_c2 = l_frac;
 
-    REAL dsto_add_c2 = total_sto - levee_base_sto;
-    REAL dwth_add_c2 = levee_dist + rw;
-    REAL f_dph_c2 = l_base_h + dsto_add_c2 / dwth_add_c2 / rl;
-    REAL r_sto_c2 = riv_max_sto + rl * rw * f_dph_c2;
-    REAL r_dph_c2 = r_sto_c2 / rl / rw;
-    REAL f_sto_c2 = fmax(total_sto - r_sto_c2, (REAL)0.0);
-    REAL f_frc_c2 = l_frac;
+        REAL dsto_add_B = total_sto - dsto_fil_B;
+        REAL term_B = dwth_fil_B * dwth_fil_B + (REAL)2.0 * dsto_add_B / rl / (gradient_B + (REAL)1e-9);
+        REAL dwth_add_B = -dwth_fil_B + sqrt(fmax(term_B, (REAL)0.0));
+        REAL ddph_add_B = dwth_add_B * gradient_B;
+        REAL p_dph_B_found = l_base_h + ddph_fil_B + ddph_add_B;
+        REAL f_frc_B_found = (dwth_fil_B + levee_dist) / (dwth_inc * (REAL)num_flood_levels);
+        REAL ddph_add_B_extra = dsto_add_B / (dwth_fil_B * rl + (REAL)1e-9);
+        REAL p_dph_B_extra = l_base_h + ddph_fil_B + ddph_add_B_extra;
+        REAL p_dph_B = found_B ? p_dph_B_found : p_dph_B_extra;
+        REAL f_frc_B = found_B ? f_frc_B_found : (REAL)1.0;
 
-    REAL dsto_add_B = total_sto - dsto_fil_B;
-    REAL term_B = dwth_fil_B * dwth_fil_B + (REAL)2.0 * dsto_add_B / rl / (gradient_B + (REAL)1e-9);
-    REAL dwth_add_B = -dwth_fil_B + sqrt(fmax(term_B, (REAL)0.0));
-    REAL ddph_add_B = dwth_add_B * gradient_B;
-    REAL p_dph_B_found = l_base_h + ddph_fil_B + ddph_add_B;
-    REAL f_frc_B_found = (dwth_fil_B + levee_dist) / (dwth_inc * (REAL)num_flood_levels);
-    REAL ddph_add_B_extra = dsto_add_B / (dwth_fil_B * rl + (REAL)1e-9);
-    REAL p_dph_B_extra = l_base_h + ddph_fil_B + ddph_add_B_extra;
-    REAL p_dph_B = found_B ? p_dph_B_found : p_dph_B_extra;
-    REAL f_frc_B = found_B ? f_frc_B_found : (REAL)1.0;
+        REAL f_dph_c3 = l_crown;
+        REAL r_sto_c3 = riv_max_sto + rl * rw * f_dph_c3;
+        REAL r_dph_c3 = r_sto_c3 / rl / rw;
+        REAL f_sto_c3 = fmax(s_top - r_sto_c3, (REAL)0.0);
+        REAL p_dph_c3 = p_dph_B;
+        REAL f_frc_c3 = clamp01(f_frc_B);
 
-    REAL f_dph_c3 = l_crown;
-    REAL r_sto_c3 = riv_max_sto + rl * rw * f_dph_c3;
-    REAL r_dph_c3 = r_sto_c3 / rl / rw;
-    REAL f_sto_c3 = fmax(s_top - r_sto_c3, (REAL)0.0);
-    REAL p_sto_c3 = fmax(total_sto - r_sto_c3 - f_sto_c3, (REAL)0.0);
-    REAL p_dph_c3 = p_dph_B;
-    REAL f_frc_c3 = clamp01(f_frc_B);
+        REAL f_dph_c4 = fld_depth_curr;
+        REAL r_sto_c4 = riv_sto_curr;
+        REAL dsto_add_c4 = (f_dph_c4 - l_crown) * (levee_dist + rw) * rl;
+        REAL f_sto_c4 = fmax(s_top + dsto_add_c4 - r_sto_c4, (REAL)0.0);
+        REAL p_dph_c4 = f_dph_c4;
 
-    REAL f_dph_c4 = fld_depth_curr;
-    REAL r_sto_c4 = riv_sto_curr;
-    REAL dsto_add_c4 = (f_dph_c4 - l_crown) * (levee_dist + rw) * rl;
-    REAL f_sto_c4 = fmax(s_top + dsto_add_c4 - r_sto_c4, (REAL)0.0);
-    REAL p_sto_c4 = fmax(total_sto - r_sto_c4 - f_sto_c4, (REAL)0.0);
-    REAL p_dph_c4 = f_dph_c4;
+        REAL r_dph_curr = __ldg(river_depth + ci);
+        REAL f_frc_curr = __ldg(flood_fraction + ci);
 
-    REAL r_dph_curr = __ldg(river_depth + ci);
-    REAL f_frc_curr = __ldg(flood_fraction + ci);
+        REAL r_sto_candidate = is_case2 ? r_sto_c2 : (is_case3 ? r_sto_c3 : (is_case4 ? r_sto_c4 : riv_sto_curr));
+        REAL f_sto_candidate = is_case2 ? f_sto_c2 : (is_case3 ? f_sto_c3 : (is_case4 ? f_sto_c4 : fld_sto_curr));
+        bool no_levee_partition = !is_case2 && !is_case3 && !is_case4;
+        STO r_sto = (is_case4 || no_levee_partition)
+            ? riv_sto_curr_hp : fmin((STO)r_sto_candidate, total_sto_hp);
+        STO remaining_sto = total_sto_hp - r_sto;
+        remaining_sto = remaining_sto > (STO)0 ? remaining_sto : (STO)0;
+        STO f_sto_candidate_hp = (STO)f_sto_candidate;
+        STO f_sto = fmin(
+            f_sto_candidate_hp > (STO)0 ? f_sto_candidate_hp : (STO)0,
+            remaining_sto);
+        if (is_case2) f_sto = remaining_sto;
+        if (no_levee_partition) f_sto = fld_sto_curr_hp;
+        STO p_sto = remaining_sto - f_sto;
+        p_sto = p_sto > (STO)0 ? p_sto : (STO)0;
+        REAL r_dph = is_case2 ? r_dph_c2 : (is_case3 ? r_dph_c3 : r_dph_curr);
+        REAL f_dph = is_case2 ? f_dph_c2 : (is_case3 ? f_dph_c3 : fld_depth_curr);
+        REAL p_dph = is_case2 ? (REAL)0.0 : (is_case3 ? p_dph_c3 : (is_case4 ? p_dph_c4 : (REAL)0.0));
+        REAL f_frc = is_case2 ? f_frc_c2 : (is_case3 ? f_frc_c3 : f_frc_curr);
 
-    REAL r_sto = is_case2 ? r_sto_c2 : (is_case3 ? r_sto_c3 : (is_case4 ? r_sto_c4 : riv_sto_curr));
-    REAL f_sto = is_case2 ? f_sto_c2 : (is_case3 ? f_sto_c3 : (is_case4 ? f_sto_c4 : fld_sto_curr));
-    REAL p_sto = is_case2 ? (REAL)0.0 : (is_case3 ? p_sto_c3 : (is_case4 ? p_sto_c4 : (REAL)0.0));
-    REAL r_dph = is_case2 ? r_dph_c2 : (is_case3 ? r_dph_c3 : r_dph_curr);
-    REAL f_dph = is_case2 ? f_dph_c2 : (is_case3 ? f_dph_c3 : fld_depth_curr);
-    REAL p_dph = is_case2 ? (REAL)0.0 : (is_case3 ? p_dph_c3 : (is_case4 ? p_dph_c4 : (REAL)0.0));
-    REAL f_frc = is_case2 ? f_frc_c2 : (is_case3 ? f_frc_c3 : f_frc_curr);
+        if constexpr (LOG) {
+            STO total_new = r_sto + f_sto + p_sto;
+            log_sum[0] += (REAL)total_new * (REAL)1e-9;
+            log_sum[1] += (REAL)(total_new - total_sto_hp) * (REAL)1e-9;
+            log_sum[2] += (REAL)r_sto * (REAL)1e-9;
+            log_sum[3] += (REAL)f_sto * (REAL)1e-9;
+            log_sum[4] += f_frc * ca * (REAL)1e-9;
+        }
+
+        river_storage[ci] = r_sto;
+        flood_storage[ci] = f_sto;
+        protected_storage[ci] = p_sto;
+        river_depth[ci] = r_dph;
+        flood_depth[ci] = f_dph;
+        protected_depth[ci] = p_dph;
+        flood_fraction[ci] = f_frc;
+
+        }  // levee partition branch
+    }  // active lane
 
     if constexpr (LOG) {
-        int step = __ldg(current_step_ptr);
-        REAL total_new = r_sto + f_sto + p_sto;
-        atomicAdd(total_storage_stage_sum + step, total_new * (REAL)1e-9);
-        atomicAdd(total_stage_error_sum + step,
-                  (total_new - total_sto) * (REAL)1e-9);
-        atomicAdd(river_storage_sum + step, r_sto * (REAL)1e-9);
-        atomicAdd(flood_storage_sum + step, f_sto * (REAL)1e-9);
-        atomicAdd(flood_area_sum + step, f_frc * ca * (REAL)1e-9);
+        REAL* const destination[CMF_LEVEE_LOG_SUMS] = {
+            total_storage_stage_sum, total_stage_error_sum,
+            river_storage_sum, flood_storage_sum, flood_area_sum,
+        };
+        cmf_block_atomic_add<REAL, CMF_LEVEE_LOG_SUMS>(
+            log_sum, destination, step);
     }
-
-    river_storage[ci] = (STO)r_sto;
-    flood_storage[ci] = (STO)f_sto;
-    protected_storage[ci] = (STO)p_sto;
-    river_depth[ci] = r_dph;
-    flood_depth[ci] = f_dph;
-    protected_depth[ci] = p_dph;
-    flood_fraction[ci] = f_frc;
 }
 
 template <typename REAL, typename STO>
@@ -266,7 +302,8 @@ __global__ void k_levee_bif_outflow(
         REAL semi_depth;
         if (lv == 0) {
             REAL old_csd = __ldg(cs_depth + level_idx);
-            semi_depth = fmax(sqrt(upd_csd * old_csd), sqrt(upd_csd * (REAL)0.01));
+            semi_depth = sqrt(upd_csd * old_csd);
+            if (semi_depth <= (REAL)0.0) semi_depth = upd_csd;
         } else {
             semi_depth = upd_csd;
         }

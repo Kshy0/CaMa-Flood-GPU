@@ -87,14 +87,14 @@ def compute_flood_stage_kernel(
         river_storage_updated
     )
     flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
-    total_storage = tl.maximum(
+    total_storage_hp = tl.maximum(
         river_storage_updated + flood_storage_updated + protected_storage
         + runoff * time_step + inflow * time_step,
         0.0,
     )
 
     # Keep flood-stage arithmetic in the active computation dtype.
-    total_storage = hpfloat_to_compute_inline(total_storage, river_outflow)
+    total_storage = hpfloat_to_compute_inline(total_storage_hp, river_outflow)
 
     # ---- 2. Flood stage computation ----
     river_height        = tl.load(river_height_ptr        + offs, mask=mask)
@@ -157,10 +157,15 @@ def compute_flood_stage_kernel(
         tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
     )
 
-    river_storage_final = tl.where(
+    river_capacity = river_max_storage + river_length * river_width * flood_depth
+    river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+    river_storage_final_hp = tl.where(
         no_flood_cond,
-        total_storage,
-        tl.minimum(river_max_storage + river_length * river_width * flood_depth, total_storage)
+        total_storage_hp,
+        tl.minimum(river_capacity_hp, total_storage_hp),
+    )
+    river_storage_final = hpfloat_to_compute_inline(
+        river_storage_final_hp, river_outflow,
     )
     river_depth = river_storage_final / (river_length * river_width)
 
@@ -171,14 +176,16 @@ def compute_flood_stage_kernel(
         tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
     )
 
-    flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
+    flood_storage_final_hp = tl.maximum(
+        total_storage_hp - river_storage_final_hp, 0.0,
+    )
 
     # Return to zero
     tl.store(outgoing_storage_ptr + offs, 0.0, mask=mask)
 
     # Store outputs (in-place update)
-    tl.store(river_storage_ptr    + offs, river_storage_final, mask=mask)
-    tl.store(flood_storage_ptr    + offs, flood_storage_final, mask=mask)
+    tl.store(river_storage_ptr + offs, river_storage_final_hp, mask=mask)
+    tl.store(flood_storage_ptr + offs, flood_storage_final_hp, mask=mask)
     tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
@@ -243,9 +250,9 @@ def compute_flood_stage_log_kernel(
 
     if HAS_LEVEE:
         is_levee = tl.load(is_levee_ptr + offs, mask=mask, other=True)
-        non_levee = ~is_levee
+        non_levee = mask & (~is_levee)
     else:
-        non_levee = tl.full((BLOCK_SIZE,), True, tl.int1)
+        non_levee = mask
 
     # ---- 1. Storage update ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
@@ -266,7 +273,10 @@ def compute_flood_stage_log_kernel(
     if HAS_BIFURCATION:
         global_bifurcation_outflow = tl.load(global_bifurcation_outflow_ptr + offs, mask=mask, other=0.0)
     total_stage_pre = river_storage + flood_storage + protected_storage
-    tl.atomic_add(total_storage_pre_sum_ptr + current_step, tl.sum(total_stage_pre) * 1e-9)
+    tl.atomic_add(
+        total_storage_pre_sum_ptr + current_step,
+        tl.sum(tl.where(mask, total_stage_pre, 0.0)) * 1e-9,
+    )
 
     # Downcast hpfloat inputs to the active computation dtype.
     river_inflow = hpfloat_to_compute_inline(river_inflow, river_outflow)
@@ -287,21 +297,23 @@ def compute_flood_stage_log_kernel(
         river_storage_updated + flood_storage_updated + protected_storage
         + runoff * time_step + inflow * time_step
     )
-    tl.atomic_add(total_storage_next_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_storage_next, 0)) * 1e-9)
-    total_storage = tl.maximum(total_storage_next, 0.0)
-    tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_storage, 0)) * 1e-9)
-    tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_inflow + flood_inflow + inflow) * time_step, 0)) * 1e-9)
-    tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum(tl.where(non_levee, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
-    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff + inflow - river_outflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_storage_next_sum_ptr + current_step, tl.sum(tl.where(mask, total_storage_next, 0)) * 1e-9)
+    total_storage_hp = tl.maximum(total_storage_next, 0.0)
+    tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(tl.where(mask, total_storage_hp, 0)) * 1e-9)
+    tl.atomic_add(total_inflow_sum_ptr + current_step, tl.sum(tl.where(mask, (river_inflow + flood_inflow + inflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_outflow_sum_ptr + current_step, tl.sum(tl.where(mask, (river_outflow + flood_outflow) * time_step, 0)) * 1e-9)
+    tl.atomic_add(total_inflow_error_sum_ptr + current_step, tl.sum(tl.where(mask, total_stage_pre - total_storage_next + (river_inflow + flood_inflow + runoff + inflow - river_outflow - flood_outflow - (global_bifurcation_outflow if HAS_BIFURCATION else 0.0)) * time_step, 0)) * 1e-9)
 
     # Keep flood-stage arithmetic in the active computation dtype.
-    total_storage = hpfloat_to_compute_inline(total_storage, river_outflow)
+    total_storage = hpfloat_to_compute_inline(total_storage_hp, river_outflow)
 
     # ---- 2. Flood stage computation ----
-    river_height        = tl.load(river_height_ptr        + offs, mask=mask)
-    catchment_area     = tl.load(catchment_area_ptr     + offs, mask=mask)
-    river_width         = tl.load(river_width_ptr         + offs, mask=mask)
-    river_length        = tl.load(river_length_ptr        + offs, mask=mask)
+    river_height = tl.load(river_height_ptr + offs, mask=mask, other=0.0)
+    catchment_area = tl.load(
+        catchment_area_ptr + offs, mask=mask, other=1.0,
+    )
+    river_width = tl.load(river_width_ptr + offs, mask=mask, other=1.0)
+    river_length = tl.load(river_length_ptr + offs, mask=mask, other=1.0)
     
     river_max_storage = river_length * river_width * river_height
     catchment_width = catchment_area / river_length
@@ -319,7 +331,11 @@ def compute_flood_stage_log_kernel(
     next_flood_depth = 0.0
     
     for i in tl.static_range(num_flood_levels):
-        H_curr = tl.load(flood_depth_table_ptr + offs * num_flood_levels + i, mask=mask)
+        H_curr = tl.load(
+            flood_depth_table_ptr + offs * num_flood_levels + i,
+            mask=mask,
+            other=0.0,
+        )
         W_curr = river_width + (i + 1) * width_increment
         dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
         S_curr = S_accum + dS
@@ -358,10 +374,15 @@ def compute_flood_stage_log_kernel(
         tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
     )
 
-    river_storage_final = tl.where(
+    river_capacity = river_max_storage + river_length * river_width * flood_depth
+    river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+    river_storage_final_hp = tl.where(
         no_flood_cond,
-        total_storage,
-        tl.minimum(river_max_storage + river_length * river_width * flood_depth, total_storage)
+        total_storage_hp,
+        tl.minimum(river_capacity_hp, total_storage_hp),
+    )
+    river_storage_final = hpfloat_to_compute_inline(
+        river_storage_final_hp, river_outflow,
     )
     river_depth = river_storage_final / (river_length * river_width)
 
@@ -372,21 +393,31 @@ def compute_flood_stage_log_kernel(
     )
 
     flood_area    = flood_fraction * catchment_area
-    flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
+    flood_storage_final_hp = tl.maximum(
+        total_storage_hp - river_storage_final_hp, 0.0,
+    )
+    flood_storage_final = hpfloat_to_compute_inline(
+        flood_storage_final_hp, river_outflow,
+    )
 
     # log
-    total_storage_stage_new = river_storage_final + flood_storage_final
-    tl.atomic_add(total_storage_stage_sum_ptr + current_step, tl.sum(total_storage_stage_new) * 1e-9)
+    total_storage_stage_new = (
+        river_storage_final_hp + flood_storage_final_hp
+    )
+    tl.atomic_add(
+        total_storage_stage_sum_ptr + current_step,
+        tl.sum(tl.where(non_levee, total_storage_stage_new, 0.0)) * 1e-9,
+    )
     tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(tl.where(non_levee, river_storage_final, 0)) * 1e-9)
     tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(tl.where(non_levee, flood_storage_final, 0)) * 1e-9)
     tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(tl.where(non_levee, flood_area, 0)) * 1e-9)
-    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, (total_storage_stage_new - total_storage) * 1e-9, 0)))
+    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(tl.where(non_levee, (total_storage_stage_new - total_storage_hp) * 1e-9, 0)))
     # Return to zero
     tl.store(outgoing_storage_ptr + offs, 0.0, mask=mask)
 
     # Store outputs (in-place update)
-    tl.store(river_storage_ptr    + offs, river_storage_final, mask=mask)
-    tl.store(flood_storage_ptr    + offs, flood_storage_final, mask=mask)
+    tl.store(river_storage_ptr + offs, river_storage_final_hp, mask=mask)
+    tl.store(flood_storage_ptr + offs, flood_storage_final_hp, mask=mask)
     tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
@@ -508,12 +539,14 @@ def compute_flood_stage_batched_kernel(
             river_storage_updated
         )
         flood_storage_updated = tl.maximum(flood_storage_updated, 0.0)
-        total_storage = tl.maximum(
+        total_storage_hp = tl.maximum(
             river_storage_updated + flood_storage_updated + protected_storage
             + runoff * time_step + inflow * time_step,
             0.0,
         )
-        total_storage = hpfloat_to_compute_inline(total_storage, river_outflow)
+        total_storage = hpfloat_to_compute_inline(
+            total_storage_hp, river_outflow,
+        )
 
         # ---- 2. Flood stage computation ----
         # Use pre-loaded shared values or load per-trial batched values
@@ -590,10 +623,17 @@ def compute_flood_stage_batched_kernel(
             tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
         )
 
-        river_storage_final = tl.where(
+        river_capacity = (
+            river_max_storage + river_length * river_width * flood_depth
+        )
+        river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+        river_storage_final_hp = tl.where(
             no_flood_cond,
-            total_storage,
-            tl.minimum(river_max_storage + river_length * river_width * flood_depth, total_storage)
+            total_storage_hp,
+            tl.minimum(river_capacity_hp, total_storage_hp),
+        )
+        river_storage_final = hpfloat_to_compute_inline(
+            river_storage_final_hp, river_outflow,
         )
         river_depth = river_storage_final / (river_length * river_width)
 
@@ -603,14 +643,16 @@ def compute_flood_stage_batched_kernel(
             tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
         )
 
-        flood_storage_final = tl.maximum(total_storage - river_storage_final, 0.0)
+        flood_storage_final_hp = tl.maximum(
+            total_storage_hp - river_storage_final_hp, 0.0,
+        )
 
         # Return to zero
         tl.store(outgoing_storage_ptr + idx, 0.0, mask=mask)
 
         # Store outputs
-        tl.store(river_storage_ptr    + idx, river_storage_final, mask=mask)
-        tl.store(flood_storage_ptr    + idx, flood_storage_final, mask=mask)
+        tl.store(river_storage_ptr + idx, river_storage_final_hp, mask=mask)
+        tl.store(flood_storage_ptr + idx, flood_storage_final_hp, mask=mask)
         tl.store(protected_storage_ptr + idx, 0.0, mask=mask)
         tl.store(river_depth_ptr      + idx, river_depth, mask=mask)
         tl.store(flood_depth_ptr      + idx, flood_depth, mask=mask)

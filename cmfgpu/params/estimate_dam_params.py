@@ -199,13 +199,20 @@ def _extract_dam_stats(
         im = idx_max[d]
         for t in range(n_years):
             v = max_data[t, im]
-            annual_max_all[t, d] = v if v > 0.0 else 0.0
+            if not np.isfinite(v) or v >= 1e20 or v <= -999.0:
+                annual_max_all[t, d] = np.nan
+            else:
+                annual_max_all[t, d] = v if v > 0.0 else 0.0
         # mean
         s = 0.0
+        count = 0
         imn = idx_mean[d]
         for t in range(n_years):
-            s += mean_data[t, imn]
-        avg = s / n_years
+            value = mean_data[t, imn]
+            if np.isfinite(value) and value < 1e20 and value > -999.0:
+                s += value
+                count += 1
+        avg = s / count if count > 0 else 1e-10
         qn[d] = avg if avg > 1e-10 else 1e-10
 
     return annual_max_all, qn
@@ -616,28 +623,43 @@ def _write_dam_csv(
     n_dam = len(dam_ids)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "w") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         f.write(f"{n_dam}\n")
-        f.write(
-            "GRAND_ID,DamName,DamLat,DamLon,area_CaMa,"
-            "DamIX,DamIY,FldVol_mcm,ConVol_mcm,TotalVol_mcm,"
-            "Qn,Qf,year\n"
+        writer = csv.writer(f)
+        writer.writerow(
+            (
+                "GRAND_ID",
+                "DamName",
+                "DamLat",
+                "DamLon",
+                "area_CaMa",
+                "DamIX",
+                "DamIY",
+                "FldVol_mcm",
+                "ConVol_mcm",
+                "TotalVol_mcm",
+                "Qn",
+                "Qf",
+                "year",
+            )
         )
         for i in range(n_dam):
-            f.write(
-                f"{dam_ids[i]},"
-                f"{names[i]},"
-                f"{lats[i]:.4f},"
-                f"{lons[i]:.4f},"
-                f"{upareas[i]:.2f},"
-                f"{ix[i]},"
-                f"{iy[i]},"
-                f"{fld_vol[i]:.4f},"
-                f"{con_vol[i]:.4f},"
-                f"{tot_vol[i]:.4f},"
-                f"{qn[i]:.4f},"
-                f"{qf[i]:.4f},"
-                f"{years[i]}\n"
+            writer.writerow(
+                (
+                    dam_ids[i],
+                    names[i],
+                    f"{lats[i]:.4f}",
+                    f"{lons[i]:.4f}",
+                    f"{upareas[i]:.2f}",
+                    ix[i],
+                    iy[i],
+                    f"{fld_vol[i]:.4f}",
+                    f"{con_vol[i]:.4f}",
+                    f"{tot_vol[i]:.4f}",
+                    f"{qn[i]:.4f}",
+                    f"{qf[i]:.4f}",
+                    years[i],
+                )
             )
 
 
@@ -698,8 +720,8 @@ def _write_dam_to_nc(
                     v.setncattr("long_name", long_name)
 
         _put("reservoir_id",
-             np.arange(n_res, dtype=np.int64), "i8",
-             long_name="reservoir index (0-based)")
+             np.asarray(dam_ids, dtype=np.int64), "i8",
+             long_name="GRanD reservoir identifier")
         _put("reservoir_catchment_id",
              dam_cids, "i8",
              long_name="catchment id of this reservoir")
@@ -879,12 +901,29 @@ def compute_dam_discharge_from_timeseries(
     with Dataset(str(max_nc), "r") as ds:
         q_cids = _read_nc_catchment_ids(ds)
         # annual_max: (time, saved_points)
-        max_data = np.asarray(ds.variables[annual_max_var][:]).astype(np.float64)
+        max_data = np.ma.asarray(
+            ds.variables[annual_max_var][:], dtype=np.float64,
+        ).filled(np.nan)
 
     with Dataset(str(mean_nc), "r") as ds:
         q_cids_mean = _read_nc_catchment_ids(ds)
         # annual_mean: (time, saved_points)
-        mean_data = np.asarray(ds.variables[annual_mean_var][:]).astype(np.float64)
+        mean_data = np.ma.asarray(
+            ds.variables[annual_mean_var][:], dtype=np.float64,
+        ).filled(np.nan)
+
+    if max_data.ndim != 2 or mean_data.ndim != 2:
+        raise ValueError(
+            "Dam outflow statistics must be 2-D (time, catchment): "
+            f"{annual_max_var} has shape {max_data.shape}, "
+            f"{annual_mean_var} has shape {mean_data.shape}"
+        )
+    if max_data.shape[0] != mean_data.shape[0]:
+        raise ValueError(
+            "Time-length mismatch between dam outflow statistics: "
+            f"{max_nc.name}:{annual_max_var} has {max_data.shape[0]} rows, "
+            f"{mean_nc.name}:{annual_mean_var} has {mean_data.shape[0]} rows"
+        )
 
     # ---- Validate catchment_id consistency ----
     same_layout = np.array_equal(q_cids, q_cids_mean)

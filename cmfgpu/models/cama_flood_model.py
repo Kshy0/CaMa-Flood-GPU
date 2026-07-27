@@ -8,6 +8,7 @@
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
 """
 
+import math
 from datetime import datetime
 from typing import ClassVar, Dict, Mapping, Optional, Type, Union
 
@@ -113,22 +114,51 @@ class CaMaFlood(AbstractModel):
         sea_surface_elevation: Optional[torch.Tensor] = None,
         output_enabled: bool = True,
     ) -> None:
-        """
-        Advance the model by one time step using the provided runoff input.
+        """Advance the hydraulic model by one outer time step."""
 
-        Statistics windows are inferred from the model's configured intervals.
+        time_step = float(time_step)
+        if not math.isfinite(time_step) or time_step <= 0:
+            raise ValueError("time_step must be finite and greater than zero")
+        if not self.has_module("adaptive_time") and (
+            type(default_num_sub_steps) is not int
+            or default_num_sub_steps < 1
+        ):
+            raise ValueError(
+                "default_num_sub_steps must be a positive integer"
+            )
 
-        Args:
-            runoff (torch.Tensor): Input runoff tensor for this time step.
-            inflow (torch.Tensor, optional): Compact prescribed discharge on
-                ``InflowModule.inflow_catchment_id``. It remains a separate
-                component until the primal physics boundary.
-            sea_surface_elevation (torch.Tensor, optional): Compact absolute
-                downstream water levels on ``SeaLevelModule.sea_level_catchment_id``.
-            time_step (float): Duration of the time step (seconds).
-            default_num_sub_steps (int): Default sub-steps if adaptive time stepping is disabled.
-            current_time (Optional[datetime]): Current simulation time. Used for logging.
-        """
+        if self.has_module("adaptive_time"):
+            self.adaptive_time.max_sub_steps.fill_(0)
+            compute_adaptive_time_step(outer_time_step=time_step)
+            if self.world_size > 1:
+                all_reduce_(self.adaptive_time.max_sub_steps, reduction="max")
+
+            # Take the maximum across all trials if batched
+            requested_sub_steps = int(
+                self.adaptive_time.max_sub_steps.max().item()
+            )
+            if requested_sub_steps < 0:
+                raise RuntimeError(
+                    "Adaptive CFL kernel returned a negative sub-step count"
+                )
+            if requested_sub_steps == torch.iinfo(torch.int32).max:
+                raise RuntimeError(
+                    "Adaptive CFL calculation produced a non-finite value or "
+                    "a sub-step count outside the int32 kernel ABI. Check "
+                    "river depth and downstream-distance inputs."
+                )
+            num_sub_steps = requested_sub_steps
+            if num_sub_steps == 0:
+                # No CFL-constrained cells (all cells are dam-related).
+                num_sub_steps = 1
+            time_sub_step = time_step / num_sub_steps
+        else:
+            num_sub_steps = default_num_sub_steps
+            time_sub_step = time_step / num_sub_steps
+
+        # CFL selection depends only on the state at the end of the preceding
+        # outer step.  Transfer this step's forcing afterwards so a rejected
+        # sub-step count cannot partially overwrite runoff/boundary inputs.
         copy_input(
             self.base.runoff,
             runoff,
@@ -153,22 +183,6 @@ class CaMaFlood(AbstractModel):
             name="sea_surface_elevation",
             trial_broadcast=self.num_trials is not None,
         )
-        if self.has_module("adaptive_time"):
-            self.adaptive_time.max_sub_steps.fill_(0)
-            compute_adaptive_time_step(outer_time_step=time_step)
-            if self.world_size > 1:
-                all_reduce_(self.adaptive_time.max_sub_steps, reduction="max")
-
-            # Take the maximum across all trials if batched
-            num_sub_steps = int(self.adaptive_time.max_sub_steps.max().item())
-            if num_sub_steps < 1:
-                num_sub_steps = 1
-            time_sub_step = time_step / num_sub_steps
-        else:
-            num_sub_steps = int(default_num_sub_steps)
-            if num_sub_steps < 1:
-                raise ValueError("default_num_sub_steps must be positive")
-            time_sub_step = time_step / num_sub_steps
         if self.has_module("log"):
             self.log.set_time(time_sub_step, num_sub_steps, current_time)
 
@@ -212,7 +226,16 @@ class CaMaFlood(AbstractModel):
             self.base.current_step.fill_(num_sub_steps - 1)
 
         if self.has_module("log"):
-            if self.world_size > 1:
-                self.log.gather_results()
-            if self.rank == 0 and output_enabled:
-                self.log.write_step(self.log_path)
+            wrote_log = False
+            try:
+                if self.world_size > 1:
+                    self.log.gather_results()
+                if self.rank == 0 and output_enabled:
+                    self.log.write_step(self.log_path)
+                    wrote_log = True
+            finally:
+                # write_step clears buffers on success. Disabled output,
+                # non-destination ranks, and failed writes must also start the
+                # next outer step from zero rather than re-accumulating data.
+                if not wrote_log:
+                    self.log.clear_buffers()

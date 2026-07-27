@@ -217,10 +217,11 @@ static inline BifurcationLevelResult bifurcation_level_inline(
     BifurcationLevelResult result;
     result.cross_section_depth = max(
         maximum_water_surface - elevation, 0.0f);
+    float implicit_flow_depth = sqrt(
+        result.cross_section_depth * previous_cross_section_depth);
     float flow_depth = semi_implicit_depth
-        ? max(
-            sqrt(result.cross_section_depth * previous_cross_section_depth),
-            sqrt(result.cross_section_depth * 0.01f))
+        ? (implicit_flow_depth <= 0.0f
+            ? result.cross_section_depth : implicit_flow_depth)
         : result.cross_section_depth;
     result.outflow = 0.0f;
     if (flow_depth > 1e-5f) {
@@ -233,6 +234,36 @@ static inline BifurcationLevelResult bifurcation_level_inline(
         result.outflow = numerator / denominator;
     }
     return result;
+}
+
+// Fold one per-levee value across the threadgroup and issue a single atomic;
+// see the identical helper in storage.metal.  Every thread must call this
+// (threadgroup barriers); ``scratch`` is reusable on return.
+static inline void cmf_block_atomic_add(
+    threadgroup float* scratch,
+    uint lid,
+    uint group_threads,
+    float value,
+    device atomic_float* destination
+) {
+    scratch[lid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // dispatchThreads permits a short final threadgroup; fold odd tail lanes.
+    for (uint active_threads = group_threads; active_threads > 1;
+            active_threads = (active_threads + 1) / 2) {
+        uint next_active = (active_threads + 1) / 2;
+        uint pair = lid + next_active;
+        if (pair < active_threads) {
+            scratch[lid] += scratch[pair];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0 && scratch[0] != 0.0f) {
+        atomic_fetch_add_explicit(
+            destination, scratch[0], memory_order_relaxed);
+    }
+    // Ensure the reduction is consumed before the caller reuses ``scratch``.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_stage
@@ -293,7 +324,19 @@ long num_levees = *args.num_levees;
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_stage_log
 long num_levees = *args.num_levees;
-    if ((long)i >= num_levees) return;
+    threadgroup float log_scratch[HF_BLOCK_SIZE];
+
+    // Out-of-range lanes contribute 0 so every thread reaches the barriers.
+    bool active_lane = (long)i < num_levees;
+    int current_step = args.current_step_ptr[0];
+
+    float log_storage_stage = 0.0f;
+    float log_river_storage = 0.0f;
+    float log_flood_storage = 0.0f;
+    float log_flood_area = 0.0f;
+    float log_stage_error = 0.0f;
+
+    if (active_lane) {
 
     long levee = (long)i;
     int catchment = args.levee_catchment_idx_ptr[levee];
@@ -317,26 +360,13 @@ long num_levees = *args.num_levees;
             + (long)catchment * (long)num_flood_levels,
         num_flood_levels);
 
-    int current_step = args.current_step_ptr[0];
     float stage_storage = result.river_storage
         + result.flood_storage + result.protected_storage;
-    atomic_fetch_add_explicit(
-        args.total_storage_stage_sum_ptr + current_step,
-        stage_storage * 1e-9f, memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.river_storage_sum_ptr + current_step,
-        result.river_storage * 1e-9f, memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.flood_storage_sum_ptr + current_step,
-        result.flood_storage * 1e-9f, memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.flood_area_sum_ptr + current_step,
-        result.flood_fraction * catchment_area * 1e-9f,
-        memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.total_stage_error_sum_ptr + current_step,
-        (stage_storage - total_storage) * 1e-9f,
-        memory_order_relaxed);
+    log_storage_stage = stage_storage * 1e-9f;
+    log_river_storage = result.river_storage * 1e-9f;
+    log_flood_storage = result.flood_storage * 1e-9f;
+    log_flood_area = result.flood_fraction * catchment_area * 1e-9f;
+    log_stage_error = (stage_storage - total_storage) * 1e-9f;
 
     args.river_storage_ptr[catchment] = result.river_storage;
     args.flood_storage_ptr[catchment] = result.flood_storage;
@@ -345,6 +375,22 @@ long num_levees = *args.num_levees;
     args.flood_depth_ptr[catchment] = result.flood_depth;
     args.protected_depth_ptr[catchment] = result.protected_depth;
     args.flood_fraction_ptr[catchment] = result.flood_fraction;
+
+    }  // active_lane
+
+    // One atomic per counter per threadgroup, reusing a single scratch buffer.
+    long group_start = (long)i - (long)lid;
+    uint group_threads = (uint)min((long)tpg, num_levees - group_start);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_storage_stage,
+        args.total_storage_stage_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_river_storage,
+        args.river_storage_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_flood_storage,
+        args.flood_storage_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_flood_area,
+        args.flood_area_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_stage_error,
+        args.total_stage_error_sum_ptr + current_step);
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_bifurcation_outflow
 long num_paths = *args.num_bifurcation_paths;

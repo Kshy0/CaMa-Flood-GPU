@@ -18,6 +18,5 @@ fortran/
 *_cpu.py
 *cutile.py
 cmfgpu/phys/cutile/
-grad*
 downscale*
 .specstory/

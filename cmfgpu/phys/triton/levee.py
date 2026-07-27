@@ -16,6 +16,50 @@ from cmfgpu.phys.triton.utils import (
 
 
 @triton.jit
+def levee_storage_partition_inline(
+    total_storage_hp,
+    river_storage_curr_hp,
+    flood_storage_curr_hp,
+    river_storage_candidate,
+    flood_storage_candidate,
+    is_case2,
+    is_case3,
+    is_case4,
+):
+    """Partition storage without narrowing the hpfloat conserved total."""
+    no_levee_partition = ~(is_case2 | is_case3 | is_case4)
+    river_candidate_hp = (
+        tl.zeros_like(total_storage_hp) + river_storage_candidate
+    )
+    river_storage_hp = tl.minimum(river_candidate_hp, total_storage_hp)
+    river_storage_hp = tl.where(
+        is_case4 | no_levee_partition,
+        river_storage_curr_hp,
+        river_storage_hp,
+    )
+    remaining_storage_hp = tl.maximum(
+        total_storage_hp - river_storage_hp, 0.0,
+    )
+    flood_candidate_hp = (
+        tl.zeros_like(total_storage_hp) + flood_storage_candidate
+    )
+    flood_storage_hp = tl.minimum(
+        tl.maximum(flood_candidate_hp, 0.0), remaining_storage_hp,
+    )
+    flood_storage_hp = tl.where(
+        is_case2,
+        remaining_storage_hp,
+        tl.where(
+            no_levee_partition, flood_storage_curr_hp, flood_storage_hp,
+        ),
+    )
+    protected_storage_hp = tl.maximum(
+        remaining_storage_hp - flood_storage_hp, 0.0,
+    )
+    return river_storage_hp, flood_storage_hp, protected_storage_hp
+
+
+@triton.jit
 def compute_levee_stage_kernel(
     levee_catchment_idx_ptr,
     river_storage_ptr,                      # *f64
@@ -59,15 +103,23 @@ def compute_levee_stage_kernel(
     # levee_base_storage calculated below
     
     # Load current state (computed by standard kernel)
-    river_storage_curr = tl.load(river_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
-    flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    river_storage_curr_hp = tl.load(
+        river_storage_ptr + levee_catchment_idx, mask=mask, other=0.0,
+    )
+    flood_storage_curr_hp = tl.load(
+        flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0,
+    )
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
-    
-    # Downcast hpfloat storage to the active computation dtype.
-    river_storage_curr = hpfloat_to_compute_inline(river_storage_curr, river_length)
-    flood_storage_curr = hpfloat_to_compute_inline(flood_storage_curr, river_length)
 
-    total_storage = river_storage_curr + flood_storage_curr
+    total_storage_hp = river_storage_curr_hp + flood_storage_curr_hp
+    # Downcast hpfloat storage to the active computation dtype.
+    river_storage_curr = hpfloat_to_compute_inline(
+        river_storage_curr_hp, river_length,
+    )
+    flood_storage_curr = hpfloat_to_compute_inline(
+        flood_storage_curr_hp, river_length,
+    )
+    total_storage = hpfloat_to_compute_inline(total_storage_hp, river_length)
     
     # Derived parameters
     river_max_storage = river_length * river_width * river_height
@@ -196,7 +248,6 @@ def compute_levee_stage_kernel(
     r_sto_c3 = river_max_storage + river_length * river_width * f_dph_c3
     r_dph_c3 = r_sto_c3 / river_length / river_width
     f_sto_c3 = tl.maximum(s_top - r_sto_c3, 0.0)
-    p_sto_c3 = tl.maximum(total_storage - r_sto_c3 - f_sto_c3, 0.0)
     p_dph_c3 = p_dph_B
     f_frc_c3 = tl.clamp(f_frc_B, 0.0, 1.0)
     
@@ -206,23 +257,28 @@ def compute_levee_stage_kernel(
     
     dsto_add_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
     f_sto_c4 = tl.maximum(s_top + dsto_add_c4 - r_sto_c4, 0.0)
-    p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
     p_dph_c4 = f_dph_c4
     
     # --- Select Results ---
     r_dph_curr = tl.load(river_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
-    r_sto = tl.where(is_case2, r_sto_c2,
+    r_sto_candidate = tl.where(is_case2, r_sto_c2,
              tl.where(is_case3, r_sto_c3,
               tl.where(is_case4, r_sto_c4, river_storage_curr)))
               
-    f_sto = tl.where(is_case2, f_sto_c2,
+    f_sto_candidate = tl.where(is_case2, f_sto_c2,
              tl.where(is_case3, f_sto_c3,
               tl.where(is_case4, f_sto_c4, flood_storage_curr)))
-              
-    p_sto = tl.where(is_case2, 0.0,
-             tl.where(is_case3, p_sto_c3,
-              tl.where(is_case4, p_sto_c4, 0.0)))
+    r_sto, f_sto, p_sto = levee_storage_partition_inline(
+        total_storage_hp,
+        river_storage_curr_hp,
+        flood_storage_curr_hp,
+        r_sto_candidate,
+        f_sto_candidate,
+        is_case2,
+        is_case3,
+        is_case4,
+    )
               
     r_dph = tl.where(is_case2, r_dph_c2,
              tl.where(is_case3, r_dph_c3, r_dph_curr))
@@ -297,15 +353,23 @@ def compute_levee_stage_log_kernel(
     # levee_base_storage calculated below
     
     # Load current state
-    river_storage_curr = tl.load(river_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
-    flood_storage_curr = tl.load(flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0)
+    river_storage_curr_hp = tl.load(
+        river_storage_ptr + levee_catchment_idx, mask=mask, other=0.0,
+    )
+    flood_storage_curr_hp = tl.load(
+        flood_storage_ptr + levee_catchment_idx, mask=mask, other=0.0,
+    )
     flood_depth_curr = tl.load(flood_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
-    
-    # Downcast hpfloat storage to the active computation dtype.
-    river_storage_curr = hpfloat_to_compute_inline(river_storage_curr, river_length)
-    flood_storage_curr = hpfloat_to_compute_inline(flood_storage_curr, river_length)
 
-    total_storage = river_storage_curr + flood_storage_curr
+    total_storage_hp = river_storage_curr_hp + flood_storage_curr_hp
+    # Downcast hpfloat storage to the active computation dtype.
+    river_storage_curr = hpfloat_to_compute_inline(
+        river_storage_curr_hp, river_length,
+    )
+    flood_storage_curr = hpfloat_to_compute_inline(
+        flood_storage_curr_hp, river_length,
+    )
+    total_storage = hpfloat_to_compute_inline(total_storage_hp, river_length)
     
     # Derived parameters
     river_max_storage = river_length * river_width * river_height
@@ -434,7 +498,6 @@ def compute_levee_stage_log_kernel(
     r_sto_c3 = river_max_storage + river_length * river_width * f_dph_c3
     r_dph_c3 = r_sto_c3 / river_length / river_width
     f_sto_c3 = tl.maximum(s_top - r_sto_c3, 0.0)
-    p_sto_c3 = tl.maximum(total_storage - r_sto_c3 - f_sto_c3, 0.0)
     p_dph_c3 = p_dph_B
     f_frc_c3 = tl.clamp(f_frc_B, 0.0, 1.0)
     
@@ -444,23 +507,28 @@ def compute_levee_stage_log_kernel(
     
     dsto_add_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
     f_sto_c4 = tl.maximum(s_top + dsto_add_c4 - r_sto_c4, 0.0)
-    p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
     p_dph_c4 = f_dph_c4
     
     # --- Select Results ---
     r_dph_curr = tl.load(river_depth_ptr + levee_catchment_idx, mask=mask, other=0.0)
     
-    r_sto = tl.where(is_case2, r_sto_c2,
+    r_sto_candidate = tl.where(is_case2, r_sto_c2,
              tl.where(is_case3, r_sto_c3,
               tl.where(is_case4, r_sto_c4, river_storage_curr)))
               
-    f_sto = tl.where(is_case2, f_sto_c2,
+    f_sto_candidate = tl.where(is_case2, f_sto_c2,
              tl.where(is_case3, f_sto_c3,
               tl.where(is_case4, f_sto_c4, flood_storage_curr)))
-              
-    p_sto = tl.where(is_case2, 0.0,
-             tl.where(is_case3, p_sto_c3,
-              tl.where(is_case4, p_sto_c4, 0.0)))
+    r_sto, f_sto, p_sto = levee_storage_partition_inline(
+        total_storage_hp,
+        river_storage_curr_hp,
+        flood_storage_curr_hp,
+        r_sto_candidate,
+        f_sto_candidate,
+        is_case2,
+        is_case3,
+        is_case4,
+    )
               
     r_dph = tl.where(is_case2, r_dph_c2,
              tl.where(is_case3, r_dph_c3, r_dph_curr))
@@ -482,7 +550,7 @@ def compute_levee_stage_log_kernel(
     tl.atomic_add(river_storage_sum_ptr + current_step, tl.sum(r_sto) * 1e-9)
     tl.atomic_add(flood_storage_sum_ptr + current_step, tl.sum(f_sto) * 1e-9)
     tl.atomic_add(flood_area_sum_ptr + current_step, tl.sum(f_frc * catchment_area) * 1e-9)
-    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(total_storage_stage_new - total_storage) * 1e-9)
+    tl.atomic_add(total_stage_error_sum_ptr + current_step, tl.sum(total_storage_stage_new - total_storage_hp) * 1e-9)
 
     # Store results
     tl.store(river_storage_ptr + levee_catchment_idx, r_sto, mask=mask)
@@ -572,9 +640,14 @@ def compute_levee_bifurcation_outflow_kernel(
         # Level > 0: Explicit (no semi-implicit)
         
         if level == 0:
-            bifurcation_semi_implicit_flow_depth = tl.maximum(
-                tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
-                tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
+            semi_implicit_depth = tl.sqrt(
+                updated_bifurcation_cross_section_depth
+                * bifurcation_cross_section_depth,
+            )
+            bifurcation_semi_implicit_flow_depth = tl.where(
+                semi_implicit_depth <= 0.0,
+                updated_bifurcation_cross_section_depth,
+                semi_implicit_depth,
             )
         else:
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth
@@ -695,15 +768,29 @@ def compute_levee_stage_batched_kernel(
         levee_base_height = tl.load(levee_base_height_ptr + trial_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_base_height else levee_base_height_shared
 
         # Load current state
-        river_storage_curr = tl.load(river_storage_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
-        flood_storage_curr = tl.load(flood_storage_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
+        river_storage_curr_hp = tl.load(
+            river_storage_ptr + trial_offset_catchments + levee_catchment_idx,
+            mask=mask,
+            other=0.0,
+        )
+        flood_storage_curr_hp = tl.load(
+            flood_storage_ptr + trial_offset_catchments + levee_catchment_idx,
+            mask=mask,
+            other=0.0,
+        )
         flood_depth_curr = tl.load(flood_depth_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
 
+        total_storage_hp = river_storage_curr_hp + flood_storage_curr_hp
         # Downcast hpfloat storage to computation dtype
-        river_storage_curr = hpfloat_to_compute_inline(river_storage_curr, river_length)
-        flood_storage_curr = hpfloat_to_compute_inline(flood_storage_curr, river_length)
-
-        total_storage = river_storage_curr + flood_storage_curr
+        river_storage_curr = hpfloat_to_compute_inline(
+            river_storage_curr_hp, river_length,
+        )
+        flood_storage_curr = hpfloat_to_compute_inline(
+            flood_storage_curr_hp, river_length,
+        )
+        total_storage = hpfloat_to_compute_inline(
+            total_storage_hp, river_length,
+        )
 
         # Use pre-computed derived constants when possible
         if batched_river_length or batched_river_width or batched_river_height:
@@ -846,7 +933,6 @@ def compute_levee_stage_batched_kernel(
         r_sto_c3 = river_max_storage + river_length * river_width * f_dph_c3
         r_dph_c3 = r_sto_c3 / river_length / river_width
         f_sto_c3 = tl.maximum(s_top - r_sto_c3, 0.0)
-        p_sto_c3 = tl.maximum(total_storage - r_sto_c3 - f_sto_c3, 0.0)
         p_dph_c3 = p_dph_B
         f_frc_c3 = tl.clamp(f_frc_B, 0.0, 1.0)
 
@@ -856,23 +942,28 @@ def compute_levee_stage_batched_kernel(
 
         dsto_add_c4 = (f_dph_c4 - levee_crown_height) * (levee_distance + river_width) * river_length
         f_sto_c4 = tl.maximum(s_top + dsto_add_c4 - r_sto_c4, 0.0)
-        p_sto_c4 = tl.maximum(total_storage - r_sto_c4 - f_sto_c4, 0.0)
         p_dph_c4 = f_dph_c4
 
         # --- Select Results ---
         r_dph_curr = tl.load(river_depth_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
 
-        r_sto = tl.where(is_case2, r_sto_c2,
+        r_sto_candidate = tl.where(is_case2, r_sto_c2,
                 tl.where(is_case3, r_sto_c3,
                 tl.where(is_case4, r_sto_c4, river_storage_curr)))
 
-        f_sto = tl.where(is_case2, f_sto_c2,
+        f_sto_candidate = tl.where(is_case2, f_sto_c2,
                 tl.where(is_case3, f_sto_c3,
                 tl.where(is_case4, f_sto_c4, flood_storage_curr)))
-
-        p_sto = tl.where(is_case2, 0.0,
-                tl.where(is_case3, p_sto_c3,
-                tl.where(is_case4, p_sto_c4, 0.0)))
+        r_sto, f_sto, p_sto = levee_storage_partition_inline(
+            total_storage_hp,
+            river_storage_curr_hp,
+            flood_storage_curr_hp,
+            r_sto_candidate,
+            f_sto_candidate,
+            is_case2,
+            is_case3,
+            is_case4,
+        )
 
         r_dph = tl.where(is_case2, r_dph_c2,
                 tl.where(is_case3, r_dph_c3, r_dph_curr))
@@ -995,9 +1086,14 @@ def compute_levee_bifurcation_outflow_batched_kernel(
         # Level > 0: Explicit (no semi-implicit)
         
         if level == 0:
-            bifurcation_semi_implicit_flow_depth = tl.maximum(
-                tl.sqrt(updated_bifurcation_cross_section_depth * bifurcation_cross_section_depth),
-                tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
+            semi_implicit_depth = tl.sqrt(
+                updated_bifurcation_cross_section_depth
+                * bifurcation_cross_section_depth,
+            )
+            bifurcation_semi_implicit_flow_depth = tl.where(
+                semi_implicit_depth <= 0.0,
+                updated_bifurcation_cross_section_depth,
+                semi_implicit_depth,
             )
         else:
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth

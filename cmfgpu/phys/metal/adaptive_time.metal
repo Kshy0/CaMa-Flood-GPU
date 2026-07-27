@@ -1,5 +1,5 @@
 // HYDROFORGE METAL KERNEL BODY: compute_adaptive_time_step
-    threadgroup float shared_min[HF_BLOCK_SIZE];
+    threadgroup int shared_steps[HF_BLOCK_SIZE];
 
     long num_catchments = *args.num_catchments;
     long num_trials = *args.num_trials;
@@ -7,7 +7,7 @@
     float outer_dt = *args.outer_time_step;
 
     if ((long)i >= total) {
-        shared_min[lid] = outer_dt;
+        shared_steps[lid] = 0;
     } else {
         long catchment = (long)i % num_catchments;
         long trial_offset = ((long)i / num_catchments) * num_catchments;
@@ -19,27 +19,51 @@
 
         long distance_offset = batched_downstream_distance
             ? trial_offset + catchment : catchment;
-        float downstream_distance =
-            args.downstream_distance_ptr[distance_offset];
-        float river_depth = args.river_depth_ptr[trial_offset + catchment];
-        float depth = max(river_depth, 0.01f);
-        float candidate = *args.adaptive_time_factor
-            * downstream_distance / sqrt(*args.gravity * depth);
-        shared_min[lid] = skip ? outer_dt : min(candidate, outer_dt);
+        if (skip) {
+            shared_steps[lid] = 0;
+        } else {
+            float downstream_distance =
+                args.downstream_distance_ptr[distance_offset];
+            float river_depth = args.river_depth_ptr[trial_offset + catchment];
+            if (!isfinite(downstream_distance)
+                    || downstream_distance <= 0.0f
+                    || !isfinite(river_depth)) {
+                shared_steps[lid] = 0x7fffffff;
+            } else {
+                float depth = max(river_depth, 0.01f);
+                float candidate = *args.adaptive_time_factor
+                    * downstream_distance / sqrt(*args.gravity * depth);
+                float minimum_dt = min(candidate, outer_dt);
+                float sub_steps_float =
+                    floor(outer_dt / minimum_dt - 0.01f) + 1.0f;
+                shared_steps[lid] = (
+                    !isfinite(sub_steps_float)
+                    || sub_steps_float >= 2147483647.0f
+                ) ? 0x7fffffff : (int)sub_steps_float;
+            }
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = tpg / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            shared_min[lid] = min(
-                shared_min[lid], shared_min[lid + stride]);
+    // dispatchThreads permits a short final threadgroup.  Derive its logical
+    // active width from the grid extent, then fold every odd tail lane.
+    long group_start = (long)i - (long)lid;
+    uint group_threads = (uint)min((long)tpg, total - group_start);
+    for (uint active_threads = group_threads; active_threads > 1;
+            active_threads = (active_threads + 1) / 2) {
+        uint next_active = (active_threads + 1) / 2;
+        uint pair = lid + next_active;
+        if (pair < active_threads) {
+            shared_steps[lid] = max(
+                shared_steps[lid], shared_steps[pair]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (lid == 0) {
-        float minimum_dt = shared_min[0];
-        int sub_steps = (int)floor(outer_dt / minimum_dt + 0.49f) + 1;
-        atomic_fetch_max_explicit(
-            args.max_sub_steps_ptr, sub_steps, memory_order_relaxed);
+        int sub_steps = shared_steps[0];
+        if (sub_steps > 0) {
+            atomic_fetch_max_explicit(
+                args.max_sub_steps_ptr, sub_steps, memory_order_relaxed);
+        }
     }

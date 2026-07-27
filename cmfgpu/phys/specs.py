@@ -117,6 +117,7 @@ OUTFLOW = _spec(
         "flood_manning_ptr",
         "flood_depth_ptr",
         "protected_depth_ptr",
+        "is_levee_ptr",
         "catchment_elevation_ptr",
         "downstream_distance_ptr",
         "flood_storage_ptr",
@@ -136,6 +137,7 @@ OUTFLOW = _spec(
         "HAS_TOTAL_STORAGE",
         "HAS_WATER_SURFACE",
         "HAS_PROTECTED_WATER_SURFACE",
+        "HAS_LEVEE",
         "is_dam_upstream_ptr",
         "HAS_RESERVOIR",
         "MIN_KINEMATIC_SLOPE",
@@ -149,6 +151,7 @@ OUTFLOW = _spec(
         "batched_river_length",
         "batched_river_height",
         "batched_catchment_elevation",
+        "batched_downstream_distance",
         "num_sea_level_boundaries",
     ),
     "num_catchments",
@@ -157,6 +160,7 @@ OUTFLOW = _spec(
         "total_storage_ptr": None,
         "water_surface_elevation_ptr": None,
         "protected_water_surface_elevation_ptr": None,
+        "is_levee_ptr": "HAS_LEVEE",
         "is_dam_upstream_ptr": "HAS_RESERVOIR",
         "sea_surface_elevation_ptr": "HAS_SEA_LEVEL",
         "catchment_sea_level_idx_ptr": "HAS_SEA_LEVEL",
@@ -166,6 +170,7 @@ OUTFLOW = _spec(
         "HAS_TOTAL_STORAGE": "bool",
         "HAS_WATER_SURFACE": "bool",
         "HAS_PROTECTED_WATER_SURFACE": "bool",
+        "HAS_LEVEE": "bool",
         "HAS_RESERVOIR": "bool",
         "MIN_KINEMATIC_SLOPE": "float32",
         "HAS_SEA_LEVEL": "bool",
@@ -175,6 +180,7 @@ OUTFLOW = _spec(
         "batched_river_length": "bool",
         "batched_river_height": "bool",
         "batched_catchment_elevation": "bool",
+        "batched_downstream_distance": "bool",
     },
     optional_values={"num_sea_level_boundaries": ("HAS_SEA_LEVEL", 0)},
     read=(
@@ -188,6 +194,7 @@ OUTFLOW = _spec(
         "flood_manning_ptr",
         "flood_depth_ptr",
         "protected_depth_ptr",
+        "is_levee_ptr",
         "catchment_elevation_ptr",
         "downstream_distance_ptr",
         "flood_storage_ptr",
@@ -585,6 +592,9 @@ FLOOD_STAGE_LOG = _spec(
         "total_inflow_error_sum_ptr",
         "total_stage_error_sum_ptr",
     ),
+    # The Metal body folds the water-balance counters through threadgroup
+    # memory, which needs a compile-time threadgroup width.
+    block_sizes={"metal": 256},
 )
 
 LEVEE_STAGE = _spec(
@@ -707,6 +717,9 @@ LEVEE_STAGE_LOG = _spec(
         "flood_area_sum_ptr",
         "total_stage_error_sum_ptr",
     ),
+    # The Metal body folds the water-balance counters through threadgroup
+    # memory, which needs a compile-time threadgroup width.
+    block_sizes={"metal": 256},
 )
 
 LEVEE_BIFURCATION_OUTFLOW = _spec(

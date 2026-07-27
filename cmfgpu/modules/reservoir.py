@@ -167,16 +167,11 @@ class ReservoirModule(AbstractModule):
     def is_dam_upstream(self) -> torch.Tensor:
         return self.is_dam_related & ~self.is_reservoir
 
-    @computed_tensor_field(
+    reservoir_total_inflow: torch.Tensor = TensorField(
         description="Accumulated reservoir total inflow from upstream (m³ s⁻¹)",
         shape=("base.num_catchments",), dtype="hpfloat",
-        dim_coords="base.catchment_id", category="state",
+        dim_coords="base.catchment_id", category="init_state", default=0,
     )
-    @cached_property
-    def reservoir_total_inflow(self) -> torch.Tensor:
-        return torch.zeros_like(
-            self.base.river_outflow, dtype=self.base.high_precision,
-        )
 
     # ------------------------------------------------------------------ #
     # Computed tensors (operations)
@@ -218,16 +213,16 @@ class ReservoirModule(AbstractModule):
     def initialize_dam_storage(self) -> int:
         """Apply the CPU cold-start conservation-volume rule at dam cells."""
         idx = self.reservoir_catchment_idx
-        current = self.base.river_storage[idx]
-        conservation = self.conservation_volume.to(current.dtype)
-        update = current < conservation
+        river = self.base.river_storage[..., idx]
+        flood = self.base.flood_storage[..., idx]
+        conservation = self.conservation_volume.to(river.dtype)
+        update = (river + flood) < conservation
         if not update.any():
             return 0
-        self.base.river_storage[idx] = torch.where(
-            update, conservation, current,
+        self.base.river_storage[..., idx] = torch.where(
+            update, conservation, river,
         )
-        flood = self.base.flood_storage[idx]
-        self.base.flood_storage[idx] = torch.where(
+        self.base.flood_storage[..., idx] = torch.where(
             update, torch.zeros_like(flood), flood,
         )
         return int(update.sum().item())
@@ -238,7 +233,7 @@ class ReservoirModule(AbstractModule):
             self.is_dam_related[bifurcation.bifurcation_catchment_idx]
             | self.is_dam_related[bifurcation.bifurcation_downstream_idx]
         )
-        bifurcation.bifurcation_elevation[masked] = 1.0e20
+        bifurcation.bifurcation_elevation[..., masked, :] = 1.0e20
         return int(masked.sum().item())
 
     # ------------------------------------------------------------------ #

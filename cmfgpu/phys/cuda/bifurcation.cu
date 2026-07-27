@@ -47,34 +47,79 @@ __global__ void k_bif_outflow(
     REAL ts_c = (REAL)total_storage[ci];
     REAL ts_d = (REAL)total_storage[di];
 
+    // Carry the per-level updated flows in registers so each level is stored
+    // exactly once, instead of storing then re-loading them for the limiter.
+    // CaMa bifurcation maps use NPTHLEV <= 5; the generic path below keeps
+    // correctness for any level count.
+    constexpr int MAX_REGISTER_LEVELS = 8;
     REAL sum_out = (REAL)0;
-    for (int lv = 0; lv < num_levels; ++lv) {
-        long li = t * (long)num_levels + lv;
-        REAL man = __ldg(manning + li);
-        REAL csd = __ldg(cs_depth + li);
-        REAL elv = __ldg(elevation + li);
-        REAL upd_csd = fmax(max_wse - elv, (REAL)0);
-        REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
-        bool flow_condition = sifd > (REAL)1e-5;
-        REAL upd_o = (REAL)0;
-        if (flow_condition) {
-            REAL w = __ldg(width + li);
-            REAL o = outflow[li];
-            REAL unit_o = o / w;
-            REAL num = w * (unit_o + gravity * time_step * sifd * slope);
-            REAL den = (REAL)1 + gravity * time_step * (man * man) * fabs(unit_o) * ((REAL)1 / pow73(sifd));
-            upd_o = num / den;
+    REAL upd[MAX_REGISTER_LEVELS];
+    const bool fits = (num_levels <= MAX_REGISTER_LEVELS);
+
+    if (fits) {
+#pragma unroll
+        for (int lv = 0; lv < MAX_REGISTER_LEVELS; ++lv) {
+            REAL upd_o = (REAL)0;
+            if (lv < num_levels) {
+                long li = t * (long)num_levels + lv;
+                REAL man = __ldg(manning + li);
+                REAL csd = __ldg(cs_depth + li);
+                REAL elv = __ldg(elevation + li);
+                REAL upd_csd = fmax(max_wse - elv, (REAL)0);
+                REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
+                if (sifd > (REAL)1e-5) {
+                    REAL w = __ldg(width + li);
+                    REAL o = outflow[li];
+                    REAL unit_o = o / w;
+                    REAL num = w * (unit_o + gravity * time_step * sifd * slope);
+                    REAL den = (REAL)1 + gravity * time_step * (man * man)
+                        * fabs(unit_o) * ((REAL)1 / pow73(sifd));
+                    upd_o = num / den;
+                }
+                sum_out += upd_o;
+                cs_depth[li] = upd_csd;
+            }
+            upd[lv] = upd_o;
         }
-        sum_out += upd_o;
-        cs_depth[li] = upd_csd;
-        outflow[li] = upd_o;
+    } else {
+        for (int lv = 0; lv < num_levels; ++lv) {
+            long li = t * (long)num_levels + lv;
+            REAL man = __ldg(manning + li);
+            REAL csd = __ldg(cs_depth + li);
+            REAL elv = __ldg(elevation + li);
+            REAL upd_csd = fmax(max_wse - elv, (REAL)0);
+            REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
+            bool flow_condition = sifd > (REAL)1e-5;
+            REAL upd_o = (REAL)0;
+            if (flow_condition) {
+                REAL w = __ldg(width + li);
+                REAL o = outflow[li];
+                REAL unit_o = o / w;
+                REAL num = w * (unit_o + gravity * time_step * sifd * slope);
+                REAL den = (REAL)1 + gravity * time_step * (man * man)
+                    * fabs(unit_o) * ((REAL)1 / pow73(sifd));
+                upd_o = num / den;
+            }
+            sum_out += upd_o;
+            cs_depth[li] = upd_csd;
+            outflow[li] = upd_o;
+        }
     }
 
     REAL limit_rate = fmin((REAL)0.05 * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step), (REAL)1);
     sum_out *= limit_rate;
-    for (int lv = 0; lv < num_levels; ++lv) {
-        long li = t * (long)num_levels + lv;
-        outflow[li] = outflow[li] * limit_rate;
+    if (fits) {
+#pragma unroll
+        for (int lv = 0; lv < MAX_REGISTER_LEVELS; ++lv) {
+            if (lv < num_levels) {
+                outflow[t * (long)num_levels + lv] = upd[lv] * limit_rate;
+            }
+        }
+    } else {
+        for (int lv = 0; lv < num_levels; ++lv) {
+            long li = t * (long)num_levels + lv;
+            outflow[li] = outflow[li] * limit_rate;
+        }
     }
 
     REAL pos = fmax(sum_out, (REAL)0);
@@ -97,16 +142,17 @@ __global__ void k_bif_inflow(
     REAL lr_c = __ldg(limit_rate + ci);
     REAL lr_d = __ldg(limit_rate + di);
 
-    REAL sum_out = (REAL)0;
+    REAL raw_sum = (REAL)0;
     for (int lv = 0; lv < num_levels; ++lv) {
         long li = t * (long)num_levels + lv;
         REAL o = outflow[li];
+        raw_sum += o;
         REAL upd = (o >= (REAL)0) ? o * lr_c : o * lr_d;
-        sum_out += upd;
         outflow[li] = upd;
     }
-    atomicAdd(global_bif_outflow + ci, (STO)sum_out);
-    atomicAdd(global_bif_outflow + di, (STO)(-sum_out));
+    REAL net = (raw_sum >= (REAL)0) ? raw_sum * lr_c : raw_sum * lr_d;
+    atomicAdd(global_bif_outflow + ci, (STO)net);
+    atomicAdd(global_bif_outflow + di, (STO)(-net));
 }
 
 void launch_bif_outflow(

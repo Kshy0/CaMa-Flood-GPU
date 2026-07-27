@@ -6,10 +6,14 @@
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
+import warnings
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -54,6 +58,32 @@ class GaugeSeries:
             units=self.units,
             meta=self.meta,
         )
+
+
+def _atomic_path_writer(function):
+    """Run a path-writing function against a sibling temporary file."""
+
+    @wraps(function)
+    def wrapped(output_path, *args, **kwargs):
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        temporary_path = Path(temporary)
+        try:
+            function(temporary_path, *args, **kwargs)
+            os.replace(temporary_path, destination)
+            print(f"Published: {destination}")
+            return destination
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    return wrapped
+
 
 def default_grdc_resolver(gauge_id: str) -> str: 
     return f"{gauge_id}_Q_Day.Cmd.txt"
@@ -128,9 +158,9 @@ def parse_grdc_text(gauge_id: str, text: str) -> GaugeSeries:
         val_str = val_str.replace(",", ".")
         try:
             v = float(val_str)
-        except Exception:
+        except (TypeError, ValueError):
             continue
-        if v in (-999.0, -999.000, -9999.0, -9999.000) or int(v) in (-999, -9999):
+        if not np.isfinite(v) or v in (-999.0, -9999.0) or int(v) in (-999, -9999):
             v = np.nan
 
         dates.append(dt)
@@ -342,6 +372,7 @@ class GaugeReader:
             Accepted forms:
               * (nx, ny) tuple
               * str/Path to a NetCDF parameter file (from which nx, ny are inferred)
+              * zero-argument callable returning an (nx, ny) tuple
           - err_threshold: filter out gauges where abs(err) > err_threshold (default 0.05)
           - skip_multi_catchment: if True, skip rows where ix2/iy2 indicate a second catchment (default False)
         """
@@ -358,9 +389,14 @@ class GaugeReader:
                     self.set_map_shape(int(sx), int(sy))
                 elif isinstance(shape_source, (str, Path)):
                     self.load_map_shape_from_nc(Path(shape_source))
+                elif callable(shape_source):
+                    sx, sy = shape_source()
+                    self.set_map_shape(int(sx), int(sy))
                 else:
                     raise TypeError(
-                        "Unsupported shape_source type. Expected (nx, ny) tuple or str/Path."
+                        "Unsupported shape_source type. Expected (nx, ny) tuple, "
+                        "str/Path, or a zero-argument callable returning "
+                        "(nx, ny)."
                     )
             else:
                 raise ValueError(
@@ -382,6 +418,12 @@ class GaugeReader:
                 # Detect header row by presence of required labels
                 if ("ID" in toks and "ix1" in toks and "iy1" in toks):
                     header_idx_map = {name: toks.index(name) for name in toks}
+                    # Allocation files produced by the current tooling use
+                    # ``error`` while older GRDC allocation tables use
+                    # ``err``.  Normalize the spelling once so the row parser
+                    # can enforce the same contract for both formats.
+                    if "err" not in header_idx_map and "error" in header_idx_map:
+                        header_idx_map["err"] = header_idx_map["error"]
                     continue
                 # Otherwise it's a data row
                 rows.append(toks)
@@ -416,24 +458,63 @@ class GaugeReader:
         temp_gauges = {}  # ct_id -> list of (gid, err, xy1, xy2, a1, a2)
 
         for toks in rows:
-            gid = str(get_val(toks, "ID", str))
-            if gid in ("None", "nan", "NaN"):
+            raw_gid = get_val(toks, "ID", str)
+            if raw_gid is None:
                 continue
+            gid = str(raw_gid)
+            if gid in ("", "None", "nan", "NaN"):
+                continue
+
             err = get_val(toks, "err", float)
-            if abs(err) > err_threshold:
+            if err is None or not np.isfinite(err) or abs(err) > err_threshold:
                 continue
-            ix1 = get_val(toks, "ix1", int) - 1
-            iy1 = get_val(toks, "iy1", int) - 1
-            ix2 = get_val(toks, "ix2", int) - 1
-            iy2 = get_val(toks, "iy2", int) - 1
+
+            # Allocation coordinates are 1-based.  Validate the raw integers
+            # before subtracting one: otherwise zero becomes a valid-looking
+            # negative Python index and missing values raise ``None - 1``.
+            ix1_raw = get_val(toks, "ix1", int)
+            iy1_raw = get_val(toks, "iy1", int)
+            if (
+                ix1_raw is None
+                or iy1_raw is None
+                or not (1 <= ix1_raw <= nx_)
+                or not (1 <= iy1_raw <= ny_)
+            ):
+                continue
+            ix1 = ix1_raw - 1
+            iy1 = iy1_raw - 1
+
+            ix2_raw = get_val(toks, "ix2", int)
+            iy2_raw = get_val(toks, "iy2", int)
+            xy2: Optional[Tuple[int, int]] = None
+            if ix2_raw is None and iy2_raw is None:
+                pass
+            elif (
+                ix2_raw is not None
+                and iy2_raw is not None
+                and ix2_raw < 0
+                and iy2_raw < 0
+            ):
+                # Negative pairs are the documented "no second catchment"
+                # sentinel in CaMa-Flood allocation files.
+                pass
+            elif (
+                ix2_raw is None
+                or iy2_raw is None
+                or not (1 <= ix2_raw <= nx_)
+                or not (1 <= iy2_raw <= ny_)
+            ):
+                continue
+            else:
+                xy2 = (ix2_raw - 1, iy2_raw - 1)
+
             a1 = get_val(toks, "area1", float)
             a2 = get_val(toks, "area2", float)
-            if ix1 is None or iy1 is None:
+            if a1 is not None and not np.isfinite(a1):
+                continue
+            if a2 is not None and not np.isfinite(a2):
                 continue
             xy1 = (int(ix1), int(iy1))
-            xy2: Optional[Tuple[int, int]] = None
-            if ix2 is not None and iy2 is not None and (ix2 >= 0) and (iy2 >= 0):
-                xy2 = (int(ix2), int(iy2))
 
             if skip_multi_catchment and xy2 is not None:
                 continue
@@ -545,7 +626,12 @@ def scan_grdc_zips(grdc_dir: Union[str, Path]) -> Dict[str, List[Tuple[int, str]
                     except ValueError:
                         continue
                     entries.append((sid, name))
-        except Exception:
+        except Exception as exc:
+            warnings.warn(
+                f"Skipping unreadable GRDC archive {zf_path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
         if entries:
             result[zf_path.stem] = entries
@@ -588,6 +674,11 @@ def extract_grdc_from_zips(
     for zi, (zf_name, entries) in enumerate(sorted(zip_file_map.items())):
         zf_path = grdc_dir / f"{zf_name}.zip"
         if not zf_path.exists():
+            warnings.warn(
+                f"GRDC archive listed in map is missing: {zf_path}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
         try:
             with zipfile.ZipFile(zf_path) as zf:
@@ -604,10 +695,19 @@ def extract_grdc_from_zips(
                         dates, vals = dates[mask], vals[mask]
                         if len(vals) > 0 and np.any(np.isfinite(vals)):
                             result[sid] = (dates, vals, gs.meta or {})
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as exc:
+                        warnings.warn(
+                            f"Skipping GRDC station {sid} entry {fname!r} in "
+                            f"{zf_path}: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+        except Exception as exc:
+            warnings.warn(
+                f"Skipping unreadable GRDC archive {zf_path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if (zi + 1) % 20 == 0 or zi + 1 == n_zips:
             print(f"  {zi+1}/{n_zips} zips done, {len(result)} series")
 
@@ -615,6 +715,7 @@ def extract_grdc_from_zips(
     return result
 
 
+@_atomic_path_writer
 def write_gauge_nc(
     output_path: Union[str, Path],
     station_ids: np.ndarray,
@@ -662,91 +763,153 @@ def write_gauge_nc(
         The written file path.
     """
     out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
+    observations = np.asarray(observations, dtype=np.float32)
+    if observations.ndim != 2:
+        raise ValueError(
+            f"observations must have shape (time, station), got "
+            f"{observations.shape}"
+        )
     n_time, n_station = observations.shape
-    ds = nc.Dataset(str(out), "w", format="NETCDF4")
+    if n_time < 1 or n_station < 1:
+        raise ValueError("observations must contain at least one time and station")
 
-    ds.title = title
-    ds.source = source
-    ds.time_start = time_start
-    ds.allocation_error_threshold = error_threshold
+    station_arrays = {
+        "station_ids": np.asarray(station_ids),
+        "lat": np.asarray(lat),
+        "lon": np.asarray(lon),
+        "reported_area_km2": np.asarray(reported_area_km2),
+        "downstream_station_id": np.asarray(downstream_station_id),
+    }
+    for name, array in station_arrays.items():
+        if array.shape != (n_station,):
+            raise ValueError(
+                f"{name} must have shape ({n_station},), got {array.shape}"
+            )
+    station_ids = station_arrays["station_ids"]
+    lat = station_arrays["lat"]
+    lon = station_arrays["lon"]
+    reported_area_km2 = station_arrays["reported_area_km2"]
+    downstream_station_id = station_arrays["downstream_station_id"]
 
-    ds.createDimension("time", None)
-    ds.createDimension("station", n_station)
-
-    # Time
-    t_var = ds.createVariable("time", "f8", ("time",))
-    t_var.units = f"days since {time_start}"
-    t_var.calendar = "standard"
-    t_var.long_name = "Time"
-    t_var[:] = np.arange(n_time, dtype=np.float64)
-
-    # Station ID
-    v = ds.createVariable("station_id", "i8", ("station",), zlib=True)
-    v.long_name = "GRDC station ID"
-    v[:] = station_ids
-
-    # Lat / Lon
-    v = ds.createVariable("lat", "f4", ("station",), zlib=True)
-    v.units = "degrees_north"
-    v.long_name = "Station latitude"
-    v[:] = lat
-
-    v = ds.createVariable("lon", "f4", ("station",), zlib=True)
-    v.units = "degrees_east"
-    v.long_name = "Station longitude"
-    v[:] = lon
-
-    # Reported area
-    v = ds.createVariable("reported_area_km2", "f4", ("station",), zlib=True)
-    v.units = "km2"
-    v.long_name = "Reported upstream drainage area"
-    v[:] = reported_area_km2
-
-    # Downstream station
-    v = ds.createVariable("downstream_station_id", "i8", ("station",), zlib=True)
-    v.long_name = "Nearest downstream station (-1 = none)"
-    v[:] = downstream_station_id
-
-    # Discharge observations (chunked per station time series)
-    v = ds.createVariable(
-        "discharge", "f4", ("time", "station"),
-        zlib=True, complevel=4, shuffle=True,
-        fill_value=np.float32(np.nan),
-        chunksizes=(n_time, 1),
-    )
-    v.units = "m3/s"
-    v.long_name = "Daily mean discharge"
-    for j in range(n_station):
-        v[:, j] = observations[:, j]
-
-    # Per-resolution allocation variables
     if resolution_allocs:
-        for res, arrs in resolution_allocs.items():
+        if resolution_dims is None:
+            raise ValueError(
+                "resolution_dims is required when resolution_allocs is provided"
+            )
+        required = {"catchment_id", "allocated_area_km2", "alloc_error"}
+        for res, arrays in resolution_allocs.items():
+            missing = required.difference(arrays)
+            if missing:
+                raise ValueError(
+                    f"resolution {res!r} is missing arrays {sorted(missing)}"
+                )
+            if res not in resolution_dims:
+                raise ValueError(f"resolution_dims is missing {res!r}")
             nx, ny = resolution_dims[res]
-            suffix = f"_{res}"
+            if type(nx) is not int or type(ny) is not int or nx <= 0 or ny <= 0:
+                raise ValueError(
+                    f"resolution {res!r} dimensions must be positive integers"
+                )
+            for name in required:
+                array = np.asarray(arrays[name])
+                if array.shape != (n_station,):
+                    raise ValueError(
+                        f"resolution {res!r} array {name!r} must have shape "
+                        f"({n_station},), got {array.shape}"
+                    )
 
-            v = ds.createVariable(
-                f"catchment_id{suffix}", "i8", ("station",), zlib=True)
-            v.long_name = f"Catchment index on {res} grid (ix*ny+iy, 0-based)"
-            v.setncattr("nx", int(nx))
-            v.setncattr("ny", int(ny))
-            v[:] = arrs["catchment_id"]
+    # The context manager closes the temporary NetCDF even when a variable
+    # assignment fails.  The outer atomic writer then removes the incomplete
+    # payload without disturbing an existing destination.
+    with nc.Dataset(str(out), "w", format="NETCDF4") as ds:
+        ds.title = title
+        ds.source = source
+        ds.time_start = time_start
+        ds.allocation_error_threshold = error_threshold
 
-            v = ds.createVariable(
-                f"allocated_area{suffix}_km2", "f4", ("station",), zlib=True)
-            v.units = "km2"
-            v.long_name = f"CaMa-allocated drainage area on {res} grid"
-            v[:] = arrs["allocated_area_km2"]
+        ds.createDimension("time", None)
+        ds.createDimension("station", n_station)
 
-            v = ds.createVariable(
-                f"alloc_error{suffix}", "f4", ("station",), zlib=True)
-            v.long_name = f"Relative area allocation error on {res} grid"
-            v[:] = arrs["alloc_error"]
+        # Time
+        t_var = ds.createVariable("time", "f8", ("time",))
+        t_var.units = f"days since {time_start}"
+        t_var.calendar = "standard"
+        t_var.long_name = "Time"
+        t_var[:] = np.arange(n_time, dtype=np.float64)
 
-    ds.close()
+        # Station ID
+        v = ds.createVariable("station_id", "i8", ("station",), zlib=True)
+        v.long_name = "GRDC station ID"
+        v[:] = station_ids
+
+        # Lat / Lon
+        v = ds.createVariable("lat", "f4", ("station",), zlib=True)
+        v.units = "degrees_north"
+        v.long_name = "Station latitude"
+        v[:] = lat
+
+        v = ds.createVariable("lon", "f4", ("station",), zlib=True)
+        v.units = "degrees_east"
+        v.long_name = "Station longitude"
+        v[:] = lon
+
+        # Reported area
+        v = ds.createVariable(
+            "reported_area_km2", "f4", ("station",), zlib=True,
+        )
+        v.units = "km2"
+        v.long_name = "Reported upstream drainage area"
+        v[:] = reported_area_km2
+
+        # Downstream station
+        v = ds.createVariable(
+            "downstream_station_id", "i8", ("station",), zlib=True,
+        )
+        v.long_name = "Nearest downstream station (-1 = none)"
+        v[:] = downstream_station_id
+
+        # Discharge observations (chunked per station time series)
+        v = ds.createVariable(
+            "discharge", "f4", ("time", "station"),
+            zlib=True, complevel=4, shuffle=True,
+            fill_value=np.float32(np.nan),
+            chunksizes=(n_time, 1),
+        )
+        v.units = "m3/s"
+        v.long_name = "Daily mean discharge"
+        for j in range(n_station):
+            v[:, j] = observations[:, j]
+
+        # Per-resolution allocation variables
+        if resolution_allocs:
+            for res, arrs in resolution_allocs.items():
+                nx, ny = resolution_dims[res]
+                suffix = f"_{res}"
+
+                v = ds.createVariable(
+                    f"catchment_id{suffix}", "i8", ("station",), zlib=True,
+                )
+                v.long_name = (
+                    f"Catchment index on {res} grid (ix*ny+iy, 0-based)"
+                )
+                v.setncattr("nx", int(nx))
+                v.setncattr("ny", int(ny))
+                v[:] = arrs["catchment_id"]
+
+                v = ds.createVariable(
+                    f"allocated_area{suffix}_km2", "f4", ("station",),
+                    zlib=True,
+                )
+                v.units = "km2"
+                v.long_name = f"CaMa-allocated drainage area on {res} grid"
+                v[:] = arrs["allocated_area_km2"]
+
+                v = ds.createVariable(
+                    f"alloc_error{suffix}", "f4", ("station",), zlib=True,
+                )
+                v.long_name = f"Relative area allocation error on {res} grid"
+                v[:] = arrs["alloc_error"]
     size_mb = out.stat().st_size / 1e6
-    print(f"Created: {out} ({size_mb:.1f} MB)")
+    print(f"Wrote gauge NetCDF payload ({size_mb:.1f} MB)")
     print(f"  {n_station} stations × {n_time} days")
     return out

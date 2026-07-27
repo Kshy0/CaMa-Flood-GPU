@@ -7,12 +7,11 @@
 from __future__ import annotations
 
 import re
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
-import matplotlib.animation as animation
-import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -26,6 +25,8 @@ class BinReader:
 
     def _load_dims(self):
         # Look for mapdim.txt in base_dir or parent directories
+        explicit_nx = self.nx
+        explicit_ny = self.ny
         candidates = [
             self.base_dir / "mapdim.txt",
             self.base_dir.parent / "mapdim.txt",
@@ -38,23 +39,52 @@ class BinReader:
                 mapdim_path = p
                 break
         
-        if mapdim_path:
-            try:
-                with open(mapdim_path, "r") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            if parts[0] == "nx":
-                                self.nx = int(parts[1])
-                            elif parts[0] == "ny":
-                                self.ny = int(parts[1])
-                print(f"Loaded dimensions from {mapdim_path}: nx={self.nx}, ny={self.ny}")
-            except Exception as e:
-                print(f"Failed to read mapdim.txt: {e}")
-        else:
-            print("mapdim.txt not found.")
-            self.nx = None
-            self.ny = None
+        if mapdim_path is None:
+            return
+
+        positional: list[int] = []
+        try:
+            with mapdim_path.open("r") as f:
+                for line in f:
+                    head = line.split("!!", 1)[0].strip()
+                    if not head:
+                        continue
+                    parts = head.replace("=", " ").split()
+                    key = parts[0].lower()
+                    if (
+                        key in {"nx", "nxx"}
+                        and len(parts) >= 2
+                        and self.nx is None
+                    ):
+                        self.nx = int(parts[1])
+                    elif (
+                        key in {"ny", "nyy"}
+                        and len(parts) >= 2
+                        and self.ny is None
+                    ):
+                        self.ny = int(parts[1])
+                    elif len(parts) == 1:
+                        try:
+                            positional.append(int(parts[0]))
+                        except ValueError:
+                            continue
+            if self.nx is None and positional:
+                self.nx = positional[0]
+            if self.ny is None and len(positional) >= 2:
+                self.ny = positional[1]
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Failed to read {mapdim_path}: {exc}") from exc
+        if self.nx is None or self.ny is None or self.nx <= 0 or self.ny <= 0:
+            raise ValueError(
+                f"{mapdim_path} does not define positive nx/ny dimensions"
+            )
+        # Explicit constructor dimensions take precedence over metadata while
+        # still allowing the missing partner to be discovered from mapdim.
+        if explicit_nx is not None:
+            self.nx = explicit_nx
+        if explicit_ny is not None:
+            self.ny = explicit_ny
+        print(f"Loaded dimensions from {mapdim_path}: nx={self.nx}, ny={self.ny}")
 
     def _scan_files(self) -> List[dict]:
         """
@@ -75,6 +105,11 @@ class BinReader:
                 size = p.stat().st_size
                 if self.nx and self.ny:
                     frame_size = self.nx * self.ny * 4 # float32
+                    if size % frame_size:
+                        raise ValueError(
+                            f"{p} size {size} is not a whole number of "
+                            f"{self.nx}x{self.ny} float32 frames"
+                        )
                     n_frames = size // frame_size
                 else:
                     n_frames = 0 # Unknown
@@ -101,6 +136,21 @@ class BinReader:
 
     def _build_time_axis(self):
         self.times = []
+        if self.start_datetime is not None:
+            current = self.start_datetime
+            for f in self.files:
+                if f["n_frames"] and current.year != f["year"]:
+                    raise ValueError(
+                        f"Explicit start_datetime and frame counts place "
+                        f"{f['path'].name} at {current:%Y-%m-%d}, which does "
+                        f"not match its filename year {f['year']}"
+                    )
+                for _ in range(f["n_frames"]):
+                    self.times.append(current)
+                    current += timedelta(seconds=self.dt)
+            self._time_len = len(self.times)
+            return
+
         for f in self.files:
             year = f["year"]
             
@@ -109,19 +159,25 @@ class BinReader:
             days_in_year = 366 if is_leap else 365
             
             start_date = datetime(year, 1, 1)
-            
-            if f["n_frames"] == days_in_year:
-                 # Daily
-                 for d in range(f["n_frames"]):
-                     self.times.append(start_date + timedelta(days=d))
-            elif f["n_frames"] == days_in_year * 24 and self.dt == 3600:
-                 # Hourly
-                 for h in range(f["n_frames"]):
-                     self.times.append(start_date + timedelta(hours=h))
-            else:
-                 # Fallback: use dt
-                 for i in range(f["n_frames"]):
-                     self.times.append(start_date + timedelta(seconds=i*self.dt))
+            seconds_in_year = days_in_year * 86400
+            complete_frames = (
+                seconds_in_year // self.dt
+                if seconds_in_year % self.dt == 0
+                else None
+            )
+            if f["n_frames"] != complete_frames:
+                warnings.warn(
+                    f"{f['path'].name} has {f['n_frames']} frames, not a "
+                    f"complete {year} at dt={self.dt}s; timestamps are being "
+                    "anchored at January 1. Pass start_datetime for a "
+                    "partial-year run.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            for i in range(f["n_frames"]):
+                self.times.append(
+                    start_date + timedelta(seconds=i * self.dt)
+                )
                      
         self._time_len = len(self.times)
     def __init__(
@@ -132,23 +188,41 @@ class BinReader:
         ny: Optional[int] = None,
         dt: int = 86400,  # Default daily (seconds)
         unit: str = "m3/s",
+        start_datetime: Optional[datetime] = None,
     ):
         self.base_dir = Path(base_dir)
         self.var_name = var_name
+        if type(dt) is not int or dt <= 0:
+            raise ValueError("dt must be a positive integer number of seconds")
         self.dt = dt
         self.unit = unit
+        if start_datetime is not None and not isinstance(
+            start_datetime, datetime
+        ):
+            raise TypeError("start_datetime must be a datetime or None")
+        self.start_datetime = start_datetime
+        self.nx = nx
+        self.ny = ny
+
+        for name, value in (("nx", nx), ("ny", ny)):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer")
 
         # Try to load dimensions if not provided
         if nx is None or ny is None:
             self._load_dims()
-        else:
-            self.nx = nx
-            self.ny = ny
 
         if self.nx is None or self.ny is None:
-             # Fallback defaults if not found (e.g. 0.25 deg)
-             # But better to warn or raise
-             print("Warning: Map dimensions not found. Please provide nx, ny.")
+            raise ValueError(
+                "Map dimensions not found; provide nx and ny or a valid mapdim.txt"
+            )
+        if (
+            type(self.nx) is not int
+            or type(self.ny) is not int
+            or self.nx <= 0
+            or self.ny <= 0
+        ):
+            raise ValueError("nx and ny must be positive integers")
         
         self.map_shape = (self.nx, self.ny) if (self.nx and self.ny) else None
         self.files = self._scan_files()
@@ -198,14 +272,16 @@ class BinReader:
             fh.seek(offset)
             data = np.fromfile(fh, dtype="<f4", count=self.nx * self.ny)
             
+        if data.size != self.nx * self.ny:
+            raise EOFError(
+                f"Short read from {target_file['path']}: got {data.size} values, "
+                f"expected {self.nx * self.ny}"
+            )
         grid = data.reshape((self.nx, self.ny), order='F')
-        
-        # Handle missing values
-        # CaMa-Flood uses -9999 or 1e20. 
-        # If fill_value is provided and not nan, we might want to replace?
-        # But usually we return raw data unless it's for plotting.
-        # MultiRankStatsReader returns grid with fill_value initialized but overwritten.
-        
+        missing = (grid == np.float32(-9999.0)) | (grid >= np.float32(1.0e19))
+        if np.any(missing):
+            grid = grid.copy()
+            grid[missing] = fill_value
         return grid
 
     def get_vector(self, t_index: int) -> np.ndarray:
@@ -221,9 +297,15 @@ class BinReader:
         Get time series for specific points (x, y).
         points: list of (x, y) tuples or (N, 2) array. 0-based indices.
         """
-        pts = np.array(points)
+        pts = np.asarray(points)
         if pts.ndim != 2 or pts.shape[1] != 2:
              raise ValueError("Points must be (N, 2) array of (x, y) coordinates")
+        if not np.issubdtype(pts.dtype, np.integer):
+            if not np.issubdtype(pts.dtype, np.number) or not np.all(
+                np.isfinite(pts) & (pts == np.floor(pts))
+            ):
+                raise TypeError("Point coordinates must be finite integers")
+        pts = pts.astype(np.int64, copy=False)
              
         if self.nx is None or self.ny is None:
             raise RuntimeError("Map dimensions not set")
@@ -235,6 +317,12 @@ class BinReader:
         # In memmap (n_frames, ny, nx) [C-order], this corresponds to [t, y, x]
         ys = pts[:, 1]
         xs = pts[:, 0]
+        invalid = (xs < 0) | (xs >= self.nx) | (ys < 0) | (ys >= self.ny)
+        if np.any(invalid):
+            raise IndexError(
+                f"Point coordinates outside [0,{self.nx}) x [0,{self.ny}): "
+                f"{pts[invalid][:5].tolist()}"
+            )
         
         current_t = 0
         for f_info in self.files:
@@ -247,6 +335,13 @@ class BinReader:
             # Extract points
             # mmap[:, ys, xs] uses fancy indexing on the last two dimensions
             chunk_data = mmap[:, ys, xs]
+            missing = (
+                (chunk_data == np.float32(-9999.0))
+                | (chunk_data >= np.float32(1.0e19))
+            )
+            if np.any(missing):
+                chunk_data = np.array(chunk_data, copy=True)
+                chunk_data[missing] = fill_value
             out[current_t : current_t + n_frames, :] = chunk_data
             
             current_t += n_frames
@@ -265,6 +360,11 @@ class BinReader:
         figsize: Tuple[int, int] = (10, 6),
         title: Optional[str] = None,
     ) -> None:
+        # Plotting is an optional analysis feature; keep matplotlib out of the
+        # reader's import path so the base package works without the ``dev``
+        # extra (and without loading a second C++ runtime during I/O tests).
+        import matplotlib.pyplot as plt
+
         grid = self.get_grid(t_index)
         
         # Mask missing values
@@ -299,6 +399,9 @@ class BinReader:
         cmap: str = "viridis",
         figsize: Tuple[int, int] = (10, 6),
     ) -> None:
+        import matplotlib.animation as animation
+        import matplotlib.pyplot as plt
+
         t_start = 0 if t_range is None else max(0, int(t_range[0]))
         t_end = self._time_len if t_range is None else min(self._time_len, int(t_range[1]))
         

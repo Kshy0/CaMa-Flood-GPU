@@ -127,17 +127,28 @@ def compute_bifurcation_inflow_kernel(
     # Load limit rate
     limit_rate = tl.load(limit_rate_ptr + bifurcation_catchment_idx, mask=mask, other=1.0)
     limit_rate_downstream = tl.load(limit_rate_ptr + bifurcation_downstream_idx, mask=mask, other=1.0)
-    sum_bifurcation_outflow = tl.zeros_like(limit_rate)
+    raw_sum_bifurcation_outflow = tl.zeros_like(limit_rate)
 
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
-        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask)
-        updated_bifurcation_outflow = tl.where(updated_bifurcation_outflow >= 0.0, updated_bifurcation_outflow * limit_rate, updated_bifurcation_outflow * limit_rate_downstream)
-        sum_bifurcation_outflow += updated_bifurcation_outflow
+        raw_bifurcation_outflow = tl.load(
+            bifurcation_outflow_ptr + level_idx, mask=mask,
+        )
+        raw_sum_bifurcation_outflow += raw_bifurcation_outflow
+        updated_bifurcation_outflow = tl.where(
+            raw_bifurcation_outflow >= 0.0,
+            raw_bifurcation_outflow * limit_rate,
+            raw_bifurcation_outflow * limit_rate_downstream,
+        )
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
-        
-    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_catchment_idx, sum_bifurcation_outflow, mask=mask)
-    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_downstream_idx, -sum_bifurcation_outflow, mask=mask)
+
+    net_bifurcation_outflow = tl.where(
+        raw_sum_bifurcation_outflow >= 0.0,
+        raw_sum_bifurcation_outflow * limit_rate,
+        raw_sum_bifurcation_outflow * limit_rate_downstream,
+    )
+    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask)
 
 
 @triton.jit
@@ -288,14 +299,26 @@ def compute_bifurcation_inflow_batched_kernel(
     # Load limit rate
     limit_rate = tl.load(limit_rate_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=1.0)
     limit_rate_downstream = tl.load(limit_rate_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=1.0)
-    sum_bifurcation_outflow = tl.zeros_like(limit_rate)
+    raw_sum_bifurcation_outflow = tl.zeros_like(limit_rate)
 
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
-        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + trial_offset_levels + level_idx, mask=mask)
-        updated_bifurcation_outflow = tl.where(updated_bifurcation_outflow >= 0.0, updated_bifurcation_outflow * limit_rate, updated_bifurcation_outflow * limit_rate_downstream)
-        sum_bifurcation_outflow += updated_bifurcation_outflow
+        raw_bifurcation_outflow = tl.load(
+            bifurcation_outflow_ptr + trial_offset_levels + level_idx,
+            mask=mask,
+        )
+        raw_sum_bifurcation_outflow += raw_bifurcation_outflow
+        updated_bifurcation_outflow = tl.where(
+            raw_bifurcation_outflow >= 0.0,
+            raw_bifurcation_outflow * limit_rate,
+            raw_bifurcation_outflow * limit_rate_downstream,
+        )
         tl.store(bifurcation_outflow_ptr + trial_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
-        
-    tl.atomic_add(global_bifurcation_outflow_ptr + trial_offset_catchments + bifurcation_catchment_idx, sum_bifurcation_outflow, mask=mask)
-    tl.atomic_add(global_bifurcation_outflow_ptr + trial_offset_catchments + bifurcation_downstream_idx, -sum_bifurcation_outflow, mask=mask)
+
+    net_bifurcation_outflow = tl.where(
+        raw_sum_bifurcation_outflow >= 0.0,
+        raw_sum_bifurcation_outflow * limit_rate,
+        raw_sum_bifurcation_outflow * limit_rate_downstream,
+    )
+    tl.atomic_add(global_bifurcation_outflow_ptr + trial_offset_catchments + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + trial_offset_catchments + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask)

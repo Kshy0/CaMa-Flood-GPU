@@ -207,12 +207,18 @@ class DamAllocMixin:
                 if len(parts) < 4:
                     continue
                 try:
-                    ids.append(int(parts[0]))
-                    lats.append(float(parts[1]))
-                    lons.append(float(parts[2]))
-                    areas.append(float(parts[3]))
+                    dam_id = int(parts[0])
+                    latitude = float(parts[1])
+                    longitude = float(parts[2])
+                    upstream_area = float(parts[3])
                 except (ValueError, IndexError):
                     continue
+                # Commit the required fields only after the whole group has
+                # parsed, keeping every per-dam column aligned on bad rows.
+                ids.append(dam_id)
+                lats.append(latitude)
+                lons.append(longitude)
+                areas.append(upstream_area)
                 names.append(parts[4].strip() if len(parts) > 4 else "")
 
                 if cap_col is not None and len(parts) > cap_col:

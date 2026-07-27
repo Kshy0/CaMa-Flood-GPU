@@ -79,11 +79,13 @@ class BaseModule(AbstractModule):
         default=9.8,
         description="Gravitational acceleration constant (m/s²)",
         gt=0.0,
+        allow_inf_nan=False,
     )
     min_kinematic_slope: float = Field(
         default=1.0e-5,
         description="Minimum bed slope for kinematic wave",
         gt=0.0,
+        allow_inf_nan=False,
     )
 
     # --------------------------------------------------------------------- #
@@ -271,7 +273,7 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def num_catchments(self) -> int:
-        return self.catchment_area.shape[0]
+        return self.catchment_id.shape[0]
 
     @computed_field(
         description="Number of catchments that will have their output saved."
@@ -285,7 +287,7 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def num_flood_levels(self) -> int:
-        return self.flood_depth_table.shape[1]
+        return self.flood_depth_table.shape[-1]
 
     # ------------------------------------------------------------------ #
     # Computed tensor fields
@@ -418,6 +420,114 @@ class BaseModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Post-init validation
     # ------------------------------------------------------------------ #
+    @model_validator(mode="after")
+    def validate_physical_parameters(self) -> Self:
+        strictly_positive = {
+            "river_width": self.river_width,
+            "river_length": self.river_length,
+            "river_height": self.river_height,
+            "catchment_area": self.catchment_area,
+            "downstream_distance": self.downstream_distance,
+            "river_manning": self.river_manning,
+            "flood_manning": self.flood_manning,
+        }
+        invalid_counts = {
+            name: int((~torch.isfinite(value) | (value <= 0)).sum().item())
+            for name, value in strictly_positive.items()
+        }
+        invalid_counts = {
+            name: count for name, count in invalid_counts.items() if count
+        }
+        if invalid_counts:
+            details = ", ".join(
+                f"{name}={count}" for name, count in invalid_counts.items()
+            )
+            raise ValueError(
+                "River geometry, catchment area, downstream distance, and "
+                "Manning coefficients must contain only finite values greater "
+                f"than zero; invalid element counts: {details}"
+            )
+
+        finite_only = {
+            "catchment_elevation": self.catchment_elevation,
+            "flood_depth_table": self.flood_depth_table,
+        }
+        nonfinite_counts = {
+            name: int((~torch.isfinite(value)).sum().item())
+            for name, value in finite_only.items()
+        }
+        nonfinite_counts = {
+            name: count for name, count in nonfinite_counts.items() if count
+        }
+        if nonfinite_counts:
+            details = ", ".join(
+                f"{name}={count}" for name, count in nonfinite_counts.items()
+            )
+            raise ValueError(
+                "Elevation and flood-depth lookup values must be finite; "
+                f"invalid element counts: {details}"
+            )
+        negative_depths = int((self.flood_depth_table < 0).sum().item())
+        if negative_depths:
+            raise ValueError(
+                "flood_depth_table must be non-negative; "
+                f"invalid element count: {negative_depths}"
+            )
+
+        nonnegative_state = {
+            "river_storage": self.river_storage,
+            "flood_storage": self.flood_storage,
+            "protected_storage": self.protected_storage,
+            "protected_depth": self.protected_depth,
+            "river_depth": self.river_depth,
+            "flood_depth": self.flood_depth,
+            "river_cross_section_depth": self.river_cross_section_depth,
+            "flood_cross_section_depth": self.flood_cross_section_depth,
+            "flood_cross_section_area": self.flood_cross_section_area,
+        }
+        invalid_state_counts = {
+            name: int((~torch.isfinite(value) | (value < 0)).sum().item())
+            for name, value in nonnegative_state.items()
+        }
+        invalid_state_counts = {
+            name: count
+            for name, count in invalid_state_counts.items()
+            if count
+        }
+        if invalid_state_counts:
+            details = ", ".join(
+                f"{name}={count}"
+                for name, count in invalid_state_counts.items()
+            )
+            raise ValueError(
+                "Initial storage, depth, and cross-section state must contain "
+                "only finite non-negative values; invalid element counts: "
+                f"{details}"
+            )
+
+        nonfinite_flow_counts = {
+            name: int((~torch.isfinite(value)).sum().item())
+            for name, value in {
+                "river_outflow": self.river_outflow,
+                "flood_outflow": self.flood_outflow,
+            }.items()
+        }
+        nonfinite_flow_counts = {
+            name: count
+            for name, count in nonfinite_flow_counts.items()
+            if count
+        }
+        if nonfinite_flow_counts:
+            details = ", ".join(
+                f"{name}={count}"
+                for name, count in nonfinite_flow_counts.items()
+            )
+            raise ValueError(
+                "Initial river and flood outflow must contain only finite "
+                f"values; invalid element counts: {details}"
+            )
+        return self
+
     @model_validator(mode="after")
     def validate_flood_depth_table_monotonicity(self) -> Self:
         if self.num_flood_levels > 1:

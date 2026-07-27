@@ -94,6 +94,37 @@ static inline FloodStageResult flood_stage_inline(
     return result;
 }
 
+// Fold one per-catchment value across the threadgroup and issue a single
+// atomic; same-address atomics otherwise serialize once per catchment.
+// Every thread must call this (threadgroup barriers), so callers keep
+// out-of-range lanes alive with 0.  ``scratch`` is reusable on return.
+static inline void cmf_block_atomic_add(
+    threadgroup float* scratch,
+    uint lid,
+    uint group_threads,
+    float value,
+    device atomic_float* destination
+) {
+    scratch[lid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // dispatchThreads permits a short final threadgroup; fold odd tail lanes.
+    for (uint active_threads = group_threads; active_threads > 1;
+            active_threads = (active_threads + 1) / 2) {
+        uint next_active = (active_threads + 1) / 2;
+        uint pair = lid + next_active;
+        if (pair < active_threads) {
+            scratch[lid] += scratch[pair];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0 && scratch[0] != 0.0f) {
+        atomic_fetch_add_explicit(
+            destination, scratch[0], memory_order_relaxed);
+    }
+    // Ensure the reduction is consumed before the caller reuses ``scratch``.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 // HYDROFORGE METAL KERNEL BODY: compute_flood_stage
 long num_catchments = *args.num_catchments;
     long num_trials = *args.num_trials;
@@ -124,22 +155,6 @@ long num_catchments = *args.num_catchments;
             prescribed_inflow = args.inflow_ptr[
                 trial * (long)(*args.num_inflow_gauges) + inflow_idx];
         }
-    }
-
-    // A completely dry, balanced cell is already in the exact state written
-    // by the dry branch below.  Avoid geometry/table reads and eight redundant
-    // global stores, which dominate the common no-water path.
-    const bool dry_balanced = river_storage == 0.0f
-        && flood_storage == 0.0f && protected_storage == 0.0f
-        && river_inflow - river_outflow == 0.0f
-        && flood_inflow - flood_outflow - bifurcation_outflow == 0.0f
-        && runoff + prescribed_inflow == 0.0f;
-    if (dry_balanced && args.outgoing_storage_ptr[cell] == 0.0f
-        && args.river_depth_ptr[cell] == 0.0f
-        && args.flood_depth_ptr[cell] == 0.0f
-        && args.protected_depth_ptr[cell] == 0.0f
-        && args.flood_fraction_ptr[cell] == 0.0f) {
-        return;
     }
 
     float updated_river_storage = river_storage
@@ -186,10 +201,27 @@ long num_catchments = *args.num_catchments;
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
 // HYDROFORGE METAL KERNEL BODY: compute_flood_stage_log
 long num_catchments = *args.num_catchments;
-    if ((long)i >= num_catchments) return;
+    threadgroup float log_scratch[HF_BLOCK_SIZE];
+
+    // Out-of-range lanes contribute 0 so every thread reaches the barriers.
+    bool active_lane = (long)i < num_catchments;
+    int current_step = args.current_step_ptr[0];
+
+    float log_storage_pre = 0.0f;
+    float log_storage_next = 0.0f;
+    float log_storage_new = 0.0f;
+    float log_inflow = 0.0f;
+    float log_outflow = 0.0f;
+    float log_inflow_error = 0.0f;
+    float log_storage_stage = 0.0f;
+    float log_river_storage = 0.0f;
+    float log_flood_storage = 0.0f;
+    float log_flood_area = 0.0f;
+    float log_stage_error = 0.0f;
+
+    if (active_lane) {
 
     long cell = (long)i;
-    int current_step = args.current_step_ptr[0];
     float time_step = args.time_step_ptr[0];
     bool non_levee =
         !HAS_LEVEE || args.is_levee_ptr[cell] == 0;
@@ -214,9 +246,7 @@ long num_catchments = *args.num_catchments;
 
     float storage_before =
         river_storage + flood_storage + protected_storage;
-    atomic_fetch_add_explicit(
-        args.total_storage_pre_sum_ptr + current_step,
-        storage_before * 1e-9f, memory_order_relaxed);
+    log_storage_pre = storage_before * 1e-9f;
 
     float updated_river_storage = river_storage
         + (river_inflow - river_outflow) * time_step;
@@ -234,30 +264,16 @@ long num_catchments = *args.num_catchments;
         + (runoff + prescribed_inflow) * time_step;
     float total_storage = max(storage_after_routing, 0.0f);
 
-    if (non_levee) {
-        atomic_fetch_add_explicit(
-            args.total_storage_next_sum_ptr + current_step,
-            storage_after_routing * 1e-9f, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.total_storage_new_sum_ptr + current_step,
-            total_storage * 1e-9f, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.total_inflow_sum_ptr + current_step,
-            (river_inflow + flood_inflow + prescribed_inflow)
-                * time_step * 1e-9f,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.total_outflow_sum_ptr + current_step,
-            (river_outflow + flood_outflow) * time_step * 1e-9f,
-            memory_order_relaxed);
-        float inflow_error = storage_before - storage_after_routing
-            + (river_inflow + flood_inflow + runoff + prescribed_inflow
-                - river_outflow - flood_outflow - bifurcation_outflow)
-                * time_step;
-        atomic_fetch_add_explicit(
-            args.total_inflow_error_sum_ptr + current_step,
-            inflow_error * 1e-9f, memory_order_relaxed);
-    }
+    log_storage_next = storage_after_routing * 1e-9f;
+    log_storage_new = total_storage * 1e-9f;
+    log_inflow = (river_inflow + flood_inflow + prescribed_inflow)
+        * time_step * 1e-9f;
+    log_outflow = (river_outflow + flood_outflow) * time_step * 1e-9f;
+    float inflow_error = storage_before - storage_after_routing
+        + (river_inflow + flood_inflow + runoff + prescribed_inflow
+            - river_outflow - flood_outflow - bifurcation_outflow)
+            * time_step;
+    log_inflow_error = inflow_error * 1e-9f;
 
     float river_height = args.river_height_ptr[cell];
     float catchment_area = args.catchment_area_ptr[cell];
@@ -270,24 +286,12 @@ long num_catchments = *args.num_catchments;
         num_flood_levels);
 
     float stage_storage = stage.river_storage + stage.flood_storage;
-    atomic_fetch_add_explicit(
-        args.total_storage_stage_sum_ptr + current_step,
-        stage_storage * 1e-9f, memory_order_relaxed);
     if (non_levee) {
-        atomic_fetch_add_explicit(
-            args.river_storage_sum_ptr + current_step,
-            stage.river_storage * 1e-9f, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.flood_storage_sum_ptr + current_step,
-            stage.flood_storage * 1e-9f, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.flood_area_sum_ptr + current_step,
-            stage.flood_fraction * catchment_area * 1e-9f,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.total_stage_error_sum_ptr + current_step,
-            (stage_storage - total_storage) * 1e-9f,
-            memory_order_relaxed);
+        log_storage_stage = stage_storage * 1e-9f;
+        log_river_storage = stage.river_storage * 1e-9f;
+        log_flood_storage = stage.flood_storage * 1e-9f;
+        log_flood_area = stage.flood_fraction * catchment_area * 1e-9f;
+        log_stage_error = (stage_storage - total_storage) * 1e-9f;
     }
 
     args.outgoing_storage_ptr[cell] = 0.0f;
@@ -298,3 +302,31 @@ long num_catchments = *args.num_catchments;
     args.flood_depth_ptr[cell] = stage.flood_depth;
     args.protected_depth_ptr[cell] = stage.flood_depth;
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
+
+    }  // active_lane
+
+    // One atomic per counter per threadgroup, reusing a single scratch buffer.
+    long group_start = (long)i - (long)lid;
+    uint group_threads = (uint)min((long)tpg, num_catchments - group_start);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_storage_pre,
+        args.total_storage_pre_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_storage_next,
+        args.total_storage_next_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_storage_new,
+        args.total_storage_new_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_inflow,
+        args.total_inflow_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_outflow,
+        args.total_outflow_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_inflow_error,
+        args.total_inflow_error_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_storage_stage,
+        args.total_storage_stage_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_river_storage,
+        args.river_storage_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_flood_storage,
+        args.flood_storage_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_flood_area,
+        args.flood_area_sum_ptr + current_step);
+    cmf_block_atomic_add(log_scratch, lid, group_threads, log_stage_error,
+        args.total_stage_error_sum_ptr + current_step);

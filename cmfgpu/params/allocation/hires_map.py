@@ -312,9 +312,27 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         dict
             ``{catchment_id: {"gauge_id": int, "error": float,
             "area_gauge": float, "area_cama": float, ...}}``
+            If several allocations resolve to the same catchment, the entry
+            with the smallest absolute allocation error is retained; ties are
+            resolved by the smallest gauge or dam ID.
         """
         mapping: Dict[int, Dict] = {}
         shape = (self.nXX, self.nYY)
+
+        def add_candidate(cid: int, candidate: Dict) -> None:
+            """Keep the deterministically best allocation for a catchment."""
+            existing = mapping.get(cid)
+            if existing is None:
+                mapping[cid] = candidate
+                return
+
+            def rank(item: Dict) -> tuple[float, int]:
+                error = float(item["error"])
+                absolute_error = abs(error) if np.isfinite(error) else np.inf
+                return absolute_error, int(item["gauge_id"])
+
+            if rank(candidate) < rank(existing):
+                mapping[cid] = candidate
 
         if kind == "flow":
             res = self.results_as_structured_array()
@@ -333,15 +351,15 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                     if sn >= 2:
                         area_cmf += float(row["area2"])
                 err = (area_cmf - area_in) / area_in if area_in > 0 else 0.0
-                mapping[cid1] = {
+                add_candidate(cid1, {
                     "gauge_id": gid, "error": err,
                     "area_gauge": area_in, "area_cama": float(row["area1"]),
-                }
+                })
                 if cid2 >= 0:
-                    mapping[cid2] = {
+                    add_candidate(cid2, {
                         "gauge_id": gid, "error": err,
                         "area_gauge": area_in, "area_cama": float(row["area2"]),
-                    }
+                    })
 
         elif kind == "dam":
             for i in range(len(self.dam_ids)):
@@ -349,12 +367,12 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                 if ix == self.MISSING:
                     continue
                 cid = int(np.ravel_multi_index((ix, iy), shape))
-                mapping[cid] = {
+                add_candidate(cid, {
                     "gauge_id": int(self.dam_ids[i]),
                     "error": float(self.dam_err_rel[i]),
                     "area_gauge": float(self.dam_areas[i]),  # already km²
                     "area_cama": float(self.dam_area_cmf[i]),
-                }
+                })
 
         elif kind == "level":
             for i in range(len(self.gauge_ids)):
@@ -365,7 +383,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                 area_in_km2 = float(self.gauge_areas[i])  # already km²
                 area_cmf = float(self.uparea[ix, iy])
                 err = (area_cmf - area_in_km2) / area_in_km2 if area_in_km2 > 0 else 0.0
-                mapping[cid] = {
+                add_candidate(cid, {
                     "gauge_id": int(self.gauge_ids[i]),
                     "error": err,
                     "area_gauge": area_in_km2,
@@ -374,7 +392,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                     "dst_outlet_km": float(self.lvl_dst_outlet[i]),
                     "elv_outlet": float(self.lvl_elv_outlet[i]),
                     "elv_gauge": float(self.lvl_elv_gauge[i]),
-                }
+                })
         else:
             raise ValueError(f"Unknown kind={kind!r}; expected 'flow', 'dam', or 'level'")
 
@@ -490,15 +508,30 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
 
         records = []
         with open(alloc_path) as f:
-            f.readline()  # skip header
+            header = [token.strip().lower() for token in f.readline().split()]
+
+            def column(*names: str) -> int:
+                for name in names:
+                    if name in header:
+                        return header.index(name)
+                raise ValueError(
+                    f"Unsupported gauge allocation header in {alloc_path}: "
+                    f"missing one of {names}"
+                )
+
+            id_col = column("id")
+            lat_col = column("lat")
+            lon_col = column("lon")
+            area_col = column("area_grdc", "area_input")
+            required_columns = max(id_col, lat_col, lon_col, area_col) + 1
             for line in f:
                 parts = line.split()
-                if len(parts) < 5:
+                if len(parts) < required_columns:
                     continue
-                gid = int(parts[0])
-                lat = float(parts[1])
-                lon = float(parts[2])
-                area = float(parts[4])  # area_GRDC (km²)
+                gid = int(parts[id_col])
+                lat = float(parts[lat_col])
+                lon = float(parts[lon_col])
+                area = float(parts[area_col])
                 records.append((gid, lat, lon, area))
 
         with open(out_path, "w") as f:

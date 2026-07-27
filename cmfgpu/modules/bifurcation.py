@@ -209,14 +209,14 @@ class BifurcationModule(AbstractModule):
     )
     @cached_property
     def num_bifurcation_paths(self) -> int:
-        return self.bifurcation_width.shape[0]
+        return self.bifurcation_path_id.shape[0]
 
     @computed_field(
         description="Number of levels in each bifurcation path."
     )
     @cached_property
     def num_bifurcation_levels(self) -> int:
-        return self.bifurcation_width.shape[1]
+        return self.bifurcation_width.shape[-1]
 
     # ------------------------------------------------------------------ #
     # Validators

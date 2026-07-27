@@ -123,21 +123,23 @@ long num_paths = *args.num_bifurcation_paths;
         args.limit_rate_ptr[catchment_offset + (long)catchment];
     float downstream_limit =
         args.limit_rate_ptr[catchment_offset + (long)downstream];
-    float sum = 0.0f;
+    float raw_sum = 0.0f;
 
     for (int level = 0; level < num_bifurcation_levels; ++level) {
         long item = path * (long)num_bifurcation_levels + level;
         float outflow = args.bifurcation_outflow_ptr[level_offset + item];
+        raw_sum += outflow;
         outflow *= outflow >= 0.0f ? local_limit : downstream_limit;
-        sum += outflow;
         args.bifurcation_outflow_ptr[level_offset + item] = outflow;
     }
 
+    float net = raw_sum >= 0.0f
+        ? raw_sum * local_limit : raw_sum * downstream_limit;
     atomic_fetch_add_explicit(
         args.global_bifurcation_outflow_ptr
             + catchment_offset + (long)catchment,
-        sum, memory_order_relaxed);
+        net, memory_order_relaxed);
     atomic_fetch_add_explicit(
         args.global_bifurcation_outflow_ptr
             + catchment_offset + (long)downstream,
-        -sum, memory_order_relaxed);
+        -net, memory_order_relaxed);

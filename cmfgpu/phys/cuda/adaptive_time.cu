@@ -6,13 +6,15 @@
 // CUDA backend for the adaptive-time-step (CFL) kernel.
 //
 // The CFL sub-step count is monotonic with respect to the per-cell dt:
-//   n(dt) = floor(outer_time_step/dt + 0.49) + 1
+//   n(dt) = floor(outer_time_step/dt - 0.01) + 1
 // decreases as dt increases, so a per-thread atomicMax over n_i gives the
 // global maximum sub-step count without a separate reduction.
 
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+
+#include "block_reduce.cuh"
 
 template <typename REAL>
 __global__ void k_adaptive_time(
@@ -23,18 +25,36 @@ __global__ void k_adaptive_time(
     REAL outer_time_step, REAL adaptive_time_factor, REAL gravity,
     long num_catchments, int has_reservoir)
 {
+    constexpr int invalid_sub_steps = 0x7fffffff;
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    if (t >= num_catchments) return;
-    // Skip dam and upstream-of-dam cells from the CFL calculation.
-    if (has_reservoir && is_dam_related && is_dam_related[t]) return;
+    // 0 is the identity for this reduction: every contributing cell yields
+    // n_steps >= 1, so non-contributing lanes cannot raise the block maximum.
+    int n_steps = 0;
 
-    REAL dist = __ldg(downstream_distance + t);
-    REAL depth = fmax(__ldg(river_depth + t), (REAL)0.01);
-    REAL dt = adaptive_time_factor * dist / sqrt(gravity * depth);
-    REAL dt_clamped = fmin(dt, outer_time_step);
-    REAL n_steps_f = floor(outer_time_step / dt_clamped + (REAL)0.49) + (REAL)1.0;
-    int n_steps = (int)n_steps_f;
-    atomicMax(max_sub_steps, n_steps);
+    bool skip = (t >= num_catchments)
+        || (has_reservoir && is_dam_related && is_dam_related[t]);
+    if (!skip) {
+        REAL dist = __ldg(downstream_distance + t);
+        REAL raw_depth = __ldg(river_depth + t);
+        if (!isfinite(dist) || dist <= (REAL)0.0 || !isfinite(raw_depth)) {
+            n_steps = invalid_sub_steps;
+        } else {
+            REAL depth = fmax(raw_depth, (REAL)0.01);
+            REAL dt = adaptive_time_factor * dist / sqrt(gravity * depth);
+            REAL dt_clamped = fmin(dt, outer_time_step);
+            REAL n_steps_f =
+                floor(outer_time_step / dt_clamped - (REAL)0.01) + (REAL)1.0;
+            // max_sub_steps has an int32 ABI.  Reserve INT_MAX as an error
+            // marker so invalid/overflowing floats are never cast to int.
+            n_steps = (
+                !isfinite(n_steps_f) || n_steps_f >= (REAL)invalid_sub_steps
+            ) ? invalid_sub_steps : (int)n_steps_f;
+        }
+    }
+
+    // Reduce inside the block so the single global scalar sees one atomic per
+    // block instead of one per catchment.
+    cmf_block_atomic_max(n_steps, max_sub_steps);
 }
 
 void launch_adaptive_time(

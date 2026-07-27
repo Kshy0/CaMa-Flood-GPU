@@ -13,6 +13,9 @@ from hydroforge.kernels.backends.cuda.dispatcher import (
 from hydroforge.kernels.backends.cuda.spec import CudaExtensionSpec
 
 _DIR = Path(__file__).resolve().parent
+# Block-level reductions shared by the kernels that fold per-catchment values
+# into a single global scalar.
+_BLOCK_REDUCE = _DIR / "block_reduce.cuh"
 _MODULE_EXTENSIONS = {
     "base": {"storage", "outflow"},
     "inflow": {"outflow"},
@@ -28,12 +31,14 @@ _CUDA = CudaExtensionGroup(
     {
         "storage": CudaExtensionSpec(
             _DIR / "storage.cu",
+            inline_includes=(_BLOCK_REDUCE,),
         ),
         "outflow": CudaExtensionSpec(
             _DIR / "outflow.cu",
         ),
         "adaptive": CudaExtensionSpec(
             _DIR / "adaptive_time.cu",
+            inline_includes=(_BLOCK_REDUCE,),
         ),
         "bifurcation": CudaExtensionSpec(
             _DIR / "bifurcation.cu",
@@ -43,6 +48,7 @@ _CUDA = CudaExtensionGroup(
         ),
         "levee": CudaExtensionSpec(
             _DIR / "levee.cu",
+            inline_includes=(_BLOCK_REDUCE,),
         ),
     },
     binary_prefix="cmfgpu_cuda",
@@ -83,6 +89,7 @@ outflow = _CUDA.route(
     projection=_shared(
         disabled=(
             "batched_catchment_elevation",
+            "batched_downstream_distance",
             "batched_flood_manning",
             "batched_river_height",
             "batched_river_length",

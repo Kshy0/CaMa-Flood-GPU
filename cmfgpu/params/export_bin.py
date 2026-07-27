@@ -170,18 +170,23 @@ def _rebuild_nextxy(
     grid_to_x[catchment_id] = catchment_x
     grid_to_y[catchment_id] = catchment_y
 
-    for i in range(len(catchment_id)):
-        ix, iy = int(catchment_x[i]), int(catchment_y[i])
-        if is_mouth[i]:
-            nextxy[ix, iy, :] = _MOUTH_OCEAN
-        else:
-            ds_id = int(downstream_id[i])
-            if 0 <= ds_id <= max_cid and grid_to_x[ds_id] >= 0:
-                nextxy[ix, iy, 0] = int(grid_to_x[ds_id]) + 1  # 1-based
-                nextxy[ix, iy, 1] = int(grid_to_y[ds_id]) + 1
-            else:
-                # Downstream cell not in subset → treat as mouth
-                nextxy[ix, iy, :] = _MOUTH_OCEAN
+    # Vectorised scatter: a per-catchment Python loop costs seconds on
+    # glb_06min-class maps (~1.5M rows) purely in interpreter overhead.
+    ix = catchment_x.astype(np.int64)
+    iy = catchment_y.astype(np.int64)
+    ds_id = downstream_id.astype(np.int64)
+
+    # A downstream cell outside the subset is treated as a mouth, exactly as
+    # the scalar form did.
+    resolvable = (~is_mouth) & (ds_id >= 0) & (ds_id <= max_cid)
+    resolvable[resolvable] &= grid_to_x[ds_id[resolvable]] >= 0
+
+    nextxy[ix[~resolvable], iy[~resolvable], :] = _MOUTH_OCEAN
+    linked = np.flatnonzero(resolvable)
+    nextxy[ix[linked], iy[linked], 0] = (
+        grid_to_x[ds_id[linked]] + 1).astype("<i4")  # 1-based
+    nextxy[ix[linked], iy[linked], 1] = (
+        grid_to_y[ds_id[linked]] + 1).astype("<i4")
     return nextxy
 
 
@@ -380,6 +385,7 @@ def _write_dam_params_csv(
     longitude: Optional[np.ndarray] = None,
     latitude: Optional[np.ndarray] = None,
     upstream_area: Optional[np.ndarray] = None,
+    reservoir_id: Optional[np.ndarray] = None,
 ) -> None:
     """Write ``dam_params.csv`` in the CaMa-Flood dam-parameter CSV format.
 
@@ -416,10 +422,21 @@ def _write_dam_params_csv(
     upstream_area : 1-D float, optional
         Catchment-indexed upstream drainage area in m² (same order as
         *catchment_id*).
+    reservoir_id : 1-D int, optional
+        Stable reservoir identifiers.  When omitted, sequential 1-based IDs
+        are generated for compatibility with parameter files that predate
+        this variable.
     """
     n_total = len(reservoir_catchment_id)
     if n_total == 0:
         return
+    if reservoir_id is not None:
+        reservoir_id = np.asarray(reservoir_id, dtype=np.int64)
+        if reservoir_id.shape != (n_total,):
+            raise ValueError(
+                "reservoir_id must have one value per reservoir: "
+                f"expected {(n_total,)}, got {reservoir_id.shape}"
+            )
 
     # ---- Unravel reservoir_catchment_id → (full_x, full_y) ----
     full_x = reservoir_catchment_id // full_ny
@@ -455,7 +472,11 @@ def _write_dam_params_csv(
                 "DamIX DamIY FldVol_mcm ConVol_mcm TotVol_mcm Qn Qf\n")
 
         for rank, i in enumerate(idx_keep):
-            dam_id = rank + 1                        # sequential 1-based ID
+            dam_id = (
+                int(reservoir_id[i])
+                if reservoir_id is not None
+                else rank + 1
+            )
             dam_name = f"DAM_{dam_id}"
 
             ix_out = int(dam_cx[i]) + 1              # 1-based output index
@@ -811,6 +832,10 @@ def export_map_params(
             "normal_outflow", "flood_control_outflow",
         )
         if all(v in ds.variables for v in _required_dam_vars):
+            res_id = (
+                ds.variables["reservoir_id"][:].astype(np.int64)
+                if "reservoir_id" in ds.variables else None
+            )
             res_cid = ds.variables["reservoir_catchment_id"][:].astype(np.int64)
             res_cap = ds.variables["reservoir_capacity"][:].astype("<f4")
             res_con = ds.variables["conservation_volume"][:].astype("<f4")
@@ -848,6 +873,7 @@ def export_map_params(
                 longitude=lon_1d,
                 latitude=lat_1d,
                 upstream_area=up_area,
+                reservoir_id=res_id,
             )
 
         # ---- mapdim.txt ----
@@ -978,11 +1004,19 @@ def export_inpmat(
         # Caller supplied cropped dimensions (e.g. from export_map_params)
         # We still need x_min/y_min to offset catchment coordinates
         if out_nx != full_nx or out_ny != full_ny:
-            bbox = _compute_bbox(nc_cx, nc_cy, full_nx, full_ny)
+            bbox = _compute_bbox(
+                nc_cx, nc_cy, full_nx, full_ny,
+                full_west=west, full_east=east,
+                full_north=north, full_south=south,
+            )
             x_min = bbox[0]  # x_min
             y_min = bbox[2]  # y_min
     elif crop_to_bbox:
-        bbox = _compute_bbox(nc_cx, nc_cy, full_nx, full_ny)
+        bbox = _compute_bbox(
+            nc_cx, nc_cy, full_nx, full_ny,
+            full_west=west, full_east=east,
+            full_north=north, full_south=south,
+        )
         x_min = bbox[0]
         y_min = bbox[2]
         out_nx = bbox[4]  # crop_nx
@@ -1014,36 +1048,40 @@ def export_inpmat(
     INPA = np.zeros((out_nx, out_ny, inpn), dtype="<f4")
 
     # --- Populate per-cell mapping ---
-    for cid in npz_catchment_ids:
-        cid_int = int(cid)
-        if cid_int > max_nc_cid or nc_grid_cx[cid_int] == -9999:
-            continue  # catchment not in this NC (e.g. different crop)
-        row = int(npz_grid_to_row[cid_int])
-        ix, iy = int(nc_grid_cx[cid_int]), int(nc_grid_cy[cid_int])
+    # Scattered in one pass: iterating catchment-by-catchment in Python costs
+    # seconds of pure interpreter overhead on glb_06min-class maps.  Each CSR
+    # entry carries its source row, so the destination cell and the within-row
+    # slot can both be derived for every entry at once.
+    row_of_entry = np.repeat(
+        np.arange(full_sparse.shape[0], dtype=np.int64),
+        np.diff(full_sparse.indptr),
+    )
+    # Rank of each entry inside its row reproduces the loop's ``[:n_entries]``
+    # write order; INPN is the longest row, so the rank always fits.
+    slot = np.arange(full_sparse.nnz, dtype=np.int64) - full_sparse.indptr[row_of_entry]
 
-        if ix < 0 or ix >= out_nx or iy < 0 or iy >= out_ny:
-            continue  # outside cropped grid
+    entry_cid = npz_catchment_ids.astype(np.int64)[row_of_entry]
+    keep = entry_cid <= max_nc_cid
+    keep[keep] &= nc_grid_cx[entry_cid[keep]] != -9999  # not in this NC crop
 
-        # Get non-zero entries for this catchment row
-        start, end = full_sparse.indptr[row], full_sparse.indptr[row + 1]
-        if start == end:
-            continue
+    entry_ix = np.where(keep, nc_grid_cx[np.where(keep, entry_cid, 0)], -1)
+    entry_iy = np.where(keep, nc_grid_cy[np.where(keep, entry_cid, 0)], -1)
+    keep &= (
+        (entry_ix >= 0) & (entry_ix < out_nx)
+        & (entry_iy >= 0) & (entry_iy < out_ny)  # outside cropped grid
+    )
 
-        col_indices = full_sparse.indices[start:end]
-        area_weights = full_sparse.data[start:end]
-        n_entries = len(col_indices)
+    sel = np.flatnonzero(keep)
+    dst_x, dst_y, dst_slot = entry_ix[sel], entry_iy[sel], slot[sel]
+    col_indices = full_sparse.indices[sel]
 
-        # Convert flattened column index → (ixin, iyin)
-        # Column convention: col = iyin * nxin + ixin
-        # NOTE: INPX/INPY are 1-based indices into the RUNOFF grid
-        #       (NXIN × NYIN), NOT the map grid — they stay unchanged.
-        ixin = (col_indices % nxin).astype("i4")
-        iyin = (col_indices // nxin).astype("i4")
-
-        # Store 1-based indices
-        INPX[ix, iy, :n_entries] = ixin + 1
-        INPY[ix, iy, :n_entries] = iyin + 1
-        INPA[ix, iy, :n_entries] = area_weights.astype("<f4")
+    # Convert flattened column index → (ixin, iyin)
+    # Column convention: col = iyin * nxin + ixin
+    # NOTE: INPX/INPY are 1-based indices into the RUNOFF grid
+    #       (NXIN × NYIN), NOT the map grid — they stay unchanged.
+    INPX[dst_x, dst_y, dst_slot] = (col_indices % nxin).astype("i4") + 1
+    INPY[dst_x, dst_y, dst_slot] = (col_indices // nxin).astype("i4") + 1
+    INPA[dst_x, dst_y, dst_slot] = full_sparse.data[sel].astype("<f4")
 
     # --- Write inpmat binary (fixed-size records, RECL = 4*out_nx*out_ny) ---
     inpmat_path = out_dir / inpmat_name

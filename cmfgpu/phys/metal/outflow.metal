@@ -38,12 +38,18 @@ long num_catchments = *args.num_catchments;
     float river_length = args.river_length_ptr[river_length_idx];
     float river_height = args.river_height_ptr[river_height_idx];
     float catchment_elevation = args.catchment_elevation_ptr[elevation_idx];
-    float downstream_distance = args.downstream_distance_ptr[catchment];
+    long downstream_distance_idx = batched_downstream_distance
+        ? cell : catchment;
+    float downstream_distance =
+        args.downstream_distance_ptr[downstream_distance_idx];
 
     float river_elevation = catchment_elevation - river_height;
     float water_surface = river_depth + river_elevation;
-    float protected_surface =
-        min(catchment_elevation + protected_depth, water_surface);
+    float protected_surface = water_surface;
+    if (HAS_LEVEE && args.is_levee_ptr[catchment]) {
+        protected_surface =
+            min(catchment_elevation + protected_depth, water_surface);
+    }
     float total_storage = river_storage + flood_storage + protected_storage;
 
     long downstream_height_idx = batched_river_height
@@ -69,11 +75,16 @@ long num_catchments = *args.num_catchments;
         (water_surface - effective_downstream_surface) / downstream_distance;
     float flood_slope = clamp(river_slope, -0.005f, 0.005f);
 
-    float updated_river_xs = maximum_surface - river_elevation;
+    // The mouth boundary level controls slope, while CaMa-Flood uses the
+    // local river depth itself for the mouth's hydraulic cross-section.
+    float updated_river_xs = is_mouth
+        ? river_depth : maximum_surface - river_elevation;
     float river_flow_depth =
         max(sqrt(updated_river_xs * river_xs_depth), 1e-6f);
+    float flood_cross_section_surface = is_mouth
+        ? water_surface : maximum_surface;
     float updated_flood_xs =
-        max(maximum_surface - catchment_elevation, 0.0f);
+        max(flood_cross_section_surface - catchment_elevation, 0.0f);
     float flood_flow_depth =
         max(sqrt(updated_flood_xs * flood_xs_depth), 1e-6f);
     float updated_flood_area = max(

@@ -14,6 +14,11 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include "block_reduce.cuh"
+
+// Number of global water-balance counters the LOG path accumulates.
+#define CMF_LOG_SUMS 11
+
 template <typename REAL, typename STO, bool LOG>
 __global__ void k_flood_stage(
     const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
@@ -46,171 +51,178 @@ __global__ void k_flood_stage(
     int has_bifurcation, int has_inflow, int has_levee)
 {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    if (t >= num_catchments) return;
-
-    REAL ts = __ldg(time_step_ptr);
-    STO rsto = river_storage[t];
-    STO fsto = flood_storage[t];
-    STO prot = protected_storage[t];
-    REAL rinf = (REAL)river_inflow[t];
-    REAL finf = (REAL)flood_inflow[t];
-    REAL gbif = has_bifurcation ? (REAL)global_bif_outflow[t] : (REAL)0;
-    REAL rout = __ldg(river_outflow + t);
-    REAL fout = __ldg(flood_outflow + t);
-    REAL ro = __ldg(runoff + t);
-    REAL prescribed_inflow = (REAL)0;
-    if (has_inflow) {
-        int inflow_idx = __ldg(catchment_inflow_idx + t);
-        if (inflow_idx >= 0) prescribed_inflow = __ldg(inflow + inflow_idx);
+    REAL log_sum[CMF_LOG_SUMS];
+    if constexpr (LOG) {
+        // Every thread must reach the block reduction, so out-of-range lanes
+        // stay alive with zero contributions instead of returning early.
+#pragma unroll
+        for (int i = 0; i < CMF_LOG_SUMS; ++i) log_sum[i] = (REAL)0;
+    } else {
+        if (t >= num_catchments) return;
     }
-
-    bool non_levee = !has_levee || !is_levee[t];
     int current_step = LOG ? __ldg(current_step_ptr) : 0;
-    STO total_stage_pre = rsto + fsto + prot;
-    if constexpr (LOG) {
-        atomicAdd(total_storage_pre_sum + current_step,
-                  (REAL)total_stage_pre * (REAL)1e-9);
-    }
 
-    REAL river_delta = (rinf - rout) * ts;
-    STO river_su = rsto + (STO)river_delta;
-    REAL flood_delta = (finf - fout - gbif) * ts;
-    STO flood_su = fsto
-        + (river_su < (STO)0 ? river_su : (STO)0)
-        + (STO)flood_delta;
-    river_su = river_su > (STO)0 ? river_su : (STO)0;
-    if (flood_su < (STO)0) {
-        STO tt = river_su + flood_su;
-        river_su = tt > (STO)0 ? tt : (STO)0;
-    }
-    flood_su = flood_su > (STO)0 ? flood_su : (STO)0;
-    REAL external_delta = (ro + prescribed_inflow) * ts;
-    STO total_next = river_su + flood_su + prot + (STO)external_delta;
-    if constexpr (LOG) {
-        if (non_levee) {
-            atomicAdd(total_storage_next_sum + current_step,
-                      (REAL)total_next * (REAL)1e-9);
-            atomicAdd(total_inflow_sum + current_step,
-                      (rinf + finf + prescribed_inflow) * ts * (REAL)1e-9);
-            atomicAdd(total_outflow_sum + current_step,
-                      (rout + fout) * ts * (REAL)1e-9);
+    if (t < num_catchments) {
+
+        REAL ts = __ldg(time_step_ptr);
+        STO rsto = river_storage[t];
+        STO fsto = flood_storage[t];
+        STO prot = protected_storage[t];
+        REAL rinf = (REAL)river_inflow[t];
+        REAL finf = (REAL)flood_inflow[t];
+        REAL gbif = has_bifurcation ? (REAL)global_bif_outflow[t] : (REAL)0;
+        REAL rout = __ldg(river_outflow + t);
+        REAL fout = __ldg(flood_outflow + t);
+        REAL ro = __ldg(runoff + t);
+        REAL prescribed_inflow = (REAL)0;
+        if (has_inflow) {
+            int inflow_idx = __ldg(catchment_inflow_idx + t);
+            if (inflow_idx >= 0) prescribed_inflow = __ldg(inflow + inflow_idx);
+        }
+
+        bool non_levee = !has_levee || !is_levee[t];
+        STO total_stage_pre = rsto + fsto + prot;
+        if constexpr (LOG) {
+            log_sum[0] += (REAL)total_stage_pre * (REAL)1e-9;
+        }
+
+        REAL river_delta = (rinf - rout) * ts;
+        STO river_su = rsto + (STO)river_delta;
+        REAL flood_delta = (finf - fout - gbif) * ts;
+        STO flood_su = fsto
+            + (river_su < (STO)0 ? river_su : (STO)0)
+            + (STO)flood_delta;
+        river_su = river_su > (STO)0 ? river_su : (STO)0;
+        if (flood_su < (STO)0) {
+            STO tt = river_su + flood_su;
+            river_su = tt > (STO)0 ? tt : (STO)0;
+        }
+        flood_su = flood_su > (STO)0 ? flood_su : (STO)0;
+        REAL external_delta = (ro + prescribed_inflow) * ts;
+        STO total_next = river_su + flood_su + prot + (STO)external_delta;
+        if constexpr (LOG) {
+            log_sum[1] += (REAL)total_next * (REAL)1e-9;
+            log_sum[2] += (rinf + finf + prescribed_inflow) * ts * (REAL)1e-9;
+            log_sum[3] += (rout + fout) * ts * (REAL)1e-9;
             REAL balance = (REAL)total_stage_pre - (REAL)total_next
                 + (rinf + finf + ro + prescribed_inflow - rout - fout - gbif) * ts;
-            atomicAdd(total_inflow_error_sum + current_step,
-                      balance * (REAL)1e-9);
+            log_sum[4] += balance * (REAL)1e-9;
         }
-    }
-    STO total_s = total_next;
-    total_s = total_s > (STO)0 ? total_s : (STO)0;
-    REAL total_storage = (REAL)total_s;
-    if constexpr (LOG) {
-        if (non_levee) {
-            atomicAdd(total_storage_new_sum + current_step,
-                      total_storage * (REAL)1e-9);
-        }
-    }
-
-    REAL rh = __ldg(river_height + t);
-    REAL rw = __ldg(river_width + t);
-    REAL rl = __ldg(river_length + t);
-    REAL river_max_storage = rl * rw * rh;
-
-    if (total_storage <= river_max_storage) {
-        REAL river_depth_dry = total_storage / (rl * rw);
+        STO total_s = total_next;
+        total_s = total_s > (STO)0 ? total_s : (STO)0;
+        REAL total_storage = (REAL)total_s;
         if constexpr (LOG) {
-            atomicAdd(total_storage_stage_sum + current_step,
-                      total_storage * (REAL)1e-9);
-            if (non_levee) {
-                atomicAdd(river_storage_sum + current_step,
-                          total_storage * (REAL)1e-9);
+            log_sum[5] += total_storage * (REAL)1e-9;
+        }
+
+        REAL rh = __ldg(river_height + t);
+        REAL rw = __ldg(river_width + t);
+        REAL rl = __ldg(river_length + t);
+        REAL river_max_storage = rl * rw * rh;
+
+        if (total_storage <= river_max_storage) {
+            REAL river_depth_dry = total_storage / (rl * rw);
+            if constexpr (LOG) {
+                if (non_levee) {
+                    log_sum[6] += total_storage * (REAL)1e-9;
+                    log_sum[7] += total_storage * (REAL)1e-9;
+                }
+            }
+            outgoing_storage[t] = (STO)0;
+            river_storage[t] = total_s;
+            flood_storage[t] = (STO)0;
+            protected_storage[t] = (STO)0;
+            river_depth[t] = river_depth_dry;
+            flood_depth[t] = (REAL)0;
+            protected_depth[t] = (REAL)0;
+            flood_fraction[t] = (REAL)0;
+        } else {
+
+        REAL ca = __ldg(catchment_area + t);
+        REAL catchment_width = ca / rl;
+        REAL width_increment = catchment_width / num_flood_levels;
+        int level = 0;
+        REAL S_accum = river_max_storage;
+        REAL prev_H = (REAL)0;
+        REAL prev_W = rw;
+        REAL prev_total_storage = river_max_storage;
+        REAL prev_flood_depth = (REAL)0;
+        REAL next_flood_depth = (REAL)0;
+
+        for (int i = 0; i < num_flood_levels; ++i) {
+            REAL H_curr = __ldg(flood_depth_table + t * num_flood_levels + i);
+            REAL W_curr = rw + (i + 1) * width_increment;
+            REAL dS = rl * (REAL)0.5 * (prev_W + W_curr) * (H_curr - prev_H);
+            REAL S_curr = S_accum + dS;
+            next_flood_depth = H_curr;
+            bool is_above = total_storage > S_curr;
+            if (is_above) {
+                level += 1;
+                prev_total_storage = S_curr;
+                prev_flood_depth = H_curr;
+                S_accum = S_curr;
+                prev_H = H_curr;
+                prev_W = W_curr;
+            } else {
+                break;
             }
         }
-        outgoing_storage[t] = (STO)0;
-        river_storage[t] = (STO)total_storage;
-        flood_storage[t] = (STO)0;
-        protected_storage[t] = (STO)0;
-        river_depth[t] = river_depth_dry;
-        flood_depth[t] = (REAL)0;
-        protected_depth[t] = (REAL)0;
-        flood_fraction[t] = (REAL)0;
-        return;
-    }
 
-    REAL ca = __ldg(catchment_area + t);
-    REAL catchment_width = ca / rl;
-    REAL width_increment = catchment_width / num_flood_levels;
-    int level = 0;
-    REAL S_accum = river_max_storage;
-    REAL prev_H = (REAL)0;
-    REAL prev_W = rw;
-    REAL prev_total_storage = river_max_storage;
-    REAL prev_flood_depth = (REAL)0;
-    REAL next_flood_depth = (REAL)0;
-
-    for (int i = 0; i < num_flood_levels; ++i) {
-        REAL H_curr = __ldg(flood_depth_table + t * num_flood_levels + i);
-        REAL W_curr = rw + (i + 1) * width_increment;
-        REAL dS = rl * (REAL)0.5 * (prev_W + W_curr) * (H_curr - prev_H);
-        REAL S_curr = S_accum + dS;
-        next_flood_depth = H_curr;
-        bool is_above = total_storage > S_curr;
-        if (is_above) {
-            level += 1;
-            prev_total_storage = S_curr;
-            prev_flood_depth = H_curr;
-            S_accum = S_curr;
-            prev_H = H_curr;
-            prev_W = W_curr;
+        REAL prev_total_width = rw + level * width_increment;
+        REAL diff_width = (REAL)0;
+        REAL fdep;
+        if (level == num_flood_levels) {
+            fdep = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * rl);
         } else {
-            break;
+            REAL flood_grad = (next_flood_depth - prev_flood_depth) / width_increment;
+            diff_width = sqrt(prev_total_width * prev_total_width
+                + (REAL)2 * (total_storage - prev_total_storage) / (flood_grad * rl)) - prev_total_width;
+            fdep = prev_flood_depth + diff_width * flood_grad;
         }
-    }
 
-    REAL prev_total_width = rw + level * width_increment;
-    REAL diff_width = (REAL)0;
-    REAL fdep;
-    if (level == num_flood_levels) {
-        fdep = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * rl);
-    } else {
-        REAL flood_grad = (next_flood_depth - prev_flood_depth) / width_increment;
-        diff_width = sqrt(prev_total_width * prev_total_width
-            + (REAL)2 * (total_storage - prev_total_storage) / (flood_grad * rl)) - prev_total_width;
-        fdep = prev_flood_depth + diff_width * flood_grad;
-    }
+        REAL cap = river_max_storage + rl * rw * fdep;
+        STO cap_s = (STO)cap;
+        STO river_storage_final = cap_s < total_s ? cap_s : total_s;
+        REAL rdep = (REAL)river_storage_final / (rl * rw);
+        REAL ff_mid = (prev_total_width + diff_width - rw) * rl / ca;
+        ff_mid = ff_mid < (REAL)0 ? (REAL)0 : (ff_mid > (REAL)1 ? (REAL)1 : ff_mid);
+        REAL ffr = (level == num_flood_levels) ? (REAL)1 : ff_mid;
+        STO flood_storage_final = total_s - river_storage_final;
+        if (flood_storage_final < (STO)0) flood_storage_final = (STO)0;
 
-    REAL cap = river_max_storage + rl * rw * fdep;
-    REAL river_storage_final = cap < total_storage ? cap : total_storage;
-    REAL rdep = river_storage_final / (rl * rw);
-    REAL ff_mid = (prev_total_width + diff_width - rw) * rl / ca;
-    ff_mid = ff_mid < (REAL)0 ? (REAL)0 : (ff_mid > (REAL)1 ? (REAL)1 : ff_mid);
-    REAL ffr = (level == num_flood_levels) ? (REAL)1 : ff_mid;
-    REAL flood_storage_final = total_storage - river_storage_final;
-    if (flood_storage_final < (REAL)0) flood_storage_final = (REAL)0;
+        if constexpr (LOG) {
+            STO total_stage_new = river_storage_final + flood_storage_final;
+            if (non_levee) {
+                log_sum[6] += (REAL)total_stage_new * (REAL)1e-9;
+                log_sum[10] += (REAL)(total_stage_new - total_s) * (REAL)1e-9;
+                log_sum[7] += (REAL)river_storage_final * (REAL)1e-9;
+                log_sum[8] += (REAL)flood_storage_final * (REAL)1e-9;
+                log_sum[9] += ffr * ca * (REAL)1e-9;
+            }
+        }
+
+        outgoing_storage[t] = (STO)0;
+        river_storage[t] = river_storage_final;
+        flood_storage[t] = flood_storage_final;
+        protected_storage[t] = (STO)0;
+        river_depth[t] = rdep;
+        flood_depth[t] = fdep;
+        protected_depth[t] = fdep;
+        flood_fraction[t] = ffr;
+
+        }  // wet branch
+    }  // active lane
 
     if constexpr (LOG) {
-        REAL total_stage_new = river_storage_final + flood_storage_final;
-        atomicAdd(total_storage_stage_sum + current_step,
-                  total_stage_new * (REAL)1e-9);
-        if (non_levee) {
-            atomicAdd(total_stage_error_sum + current_step,
-                      (total_stage_new - total_storage) * (REAL)1e-9);
-            atomicAdd(river_storage_sum + current_step,
-                      river_storage_final * (REAL)1e-9);
-            atomicAdd(flood_storage_sum + current_step,
-                      flood_storage_final * (REAL)1e-9);
-            atomicAdd(flood_area_sum + current_step,
-                      ffr * ca * (REAL)1e-9);
-        }
+        REAL* const destination[CMF_LOG_SUMS] = {
+            total_storage_pre_sum, total_storage_next_sum, total_inflow_sum,
+            total_outflow_sum, total_inflow_error_sum, total_storage_new_sum,
+            total_storage_stage_sum, river_storage_sum, flood_storage_sum,
+            flood_area_sum, total_stage_error_sum,
+        };
+        cmf_block_atomic_add<REAL, CMF_LOG_SUMS>(
+            log_sum, destination, current_step);
     }
-
-    outgoing_storage[t] = (STO)0;
-    river_storage[t] = (STO)river_storage_final;
-    flood_storage[t] = (STO)flood_storage_final;
-    protected_storage[t] = (STO)0;
-    river_depth[t] = rdep;
-    flood_depth[t] = fdep;
-    protected_depth[t] = fdep;
-    flood_fraction[t] = ffr;
 }
 
 template <typename REAL, typename STO, bool LOG>

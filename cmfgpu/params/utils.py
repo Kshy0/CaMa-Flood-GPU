@@ -166,24 +166,25 @@ def build_upstream_csr(catchment_id, downstream_id):
     """
     n = len(catchment_id)
 
-    # Array-based grid-id to index lookup (replaces typed dict)
+    # Sorted-id lookup instead of a dense grid_to_idx table.  catchment_id is
+    # x*ny + y, so a dense table costs O(nx*ny) whatever the catchment count
+    # (1.8 GiB on a 1-arcmin map); sorting costs O(n) memory instead.
     max_id = np.int64(0)
     for i in range(n):
         if catchment_id[i] > max_id:
             max_id = catchment_id[i]
     total = max_id + 1
-    grid_to_idx = np.full(total, np.int64(-1))
-    for i in range(n):
-        grid_to_idx[catchment_id[i]] = np.int64(i)
+    order = np.argsort(catchment_id)
+    sorted_ids = catchment_id[order]
 
     # Pass 1: count upstream neighbours per node
     count = np.zeros(n, dtype=np.int32)
     for i in range(n):
         did = downstream_id[i]
         if did >= 0 and did < total and did != catchment_id[i]:
-            d_idx = grid_to_idx[did]
-            if d_idx >= 0:
-                count[d_idx] += 1
+            pos = np.searchsorted(sorted_ids, did)
+            if pos < n and sorted_ids[pos] == did:
+                count[order[pos]] += 1
 
     # Pass 2: build indptr
     indptr = np.zeros(n + 1, dtype=np.int32)
@@ -196,8 +197,9 @@ def build_upstream_csr(catchment_id, downstream_id):
     for i in range(n):
         did = downstream_id[i]
         if did >= 0 and did < total and did != catchment_id[i]:
-            d_idx = grid_to_idx[did]
-            if d_idx >= 0:
+            pos = np.searchsorted(sorted_ids, did)
+            if pos < n and sorted_ids[pos] == did:
+                d_idx = order[pos]
                 indices[indptr[d_idx] + offset[d_idx]] = i
                 offset[d_idx] += 1
 
@@ -688,12 +690,14 @@ def get_kept_basin_ids(
         return np.array([], dtype=np.int64)
 
     target_idx = find_indices_in(target_cids, catchment_id)
-    # Filter out -1 (not found)
-    valid_mask = target_idx >= 0
-    if not np.any(valid_mask):
-         return np.array([], dtype=np.int64)
-    
-    kept_basin_ids = np.unique(catchment_basin_id[target_idx[valid_mask]])
+    missing = np.asarray(target_cids)[target_idx < 0]
+    if missing.size:
+        raise ValueError(
+            "Target catchment IDs are not present in the parameter map: "
+            + ", ".join(str(int(cid)) for cid in missing)
+        )
+
+    kept_basin_ids = np.unique(catchment_basin_id[target_idx])
     return kept_basin_ids
 
 
@@ -1068,14 +1072,24 @@ def visualize_nc_basins(
 
 
 def _trace_upstream_bfs(start_cid, upstream_adj, stop_at=None):
-    """BFS upstream from *start_cid*.  Returns a **set of CIDs**.
+    """BFS upstream from *start_cid*.  Returns the **boolean visited mask**.
 
     *upstream_adj* must be the tuple returned by ``_build_upstream_adj``.
     If *stop_at* is a set of CIDs, those nodes are included but not expanded.
+
+    The mask is returned in index space rather than as a set of CIDs: callers
+    combine it with ``|`` / ``~`` and index with it directly, which avoids
+    materialising a multi-million-entry Python int set per POI and the
+    ``sorted()`` + ``np.isin`` round trip that follows it.
     """
     indptr, indices, id_to_idx, cid_arr = upstream_adj
     n = len(cid_arr)
-    start_idx = id_to_idx[int(start_cid)]
+    start_value = int(start_cid)
+    if start_value < 0 or start_value >= len(id_to_idx):
+        raise ValueError(f"Start catchment ID {start_value} is not in the map")
+    start_idx = int(id_to_idx[start_value])
+    if start_idx < 0:
+        raise ValueError(f"Start catchment ID {start_value} is not in the map")
     stop_mask = np.zeros(n, dtype=np.bool_)
     if stop_at is not None:
         id_to_idx_len = len(id_to_idx)
@@ -1083,24 +1097,27 @@ def _trace_upstream_bfs(start_cid, upstream_adj, stop_at=None):
             si = int(s)
             if 0 <= si < id_to_idx_len and id_to_idx[si] >= 0:
                 stop_mask[id_to_idx[si]] = True
-    visited = trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
-    return set(cid_arr[visited].tolist())
+    return trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
 
 
-def _check_poi_overlap(sorted_pois, poi_upstream_list):
+def _check_poi_overlap(sorted_pois, poi_upstream_list, id_to_idx):
     """Raise ValueError if any POI is in the upstream set of another.
-    
+
     Parameters
     ----------
     sorted_pois : array-like of int
         Sorted POI catchment IDs.
-    poi_upstream_list : list of set
-        ``poi_upstream_list[i]`` is the upstream set for ``sorted_pois[i]``.
+    poi_upstream_list : list of np.ndarray
+        ``poi_upstream_list[i]`` is the boolean upstream mask for
+        ``sorted_pois[i]``, in catchment-index space.
+    id_to_idx : np.ndarray
+        CID -> index lookup from ``_build_upstream_adj``.
     """
     overlapping = []
     for ia, cid_a in enumerate(sorted_pois):
+        idx_a = int(id_to_idx[int(cid_a)])
         for ib, cid_b in enumerate(sorted_pois):
-            if ia != ib and int(cid_a) in poi_upstream_list[ib]:
+            if ia != ib and idx_a >= 0 and poi_upstream_list[ib][idx_a]:
                 overlapping.append((int(cid_a), int(cid_b)))
     if overlapping:
         pairs_str = "; ".join(f"POI {a} is upstream of POI {b}" for a, b in overlapping)
@@ -1108,6 +1125,26 @@ def _check_poi_overlap(sorted_pois, poi_upstream_list):
             f"Overlapping POIs detected (one is upstream of another): {pairs_str}. "
             f"Please remove redundant POIs so that no POI is in the upstream set of another."
         )
+
+
+def _create_variable_like(dst, name, source, dimensions=None):
+    """Create a cropped variable while preserving NetCDF metadata."""
+    attrs = {key: source.getncattr(key) for key in source.ncattrs()}
+    fill_value = attrs.pop("_FillValue", None)
+    kwargs = {"zlib": True}
+    if fill_value is not None:
+        kwargs["fill_value"] = fill_value
+    out = dst.createVariable(
+        name,
+        source.dtype,
+        source.dimensions if dimensions is None else dimensions,
+        **kwargs,
+    )
+    # Set scale/offset before assigning decoded source data so netCDF4 packs
+    # values with the same convention as the input variable.
+    if attrs:
+        out.setncatts(attrs)
+    return out
 
 
 def crop_parameters_nc(
@@ -1224,28 +1261,24 @@ def crop_parameters_nc(
             effective_outlets = sorted(int(c) for c in target_cids)
             poi_upstream_list = [_trace_upstream_bfs(int(cid), upstream_adj) for cid in effective_outlets]
 
-            _check_poi_overlap(effective_outlets, poi_upstream_list)
+            _check_poi_overlap(effective_outlets, poi_upstream_list, grid_to_idx)
 
             print(f"crop_upstream: Effective outlet POIs: {effective_outlets}")
 
-            # Collect all upstream catchments of effective outlets
-            kept_cid_set = set()
-            for us_set in poi_upstream_list:
-                kept_cid_set.update(us_set)
+            # Union of every POI's upstream mask -- the BFS already produced
+            # these in index space, so no CID set round trip is needed.
+            keep_mask_upstream = np.zeros(len(catchment_id), dtype=bool)
+            for us_mask in poi_upstream_list:
+                keep_mask_upstream |= us_mask
 
-            # Override keep_mask: only keep these catchments
-            keep_mask_upstream = np.isin(catchment_id, np.array(sorted(kept_cid_set), dtype=np.int64))
-            
             # Recompute basin info for the kept subset
             # Reassign basins: each outlet defines its own basin
             outlet_cids = np.array(effective_outlets, dtype=np.int64)
-            
+
             # Assign each kept catchment to the outlet it flows to
             new_basin_assignment = np.full(len(catchment_id), -1, dtype=np.int64)
-            for basin_idx, us_set in enumerate(poi_upstream_list):
-                for upstream_cid in us_set:
-                    if grid_to_idx[upstream_cid] >= 0:
-                        new_basin_assignment[grid_to_idx[upstream_cid]] = basin_idx
+            for basin_idx, us_mask in enumerate(poi_upstream_list):
+                new_basin_assignment[us_mask] = basin_idx
 
             # For catchments that belong to multiple outlet upstream sets (shouldn't happen
             # after dedup, but just in case from bifurcation), assign to the first.
@@ -1263,7 +1296,7 @@ def crop_parameters_nc(
 
         # ── crop_downstream mode: remove the gauged upstream network and
         # inject its outlet discharge into the first retained downstream cell. ──
-        removed_cid_set_dn = set()
+        removed_mask_dn = np.zeros(len(catchment_id), dtype=bool)
         if crop_downstream and len(target_cids) > 0:
             if downstream_id is None:
                 print("Error: crop_downstream requires 'downstream_id' in the input NC. Aborting.")
@@ -1274,23 +1307,20 @@ def crop_parameters_nc(
             sorted_pois_dn = sorted(int(c) for c in target_cids)
             poi_upstream_list_dn = [_trace_upstream_bfs(int(cid), upstream_adj) for cid in sorted_pois_dn]
 
-            _check_poi_overlap(sorted_pois_dn, poi_upstream_list_dn)
+            _check_poi_overlap(sorted_pois_dn, poi_upstream_list_dn, upstream_adj[2])
 
             # An outlet gauge measures everything leaving its own catchment, so
             # that catchment is part of the replaced upstream network as well.
-            for i in range(len(sorted_pois_dn)):
-                removed_cid_set_dn.update(poi_upstream_list_dn[i])
+            for us_mask in poi_upstream_list_dn:
+                removed_mask_dn |= us_mask
 
             # Recompute kept_basin_ids from remaining catchments
-            if removed_cid_set_dn:
-                remaining_mask = ~np.isin(catchment_id, np.array(sorted(removed_cid_set_dn), dtype=np.int64))
-            else:
-                remaining_mask = np.ones(len(catchment_id), dtype=bool)
+            remaining_mask = ~removed_mask_dn
             kept_basin_ids = np.unique(catchment_basin_id[remaining_mask])
 
             print(
                 "crop_downstream: Removing "
-                f"{len(removed_cid_set_dn)} gauged/upstream catchments at "
+                f"{int(removed_mask_dn.sum())} gauged/upstream catchments at "
                 f"{len(target_cids)} POIs"
             )
 
@@ -1321,7 +1351,16 @@ def crop_parameters_nc(
             cid_to_poi_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
             # First pass: non-POI catchments assigned to their downstream POI
             for pi, poi_cid in enumerate(sorted_pois):
-                start_idx = grid_to_idx[int(poi_cid)]
+                poi_value = int(poi_cid)
+                if poi_value < 0 or poi_value >= len(grid_to_idx):
+                    raise ValueError(
+                        f"Start catchment ID {poi_value} is not in the map"
+                    )
+                start_idx = int(grid_to_idx[poi_value])
+                if start_idx < 0:
+                    raise ValueError(
+                        f"Start catchment ID {poi_value} is not in the map"
+                    )
                 visited = trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
                 member_cids = cid_arr[visited]
                 # Assign non-POI members (POIs overwritten in second pass)
@@ -1431,8 +1470,8 @@ def crop_parameters_nc(
             
             keep_mask = np.isin(catchment_basin_id, kept_basin_ids)
             # In crop_downstream, additionally exclude the removed upstream catchments
-            if crop_downstream and removed_cid_set_dn:
-                keep_mask = keep_mask & ~np.isin(catchment_id, np.array(sorted(removed_cid_set_dn), dtype=np.int64))
+            if crop_downstream and removed_mask_dn.any():
+                keep_mask = keep_mask & ~removed_mask_dn
             num_kept_catchments = int(np.sum(keep_mask))
             print(f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})")
         
@@ -1496,7 +1535,10 @@ def crop_parameters_nc(
                     pidx = int(full_idx_of_arr[poi_cid_v])
                     if pidx >= 0:
                         stop_mask_base[pidx] = True
-            kept_source_set = set(int(c) for c in kept_catchment_ids)
+            # Boolean membership in index space: the per-element ``in set``
+            # test below runs once per visited node of every corridor step.
+            kept_source_mask = np.zeros(len(cid_arr_ext), dtype=bool)
+            kept_source_mask[kept_idx_ext] = True
             g_full, g_cid_new, g_basin = [], [], []
             g_outlet, g_entry, g_downstream, g_level = [], [], [], []
             next_cid = max_cid_lookup + 1
@@ -1540,10 +1582,10 @@ def crop_parameters_nc(
                         src_fidx, indptr_ext, indices_ext,
                         len(cid_arr_ext), stop_mask_base,
                     )
-                    for upstream_cid in cid_arr_ext[visited]:
+                    # Drop the already-kept sources with a mask instead of a
+                    # per-node set lookup.
+                    for upstream_cid in cid_arr_ext[visited & ~kept_source_mask]:
                         upstream_cid = int(upstream_cid)
-                        if upstream_cid in kept_source_set:
-                            continue
                         selected_level[upstream_cid] = min(
                             selected_level.get(upstream_cid, level), level)
 
@@ -1721,8 +1763,8 @@ def crop_parameters_nc(
                 primary_dim = dims[0] if dims else None
                 
                 if name == 'num_basins':
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = np.array(num_merged_basins, dtype=var.dtype)
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = np.array(num_merged_basins, dtype=var.dtype)
                      continue
 
                 # The output selection is rebuilt after catchment filtering.
@@ -1782,8 +1824,8 @@ def crop_parameters_nc(
                          elif name == 'downstream_id':
                              ghost_data = ghost_downstream_cid.astype(new_data.dtype)
                          new_data = np.concatenate([new_data, ghost_data.astype(new_data.dtype)])
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = new_data
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = new_data
                      
                 elif primary_dim == 'basin':
                      if name == 'basin_sizes':
@@ -1795,38 +1837,49 @@ def crop_parameters_nc(
                      else:
                           new_data = data[roots]
                           
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = new_data
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = new_data
 
                 elif primary_dim == 'bifurcation_path' and bif_mask is not None:
                      new_data = data[bif_mask]
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = new_data
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = new_data
                      
                 elif primary_dim == 'levee' and lev_mask is not None:
                      new_data = data[lev_mask]
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = new_data
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = new_data
 
                 elif primary_dim == 'reservoir' and reservoir_mask is not None:
                      new_data = data[reservoir_mask]
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = new_data
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = new_data
                 
                 elif primary_dim == 'gauge' and gauge_mask is not None:
                     new_data = data[gauge_mask]
-                    dst.createVariable(name, var.dtype, dims, zlib=True)
-                    dst[name][:] = new_data
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = new_data
 
                 else:
                      # Skip variables whose dimensions were not created in dst
                      if any(d not in dst.dimensions for d in dims):
                          continue
-                     dst.createVariable(name, var.dtype, dims, zlib=True)
-                     dst[name][:] = data
+                     out = _create_variable_like(dst, name, var)
+                     out[:] = data
             
             # Output points are partitioned directly by catchment ID.
-            var = dst.createVariable('output_catchment_id', np.int64, ('saved_points',), zlib=True)
+            if 'output_catchment_id' in src.variables:
+                var = _create_variable_like(
+                    dst,
+                    'output_catchment_id',
+                    src.variables['output_catchment_id'],
+                    dimensions=('saved_points',),
+                )
+            else:
+                var = dst.createVariable(
+                    'output_catchment_id', np.int64,
+                    ('saved_points',), zlib=True,
+                )
             var[:] = new_save_ids
 
             # ── Write catchment_source_id / catchment_ghost_level ──

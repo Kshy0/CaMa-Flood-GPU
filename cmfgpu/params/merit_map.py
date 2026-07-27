@@ -9,6 +9,10 @@ MERIT-based map parameter generation using Pydantic v2.
 """
 from __future__ import annotations
 
+import csv
+import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional, Union
 
@@ -29,6 +33,25 @@ from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
                                  resolve_target_cids_from_poi,
                                  search_optimal_merge_rate, topological_sort,
                                  trace_outlets)
+
+
+@contextmanager
+def _atomic_netcdf(path: Path):
+    """Yield a NetCDF dataset and publish it only after a successful close."""
+
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    temporary_path = Path(temporary)
+    try:
+        with Dataset(temporary_path, "w", format="NETCDF4") as dataset:
+            yield dataset
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 class MERITMap(BaseModel):
@@ -251,21 +274,51 @@ class MERITMap(BaseModel):
         with open(self.gauge_file, "r") as f:
             lines = f.readlines()
 
+        if not lines:
+            raise ValueError(f"Gauge allocation file is empty: {self.gauge_file}")
+        header = [token.strip().lower() for token in lines[0].split()]
+
+        def column(*names: str) -> int:
+            for name in names:
+                if name in header:
+                    return header.index(name)
+            raise ValueError(
+                f"Unsupported gauge allocation header in {self.gauge_file}: "
+                f"missing one of {names}"
+            )
+
+        columns = {
+            "id": column("id"),
+            "lat": column("lat"),
+            "lon": column("lon"),
+            "error": column("err", "error"),
+            "reported_area": column("area_grdc", "area_input"),
+            "allocated_area": column("area_cama"),
+            "type": column("ups_num", "type"),
+            "ix1": column("ix1"),
+            "iy1": column("iy1"),
+            "ix2": column("ix2"),
+            "iy2": column("iy2"),
+        }
+        required_columns = max(columns.values()) + 1
+
         # Skip header and process gauge data
         for line in lines[1:]:
             data = line.split()
-            if len(data) < 14:
+            if len(data) < required_columns:
                 raise ValueError(f"Invalid gauge data line: {line.strip()}")
 
-            gauge_name = int(data[0])
-            lat = float(data[1])
-            lon = float(data[2])
-            err = float(data[3])
-            area_grdc = float(data[4])
-            area_cama = float(data[5])
-            type_num = int(data[7])
-            ix1, iy1 = int(data[8]) - 1, int(data[9]) - 1
-            ix2, iy2 = int(data[10]) - 1, int(data[11]) - 1
+            gauge_name = int(data[columns["id"]])
+            lat = float(data[columns["lat"]])
+            lon = float(data[columns["lon"]])
+            err = float(data[columns["error"]])
+            area_grdc = float(data[columns["reported_area"]])
+            area_cama = float(data[columns["allocated_area"]])
+            type_num = int(data[columns["type"]])
+            ix1 = int(data[columns["ix1"]]) - 1
+            iy1 = int(data[columns["iy1"]]) - 1
+            ix2 = int(data[columns["ix2"]]) - 1
+            iy2 = int(data[columns["iy2"]]) - 1
 
             # Option: exclude entire line if secondary coords exist
             if self.skip_secondary_gauges and (ix2 >= 0 and iy2 >= 0):
@@ -339,6 +392,27 @@ class MERITMap(BaseModel):
         arr = getattr(self, name)
         setattr(self, name, arr[mask])
 
+    def _slice_declared_axis(self, axis: str, mask: np.ndarray) -> None:
+        """Slice every materialized schema field whose leading axis matches."""
+
+        mask = np.asarray(mask, dtype=bool)
+        if mask.ndim != 1:
+            raise ValueError(f"{axis} filter mask must be one-dimensional")
+        for name, dims in PARAMETER_FIELD_DIMS.items():
+            if not dims or dims[0] != axis or not hasattr(self, name):
+                continue
+            value = getattr(self, name)
+            if value is None:
+                continue
+            array = np.asarray(value)
+            if array.ndim == 0 or array.shape[0] != mask.size:
+                raise ValueError(
+                    f"Cannot filter {name!r} on {axis}: leading extent "
+                    f"{array.shape if array.ndim else ()} does not match "
+                    f"mask length {mask.size}"
+                )
+            setattr(self, name, array[mask])
+
     def _finalize_connectivity(self, root_mouth: np.ndarray) -> None:
         """Finalize ordering and connectivity regardless of bifurcation availability.
 
@@ -389,8 +463,13 @@ class MERITMap(BaseModel):
             return
 
         # Read maps needed by bifurcation parsing (memory-mapped)
-        rivhgt_2d = self._open_memmap(
-            self.map_dir / "rivhgt.bin", self.map_precision, (self.nx, self.ny)
+        rivhgt_path = self.map_dir / "rivhgt.bin"
+        rivhgt_2d = (
+            self._open_memmap(
+                rivhgt_path, self.map_precision, (self.nx, self.ny)
+            )
+            if rivhgt_path.exists()
+            else None
         )
         pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifori(self.bifori_file, rivhgt_2d, self.bif_levels_to_keep)
         del rivhgt_2d
@@ -533,9 +612,12 @@ class MERITMap(BaseModel):
                 for c1, c2 in zip(ori_compact, bif_compact, strict=True):
                     union(c1, c2)
 
-                # Ensure full path compression
+                # ``find`` uses path halving, so its side effects alone do not
+                # necessarily replace the starting node's parent with the
+                # canonical root.  Store the returned roots explicitly before
+                # using ``parent`` as a component-label lookup table.
                 for i in range(n_um):
-                    find(i)
+                    parent[i] = find(i)
 
                 # Map all river_mouth_id to their root
                 all_compact = np.searchsorted(unique_mouths, self.river_mouth_id)
@@ -641,18 +723,12 @@ class MERITMap(BaseModel):
         # Apply common filtering given kept_basin_ids
         keep_mask = np.isin(self.catchment_basin_id, kept_basin_ids)
 
-        # Slice catchment-level arrays that depend on catchment dimension
-        for key in [
-            "catchment_id",
-            "downstream_id",
-            "is_river_mouth",
-            "catchment_x",
-            "catchment_y",
-            "root_mouth",
-            "catchment_basin_id",
-            "river_mouth_id",
-        ]:
-            self._slice_arr(key, keep_mask)
+        # Keep every materialized catchment field aligned.  Schema-driven
+        # slicing prevents newly added required/optional arrays from being
+        # forgotten here.
+        self._slice_declared_axis("catchment", keep_mask)
+        for internal in ("root_mouth", "is_river_mouth"):
+            self._slice_arr(internal, keep_mask)
 
         # Update count
         self.num_catchments = int(self.catchment_id.shape[0])
@@ -684,20 +760,7 @@ class MERITMap(BaseModel):
         if self.num_bifurcation_paths > 0:
             keep_bif = np.isin(self.bifurcation_catchment_id, self.catchment_id)
 
-            for key in [
-                "bifurcation_path_id",
-                "bifurcation_catchment_id",
-                "bifurcation_downstream_id",
-                "bifurcation_manning",
-                "bifurcation_catchment_x",
-                "bifurcation_downstream_x",
-                "bifurcation_catchment_y",
-                "bifurcation_downstream_y",
-                "bifurcation_width",
-                "bifurcation_length",
-                "bifurcation_elevation",
-            ]:
-                self._slice_arr(key, keep_bif)
+            self._slice_declared_axis("bifurcation_path", keep_bif)
 
             self.num_bifurcation_paths = int(np.sum(keep_bif))
             self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
@@ -720,7 +783,7 @@ class MERITMap(BaseModel):
 
         if self.num_gauges > 0 and hasattr(self, 'gauge_catchment_id'):
             gauge_mask = np.isin(self.gauge_catchment_id, self.catchment_id)
-            self.gauge_catchment_id = self.gauge_catchment_id[gauge_mask]
+            self._slice_declared_axis("gauge", gauge_mask)
             self.gauge_id = self.gauge_catchment_id
             self.num_gauges = len(self.gauge_id)
 
@@ -745,9 +808,15 @@ class MERITMap(BaseModel):
         dam_path = Path(self.dam_file) if not isinstance(self.dam_file, Path) else self.dam_file
         print(f"Loading dam parameters from {dam_path}")
 
-        with open(dam_path, "r") as f:
+        with open(dam_path, "r", newline="", encoding="utf-8-sig") as f:
             ndam = int(f.readline().strip().split()[0])
-            f.readline()  # skip header
+            header = f.readline()
+            if "," in header:
+                rows = csv.reader(f)
+            else:
+                # Retain compatibility with legacy whitespace-delimited
+                # CaMa-Flood parameter files.
+                rows = (line.split() for line in f)
 
             dam_ids = []
             dam_ix = []
@@ -759,8 +828,8 @@ class MERITMap(BaseModel):
             qf_list = []
             upreal_list = []
 
-            for _ in range(ndam):
-                parts = f.readline().strip().split()
+            for _, parts in zip(range(ndam), rows, strict=False):
+                parts = [part.strip() for part in parts]
                 if len(parts) < 12:
                     continue
                 dam_ids.append(int(parts[0]))
@@ -827,7 +896,7 @@ class MERITMap(BaseModel):
 
         # Store results (reservoir-indexed arrays)
         self.num_reservoirs = n_kept
-        self.reservoir_id = np.arange(n_kept, dtype=np.int64)
+        self.reservoir_id = dam_ids
         self.reservoir_catchment_id = dam_cids
 
         # Physical parameters (saved to NetCDF, loaded by ReservoirModule)
@@ -943,7 +1012,7 @@ class MERITMap(BaseModel):
     def create_nc_file(self) -> None:
         """Create a NetCDF4 file and store parameters."""
         nc_path = self.out_dir / self.out_file
-        with Dataset(nc_path, 'w', format='NETCDF4') as ds:
+        with _atomic_netcdf(nc_path) as ds:
             # Global attributes
             ds.title = "MERIT-based map parameters for CaMa-Flood-GPU"
             ds.history = "Created by CaMa-Flood-GPU netCDF4 writer"

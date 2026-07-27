@@ -174,6 +174,7 @@ def search_best_pixel(
 ) -> Tuple[int, int, float, float, float]:
     """Search ±nn neighbourhood of (ix_center, iy_center) on the hi-res grid.
 
+
     Returns (best_kx, best_ky, best_err1, best_area, best_rate).
     best_kx == -1 means no match found.
     """
