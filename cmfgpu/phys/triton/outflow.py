@@ -434,6 +434,7 @@ def compute_outflow_batched_kernel(
     batched_river_height: tl.constexpr,
     batched_catchment_elevation: tl.constexpr,
     batched_downstream_distance: tl.constexpr,
+    batched_sea_surface_elevation: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
     HAS_TOTAL_STORAGE: tl.constexpr = True, # whether auxiliary storage is active
     HAS_WATER_SURFACE: tl.constexpr = True,
@@ -530,7 +531,10 @@ def compute_outflow_batched_kernel(
         sea_level_idx = tl.load(
             catchment_sea_level_idx_ptr + catchment_idx, mask=mask, other=-1,
         )
-        sea_trial_offset = (idx // num_catchments) * num_sea_level_boundaries
+        sea_trial_offset = (
+            (idx // num_catchments) * num_sea_level_boundaries
+            if batched_sea_surface_elevation else 0
+        )
         prescribed_level = tl.load(
             sea_surface_elevation_ptr + sea_trial_offset + sea_level_idx,
             mask=mask & (sea_level_idx >= 0), other=0.0,

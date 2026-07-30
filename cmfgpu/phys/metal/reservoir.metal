@@ -33,7 +33,8 @@
     float total_storage = river_storage + flood_storage;
     float total_inflow = args.reservoir_total_inflow_ptr[catchment];
     args.reservoir_total_inflow_ptr[catchment] = 0.0f;
-    float reservoir_inflow = total_inflow + args.runoff_ptr[catchment];
+    long runoff_idx = batched_runoff ? catchment : local_catchment;
+    float reservoir_inflow = total_inflow + args.runoff_ptr[runoff_idx];
 
     float conservation_volume =
         args.conservation_volume_ptr[reservoir_idx];

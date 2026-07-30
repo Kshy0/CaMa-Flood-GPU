@@ -459,6 +459,7 @@ def compute_flood_stage_batched_kernel(
     BLOCK_SIZE: tl.constexpr,
     # Batch flags
     batched_runoff: tl.constexpr,
+    batched_inflow: tl.constexpr,
     batched_river_height: tl.constexpr,
     batched_flood_depth_table: tl.constexpr,
     batched_catchment_area: tl.constexpr,
@@ -517,8 +518,9 @@ def compute_flood_stage_batched_kernel(
             inflow_idx = tl.load(
                 catchment_inflow_idx_ptr + offs, mask=mask, other=-1,
             )
+            inflow_base = t * num_inflow_gauges if batched_inflow else 0
             inflow = tl.load(
-                inflow_ptr + t * num_inflow_gauges + inflow_idx,
+                inflow_ptr + inflow_base + inflow_idx,
                 mask=mask & (inflow_idx >= 0), other=0.0,
             )
 

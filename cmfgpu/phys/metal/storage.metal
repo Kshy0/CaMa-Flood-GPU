@@ -152,8 +152,10 @@ long num_catchments = *args.num_catchments;
     if (HAS_INFLOW) {
         int inflow_idx = args.catchment_inflow_idx_ptr[catchment];
         if (inflow_idx >= 0) {
+            long inflow_trial_offset = batched_inflow
+                ? trial * (long)(*args.num_inflow_gauges) : 0;
             prescribed_inflow = args.inflow_ptr[
-                trial * (long)(*args.num_inflow_gauges) + inflow_idx];
+                inflow_trial_offset + inflow_idx];
         }
     }
 

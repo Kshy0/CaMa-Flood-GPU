@@ -152,7 +152,7 @@ class BaseModule(AbstractModule):
 
     runoff: torch.Tensor = BaseField(
         description="Current external runoff forcing (m³/s)",
-        category="state",
+        category="param",
         output="disabled",
         default=0,
     )

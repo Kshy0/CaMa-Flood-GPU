@@ -206,6 +206,7 @@ def compute_reservoir_outflow_batched_kernel(
     num_reservoirs: tl.constexpr,
     num_catchments: tl.constexpr,
     num_trials: tl.constexpr,
+    batched_runoff: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -271,8 +272,9 @@ def compute_reservoir_outflow_batched_kernel(
         reservoir_total_inflow_ptr + catchment_idx,
         tl.zeros_like(total_inflow), mask=mask,
     )
+    runoff_idx = catchment_idx if batched_runoff else local_catchment
     reservoir_inflow = total_inflow + tl.load(
-        runoff_ptr + catchment_idx, mask=mask, other=0.0,
+        runoff_ptr + runoff_idx, mask=mask, other=0.0,
     )
 
     conservation_volume = tl.load(

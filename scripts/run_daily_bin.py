@@ -121,14 +121,18 @@ def main():
     last_valid_time = start_date
     for batch_runoff in loader:
         with stream_ctx:
-            batch_runoff = dataset.shard_forcing(batch_runoff.to(device), local_mapping)
+            batch_runoff = dataset.shard_forcing(
+                batch_runoff.to(device),
+                local_mapping,
+                target=model.base.runoff,
+            )
             for runoff in batch_runoff:
                 step = next(step_iter)
                 if not step.valid:
                     continue
                 last_valid_time = step.model_time
+                model.base.runoff.copy_(runoff)
                 model.step_advance(
-                    runoff=runoff,
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=step.model_time,

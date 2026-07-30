@@ -18,7 +18,6 @@ from hydroforge.model.model import AbstractModel
 from hydroforge.contracts.events import emit
 from hydroforge.contracts import BackendRequirement, ModuleRequirement
 from hydroforge.execution import all_reduce_
-from hydroforge.execution.inputs import copy_input
 from hydroforge.execution.step import managed_step
 
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
@@ -106,15 +105,12 @@ class CaMaFlood(AbstractModel):
     @torch.inference_mode()
     def step_advance(
         self,
-        runoff: torch.Tensor,
         time_step: float,
         default_num_sub_steps: int,
         current_time: Optional[Union[datetime, cftime.datetime]],
-        inflow: Optional[torch.Tensor] = None,
-        sea_surface_elevation: Optional[torch.Tensor] = None,
         output_enabled: bool = True,
     ) -> None:
-        """Advance the hydraulic model by one outer time step."""
+        """Advance one outer time step using the already-staged forcing."""
 
         time_step = float(time_step)
         if not math.isfinite(time_step) or time_step <= 0:
@@ -156,33 +152,6 @@ class CaMaFlood(AbstractModel):
             num_sub_steps = default_num_sub_steps
             time_sub_step = time_step / num_sub_steps
 
-        # CFL selection depends only on the state at the end of the preceding
-        # outer step.  Transfer this step's forcing afterwards so a rejected
-        # sub-step count cannot partially overwrite runoff/boundary inputs.
-        copy_input(
-            self.base.runoff,
-            runoff,
-            when_none="required",
-            name="runoff",
-            trial_broadcast=self.num_trials is not None,
-        )
-        copy_input(
-            self.inflow.inflow if self.has_module("inflow") else None,
-            inflow,
-            name="inflow",
-            trial_broadcast=self.num_trials is not None,
-        )
-        copy_input(
-            (
-                self.sea_level.sea_surface_elevation
-                if self.has_module("sea_level")
-                else None
-            ),
-            sea_surface_elevation,
-            when_none="required" if self.has_module("sea_level") else "keep",
-            name="sea_surface_elevation",
-            trial_broadcast=self.num_trials is not None,
-        )
         if self.has_module("log"):
             self.log.set_time(time_sub_step, num_sub_steps, current_time)
 
@@ -234,8 +203,5 @@ class CaMaFlood(AbstractModel):
                     self.log.write_step(self.log_path)
                     wrote_log = True
             finally:
-                # write_step clears buffers on success. Disabled output,
-                # non-destination ranks, and failed writes must also start the
-                # next outer step from zero rather than re-accumulating data.
                 if not wrote_log:
                     self.log.clear_buffers()

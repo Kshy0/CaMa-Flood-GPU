@@ -76,6 +76,7 @@ flood_stage = _CUDA.route(
             "batched_river_length",
             "batched_river_width",
             "batched_runoff",
+            "batched_inflow",
         ),
     ),
 )
@@ -95,6 +96,7 @@ outflow = _CUDA.route(
             "batched_river_length",
             "batched_river_manning",
             "batched_river_width",
+            "batched_sea_surface_elevation",
         ),
     ),
 )
@@ -128,7 +130,7 @@ bifurcation_inflow = _CUDA.route(
 reservoir_outflow = _CUDA.route(
     "reservoir",
     "launch_reservoir_outflow",
-    projection=_shared(),
+    projection=_shared(disabled=("batched_runoff",)),
 )
 levee_stage = _CUDA.route(
     "levee",

@@ -168,15 +168,15 @@ def main():
             batch_runoff = dataset0.shard_forcing(
                 batch_runoff0.to(device) + batch_runoff1.to(device),
                 local_mapping0,
+                target=model.base.runoff,
             )
             for runoff in batch_runoff:
                 step = next(step_iter)
                 if not step.valid:
                     continue
                 last_valid_time = step.model_time
-                
+                model.base.runoff.copy_(runoff)
                 model.step_advance(
-                    runoff=runoff,
                     time_step=time_step,
                     default_num_sub_steps=default_num_sub_steps,
                     current_time=step.model_time,

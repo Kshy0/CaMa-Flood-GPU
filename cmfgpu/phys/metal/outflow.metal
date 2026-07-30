@@ -66,8 +66,10 @@ long num_catchments = *args.num_catchments;
     if (HAS_SEA_LEVEL) {
         int sea_level = args.catchment_sea_level_idx_ptr[catchment];
         if (sea_level >= 0) {
+            long sea_trial_offset = batched_sea_surface_elevation
+                ? trial * *args.num_sea_level_boundaries : 0;
             effective_downstream_surface = args.sea_surface_elevation_ptr[
-                trial * *args.num_sea_level_boundaries + sea_level];
+                sea_trial_offset + sea_level];
         }
     }
     float maximum_surface = max(water_surface, effective_downstream_surface);
