@@ -21,8 +21,9 @@ from hydroforge.model.module import (
     ReferenceIndexField,
     TensorField,
     computed_tensor_field,
+    module_ref,
 )
-from pydantic import Field, computed_field, model_validator
+from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
 
@@ -74,12 +75,7 @@ class LeveeModule(AbstractModule):
 
     module_name: ClassVar[str] = "levee"
     description: ClassVar[str] = "Levee protection module with protected storage states"
-    dependencies: ClassVar[list[str]] = ["base"]
-
-    base: BaseModule = Field(
-        exclude=True,
-        description="Reference to BaseModule",
-    )
+    base = module_ref(BaseModule)
 
     # ------------------------------------------------------------------ #
     # Levee metadata and topology
@@ -234,8 +230,7 @@ class LeveeModule(AbstractModule):
             raise ValueError("levee_fraction must be finite and lie within [0, 1)")
         return self
 
-    @model_validator(mode="after")
-    def validate_levee_height(self) -> Self:
+    def validate_linked_state(self) -> None:
         invalid = (
             ~torch.isfinite(self.levee_crown_height)
             | ~torch.isfinite(self.levee_base_height)
@@ -247,4 +242,3 @@ class LeveeModule(AbstractModule):
                 f"{num_invalid} levees have non-finite heights or a base "
                 "height greater than or equal to the crown height"
             )
-        return self

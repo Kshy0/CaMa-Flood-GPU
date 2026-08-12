@@ -11,7 +11,7 @@ helpers for concise tensor metadata.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, List, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
 from hydroforge.model.module import (AbstractModule, CoordinateField,
@@ -70,8 +70,6 @@ class BaseModule(AbstractModule):
     description: ClassVar[str] = (
         "Core hydrodynamic module with fundamental river and catchment variables"
     )
-    dependencies: ClassVar[List[str]] = []
-
     # --------------------------------------------------------------------- #
     # Scalars (dimensions & constants)
     # --------------------------------------------------------------------- #
@@ -265,6 +263,13 @@ class BaseModule(AbstractModule):
         category="init_state",
     )
 
+    flood_fraction: torch.Tensor = BaseField(
+        description="Fraction of catchment area that is flooded (-)",
+        default=0,
+        category="init_state",
+        output="auto",
+    )
+
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
@@ -288,6 +293,29 @@ class BaseModule(AbstractModule):
     @cached_property
     def num_flood_levels(self) -> int:
         return self.flood_depth_table.shape[-1]
+
+    @computed_field(
+        description="Whether total-storage scratch state is materialized."
+    )
+    @cached_property
+    def has_total_storage(self) -> bool:
+        return bool(
+            {"bifurcation", "reservoir"}.intersection(self.opened_modules)
+        )
+
+    @computed_field(
+        description="Whether bifurcation water-surface state is materialized."
+    )
+    @cached_property
+    def has_water_surface(self) -> bool:
+        return "bifurcation" in self.opened_modules
+
+    @computed_field(
+        description="Whether protected water-surface state is materialized."
+    )
+    @cached_property
+    def has_protected_water_surface(self) -> bool:
+        return {"bifurcation", "levee"}.issubset(self.opened_modules)
 
     # ------------------------------------------------------------------ #
     # Computed tensor fields
@@ -362,14 +390,6 @@ class BaseModule(AbstractModule):
     @cached_property
     def flood_area(self) -> Optional[torch.Tensor]:
         return None
-
-    @computed_base_field(
-        description="Fraction of catchment area that is flooded (-)",
-        category="state",
-    )
-    @cached_property
-    def flood_fraction(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow)
 
     @computed_base_field(
         description="Total inflow to floodplains (m³ s⁻¹)",
@@ -484,6 +504,7 @@ class BaseModule(AbstractModule):
             "river_cross_section_depth": self.river_cross_section_depth,
             "flood_cross_section_depth": self.flood_cross_section_depth,
             "flood_cross_section_area": self.flood_cross_section_area,
+            "flood_fraction": self.flood_fraction,
         }
         invalid_state_counts = {
             name: int((~torch.isfinite(value) | (value < 0)).sum().item())
@@ -503,6 +524,12 @@ class BaseModule(AbstractModule):
                 "Initial storage, depth, and cross-section state must contain "
                 "only finite non-negative values; invalid element counts: "
                 f"{details}"
+            )
+        fraction_above_one = int((self.flood_fraction > 1).sum().item())
+        if fraction_above_one:
+            raise ValueError(
+                "Initial flood_fraction must not exceed one; "
+                f"invalid element count: {fraction_above_one}"
             )
 
         nonfinite_flow_counts = {

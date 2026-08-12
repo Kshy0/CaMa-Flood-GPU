@@ -25,7 +25,6 @@ __global__ void k_adaptive_time(
     REAL outer_time_step, REAL adaptive_time_factor, REAL gravity,
     long num_catchments, int has_reservoir)
 {
-    constexpr int invalid_sub_steps = 0x7fffffff;
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     // 0 is the identity for this reduction: every contributing cell yields
     // n_steps >= 1, so non-contributing lanes cannot raise the block maximum.
@@ -36,20 +35,11 @@ __global__ void k_adaptive_time(
     if (!skip) {
         REAL dist = __ldg(downstream_distance + t);
         REAL raw_depth = __ldg(river_depth + t);
-        if (!isfinite(dist) || dist <= (REAL)0.0 || !isfinite(raw_depth)) {
-            n_steps = invalid_sub_steps;
-        } else {
-            REAL depth = fmax(raw_depth, (REAL)0.01);
-            REAL dt = adaptive_time_factor * dist / sqrt(gravity * depth);
-            REAL dt_clamped = fmin(dt, outer_time_step);
-            REAL n_steps_f =
-                floor(outer_time_step / dt_clamped - (REAL)0.01) + (REAL)1.0;
-            // max_sub_steps has an int32 ABI.  Reserve INT_MAX as an error
-            // marker so invalid/overflowing floats are never cast to int.
-            n_steps = (
-                !isfinite(n_steps_f) || n_steps_f >= (REAL)invalid_sub_steps
-            ) ? invalid_sub_steps : (int)n_steps_f;
-        }
+        REAL depth = fmax(raw_depth, (REAL)0.01);
+        REAL dt = adaptive_time_factor * dist / sqrt(gravity * depth);
+        REAL dt_clamped = fmin(dt, outer_time_step);
+        n_steps = (int)(
+            floor(outer_time_step / dt_clamped - (REAL)0.01) + (REAL)1.0);
     }
 
     // Reduce inside the block so the single global scalar sees one atomic per

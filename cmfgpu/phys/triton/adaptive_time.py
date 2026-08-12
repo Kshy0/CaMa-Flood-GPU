@@ -43,21 +43,8 @@ def compute_adaptive_time_step_kernel(
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, outer_time_step)
 
-    # ``x - x == 0`` is true only for finite x, avoiding backend-specific
-    # isfinite helpers while rejecting both NaN and infinities.
-    valid_dt = (
-        (river_depth - river_depth == 0.0)
-        & (downstream_distance - downstream_distance == 0.0)
-        & (dt_clamped > 0.0)
-        & (dt_clamped == dt_clamped)
-    )
     n_steps_float = tl.floor(outer_time_step / dt_clamped - 0.01) + 1.0
-    # max_sub_steps has an int32 ABI. Reserve INT_MAX as the failure marker;
-    # the next smaller representable fp32 value is safe to cast to int32.
-    valid_count = valid_dt & (n_steps_float < 2147483647.0)
-    bounded = tl.where(valid_count, n_steps_float, 0.0)
-    n_steps = nonnegative_to_index_inline(bounded)
-    n_steps = tl.where(valid_count, n_steps, 2147483647)
+    n_steps = nonnegative_to_index_inline(n_steps_float)
     n_steps = tl.where(mask, n_steps, 0)
 
     tl.atomic_max(max_sub_steps_ptr, tl.max(n_steps))
@@ -111,17 +98,8 @@ def compute_adaptive_time_step_batched_kernel(
     dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
     dt_clamped = tl.minimum(dt, outer_time_step)
 
-    valid_dt = (
-        (river_depth - river_depth == 0.0)
-        & (downstream_distance - downstream_distance == 0.0)
-        & (dt_clamped > 0.0)
-        & (dt_clamped == dt_clamped)
-    )
     n_steps_float = tl.floor(outer_time_step / dt_clamped - 0.01) + 1.0
-    valid_count = valid_dt & (n_steps_float < 2147483647.0)
-    bounded = tl.where(valid_count, n_steps_float, 0.0)
-    n_steps = nonnegative_to_index_inline(bounded)
-    n_steps = tl.where(valid_count, n_steps, 2147483647)
+    n_steps = nonnegative_to_index_inline(n_steps_float)
     n_steps = tl.where(mask, n_steps, 0)
 
     tl.atomic_max(max_sub_steps_ptr, tl.max(n_steps))

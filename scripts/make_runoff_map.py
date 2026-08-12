@@ -7,7 +7,7 @@
 """
 Script to generate runoff mapping tables for input datasets.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from hydroforge.data.datasets import DailyBinDataset
 
@@ -34,6 +34,7 @@ def main():
         shape=runoff_shape,
         start_date=start_date,
         end_date=end_date,
+        model_step=timedelta(days=1),
     )
 
     dataset.generate_mapping_table(

@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, List, Literal, Optional, Self
+from typing import ClassVar, Literal, Optional, Self
 
 import torch
 from hydroforge.model.module import (AbstractModule, CoordinateField,
-                                        ReferenceIndexField, TensorField)
-from pydantic import Field, computed_field, model_validator
+                                        ReferenceIndexField, TensorField,
+                                        module_ref)
+from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
 
@@ -22,9 +23,7 @@ class InflowModule(AbstractModule):
 
     module_name: ClassVar[str] = "inflow"
     description: ClassVar[str] = "External gauge inflow forcing"
-    dependencies: ClassVar[List[str]] = ["base"]
-
-    base: BaseModule = Field(exclude=True)
+    base = module_ref(BaseModule)
 
     inflow_catchment_id: torch.Tensor = CoordinateField(
         description="Catchment ID for each inflow injection gauge",

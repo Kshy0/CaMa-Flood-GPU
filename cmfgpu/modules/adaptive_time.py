@@ -8,8 +8,14 @@ from functools import cached_property
 from typing import ClassVar
 
 import torch
-from hydroforge.model.module import AbstractModule, computed_tensor_field
+from hydroforge.model.module import (
+    AbstractModule,
+    computed_tensor_field,
+    module_ref,
+)
 from pydantic import Field
+
+from cmfgpu.modules.base import BaseModule
 
 
 class AdaptiveTimeModule(AbstractModule):
@@ -20,7 +26,7 @@ class AdaptiveTimeModule(AbstractModule):
     # Module metadata
     module_name: ClassVar[str] = "adaptive_time"
     description: ClassVar[str] = "Adaptive time step calculation module for river networks"
-    dependencies: ClassVar[list] = ["base"]
+    base = module_ref(BaseModule)
     adaptive_time_factor: float = Field(
         0.7,
         description="Factor to adjust adaptive time step calculation",

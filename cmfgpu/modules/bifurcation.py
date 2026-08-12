@@ -17,8 +17,8 @@ import torch
 from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceField, ReferenceIndexField,
                                         SelectionField, TensorField,
-                                        computed_tensor_field)
-from pydantic import Field, computed_field
+                                        computed_tensor_field, module_ref)
+from pydantic import computed_field
 
 from cmfgpu.modules.base import BaseModule
 
@@ -67,12 +67,7 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     module_name: ClassVar[str] = "bifurcation"
     description: ClassVar[str] = "Bifurcation flow module with multi-level channel calculations"
-    dependencies: ClassVar[list] = ["base"]
-
-    base: BaseModule = Field(
-        exclude=True,
-        description="Reference to BaseModule",
-    )
+    base = module_ref(BaseModule)
 
     # ------------------------------------------------------------------ #
     # IDs

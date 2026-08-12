@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.contracts.temporal import SimulationSchedule
 from hydroforge.data.datasets import DailyBinDataset
 from hydroforge.data.distributed import setup_distributed
 from hydroforge.data.input import InputProxy
@@ -27,9 +26,9 @@ def benchmark_block_sizes():
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ["base", "adaptive_time", "bifurcation"]
+    num_sub_steps = 360 if "adaptive_time" not in opened_modules else None
     variables_to_save = {}
-    time_step = 86400.0
-    default_num_sub_steps = 360
+    runoff_time_interval = timedelta(days=1)
     loader_workers = 3
     prefetch_factor = 2
     save_state = False
@@ -45,7 +44,6 @@ def benchmark_block_sizes():
     prefix = "Roff____"
     suffix = ".one"
 
-    batch_size = loader_workers
     local_rank, rank, world_size = setup_distributed()
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
@@ -61,21 +59,20 @@ def benchmark_block_sizes():
         shape=runoff_shape,
         start_date=start_date,
         end_date=end_date,
+        model_step=runoff_time_interval,
         unit_factor=unit_factor,
         bin_dtype=bin_dtype,
         prefix=prefix,
         suffix=suffix,
     )
-    schedule = SimulationSchedule.from_contract(
-        dataset.temporal_contract(), step=timedelta(seconds=time_step),
-    )
+    schedule = dataset.simulation_schedule
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=None,
         shuffle=False,
         num_workers=loader_workers,
         pin_memory=True,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=prefetch_factor if loader_workers > 0 else None,
     )
 
     results = []
@@ -87,8 +84,6 @@ def benchmark_block_sizes():
         # model also guarantees identical hydrological initial state for every
         # benchmark candidate.
         model = CaMaFlood(
-            rank=rank,
-            world_size=world_size,
             device=device,
             experiment_name=f"{experiment_name}_bs{block_size}",
             input_proxy=input_proxy,
@@ -106,8 +101,6 @@ def benchmark_block_sizes():
             desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
             device=device,
         )
-        current_time = start_date
-        last_valid_time = start_date
         if rank == 0:
             print(f"Benchmarking BLOCK_SIZE={block_size}...")
         if device.type == "cuda":
@@ -117,24 +110,17 @@ def benchmark_block_sizes():
             stream_ctx = nullcontext()
         start = time.time()
 
-        for batch_runoff in loader:
+        for runoff_chunk in loader:
             with stream_ctx:
-                batch_runoff = dataset.shard_forcing(
-                    batch_runoff.to(device),
+                runoff_chunk = dataset.shard_forcing(
+                    runoff_chunk.to(device),
                     local_mapping,
-                    target=model.base.runoff,
                 )
-                for runoff in batch_runoff:
-                    if current_time > end_date:
-                        continue
-                    last_valid_time = current_time
-                    model.base.runoff.copy_(runoff)
+                for runoff in runoff_chunk:
+                    model.set_inputs(runoff)
                     model.step_advance(
-                        time_step=time_step,
-                        default_num_sub_steps=default_num_sub_steps,
-                        current_time=current_time,
+                        num_sub_steps=num_sub_steps,
                     )
-                    current_time += timedelta(seconds=time_step)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -143,7 +129,7 @@ def benchmark_block_sizes():
         elapsed_ms = (end - start) * 1000
         results.append((block_size, elapsed_ms))
         if save_state and block_size == BLOCK_SIZE_LIST[-1]:
-            model.save_state(last_valid_time + timedelta(seconds=time_step))
+            model.save_state()
         model.close()
     if world_size > 1:
         dist.destroy_process_group()

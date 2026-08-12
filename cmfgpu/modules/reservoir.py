@@ -10,18 +10,17 @@ Reservoir module for CaMa-Flood-GPU using TensorField / computed_tensor_field he
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING, ClassVar, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
 from hydroforge.model.module import (AbstractModule, CoordinateField,
                                         ReferenceField, ReferenceIndexField,
-                                        TensorField, computed_tensor_field)
-from pydantic import Field, computed_field, model_validator
+                                        TensorField, computed_tensor_field,
+                                        module_ref, optional_module_ref)
+from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
-
-if TYPE_CHECKING:
-    from cmfgpu.modules.bifurcation import BifurcationModule
+from cmfgpu.modules.bifurcation import BifurcationModule
 
 
 def ReservoirField(
@@ -68,12 +67,8 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     module_name: ClassVar[str] = "reservoir"
     description: ClassVar[str] = "Reservoir operation module with storage and outflow regulation"
-    dependencies: ClassVar[list] = ["base"]
-
-    base: BaseModule = Field(
-        exclude=True,
-        description="Reference to BaseModule",
-    )
+    base = module_ref(BaseModule)
+    bifurcation = optional_module_ref(BifurcationModule)
 
     # ------------------------------------------------------------------ #
     # Reservoir topology
@@ -227,14 +222,36 @@ class ReservoirModule(AbstractModule):
         )
         return int(update.sum().item())
 
-    def mask_bifurcation_paths(self, bifurcation: "BifurcationModule") -> int:
+    def mask_bifurcation_paths(self) -> int:
         """Disable paths whose upstream or downstream cell is dam-related."""
+        bifurcation = self.bifurcation
+        if bifurcation is None:
+            return 0
         masked = (
             self.is_dam_related[bifurcation.bifurcation_catchment_idx]
             | self.is_dam_related[bifurcation.bifurcation_downstream_idx]
         )
         bifurcation.bifurcation_elevation[..., masked, :] = 1.0e20
         return int(masked.sum().item())
+
+    def initialize_state(self) -> None:
+        """Apply reservoir-owned cold-start adjustments after module linking."""
+        fixed = self.initialize_dam_storage()
+        if fixed:
+            self._emit(
+                "info",
+                "reservoir.storage_initialized",
+                "Initialized dam cells to conservation storage",
+                cells=fixed,
+            )
+        masked = self.mask_bifurcation_paths()
+        if masked:
+            self._emit(
+                "info",
+                "reservoir.bifurcation_masked",
+                "Masked dam-related bifurcation paths",
+                paths=masked,
+            )
 
     # ------------------------------------------------------------------ #
     # Validators

@@ -18,7 +18,7 @@ Example: estimate river width / height from ELSE_GPCC daily climatology.
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 from hydroforge.data.datasets import DailyBinDataset
@@ -61,6 +61,7 @@ def main():
         shape=runoff_shape,
         start_date=datetime(2001, 1, 1),  # any non-leap year with 365 days
         end_date=datetime(2001, 12, 31),
+        model_step=timedelta(days=1),
         unit_factor=unit_factor,
         prefix=runoff_clm_prefix,
         suffix=runoff_clm_suffix,

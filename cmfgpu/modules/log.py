@@ -23,6 +23,7 @@ from hydroforge.execution import reduce_many_
 from hydroforge.model.module import (
     AbstractModule,
     computed_tensor_field,
+    module_ref,
 )
 from pydantic import Field, PrivateAttr
 
@@ -53,11 +54,7 @@ class LogModule(AbstractModule):
     # ------------------------------------------------------------------ #
     module_name: ClassVar[str] = "log"
     description: ClassVar[str] = "Log module for storing and managing simulation data"
-    dependencies: ClassVar[list] = ["base"]
-    base: BaseModule = Field(
-        exclude=True,
-        description="Reference to BaseModule",
-    )
+    base = module_ref(BaseModule)
 
     log_buffer_size: int = Field(
         default=20000,

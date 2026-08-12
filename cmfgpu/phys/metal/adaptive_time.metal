@@ -25,22 +25,12 @@
             float downstream_distance =
                 args.downstream_distance_ptr[distance_offset];
             float river_depth = args.river_depth_ptr[trial_offset + catchment];
-            if (!isfinite(downstream_distance)
-                    || downstream_distance <= 0.0f
-                    || !isfinite(river_depth)) {
-                shared_steps[lid] = 0x7fffffff;
-            } else {
-                float depth = max(river_depth, 0.01f);
-                float candidate = *args.adaptive_time_factor
-                    * downstream_distance / sqrt(*args.gravity * depth);
-                float minimum_dt = min(candidate, outer_dt);
-                float sub_steps_float =
-                    floor(outer_dt / minimum_dt - 0.01f) + 1.0f;
-                shared_steps[lid] = (
-                    !isfinite(sub_steps_float)
-                    || sub_steps_float >= 2147483647.0f
-                ) ? 0x7fffffff : (int)sub_steps_float;
-            }
+            float depth = max(river_depth, 0.01f);
+            float candidate = *args.adaptive_time_factor
+                * downstream_distance / sqrt(*args.gravity * depth);
+            float minimum_dt = min(candidate, outer_dt);
+            shared_steps[lid] = (int)(
+                floor(outer_dt / minimum_dt - 0.01f) + 1.0f);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

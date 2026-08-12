@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, List
+from typing import ClassVar
 
 import torch
 from hydroforge.model.module import (AbstractModule, CoordinateField,
-                                        ReferenceIndexField, TensorField)
-from pydantic import Field, computed_field, model_validator
+                                        ReferenceIndexField, TensorField,
+                                        module_ref)
+from pydantic import computed_field
 
 from cmfgpu.modules.base import BaseModule
 
@@ -25,9 +26,7 @@ class SeaLevelModule(AbstractModule):
 
     module_name: ClassVar[str] = "sea_level"
     description: ClassVar[str] = "Prescribed downstream water-level boundary"
-    dependencies: ClassVar[List[str]] = ["base"]
-
-    base: BaseModule = Field(exclude=True)
+    base = module_ref(BaseModule)
 
     sea_level_catchment_id: torch.Tensor = CoordinateField(
         description="Catchment IDs whose downstream water level is prescribed",
@@ -56,8 +55,7 @@ class SeaLevelModule(AbstractModule):
         default=0,
     )
 
-    @model_validator(mode="after")
-    def validate_river_mouths(self):
+    def validate_linked_state(self) -> None:
         """Require every prescribed boundary catchment to be a river mouth."""
         idx = self.sea_level_catchment_idx.to(self.base.downstream_idx.device)
         invalid = self.base.downstream_idx[idx] != idx
@@ -69,4 +67,3 @@ class SeaLevelModule(AbstractModule):
                 "Sea-level boundary catchments are not river mouths: "
                 f"{ids}"
             )
-        return self
