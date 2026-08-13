@@ -7,13 +7,33 @@
 // serialize in L2, so folding inside the block turns O(num_catchments) atomics
 // per counter into O(num_blocks) -- and the tree sum is far more accurate.
 //
-// Every thread must reach these: they use __syncthreads and full-mask
-// shuffles, so callers keep out-of-range lanes alive with an identity value.
+// Every thread must reach these reductions with an identity value.
 
 #ifndef CMFGPU_BLOCK_REDUCE_CUH
 #define CMFGPU_BLOCK_REDUCE_CUH
 
-#define CMF_FULL_WARP_MASK 0xffffffffu
+template <typename REAL>
+__device__ __forceinline__ REAL cmf_shfl_down_sum(
+    REAL value, unsigned active_mask, int lane, int offset)
+{
+    REAL other = __shfl_down_sync(active_mask, value, offset);
+    const int source_lane = lane + offset;
+    if (source_lane >= 32
+        || ((active_mask & (1u << source_lane)) == 0u))
+        return (REAL)0;
+    return other;
+}
+
+__device__ __forceinline__ int cmf_shfl_down_max(
+    int value, unsigned active_mask, int lane, int offset)
+{
+    int other = __shfl_down_sync(active_mask, value, offset);
+    const int source_lane = lane + offset;
+    if (source_lane >= 32
+        || ((active_mask & (1u << source_lane)) == 0u))
+        return 0;
+    return other;
+}
 
 // Sum N per-thread values across the block; one thread issues one atomic each.
 template <typename REAL, int N>
@@ -24,12 +44,14 @@ __device__ __forceinline__ void cmf_block_atomic_add(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int num_warps = (blockDim.x + 31) >> 5;
+    const unsigned active_mask = __activemask();
 
 #pragma unroll
     for (int i = 0; i < N; ++i) {
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value[i] += __shfl_down_sync(CMF_FULL_WARP_MASK, value[i], offset);
+            value[i] += cmf_shfl_down_sum(
+                value[i], active_mask, lane, offset);
         }
         if (lane == 0) partial[i][warp] = value[i];
     }
@@ -40,15 +62,14 @@ __device__ __forceinline__ void cmf_block_atomic_add(
         REAL total = (lane < num_warps) ? partial[i][lane] : (REAL)0;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            total += __shfl_down_sync(CMF_FULL_WARP_MASK, total, offset);
+            total += cmf_shfl_down_sum(total, active_mask, lane, offset);
         }
         // A block contributing nothing leaves the accumulator untouched.
         if (lane == 0 && total != (REAL)0) atomicAdd(destination[i] + slot, total);
     }
 }
 
-// Block maximum folded into ``destination`` with one atomic.  Non-contributing
-// lanes pass 0, the identity here because every real contribution is >= 1.
+// Block maximum folded into ``destination`` with one atomic.
 __device__ __forceinline__ void cmf_block_atomic_max(
     int value, int* destination)
 {
@@ -56,18 +77,20 @@ __device__ __forceinline__ void cmf_block_atomic_max(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int num_warps = (blockDim.x + 31) >> 5;
+    const unsigned active_mask = __activemask();
 
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value = max(value, __shfl_down_sync(CMF_FULL_WARP_MASK, value, offset));
+        value = max(
+            value, cmf_shfl_down_max(value, active_mask, lane, offset));
     }
     if (lane == 0) partial[warp] = value;
     __syncthreads();
     if (warp != 0) return;
     int total = (lane < num_warps) ? partial[lane] : 0;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        total = max(total, __shfl_down_sync(CMF_FULL_WARP_MASK, total, offset));
+        total = max(
+            total, cmf_shfl_down_max(total, active_mask, lane, offset));
     }
-    // Blocks with no contributing cell must not disturb the accumulator.
     if (lane == 0 && total > 0) atomicMax(destination, total);
 }
 

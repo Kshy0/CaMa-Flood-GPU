@@ -103,11 +103,8 @@ class CaMaFlood(AbstractModel):
 
     @managed_step
     @torch.inference_mode()
-    def step_advance(
-        self,
-        num_sub_steps: Optional[int] = None,
-    ) -> None:
-        """Advance one outer time step using the already-staged forcing."""
+    def step_advance(self) -> None:
+        """Advance one step; fixed mode accepts managed ``num_sub_steps``."""
 
         time_step_seconds = self.step_duration.total_seconds()
         adaptive_time = self.adaptive_time
@@ -115,23 +112,17 @@ class CaMaFlood(AbstractModel):
         reservoir = self.reservoir
         bifurcation = self.bifurcation
         levee = self.levee
+        self.base.outer_time_step.fill_(time_step_seconds)
         if adaptive_time is not None:
-            if num_sub_steps is not None:
-                raise ValueError(
-                    "num_sub_steps must be None when adaptive_time is open"
-                )
-            adaptive_time.max_sub_steps.fill_(0)
-            compute_adaptive_time_step(outer_time_step=time_step_seconds)
+            adaptive_time.max_sub_steps.zero_()
+            compute_adaptive_time_step()
             if self.world_size > 1:
                 all_reduce_(adaptive_time.max_sub_steps, reduction="max")
-
-            requested_sub_steps = int(
-                adaptive_time.max_sub_steps.item()
+            fixed_substeps = self.substeps.fixed(
+                count=int(adaptive_time.max_sub_steps.item()),
             )
-            # Zero means every cell was excluded from the CFL reduction.
-            num_sub_steps = max(requested_sub_steps, 1)
-
-        fixed_substeps = self.substeps.fixed(count=num_sub_steps)
+        else:
+            fixed_substeps = self.substeps.fixed()
         fixed_count = fixed_substeps.count
         time_sub_step = time_step_seconds / fixed_count
 
@@ -141,8 +132,6 @@ class CaMaFlood(AbstractModel):
         self.base.time_step.fill_(time_sub_step)
 
         for sub_step in fixed_substeps:
-            # Tensor expressions are captured together with the registered
-            # kernels; no backend/march code belongs in the model.
             if log is not None:
                 self.base.current_step.copy_(sub_step.index)
             compute_outflow()
@@ -172,19 +161,13 @@ class CaMaFlood(AbstractModel):
                 else:
                     compute_levee_stage()
 
-        # Keep the historical public state without adding scalar work to each
-        # compiled physics iteration when per-substep logging is disabled.
         if log is None:
             self.base.current_step.fill_(fixed_count - 1)
 
         if log is not None:
-            wrote_log = False
-            try:
-                if self.world_size > 1:
-                    log.gather_results()
-                if self.rank == 0 and self.step_output_enabled:
-                    log.write_step(self.log_path)
-                    wrote_log = True
-            finally:
-                if not wrote_log:
-                    log.clear_buffers()
+            if self.world_size > 1:
+                log.gather_results()
+            if self.rank == 0 and self.step_output_enabled:
+                log.write_step(self.log_path)
+            else:
+                log.clear_buffers()

@@ -288,11 +288,11 @@ void launch_outflow(
     at::Tensor outgoing_storage_ptr,
     c10::optional<at::Tensor> water_surface_elevation_ptr,
     c10::optional<at::Tensor> protected_water_surface_elevation_ptr,
-    float gravity, at::Tensor time_step_ptr, long num_catchments,
+    double gravity, at::Tensor time_step_ptr, long num_catchments,
     bool HAS_BIFURCATION, bool HAS_TOTAL_STORAGE,
     bool HAS_WATER_SURFACE, bool HAS_PROTECTED_WATER_SURFACE, bool HAS_LEVEE,
     c10::optional<at::Tensor> is_dam_upstream_ptr, bool HAS_RESERVOIR,
-    float MIN_KINEMATIC_SLOPE,
+    double MIN_KINEMATIC_SLOPE,
     c10::optional<at::Tensor> sea_surface_elevation_ptr,
     c10::optional<at::Tensor> catchment_sea_level_idx_ptr,
     bool HAS_SEA_LEVEL, long num_sea_level_boundaries, long BLOCK_SIZE)

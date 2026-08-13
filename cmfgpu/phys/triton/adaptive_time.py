@@ -16,7 +16,7 @@ def compute_adaptive_time_step_kernel(
     downstream_distance_ptr,                # *f32 distance to downstream unit
     is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
     max_sub_steps_ptr,                      # *i32 max sub steps
-    outer_time_step,
+    outer_time_step_ptr,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
@@ -32,20 +32,20 @@ def compute_adaptive_time_step_kernel(
         is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
         mask = mask & (~is_dam)
 
-    # Compute a per-cell step count instead of reducing a padded minimum dt.
-    # This leaves max_sub_steps untouched when every cell is dam-related and
-    # lets the host apply the intentional one-step fallback for that case.
     downstream_distance = tl.load(
         downstream_distance_ptr + offs, mask=mask, other=1.0,
     )
     river_depth = tl.load(river_depth_ptr + offs, mask=mask, other=0)
     depth = tl.maximum(river_depth, 0.01)
-    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
+    factor = tl.full(depth.shape, adaptive_time_factor, depth.dtype)
+    gravity_value = tl.full(depth.shape, gravity, depth.dtype)
+    dt = factor * downstream_distance / tl.sqrt(gravity_value * depth)
+    outer_time_step = tl.load(outer_time_step_ptr)
     dt_clamped = tl.minimum(dt, outer_time_step)
 
     n_steps_float = tl.floor(outer_time_step / dt_clamped - 0.01) + 1.0
     n_steps = nonnegative_to_index_inline(n_steps_float)
-    n_steps = tl.where(mask, n_steps, 0)
+    n_steps = tl.where(mask, n_steps, 1)
 
     tl.atomic_max(max_sub_steps_ptr, tl.max(n_steps))
 
@@ -56,7 +56,7 @@ def compute_adaptive_time_step_batched_kernel(
     downstream_distance_ptr,                # *f32 distance to downstream unit
     is_dam_related_ptr,                     # *bool: True for dam + upstream-of-dam cells (I2MASK > 0)
     max_sub_steps_ptr,                      # *i32 (size 1, shared_state)
-    outer_time_step,
+    outer_time_step_ptr,
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
@@ -89,17 +89,15 @@ def compute_adaptive_time_step_batched_kernel(
     )
     river_depth = tl.load(river_depth_ptr + trial_offset + offs, mask=mask, other=0)
 
-    # Upcast to fp32 for intermediate computation:
-    # outer_time_step (86400) exceeds fp16 max (65504), so fp16 would overflow.
-    downstream_distance = downstream_distance
-    river_depth = river_depth
-
     depth = tl.maximum(river_depth, 0.01)
-    dt = adaptive_time_factor * downstream_distance / tl.sqrt(gravity * depth)
+    factor = tl.full(depth.shape, adaptive_time_factor, depth.dtype)
+    gravity_value = tl.full(depth.shape, gravity, depth.dtype)
+    dt = factor * downstream_distance / tl.sqrt(gravity_value * depth)
+    outer_time_step = tl.load(outer_time_step_ptr)
     dt_clamped = tl.minimum(dt, outer_time_step)
 
     n_steps_float = tl.floor(outer_time_step / dt_clamped - 0.01) + 1.0
     n_steps = nonnegative_to_index_inline(n_steps_float)
-    n_steps = tl.where(mask, n_steps, 0)
+    n_steps = tl.where(mask, n_steps, 1)
 
     tl.atomic_max(max_sub_steps_ptr, tl.max(n_steps))

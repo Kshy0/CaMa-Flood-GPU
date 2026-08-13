@@ -66,6 +66,7 @@ def main():
         prefix=runoff_clm_prefix,
         suffix=runoff_clm_suffix,
         time_to_key=None,              # single file mode
+        file_start_date=datetime(2001, 1, 1),
     )
 
     if not os.path.exists(runoff_mapping_file):

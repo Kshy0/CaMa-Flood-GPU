@@ -424,6 +424,16 @@ class BaseModule(AbstractModule):
         return torch.zeros(1, dtype=self.precision, device=self.device)
 
     @computed_base_field(
+        description="Current outer time-step duration (seconds).",
+        shape=(1,),
+        output="disabled",
+        category="shared_state",
+    )
+    @cached_property
+    def outer_time_step(self) -> torch.Tensor:
+        return torch.zeros(1, dtype=self.precision, device=self.device)
+
+    @computed_base_field(
         description="Current sub-step index within the time step. "
                     "Updated via .fill_() before each sub-step for log kernels.",
         shape=(1,),

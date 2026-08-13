@@ -23,7 +23,7 @@ where = ["."]
 include = ["cmfgpu*"]
 
 [tool.setuptools.package-data]
-"cmfgpu.phys.cuda" = ["*.cu"]
+"cmfgpu.phys.cuda" = ["*.cu", "*.cuh"]
 "cmfgpu.phys.metal" = ["*.metal"]
 
 [project.optional-dependencies]

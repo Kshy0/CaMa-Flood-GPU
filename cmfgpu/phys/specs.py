@@ -1,13 +1,16 @@
 """Canonical backend-neutral ABIs for CaMa-Flood physics kernels."""
 
-from hydroforge.contracts import KernelSpec
+from hydroforge.contracts import (
+    KernelSpec,
+    module_enabled,
+    module_flag,
+)
 
 
 _RUNTIME_SCALARS = {
-    "gravity": "float32",
-    "time_step": "float32",
-    "outer_time_step": "float32",
-    "adaptive_time_factor": "float32",
+    "gravity": "precision",
+    "time_step": "precision",
+    "adaptive_time_factor": "precision",
     "num_catchments": "index",
     "num_trials": "index",
     "num_sea_level_boundaries": "index",
@@ -20,6 +23,19 @@ _RUNTIME_SCALARS = {
 _STRUCTURAL_CONSTANTS = {
     "num_bifurcation_levels": "int32",
     "num_flood_levels": "int32",
+}
+
+_FEATURE_SOURCES = {
+    "HAS_BIFURCATION": module_enabled("bifurcation"),
+    "HAS_INFLOW": module_enabled("inflow"),
+    "HAS_LEVEE": module_enabled("levee"),
+    "HAS_RESERVOIR": module_enabled("reservoir"),
+    "HAS_SEA_LEVEL": module_enabled("sea_level"),
+    "HAS_TOTAL_STORAGE": module_flag("base", "has_total_storage"),
+    "HAS_WATER_SURFACE": module_flag("base", "has_water_surface"),
+    "HAS_PROTECTED_WATER_SURFACE": module_flag(
+        "base", "has_protected_water_surface"
+    ),
 }
 
 
@@ -92,6 +108,11 @@ def _spec(
         buffers=buffers,
         optional_buffers=optional or {},
         compile_time=constants,
+        feature_sources={
+            parameter: _FEATURE_SOURCES[parameter]
+            for parameter in constants
+            if parameter in _FEATURE_SOURCES
+        },
         runtime_scalars={
             parameter: _RUNTIME_SCALARS[parameter] for parameter in scalar_names
         },
@@ -173,7 +194,7 @@ OUTFLOW = _spec(
         "HAS_PROTECTED_WATER_SURFACE": "bool",
         "HAS_LEVEE": "bool",
         "HAS_RESERVOIR": "bool",
-        "MIN_KINEMATIC_SLOPE": "float32",
+        "MIN_KINEMATIC_SLOPE": "precision",
         "HAS_SEA_LEVEL": "bool",
         "batched_river_manning": "bool",
         "batched_flood_manning": "bool",
@@ -273,7 +294,7 @@ ADAPTIVE_TIME = _spec(
         "downstream_distance_ptr",
         "is_dam_related_ptr",
         "max_sub_steps_ptr",
-        "outer_time_step",
+        "outer_time_step_ptr",
         "adaptive_time_factor",
         "gravity",
         "num_catchments",
@@ -288,6 +309,7 @@ ADAPTIVE_TIME = _spec(
         "river_depth_ptr",
         "downstream_distance_ptr",
         "is_dam_related_ptr",
+        "outer_time_step_ptr",
     ),
     atomic_max=("max_sub_steps_ptr",),
     block_sizes={"metal": 256},

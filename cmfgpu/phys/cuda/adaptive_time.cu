@@ -22,13 +22,12 @@ __global__ void k_adaptive_time(
     const REAL* __restrict__ downstream_distance,
     const bool*  __restrict__ is_dam_related,
     int* __restrict__ max_sub_steps,
-    REAL outer_time_step, REAL adaptive_time_factor, REAL gravity,
+    const REAL* __restrict__ outer_time_step,
+    REAL adaptive_time_factor, REAL gravity,
     long num_catchments, int has_reservoir)
 {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    // 0 is the identity for this reduction: every contributing cell yields
-    // n_steps >= 1, so non-contributing lanes cannot raise the block maximum.
-    int n_steps = 0;
+    int n_steps = 1;
 
     bool skip = (t >= num_catchments)
         || (has_reservoir && is_dam_related && is_dam_related[t]);
@@ -37,9 +36,10 @@ __global__ void k_adaptive_time(
         REAL raw_depth = __ldg(river_depth + t);
         REAL depth = fmax(raw_depth, (REAL)0.01);
         REAL dt = adaptive_time_factor * dist / sqrt(gravity * depth);
-        REAL dt_clamped = fmin(dt, outer_time_step);
+        REAL outer_dt = *outer_time_step;
+        REAL dt_clamped = fmin(dt, outer_dt);
         n_steps = (int)(
-            floor(outer_time_step / dt_clamped - (REAL)0.01) + (REAL)1.0);
+            floor(outer_dt / dt_clamped - (REAL)0.01) + (REAL)1.0);
     }
 
     // Reduce inside the block so the single global scalar sees one atomic per
@@ -51,7 +51,8 @@ void launch_adaptive_time(
     at::Tensor river_depth_ptr, at::Tensor downstream_distance_ptr,
     c10::optional<at::Tensor> is_dam_related_ptr,
     at::Tensor max_sub_steps_ptr,
-    float outer_time_step, float adaptive_time_factor, float gravity,
+    at::Tensor outer_time_step_ptr,
+    double adaptive_time_factor, double gravity,
     long num_catchments, bool HAS_RESERVOIR, long BLOCK_SIZE)
 {
     int grid = (int)((num_catchments + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -63,14 +64,14 @@ void launch_adaptive_time(
             river_depth_ptr.data_ptr<double>(),
             downstream_distance_ptr.data_ptr<double>(),
             dam, max_sub_steps_ptr.data_ptr<int>(),
-            (double)outer_time_step, (double)adaptive_time_factor,
+            outer_time_step_ptr.data_ptr<double>(), (double)adaptive_time_factor,
             (double)gravity, num_catchments, (int)HAS_RESERVOIR);
     } else {
         k_adaptive_time<float><<<grid, (int)BLOCK_SIZE, 0, stream>>>(
             river_depth_ptr.data_ptr<float>(),
             downstream_distance_ptr.data_ptr<float>(),
             dam, max_sub_steps_ptr.data_ptr<int>(),
-            outer_time_step, adaptive_time_factor, gravity,
+            outer_time_step_ptr.data_ptr<float>(), adaptive_time_factor, gravity,
             num_catchments, (int)HAS_RESERVOIR);
     }
 }

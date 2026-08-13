@@ -4,10 +4,10 @@
     long num_catchments = *args.num_catchments;
     long num_trials = *args.num_trials;
     long total = num_catchments * num_trials;
-    float outer_dt = *args.outer_time_step;
+    float outer_dt = args.outer_time_step_ptr[0];
 
     if ((long)i >= total) {
-        shared_steps[lid] = 0;
+        shared_steps[lid] = 1;
     } else {
         long catchment = (long)i % num_catchments;
         long trial_offset = ((long)i / num_catchments) * num_catchments;
@@ -20,7 +20,7 @@
         long distance_offset = batched_downstream_distance
             ? trial_offset + catchment : catchment;
         if (skip) {
-            shared_steps[lid] = 0;
+            shared_steps[lid] = 1;
         } else {
             float downstream_distance =
                 args.downstream_distance_ptr[distance_offset];
@@ -52,8 +52,6 @@
 
     if (lid == 0) {
         int sub_steps = shared_steps[0];
-        if (sub_steps > 0) {
-            atomic_fetch_max_explicit(
-                args.max_sub_steps_ptr, sub_steps, memory_order_relaxed);
-        }
+        atomic_fetch_max_explicit(
+            args.max_sub_steps_ptr, sub_steps, memory_order_relaxed);
     }

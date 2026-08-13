@@ -163,7 +163,7 @@ void launch_bif_outflow(
     at::Tensor bifurcation_elevation_ptr,
     at::Tensor bifurcation_cross_section_depth_ptr,
     at::Tensor water_surface_elevation_ptr, at::Tensor total_storage_ptr,
-    at::Tensor outgoing_storage_ptr, float gravity,
+    at::Tensor outgoing_storage_ptr, double gravity,
     at::Tensor time_step_ptr, long num_catchments,
     long num_bifurcation_paths,
     int num_bifurcation_levels, long BLOCK_SIZE)
