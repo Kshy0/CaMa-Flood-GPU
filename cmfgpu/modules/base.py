@@ -347,7 +347,10 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def outgoing_storage(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
+        return torch.zeros_like(
+            self.river_outflow,
+            dtype=self.get_expected_dtype("outgoing_storage"),
+        )
 
     @computed_base_field(
         description="Water-surface elevation (m a.s.l.)",
@@ -380,7 +383,10 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def river_inflow(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
+        return torch.zeros_like(
+            self.river_outflow,
+            dtype=self.get_expected_dtype("river_inflow"),
+        )
 
     @computed_base_field(
         description="Total flooded area (m²)",
@@ -398,7 +404,10 @@ class BaseModule(AbstractModule):
     )
     @cached_property
     def flood_inflow(self) -> torch.Tensor:
-        return torch.zeros_like(self.river_outflow, dtype=self.high_precision)
+        return torch.zeros_like(
+            self.river_outflow,
+            dtype=self.get_expected_dtype("flood_inflow"),
+        )
 
     @computed_base_field(
         description="Total outflow from catchment (river + flood) (m³ s⁻¹)",

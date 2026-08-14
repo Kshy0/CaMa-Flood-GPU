@@ -173,7 +173,7 @@ class BifurcationModule(AbstractModule):
     def global_bifurcation_outflow(self) -> torch.Tensor:
         return torch.zeros_like(
             self.base.river_outflow,
-            dtype=self.high_precision,
+            dtype=self.get_expected_dtype("global_bifurcation_outflow"),
         )
 
     @computed_bifurcation_field(
