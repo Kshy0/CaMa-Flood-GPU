@@ -34,7 +34,6 @@ def main() -> None:
 
     loader_workers = 1
     output_workers = 2
-    runoff_chunk_len = 24
     unit_factor = 3600 * runoff_time_interval_hour
     prefetch_factor = 2
     BLOCK_SIZE = 128
@@ -72,7 +71,6 @@ def main() -> None:
         spin_up_end_date=spin_up_end_date if spin_up_cycles > 0 else None,
         model_step=runoff_time_interval,
         unit_factor=unit_factor,  # mm/day divided by unit_factor to get m/s
-        chunk_len=runoff_chunk_len,
         var_name=var_name,
         prefix=prefix,
         suffix=suffix,

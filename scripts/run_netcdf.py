@@ -29,7 +29,6 @@ def main() -> None:
         "mean": ["total_outflow"],
         "last": ["river_depth"],
     }
-    runoff_chunk_len = None
     loader_workers = 2
     output_workers = 2
     unit_factor = 86400000
@@ -72,7 +71,6 @@ def main() -> None:
         model_step=runoff_time_interval,
         unit_factor=unit_factor,
         var_name=var_name,
-        chunk_len=runoff_chunk_len,
         prefix=prefix,
         suffix=suffix,
         clip_negative=True,

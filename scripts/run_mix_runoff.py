@@ -25,7 +25,6 @@ def main() -> None:
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
     opened_modules = ("base", "adaptive_time", "bifurcation")
     num_sub_steps = 360 if "adaptive_time" not in opened_modules else None
-    runoff_chunk_len = 48
     loader_workers = 3
     output_workers = 2
     unit_factor = 86400000
@@ -82,7 +81,6 @@ def main() -> None:
         model_step=runoff_time_interval,
         unit_factor=unit_factor,
         var_name=var_name0,
-        chunk_len=runoff_chunk_len,
         prefix=prefix0,
         suffix=suffix,
         clip_negative=True,
@@ -93,7 +91,6 @@ def main() -> None:
         model_step=runoff_time_interval,
         unit_factor=unit_factor,
         var_name=var_name1,
-        chunk_len=runoff_chunk_len,
         prefix=prefix1,
         suffix=suffix,
         clip_negative=True,
