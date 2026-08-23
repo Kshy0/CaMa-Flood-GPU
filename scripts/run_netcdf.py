@@ -87,7 +87,6 @@ def main() -> None:
         opened_modules=opened_modules,
         variables_to_save=variables_to_save,
         output_workers=output_workers,
-        output_netcdf_options={"compression": "zlib", "complevel": 4},
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year,
         simulation_schedule=schedule,

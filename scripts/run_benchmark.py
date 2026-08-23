@@ -90,7 +90,6 @@ def benchmark_block_sizes():
             output_dir=output_dir,
             opened_modules=opened_modules,
             output_workers=0,
-            output_netcdf_options={},
             BLOCK_SIZE=block_size,
             output_split_by_year=output_split_by_year,
             simulation_schedule=schedule,

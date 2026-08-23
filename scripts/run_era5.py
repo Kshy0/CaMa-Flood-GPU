@@ -94,7 +94,6 @@ def main() -> None:
         simulation_schedule=schedule,
         statistics_plan=statistics_plan,
         output_workers=output_workers,
-        output_netcdf_options={"compression": "zlib", "complevel": 4},
         BLOCK_SIZE=BLOCK_SIZE,
         output_split_by_year=output_split_by_year,
     )
