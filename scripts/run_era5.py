@@ -119,7 +119,10 @@ def main() -> None:
     for runoff_chunk in loader:
         with stream_ctx:
             runoff_chunk = dataset.shard_forcing(
-                runoff_chunk.to(device),
+                runoff_chunk.to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                ),
                 local_mapping,
             )
             for runoff in runoff_chunk:

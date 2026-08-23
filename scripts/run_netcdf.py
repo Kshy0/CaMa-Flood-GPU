@@ -29,7 +29,7 @@ def main() -> None:
         "mean": ["total_outflow"],
         "last": ["river_depth"],
     }
-    runoff_chunk_len = 24
+    runoff_chunk_len = None
     loader_workers = 2
     output_workers = 2
     unit_factor = 86400000
@@ -102,7 +102,7 @@ def main() -> None:
         batch_size=None,
         shuffle=False,
         num_workers=loader_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         prefetch_factor=prefetch_factor if loader_workers > 0 else None,
     )
     stream_ctx = (
@@ -113,7 +113,10 @@ def main() -> None:
     for runoff_chunk in loader:
         with stream_ctx:
             runoff_chunk = dataset.shard_forcing(
-                runoff_chunk.to(device),
+                runoff_chunk.to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                ),
                 local_mapping,
             )
             for runoff in runoff_chunk:

@@ -134,7 +134,7 @@ def main() -> None:
         batch_size=None,
         shuffle=False,
         num_workers=loader_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         prefetch_factor=prefetch_factor if loader_workers > 0 else None,
     )
     loader1 = DataLoader(
@@ -142,7 +142,7 @@ def main() -> None:
         batch_size=None,
         shuffle=False,
         num_workers=loader_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         prefetch_factor=prefetch_factor if loader_workers > 0 else None,
     )
 
@@ -154,7 +154,14 @@ def main() -> None:
     for runoff_chunk0, runoff_chunk1 in zip(loader0, loader1, strict=True):
         with stream_ctx:
             runoff_chunk = dataset0.shard_forcing(
-                runoff_chunk0.to(device) + runoff_chunk1.to(device),
+                runoff_chunk0.to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                )
+                + runoff_chunk1.to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                ),
                 local_mapping0,
             )
             for runoff in runoff_chunk:
