@@ -39,8 +39,8 @@ def main():
     runoff_clm_prefix = "ELSE_GPCC_dayclm-1981-2010"
     runoff_clm_suffix = ".one"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_clm.npz"
-    runoff_shape = [180, 360]       # (ny, nx)
-    unit_factor = 86400000          # mm/day → m/s
+    runoff_shape = (180, 360)  # (ny, nx)
+    unit_factor = 86400000  # mm/day → m/s
 
     # Output paths
     climatology_nc = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_clm.nc"
@@ -59,13 +59,14 @@ def main():
     dataset = DailyBinDataset(
         base_dir=runoff_clm_dir,
         shape=runoff_shape,
-        start_date=datetime(2001, 1, 1),  # any non-leap year with 365 days
+        start_date=datetime(2001, 1, 1),
         end_date=datetime(2001, 12, 31),
+        time_interval=timedelta(days=1),
         model_step=timedelta(days=1),
         unit_factor=unit_factor,
         prefix=runoff_clm_prefix,
         suffix=runoff_clm_suffix,
-        time_to_key=None,              # single file mode
+        time_to_key=None,  # single file mode
         file_start_date=datetime(2001, 1, 1),
     )
 
@@ -90,8 +91,8 @@ def main():
     # 3. Export runoff climatology
     # ------------------------------------------------------------------
     dataset.export_climatology(
-        out_path=climatology_nc,
         local_mapping=local_mapping,
+        out_path=climatology_nc,
         var_name="runoff_clm",
         device="cpu",
     )

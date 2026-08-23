@@ -15,9 +15,9 @@ _RUNTIME_SCALARS = {
     "num_trials": "index",
     "num_sea_level_boundaries": "index",
     "num_bifurcation_paths": "index",
-    "num_reservoirs": "index",
+    "num_reservoirs": "int32",
     "num_inflow_gauges": "int32",
-    "num_levees": "index",
+    "num_levees": "int32",
 }
 
 _STRUCTURAL_CONSTANTS = {
@@ -161,7 +161,7 @@ OUTFLOW = _spec(
         "HAS_LEVEE",
         "is_dam_upstream_ptr",
         "HAS_RESERVOIR",
-        "MIN_KINEMATIC_SLOPE",
+        "min_kinematic_slope",
         "sea_surface_elevation_ptr",
         "catchment_sea_level_idx_ptr",
         "HAS_SEA_LEVEL",
@@ -194,7 +194,7 @@ OUTFLOW = _spec(
         "HAS_PROTECTED_WATER_SURFACE": "bool",
         "HAS_LEVEE": "bool",
         "HAS_RESERVOIR": "bool",
-        "MIN_KINEMATIC_SLOPE": "precision",
+        "min_kinematic_slope": "precision",
         "HAS_SEA_LEVEL": "bool",
         "batched_river_manning": "bool",
         "batched_flood_manning": "bool",

@@ -27,9 +27,9 @@ __global__ void k_reservoir_outflow(
     const REAL* __restrict__ adjustment_outflow, const REAL* __restrict__ flood_control_outflow,
     const REAL* __restrict__ runoff, STO* __restrict__ total_storage,
     STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr,
-    long num_reservoirs)
+    int num_reservoirs)
 {
-    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= num_reservoirs) return;
     REAL time_step = __ldg(time_step_ptr);
 
@@ -103,7 +103,7 @@ void launch_reservoir_outflow(
     at::Tensor flood_control_outflow_ptr, at::Tensor runoff_ptr,
     at::Tensor total_storage_ptr, at::Tensor outgoing_storage_ptr,
     at::Tensor time_step_ptr, long num_catchments,
-    long num_reservoirs, long BLOCK_SIZE)
+    int num_reservoirs, long BLOCK_SIZE)
 {
     (void)num_catchments;
     int grid = (int)((num_reservoirs + BLOCK_SIZE - 1) / BLOCK_SIZE);

@@ -55,7 +55,7 @@ void launch_adaptive_time(
     double adaptive_time_factor, double gravity,
     long num_catchments, bool HAS_RESERVOIR, long BLOCK_SIZE)
 {
-    int grid = (int)((num_catchments + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const long grid = (num_catchments + BLOCK_SIZE - 1) / BLOCK_SIZE;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     const bool* dam = (
         is_dam_related_ptr ? is_dam_related_ptr->data_ptr<bool>() : nullptr);

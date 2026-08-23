@@ -17,8 +17,12 @@ from hydroforge.model import (
     optional_module_ref,
 )
 from hydroforge.contracts import BackendRequirement, ModuleRequirement
-from hydroforge.execution import all_reduce_, between_steps
-from hydroforge.execution.step import managed_step
+from hydroforge.execution import (
+    ManagedStep,
+    all_reduce_,
+    between_steps,
+    managed_step,
+)
 
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
@@ -75,38 +79,42 @@ class CaMaFlood(AbstractModel):
     @torch.inference_mode()
     def set_inputs(
         self,
+        *,
         runoff: torch.Tensor,
         inflow: Optional[torch.Tensor] = None,
         sea_surface_elevation: Optional[torch.Tensor] = None,
     ) -> None:
         """Stage all public dynamic forcing without rebinding model buffers."""
 
-        inflow_module = self.inflow
-        if (inflow_module is None) != (inflow is None):
-            raise ValueError(
-                "inflow must be provided exactly when the inflow module is open"
-            )
-        sea_level_module = self.sea_level
-        if (sea_level_module is None) != (sea_surface_elevation is None):
-            raise ValueError(
-                "sea_surface_elevation must be provided exactly when the "
-                "sea_level module is open"
-            )
-
         self.base.runoff.copy_(runoff)
-        if inflow_module is not None:
+        inflow_module = self.inflow
+        if inflow_module is None:
+            if inflow is not None:
+                raise ValueError("inflow forcing requires the inflow module")
+        else:
+            if inflow is None:
+                raise ValueError("the inflow module requires inflow forcing")
             inflow_module.inflow.copy_(inflow)
-        if sea_level_module is not None:
-            sea_level_module.sea_surface_elevation.copy_(
-                sea_surface_elevation
-            )
+
+        sea_level_module = self.sea_level
+        if sea_level_module is None:
+            if sea_surface_elevation is not None:
+                raise ValueError(
+                    "sea_surface_elevation forcing requires the sea_level module"
+                )
+        else:
+            if sea_surface_elevation is None:
+                raise ValueError(
+                    "the sea_level module requires sea_surface_elevation forcing"
+                )
+            sea_level_module.sea_surface_elevation.copy_(sea_surface_elevation)
 
     @managed_step
     @torch.inference_mode()
-    def step_advance(self) -> None:
+    def step_advance(self, step: ManagedStep) -> None:
         """Advance one step; fixed mode accepts managed ``num_sub_steps``."""
 
-        time_step_seconds = self.step_duration.total_seconds()
+        time_step_seconds = step.duration.total_seconds()
         adaptive_time = self.adaptive_time
         log = self.log
         reservoir = self.reservoir
@@ -118,16 +126,16 @@ class CaMaFlood(AbstractModel):
             compute_adaptive_time_step()
             if self.world_size > 1:
                 all_reduce_(adaptive_time.max_sub_steps, reduction="max")
-            fixed_substeps = self.substeps.fixed(
+            fixed_substeps = step.fixed(
                 count=int(adaptive_time.max_sub_steps.item()),
             )
         else:
-            fixed_substeps = self.substeps.fixed()
+            fixed_substeps = step.fixed()
         fixed_count = fixed_substeps.count
         time_sub_step = time_step_seconds / fixed_count
 
         if log is not None:
-            log.set_time(time_sub_step, fixed_count, self.current_time)
+            log.set_time(time_sub_step, fixed_count, step.current_time)
 
         self.base.time_step.fill_(time_sub_step)
 
@@ -167,7 +175,7 @@ class CaMaFlood(AbstractModel):
         if log is not None:
             if self.world_size > 1:
                 log.gather_results()
-            if self.rank == 0 and self.step_output_enabled:
+            if self.rank == 0 and step.output_enabled:
                 log.write_step(self.log_path)
             else:
                 log.clear_buffers()

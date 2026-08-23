@@ -4,7 +4,7 @@
 
 """Registered flood-stage implementations."""
 
-from hydroforge.kernels.registry import BackendRegistry
+from hydroforge.kernels import BackendRegistry
 from cmfgpu.phys.specs import FLOOD_STAGE, FLOOD_STAGE_LOG
 
 
@@ -29,7 +29,7 @@ def _cuda_log():
 
 
 def _triton_stage():
-    from hydroforge.kernels.registry import make_triton_dispatcher
+    from hydroforge.kernels import make_triton_dispatcher
     from cmfgpu.phys.triton.storage import (
         compute_flood_stage_batched_kernel, compute_flood_stage_kernel,
     )
@@ -40,18 +40,18 @@ def _triton_stage():
 
 
 def _triton_log():
-    from hydroforge.kernels.registry import make_triton_dispatcher
+    from hydroforge.kernels import make_triton_dispatcher
     from cmfgpu.phys.triton.storage import compute_flood_stage_log_kernel
     return make_triton_dispatcher(compute_flood_stage_log_kernel)
 
 
 compute_flood_stage = BackendRegistry(
-    {"metal": _metal_stage, "cuda": _cuda_stage, "triton": _triton_stage},
+    implementations={"metal": _metal_stage, "cuda": _cuda_stage, "triton": _triton_stage},
     name="compute_flood_stage",
     spec=FLOOD_STAGE,
 ).selected
 compute_flood_stage_log = BackendRegistry(
-    {"metal": _metal_log, "cuda": _cuda_log, "triton": _triton_log},
+    implementations={"metal": _metal_log, "cuda": _cuda_log, "triton": _triton_log},
     name="compute_flood_stage_log",
     spec=FLOOD_STAGE_LOG,
 ).selected

@@ -4,7 +4,7 @@
 
 """Registered levee implementations."""
 
-from hydroforge.kernels.registry import (
+from hydroforge.kernels import (
     BackendRegistry, make_triton_dispatcher,
 )
 from cmfgpu.phys.specs import (
@@ -69,7 +69,7 @@ def _triton_bif():
 
 
 compute_levee_stage = BackendRegistry(
-    {
+    implementations={
         "metal": _metal_stage,
         "cuda": _cuda_stage,
         "triton": _triton_stage,
@@ -78,7 +78,7 @@ compute_levee_stage = BackendRegistry(
     spec=LEVEE_STAGE,
 ).selected
 compute_levee_stage_log = BackendRegistry(
-    {
+    implementations={
         "metal": _metal_log,
         "cuda": _cuda_log,
         "triton": _triton_log,
@@ -87,7 +87,7 @@ compute_levee_stage_log = BackendRegistry(
     spec=LEVEE_STAGE_LOG,
 ).selected
 compute_levee_bifurcation_outflow = BackendRegistry(
-    {"metal": _metal_bif, "cuda": _cuda_bif,
+    implementations={"metal": _metal_bif, "cuda": _cuda_bif,
      "triton": _triton_bif},
     name="compute_levee_bifurcation_outflow",
     spec=LEVEE_BIFURCATION_OUTFLOW,

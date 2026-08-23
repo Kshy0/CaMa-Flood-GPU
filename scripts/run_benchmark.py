@@ -10,14 +10,14 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
+from hydroforge.data import InputProxy, setup_distributed
 from hydroforge.data.datasets import DailyBinDataset
-from hydroforge.data.distributed import setup_distributed
-from hydroforge.data.input import InputProxy
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
 
 BLOCK_SIZE_LIST = [64, 128, 256, 512, 1024]
+
 
 def benchmark_block_sizes():
     ### Benchmark Configuration ###
@@ -25,9 +25,8 @@ def benchmark_block_sizes():
     resolution = "glb_15min"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"
-    opened_modules = ["base", "adaptive_time", "bifurcation"]
+    opened_modules = ("base", "adaptive_time", "bifurcation")
     num_sub_steps = 360 if "adaptive_time" not in opened_modules else None
-    variables_to_save = {}
     runoff_time_interval = timedelta(days=1)
     loader_workers = 3
     prefetch_factor = 2
@@ -36,21 +35,13 @@ def benchmark_block_sizes():
 
     runoff_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_bin.npz"
-    runoff_shape = [180, 360]
+    runoff_shape = (180, 360)
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 4, 1)
     unit_factor = 86400000
     bin_dtype = "float32"
     prefix = "Roff____"
     suffix = ".one"
-
-    local_rank, rank, world_size = setup_distributed()
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{local_rank}")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
 
     input_proxy = InputProxy.from_nc(input_file)
 
@@ -59,6 +50,7 @@ def benchmark_block_sizes():
         shape=runoff_shape,
         start_date=start_date,
         end_date=end_date,
+        time_interval=runoff_time_interval,
         model_step=runoff_time_interval,
         unit_factor=unit_factor,
         bin_dtype=bin_dtype,
@@ -73,7 +65,15 @@ def benchmark_block_sizes():
         num_workers=loader_workers,
         pin_memory=True,
         prefetch_factor=prefetch_factor if loader_workers > 0 else None,
+        persistent_workers=loader_workers > 0,
     )
+
+    distributed = setup_distributed(
+        allowed_devices=("cuda", "mps"),
+    )
+    rank = distributed.rank
+    world_size = distributed.world_size
+    device = distributed.device
 
     results = []
     if rank == 0:
@@ -89,7 +89,6 @@ def benchmark_block_sizes():
             input_proxy=input_proxy,
             output_dir=output_dir,
             opened_modules=opened_modules,
-            variables_to_save=variables_to_save,
             output_workers=0,
             output_netcdf_options={},
             BLOCK_SIZE=block_size,
@@ -113,11 +112,11 @@ def benchmark_block_sizes():
         for runoff_chunk in loader:
             with stream_ctx:
                 runoff_chunk = dataset.shard_forcing(
-                    runoff_chunk.to(device),
+                    runoff_chunk.to(device, non_blocking=True),
                     local_mapping,
                 )
                 for runoff in runoff_chunk:
-                    model.set_inputs(runoff)
+                    model.set_inputs(runoff=runoff)
                     model.step_advance(
                         num_sub_steps=num_sub_steps,
                     )
@@ -138,5 +137,10 @@ def benchmark_block_sizes():
         for bs, t in results:
             print(f"BLOCK_SIZE={bs} --> {t:.2f} ms")
 
-if __name__ == "__main__":
+
+def main() -> None:
     benchmark_block_sizes()
+
+
+if __name__ == "__main__":
+    main()

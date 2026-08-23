@@ -4,7 +4,7 @@
 
 """Registered bifurcation implementations."""
 
-from hydroforge.kernels.registry import (
+from hydroforge.kernels import (
     BackendRegistry, make_triton_dispatcher,
 )
 from cmfgpu.phys.specs import BIFURCATION_INFLOW, BIFURCATION_OUTFLOW
@@ -43,7 +43,7 @@ def _triton(which):
 
 
 compute_bifurcation_outflow = BackendRegistry(
-    {
+    implementations={
         "metal": _metal_outflow,
         "cuda": _cuda_outflow,
         "triton": _triton("outflow"),
@@ -52,7 +52,7 @@ compute_bifurcation_outflow = BackendRegistry(
     spec=BIFURCATION_OUTFLOW,
 ).selected
 compute_bifurcation_inflow = BackendRegistry(
-    {
+    implementations={
         "metal": _metal_inflow,
         "cuda": _cuda_inflow,
         "triton": _triton("inflow"),

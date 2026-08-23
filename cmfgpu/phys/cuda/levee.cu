@@ -46,9 +46,9 @@ __global__ void k_levee_stage(
     REAL* __restrict__ flood_area_sum,
     REAL* __restrict__ total_stage_error_sum,
     const int* __restrict__ current_step_ptr,
-    long num_levees, int num_flood_levels)
+    int num_levees, int num_flood_levels)
 {
-    long li = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    int li = blockIdx.x * blockDim.x + threadIdx.x;
     REAL log_sum[CMF_LEVEE_LOG_SUMS];
     if constexpr (LOG) {
         // Out-of-range lanes stay alive with zero contributions so every
@@ -349,7 +349,7 @@ void launch_levee_stage(
     at::Tensor catchment_area_ptr, at::Tensor river_width_ptr,
     at::Tensor river_length_ptr, at::Tensor levee_base_height_ptr,
     at::Tensor levee_crown_height_ptr, at::Tensor levee_fraction_ptr,
-    at::Tensor flood_fraction_ptr, long num_catchments, long num_levees,
+    at::Tensor flood_fraction_ptr, long num_catchments, int num_levees,
     int num_flood_levels, long BLOCK_SIZE)
 {
     (void)num_catchments;
@@ -391,7 +391,7 @@ void launch_levee_stage_log(
     at::Tensor flood_fraction_ptr, at::Tensor total_storage_stage_sum_ptr,
     at::Tensor river_storage_sum_ptr, at::Tensor flood_storage_sum_ptr,
     at::Tensor flood_area_sum_ptr, at::Tensor total_stage_error_sum_ptr,
-    at::Tensor current_step_ptr, long num_levees,
+    at::Tensor current_step_ptr, int num_levees,
     int num_flood_levels, long BLOCK_SIZE)
 {
     int grid = (int)((num_levees + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -437,7 +437,9 @@ void launch_levee_bif_outflow(
     long BLOCK_SIZE)
 {
     (void)num_catchments;
-    int grid = (int)((num_bifurcation_paths + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const long grid = (
+        num_bifurcation_paths + BLOCK_SIZE - 1
+    ) / BLOCK_SIZE;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 #define LAUNCH_LEVEE_BIF(REAL_T, STO_T) \
         k_levee_bif_outflow<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \

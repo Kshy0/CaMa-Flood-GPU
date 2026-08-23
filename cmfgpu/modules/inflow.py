@@ -10,7 +10,7 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self
 
 import torch
-from hydroforge.model.module import (AbstractModule, CoordinateField,
+from hydroforge.model import (AbstractModule, CoordinateField,
                                         ReferenceIndexField, TensorField,
                                         module_ref)
 from pydantic import computed_field, model_validator
@@ -94,7 +94,7 @@ class InflowModule(AbstractModule):
             if placement == "same":
                 expected = gauge_id
             else:
-                from hydroforge.data.distributed import find_indices_in_torch
+                from hydroforge.data import find_indices_in_torch
                 gauge_idx = find_indices_in_torch(gauge_id, self.base.catchment_id)
                 if torch.any(gauge_idx < 0):
                     missing = gauge_id[gauge_idx < 0][:5].detach().cpu().tolist()

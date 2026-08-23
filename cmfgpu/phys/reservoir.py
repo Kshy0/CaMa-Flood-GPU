@@ -4,7 +4,7 @@
 
 """Registered reservoir-outflow implementations."""
 
-from hydroforge.kernels.registry import BackendRegistry
+from hydroforge.kernels import BackendRegistry
 from cmfgpu.phys.specs import RESERVOIR_OUTFLOW
 
 
@@ -19,7 +19,7 @@ def _cuda():
 
 
 def _triton():
-    from hydroforge.kernels.registry import make_triton_dispatcher
+    from hydroforge.kernels import make_triton_dispatcher
     from cmfgpu.phys.triton.reservoir import (
         compute_reservoir_outflow_batched_kernel,
         compute_reservoir_outflow_kernel,
@@ -30,8 +30,9 @@ def _triton():
     )
 
 
-compute_reservoir_outflow = BackendRegistry(
-    {"metal": _metal, "cuda": _cuda, "triton": _triton},
+compute_reservoir_outflow_registry = BackendRegistry(
+    implementations={"metal": _metal, "cuda": _cuda, "triton": _triton},
     name="compute_reservoir_outflow",
     spec=RESERVOIR_OUTFLOW,
-).selected
+)
+compute_reservoir_outflow = compute_reservoir_outflow_registry.selected

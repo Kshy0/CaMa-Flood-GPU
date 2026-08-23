@@ -8,7 +8,6 @@ __pycache__/
 *.mod
 *.so
 .DS_Store
-tests/
 scripts_*/
 temp/
 inp/

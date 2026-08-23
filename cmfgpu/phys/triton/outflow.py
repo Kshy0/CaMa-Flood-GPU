@@ -60,7 +60,7 @@ def compute_outflow_kernel(
     HAS_LEVEE: tl.constexpr = False,
     is_dam_upstream_ptr=None,               # *bool  upstream-of-dam mask (catchment-indexed)
     HAS_RESERVOIR: tl.constexpr = False,    # whether reservoir module is active
-    MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
+    min_kinematic_slope: tl.constexpr = 1.0e-5,  # minimum bed slope for kinematic wave
     sea_surface_elevation_ptr=None,
     catchment_sea_level_idx_ptr=None,
     num_sea_level_boundaries: tl.constexpr = 0,
@@ -254,7 +254,7 @@ def compute_outflow_kernel(
         ) != 0
         # Bed slope
         bed_slope = (catchment_elevation - tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0)) / downstream_distance
-        bed_slope = tl.maximum(bed_slope, MIN_KINEMATIC_SLOPE)
+        bed_slope = tl.maximum(bed_slope, min_kinematic_slope)
         # River kinematic: Q = W * n^{-1} * S^{0.5} * d^{5/3}
         kin_riv_vel = (1.0 / river_manning) * tl.sqrt(bed_slope) * cbrt_compat_inline(river_depth * river_depth)
         kin_riv = river_width * river_depth * kin_riv_vel
@@ -442,7 +442,7 @@ def compute_outflow_batched_kernel(
     HAS_LEVEE: tl.constexpr = False,
     is_dam_upstream_ptr=None,
     HAS_RESERVOIR: tl.constexpr = False,
-    MIN_KINEMATIC_SLOPE: tl.constexpr = 1.0e-5,
+    min_kinematic_slope: tl.constexpr = 1.0e-5,
     sea_surface_elevation_ptr=None,
     catchment_sea_level_idx_ptr=None,
     num_sea_level_boundaries: tl.constexpr = 0,
@@ -651,7 +651,7 @@ def compute_outflow_batched_kernel(
             mask=mask, other=0.0,
         )
         bed_slope = (catchment_elevation - downstream_elevation) / downstream_distance
-        bed_slope = tl.maximum(bed_slope, MIN_KINEMATIC_SLOPE)
+        bed_slope = tl.maximum(bed_slope, min_kinematic_slope)
         kin_riv_vel = (
             tl.sqrt(bed_slope) * cbrt_compat_inline(river_depth * river_depth)
             / river_manning

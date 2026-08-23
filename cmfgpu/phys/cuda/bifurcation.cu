@@ -169,7 +169,9 @@ void launch_bif_outflow(
     int num_bifurcation_levels, long BLOCK_SIZE)
 {
     (void)num_catchments;
-    int grid = (int)((num_bifurcation_paths + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const long grid = (
+        num_bifurcation_paths + BLOCK_SIZE - 1
+    ) / BLOCK_SIZE;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     bool real64 = (water_surface_elevation_ptr.scalar_type() == at::kDouble);
     bool sto64 = (total_storage_ptr.scalar_type() == at::kDouble);
@@ -208,7 +210,9 @@ void launch_bif_inflow(
     long BLOCK_SIZE)
 {
     (void)num_catchments;
-    int grid = (int)((num_bifurcation_paths + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const long grid = (
+        num_bifurcation_paths + BLOCK_SIZE - 1
+    ) / BLOCK_SIZE;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     bool real64 = (bifurcation_outflow_ptr.scalar_type() == at::kDouble);
     bool sto64 = (global_bifurcation_outflow_ptr.scalar_type() == at::kDouble);

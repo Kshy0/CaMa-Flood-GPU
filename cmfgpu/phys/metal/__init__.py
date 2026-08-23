@@ -6,7 +6,7 @@ the active BackendRegistry when a factory returned by :func:`route` is called.
 
 from pathlib import Path
 
-from hydroforge.kernels.registry import (
+from hydroforge.kernels import (
     make_spec_metal_dispatcher,
     registry_factory,
 )

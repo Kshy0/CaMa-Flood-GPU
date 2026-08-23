@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from hydroforge.data.distributed import find_indices_in
+from hydroforge.data import find_indices_in
 from netCDF4 import Dataset
 from numba import njit
 
@@ -686,6 +686,12 @@ def get_kept_basin_ids(
     """
     Given target catchment IDs, find which basins they belong to.
     """
+    target_cids = _require_unmasked_array(target_cids, name="target_cids")
+    catchment_id = _require_unmasked_array(catchment_id, name="catchment_id")
+    catchment_basin_id = _require_unmasked_array(
+        catchment_basin_id,
+        name="catchment_basin_id",
+    )
     if len(target_cids) == 0:
         return np.array([], dtype=np.int64)
 
@@ -699,6 +705,23 @@ def get_kept_basin_ids(
 
     kept_basin_ids = np.unique(catchment_basin_id[target_idx])
     return kept_basin_ids
+
+
+def _require_unmasked_array(value: Any, *, name: str) -> np.ndarray:
+    """Return a plain ndarray, rejecting actual missing NetCDF values.
+
+    netCDF4 commonly returns ``MaskedArray(mask=False)`` even when every value
+    is present. HydroForge's strict lookup contract correctly rejects masked
+    arrays, so consumer code must distinguish that harmless wrapper from a
+    topology variable that really contains missing data before converting it.
+    """
+    if np.ma.isMaskedArray(value):
+        if np.any(np.ma.getmaskarray(value)):
+            raise ValueError(
+                f"Parameter variable '{name}' contains masked or missing values."
+            )
+        value = value.data
+    return np.asarray(value)
 
 
 def _build_upstream_adj(catchment_id, downstream_id):
@@ -1194,11 +1217,23 @@ def crop_parameters_nc(
         raise ValueError("Only one of crop_upstream, crop_downstream, crop_interval can be True.")
     with Dataset(input_nc, 'r') as src:
         # Load connectivity
-        catchment_id = src['catchment_id'][:]
-        catchment_x = src['catchment_x'][:]
-        catchment_y = src['catchment_y'][:]
-        catchment_basin_id = src['catchment_basin_id'][:]
-        downstream_id = src['downstream_id'][:] if 'downstream_id' in src.variables else None
+        catchment_id = _require_unmasked_array(
+            src['catchment_id'][:], name="catchment_id"
+        )
+        catchment_x = _require_unmasked_array(
+            src['catchment_x'][:], name="catchment_x"
+        )
+        catchment_y = _require_unmasked_array(
+            src['catchment_y'][:], name="catchment_y"
+        )
+        catchment_basin_id = _require_unmasked_array(
+            src['catchment_basin_id'][:], name="catchment_basin_id"
+        )
+        downstream_id = (
+            _require_unmasked_array(src['downstream_id'][:], name="downstream_id")
+            if 'downstream_id' in src.variables
+            else None
+        )
 
         # In cut mode, use the pre-merge main-stem basins so a POI does not
         # pull in a basin connected only through a bifurcation.

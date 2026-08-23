@@ -136,7 +136,7 @@ long num_catchments = *args.num_catchments;
         float bed_slope = max(
             (catchment_elevation - downstream_elevation)
                 / downstream_distance,
-            MIN_KINEMATIC_SLOPE);
+            min_kinematic_slope);
         float river_velocity = sqrt(bed_slope)
             * pow(river_depth * river_depth, 1.0f / 3.0f) / river_manning;
         updated_river_outflow = clamp(

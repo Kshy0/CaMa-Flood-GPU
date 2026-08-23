@@ -4,7 +4,7 @@
 
 """Registered adaptive-time implementations."""
 
-from hydroforge.kernels.registry import BackendRegistry
+from hydroforge.kernels import BackendRegistry
 from cmfgpu.phys.specs import ADAPTIVE_TIME
 
 
@@ -20,7 +20,7 @@ def _cuda():
 
 
 def _triton():
-    from hydroforge.kernels.registry import make_triton_dispatcher
+    from hydroforge.kernels import make_triton_dispatcher
     from cmfgpu.phys.triton.adaptive_time import (
         compute_adaptive_time_step_batched_kernel,
         compute_adaptive_time_step_kernel,
@@ -31,8 +31,9 @@ def _triton():
     )
 
 
-compute_adaptive_time_step = BackendRegistry(
-    {"metal": _metal, "cuda": _cuda, "triton": _triton},
+compute_adaptive_time_step_registry = BackendRegistry(
+    implementations={"metal": _metal, "cuda": _cuda, "triton": _triton},
     name="compute_adaptive_time_step",
     spec=ADAPTIVE_TIME,
-).selected
+)
+compute_adaptive_time_step = compute_adaptive_time_step_registry.selected

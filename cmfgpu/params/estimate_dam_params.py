@@ -57,12 +57,13 @@ from typing import Optional, Union
 
 import numba
 import numpy as np
-from hydroforge.data.distributed import find_indices_in
+from hydroforge.data import find_indices_in
 from netCDF4 import Dataset
 
 # ---------------------------------------------------------------------------
 # Numba-accelerated kernels
 # ---------------------------------------------------------------------------
+
 
 @numba.njit(cache=True)
 def _gumbel_100yr(annual_max: np.ndarray) -> float:
@@ -258,8 +259,7 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
         missing = [k for k in required if col[k] is None]
         if missing:
             raise ValueError(
-                f"Dam list CSV is missing required columns: {missing}. "
-                f"Header: {header}"
+                f"Dam list CSV is missing required columns: {missing}. Header: {header}"
             )
 
         # After validation, required columns are guaranteed non-None
@@ -276,17 +276,16 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
                 lats.append(float(row[lats_col]))
                 lons.append(float(row[lons_col]))
                 upareas.append(
-                    float(row[col["upareas"]]) if col["upareas"] is not None
-                    else -999.0
+                    float(row[col["upareas"]]) if col["upareas"] is not None else -999.0
                 )
                 names.append(
-                    row[col["names"]].strip() if col["names"] is not None
+                    row[col["names"]].strip()
+                    if col["names"] is not None
                     else f"dam_{row[ids_col]}"
                 )
                 cap_mcm_list.append(float(row[cap_col]))
                 years_list.append(
-                    int(row[col["years"]]) if col["years"] is not None
-                    else -99
+                    int(row[col["years"]]) if col["years"] is not None else -99
                 )
             except (ValueError, IndexError):
                 continue  # skip malformed rows
@@ -305,6 +304,7 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_dam_list(dam_list_path: Path) -> dict:
     """Parse a ``GRanD_allocated.csv`` (or similar) dam-list CSV.
@@ -334,22 +334,24 @@ def _read_alloc_file(path: Path) -> np.ndarray:
             if len(parts) < 10:
                 continue
             ids.append(int(parts[0]))
-            areas.append(float(parts[4]))   # area_CaMa
-            ixs.append(int(parts[7]))       # 1-based
-            iys.append(int(parts[8]))       # 1-based
-            cids.append(int(parts[9]))      # catchment_id
+            areas.append(float(parts[4]))  # area_CaMa
+            ixs.append(int(parts[7]))  # 1-based
+            iys.append(int(parts[8]))  # 1-based
+            cids.append(int(parts[9]))  # catchment_id
 
     n = len(ids)
-    dtype = np.dtype([
-        ("id", np.int64),
-        ("ix", np.int32),
-        ("iy", np.int32),
-        ("catchment_id", np.int64),
-        ("area_cama", np.float64),
-    ])
+    dtype = np.dtype(
+        [
+            ("id", np.int64),
+            ("ix", np.int32),
+            ("iy", np.int32),
+            ("catchment_id", np.int64),
+            ("area_cama", np.float64),
+        ]
+    )
     arr = np.empty(n, dtype=dtype)
     arr["id"] = ids
-    arr["ix"] = np.array(ixs, dtype=np.int32) - 1   # 1-based → 0-based
+    arr["ix"] = np.array(ixs, dtype=np.int32) - 1  # 1-based → 0-based
     arr["iy"] = np.array(iys, dtype=np.int32) - 1
     arr["catchment_id"] = cids
     arr["area_cama"] = areas
@@ -453,8 +455,10 @@ def _deduplicate_dams(
 
     if verbose and n_removed > 0:
         n_cells = sum(1 for v in cid_to_indices.values() if len(v) > 1)
-        print(f"[dam_params] Dedup: removed {n_removed} smaller dams "
-              f"across {n_cells} shared grid cells")
+        print(
+            f"[dam_params] Dedup: removed {n_removed} smaller dams "
+            f"across {n_cells} shared grid cells"
+        )
 
     return keep
 
@@ -558,9 +562,7 @@ def _estimate_flood_storage_grsad(
         if rg_area < fld_area:
             continue
         elif rg_area == fld_area:
-            use_sto = float(np.mean(
-                regeom.query("Area == @fld_area")["Storage"]
-            ))
+            use_sto = float(np.mean(regeom.query("Area == @fld_area")["Storage"]))
             break
         else:
             if i == 0:
@@ -573,9 +575,9 @@ def _estimate_flood_storage_grsad(
             if area_hi == area_lo:
                 use_sto = sto_min
             else:
-                use_sto = sto_min + (sto_max - sto_min) * (
-                    fld_area - area_lo
-                ) / (area_hi - area_lo)
+                use_sto = sto_min + (sto_max - sto_min) * (fld_area - area_lo) / (
+                    area_hi - area_lo
+                )
             break
 
     if np.isnan(use_sto):
@@ -594,6 +596,7 @@ def _estimate_flood_storage_grsad(
 # ---------------------------------------------------------------------------
 # CSV writer
 # ---------------------------------------------------------------------------
+
 
 def _write_dam_csv(
     path: Path,
@@ -667,6 +670,7 @@ def _write_dam_csv(
 # NetCDF writer
 # ---------------------------------------------------------------------------
 
+
 def _write_dam_to_nc(
     nc_path: Path,
     param_cids: np.ndarray,
@@ -705,13 +709,22 @@ def _write_dam_to_nc(
         else:
             ds.createDimension("reservoir", n_res)
 
-        def _put(name: str, data: np.ndarray, dtype: str,
-                 units: str = "", long_name: str = "") -> None:
+        def _put(
+            name: str,
+            data: np.ndarray,
+            dtype: str,
+            units: str = "",
+            long_name: str = "",
+        ) -> None:
             if name in ds.variables:
                 ds.variables[name][:] = data
             else:
                 v = ds.createVariable(
-                    name, dtype, ("reservoir",), zlib=True, complevel=4,
+                    name,
+                    dtype,
+                    ("reservoir",),
+                    zlib=True,
+                    complevel=4,
                 )
                 v[:] = data
                 if units:
@@ -719,30 +732,30 @@ def _write_dam_to_nc(
                 if long_name:
                     v.setncattr("long_name", long_name)
 
-        _put("reservoir_id",
-             np.asarray(dam_ids, dtype=np.int64), "i8",
-             long_name="GRanD reservoir identifier")
-        _put("reservoir_catchment_id",
-             dam_cids, "i8",
-             long_name="catchment id of this reservoir")
-        _put("reservoir_capacity",
-             tot_vol_m3, "f8", "m3",
-             "total reservoir capacity")
-        _put("conservation_volume",
-             con_vol_m3, "f8", "m3",
-             "conservation (normal-use) storage")
-        _put("emergency_volume",
-             eme_vol, "f8", "m3",
-             "emergency storage threshold")
-        _put("normal_outflow",
-             qn, "f8", "m3/s",
-             "mean annual outflow (Qn)")
-        _put("flood_control_outflow",
-             qf, "f8", "m3/s",
-             "flood control outflow (Qf)")
-        _put("reservoir_area",
-             res_area, "f8", "m2",
-             "reservoir surface area")
+        _put(
+            "reservoir_id",
+            np.asarray(dam_ids, dtype=np.int64),
+            "i8",
+            long_name="GRanD reservoir identifier",
+        )
+        _put(
+            "reservoir_catchment_id",
+            dam_cids,
+            "i8",
+            long_name="catchment id of this reservoir",
+        )
+        _put("reservoir_capacity", tot_vol_m3, "f8", "m3", "total reservoir capacity")
+        _put(
+            "conservation_volume",
+            con_vol_m3,
+            "f8",
+            "m3",
+            "conservation (normal-use) storage",
+        )
+        _put("emergency_volume", eme_vol, "f8", "m3", "emergency storage threshold")
+        _put("normal_outflow", qn, "f8", "m3/s", "mean annual outflow (Qn)")
+        _put("flood_control_outflow", qf, "f8", "m3/s", "flood control outflow (Qf)")
+        _put("reservoir_area", res_area, "f8", "m2", "reservoir surface area")
 
     if verbose:
         print(f"[dam_params] Written {n_res} reservoirs to {nc_path}")
@@ -752,13 +765,13 @@ def _write_dam_to_nc(
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def _read_nc_catchment_ids(ds: Dataset) -> np.ndarray:
     """Read catchment IDs from a NC dataset."""
     if "catchment_id" in ds.variables:
         return np.asarray(ds.variables["catchment_id"][:]).astype(np.int64)
     raise KeyError(
-        f"NC has no 'catchment_id' variable. "
-        f"Variables: {list(ds.variables.keys())}"
+        f"NC has no 'catchment_id' variable. Variables: {list(ds.variables.keys())}"
     )
 
 
@@ -791,8 +804,7 @@ def _find_nc_with_var(
                 return nc_file
 
     raise FileNotFoundError(
-        f"Cannot find variable '{var_name}' in any NC file "
-        f"under {search_dir}"
+        f"Cannot find variable '{var_name}' in any NC file under {search_dir}"
     )
 
 
@@ -884,8 +896,7 @@ def compute_dam_discharge_from_timeseries(
 
     if verbose:
         n_ok = int((dam_cids >= 0).sum())
-        print(f"[dam_params] Loaded {n_dam} dams, grid ({nx}×{ny}), "
-              f"{n_ok} allocated")
+        print(f"[dam_params] Loaded {n_dam} dams, grid ({nx}×{ny}), {n_ok} allocated")
 
     # ---- Read pre-aggregated statistics ----
     # Max and mean may live in the same NC or separate files
@@ -895,21 +906,24 @@ def compute_dam_discharge_from_timeseries(
         if max_nc == mean_nc:
             print(f"[dam_params] Reading stats from {max_nc.name}")
         else:
-            print(f"[dam_params] Reading max from {max_nc.name}, "
-                  f"mean from {mean_nc.name}")
+            print(
+                f"[dam_params] Reading max from {max_nc.name}, mean from {mean_nc.name}"
+            )
 
     with Dataset(str(max_nc), "r") as ds:
         q_cids = _read_nc_catchment_ids(ds)
         # annual_max: (time, saved_points)
         max_data = np.ma.asarray(
-            ds.variables[annual_max_var][:], dtype=np.float64,
+            ds.variables[annual_max_var][:],
+            dtype=np.float64,
         ).filled(np.nan)
 
     with Dataset(str(mean_nc), "r") as ds:
         q_cids_mean = _read_nc_catchment_ids(ds)
         # annual_mean: (time, saved_points)
         mean_data = np.ma.asarray(
-            ds.variables[annual_mean_var][:], dtype=np.float64,
+            ds.variables[annual_mean_var][:],
+            dtype=np.float64,
         ).filled(np.nan)
 
     if max_data.ndim != 2 or mean_data.ndim != 2:
@@ -950,12 +964,15 @@ def compute_dam_discharge_from_timeseries(
 
     # ---- Map dams to aggregator catchment indices ----
     dam_idx_in_max = find_indices_in(dam_cids, q_cids)
-    dam_idx_in_mean = dam_idx_in_max if same_layout else find_indices_in(dam_cids, q_cids_mean)
+    dam_idx_in_mean = (
+        dam_idx_in_max if same_layout else find_indices_in(dam_cids, q_cids_mean)
+    )
     valid = (dam_idx_in_max >= 0) & (dam_idx_in_mean >= 0)
 
     # ---- Extract at dam cells (Numba-parallel) ----
     annual_max_all, qn = _extract_dam_stats(
-        max_data, mean_data,
+        max_data,
+        mean_data,
         dam_idx_in_max.astype(np.int64),
         dam_idx_in_mean.astype(np.int64),
         valid,
@@ -963,14 +980,18 @@ def compute_dam_discharge_from_timeseries(
 
     if verbose:
         n_valid = int(valid.sum())
-        print(f"[dam_params] Matched {n_valid}/{n_dam} dams "
-              f"({n_years} years of aggregated statistics)")
+        print(
+            f"[dam_params] Matched {n_valid}/{n_dam} dams "
+            f"({n_years} years of aggregated statistics)"
+        )
         if n_valid > 0:
             qn_pos = qn[valid]
-            print(f"[dam_params] Qn stats (m³/s): "
-                  f"min={qn_pos.min():.2f}, "
-                  f"median={np.median(qn_pos):.2f}, "
-                  f"max={qn_pos.max():.2f}")
+            print(
+                f"[dam_params] Qn stats (m³/s): "
+                f"min={qn_pos.min():.2f}, "
+                f"median={np.median(qn_pos):.2f}, "
+                f"max={qn_pos.max():.2f}"
+            )
 
     return annual_max_all, qn, dam_cids, dam_info
 
@@ -1007,13 +1028,14 @@ def estimate_flood_discharge(
     if verbose:
         valid = np.isfinite(qf)
         n_ok = int(valid.sum())
-        print(f"[dam_params] Gumbel 100-yr fitting: "
-              f"{n_ok}/{n_dam} dams successful")
+        print(f"[dam_params] Gumbel 100-yr fitting: {n_ok}/{n_dam} dams successful")
         if n_ok > 0:
-            print(f"[dam_params] Qf stats (m³/s): "
-                  f"min={qf[valid].min():.2f}, "
-                  f"median={np.median(qf[valid]):.2f}, "
-                  f"max={qf[valid].max():.2f}")
+            print(
+                f"[dam_params] Qf stats (m³/s): "
+                f"min={qf[valid].min():.2f}, "
+                f"median={np.median(qf[valid]):.2f}, "
+                f"max={qf[valid].max():.2f}"
+            )
 
     return qf
 
@@ -1115,7 +1137,10 @@ def estimate_dam_params(
     )
     # Gumbel 100-yr → Qf
     qf = estimate_flood_discharge(
-        annual_max, qn, qf_ratio=qf_ratio, verbose=verbose,
+        annual_max,
+        qn,
+        qf_ratio=qf_ratio,
+        verbose=verbose,
     )
 
     n_dam = len(dam_info["ids"])
@@ -1147,8 +1172,10 @@ def estimate_dam_params(
     con_vol_mcm = cap_mcm - fld_vol_mcm
 
     if verbose and n_fallback > 0:
-        print(f"[dam_params] Used {flood_storage_ratio:.0%} fallback "
-              f"for {n_fallback}/{n_dam} dams")
+        print(
+            f"[dam_params] Used {flood_storage_ratio:.0%} fallback "
+            f"for {n_fallback}/{n_dam} dams"
+        )
 
     # ------------------------------------------------------------------
     # 3. Filter by minimum upstream area
@@ -1156,14 +1183,19 @@ def estimate_dam_params(
     area_col = dam_info.get("area_cama", dam_info["upareas"])
     keep = area_col >= min_uparea
     if not keep.all() and verbose:
-        print(f"[dam_params] Filtered {int((~keep).sum())} dams "
-              f"with upstream area < {min_uparea} km²")
+        print(
+            f"[dam_params] Filtered {int((~keep).sum())} dams "
+            f"with upstream area < {min_uparea} km²"
+        )
 
     # ------------------------------------------------------------------
     # 4. De-duplicate dams on same grid cell
     # ------------------------------------------------------------------
     keep_dedup = _deduplicate_dams(
-        dam_info["ids"], dam_cids, cap_mcm, verbose=verbose,
+        dam_info["ids"],
+        dam_cids,
+        cap_mcm,
+        verbose=verbose,
     )
     keep = keep & keep_dedup & (dam_cids >= 0)
 
@@ -1180,8 +1212,10 @@ def estimate_dam_params(
     n_out = int((keep & ~in_domain).sum())
     keep = keep & in_domain
     if verbose and n_out > 0:
-        print(f"[dam_params] Filtered {n_out} dams outside local domain "
-              f"({len(param_cids)} catchments)")
+        print(
+            f"[dam_params] Filtered {n_out} dams outside local domain "
+            f"({len(param_cids)} catchments)"
+        )
 
     n_kept = int(keep.sum())
     if verbose:
@@ -1214,8 +1248,20 @@ def estimate_dam_params(
     if output_csv is not None:
         csv_path = Path(output_csv)
         _write_dam_csv(
-            csv_path, dam_ids_k, names_k, lats_k, lons_k, upareas_k,
-            ix_k, iy_k, fld_k, con_k, tot_k, qn_k, qf_k, years_k,
+            csv_path,
+            dam_ids_k,
+            names_k,
+            lats_k,
+            lons_k,
+            upareas_k,
+            ix_k,
+            iy_k,
+            fld_k,
+            con_k,
+            tot_k,
+            qn_k,
+            qf_k,
+            years_k,
         )
         if verbose:
             print(f"[dam_params] Wrote CSV: {csv_path} ({n_kept} dams)")
@@ -1244,17 +1290,26 @@ def estimate_dam_params(
         res_area = np.zeros(n_kept, dtype=np.float64)
 
         _write_dam_to_nc(
-            nc_path, param_cids, (nx, ny),
-            cids_k, dam_ids_k,
-            fld_m3, con_m3, tot_m3,
-            qn_k, qf_k, res_area,
+            nc_path,
+            param_cids,
+            (nx, ny),
+            cids_k,
+            dam_ids_k,
+            fld_m3,
+            con_m3,
+            tot_m3,
+            qn_k,
+            qf_k,
+            res_area,
             verbose=verbose,
         )
         if primary_output is None:
             primary_output = nc_path
 
     if primary_output is None:
-        raise RuntimeError("No output file was generated (neither CSV nor NC was requested).")
+        raise RuntimeError(
+            "No output file was generated (neither CSV nor NC was requested)."
+        )
 
     return primary_output
 

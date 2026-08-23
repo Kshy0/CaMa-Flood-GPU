@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional, Union
 
 import numpy as np
-from hydroforge.data.distributed import find_indices_in
+from hydroforge.data import find_indices_in
 from netCDF4 import Dataset
 from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
                       model_validator)

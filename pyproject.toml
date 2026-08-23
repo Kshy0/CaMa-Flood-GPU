@@ -10,7 +10,7 @@ authors = [
     {name = "Shengyu Kang", email = "kshy0204@whu.edu.cn"}
 ]
 dependencies = [
-    "hydroforge>=0.1.0",
+    "hydroforge>=0.2.0",
     "netCDF4",
     "scipy",
     "numba",

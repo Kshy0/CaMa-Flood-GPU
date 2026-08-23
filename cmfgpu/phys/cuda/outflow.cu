@@ -292,7 +292,7 @@ void launch_outflow(
     bool HAS_BIFURCATION, bool HAS_TOTAL_STORAGE,
     bool HAS_WATER_SURFACE, bool HAS_PROTECTED_WATER_SURFACE, bool HAS_LEVEE,
     c10::optional<at::Tensor> is_dam_upstream_ptr, bool HAS_RESERVOIR,
-    double MIN_KINEMATIC_SLOPE,
+    double min_kinematic_slope,
     c10::optional<at::Tensor> sea_surface_elevation_ptr,
     c10::optional<at::Tensor> catchment_sea_level_idx_ptr,
     bool HAS_SEA_LEVEL, long num_sea_level_boundaries, long BLOCK_SIZE)
@@ -317,7 +317,7 @@ void launch_outflow(
             (int)HAS_WATER_SURFACE,
             (int)HAS_PROTECTED_WATER_SURFACE, (int)HAS_LEVEE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
-            (double)MIN_KINEMATIC_SLOPE, sea_surface_elevation_ptr,
+            (double)min_kinematic_slope, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
             (int)BLOCK_SIZE);
     else if (river_storage_ptr.scalar_type() == at::kDouble)
@@ -339,7 +339,7 @@ void launch_outflow(
             (int)HAS_WATER_SURFACE,
             (int)HAS_PROTECTED_WATER_SURFACE, (int)HAS_LEVEE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
-            MIN_KINEMATIC_SLOPE, sea_surface_elevation_ptr,
+            min_kinematic_slope, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
             (int)BLOCK_SIZE);
     else
@@ -361,7 +361,7 @@ void launch_outflow(
             (int)HAS_WATER_SURFACE,
             (int)HAS_PROTECTED_WATER_SURFACE, (int)HAS_LEVEE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
-            MIN_KINEMATIC_SLOPE, sea_surface_elevation_ptr,
+            min_kinematic_slope, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
             (int)BLOCK_SIZE);
 }

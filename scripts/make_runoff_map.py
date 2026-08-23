@@ -7,6 +7,7 @@
 """
 Script to generate runoff mapping tables for input datasets.
 """
+
 from datetime import datetime, timedelta
 
 from hydroforge.data.datasets import DailyBinDataset
@@ -22,7 +23,7 @@ def main():
 
     # Runoff data configuration
     runoff_base_dir = "/home/eat/cmf_v420_pkg/inp/test_1deg/runoff"
-    runoff_shape = [180, 360]  # [lat, lon]
+    runoff_shape = (180, 360)  # (lat, lon)
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 12, 31)
     # --- Configuration End ---
@@ -34,6 +35,7 @@ def main():
         shape=runoff_shape,
         start_date=start_date,
         end_date=end_date,
+        time_interval=timedelta(days=1),
         model_step=timedelta(days=1),
     )
 
@@ -52,6 +54,7 @@ if __name__ == "__main__":
 #     base_dir="/home/eat/cmf_v420_pkg/inp/test_15min_nc",
 #     start_date=datetime(2000, 1, 1),
 #     end_date=datetime(2000, 12, 31),
+#     time_interval=timedelta(days=1),
 #     prefix="e2o_ecmwf_wrr2_glob15_day_Runoff_",
 #     suffix=".nc",
 #     var_name="Runoff",

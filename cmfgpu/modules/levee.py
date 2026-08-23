@@ -14,7 +14,7 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self, Tuple
 
 import torch
-from hydroforge.model.module import (
+from hydroforge.model import (
     AbstractModule,
     CoordinateField,
     ReferenceField,
@@ -230,7 +230,8 @@ class LeveeModule(AbstractModule):
             raise ValueError("levee_fraction must be finite and lie within [0, 1)")
         return self
 
-    def validate_linked_state(self) -> None:
+    @model_validator(mode="after")
+    def validate_levee_heights(self) -> Self:
         invalid = (
             ~torch.isfinite(self.levee_crown_height)
             | ~torch.isfinite(self.levee_base_height)
@@ -242,3 +243,4 @@ class LeveeModule(AbstractModule):
                 f"{num_invalid} levees have non-finite heights or a base "
                 "height greater than or equal to the crown height"
             )
+        return self
