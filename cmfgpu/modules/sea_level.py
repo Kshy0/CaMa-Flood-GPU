@@ -10,9 +10,13 @@ from functools import cached_property
 from typing import ClassVar, Self
 
 import torch
-from hydroforge.model import (AbstractModule, CoordinateField,
-                                        ReferenceIndexField, TensorField,
-                                        module_ref)
+from hydroforge.model import (
+    AbstractModule,
+    CoordinateField,
+    ReferenceIndexField,
+    TensorField,
+    module_ref,
+)
 from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
@@ -50,7 +54,7 @@ class SeaLevelModule(AbstractModule):
         shape=("num_sea_level_boundaries",),
         dtype="float",
         dim_coords="sea_level_catchment_id",
-        category="param",
+        category="forcing",
         output="disabled",
         default=0,
     )

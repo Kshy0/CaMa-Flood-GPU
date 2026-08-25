@@ -26,7 +26,9 @@ def BaseField(
     shape: Tuple[str, ...] = ("num_catchments",),
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     dim_coords: Optional[str] = "catchment_id",
-    category: Literal["topology", "param", "init_state", "state"] = "param",
+    category: Literal[
+        "topology", "param", "forcing", "init_state", "state"
+    ] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs
 ):
@@ -150,7 +152,7 @@ class BaseModule(AbstractModule):
 
     runoff: torch.Tensor = BaseField(
         description="Current external runoff forcing (m³/s)",
-        category="param",
+        category="forcing",
         output="disabled",
         default=0,
     )

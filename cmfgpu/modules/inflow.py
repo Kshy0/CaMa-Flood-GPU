@@ -10,9 +10,13 @@ from functools import cached_property
 from typing import ClassVar, Literal, Optional, Self
 
 import torch
-from hydroforge.model import (AbstractModule, CoordinateField,
-                                        ReferenceIndexField, TensorField,
-                                        module_ref)
+from hydroforge.model import (
+    AbstractModule,
+    CoordinateField,
+    ReferenceIndexField,
+    TensorField,
+    module_ref,
+)
 from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
@@ -134,7 +138,7 @@ class InflowModule(AbstractModule):
         shape=("num_inflow_gauges",),
         dtype="float",
         dim_coords="inflow_catchment_id",
-        category="param",
+        category="forcing",
         output="disabled",
         default=0,
     )
