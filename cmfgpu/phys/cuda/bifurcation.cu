@@ -5,10 +5,8 @@
 //
 // CUDA backend for the bifurcation outflow / inflow kernels.
 //
-// One thread per bifurcation path; each path owns num_bifurcation_levels
-// contiguous level entries.  Cross-path collisions on (catchment, downstream)
-// cells use atomics.  Templated on STO (hpfloat) for total_storage /
-// outgoing_storage / global_bif_outflow and REAL for ordinary model fields.
+// One thread per path with contiguous level entries; colliding cells use atomics.
+// STO stores hpfloat state and REAL stores compute fields.
 // No --use_fast_math.
 
 #include <cuda_runtime.h>
@@ -24,7 +22,11 @@ __global__ void k_bif_outflow(
     const REAL* __restrict__ manning, REAL* __restrict__ outflow,
     const REAL* __restrict__ width, const REAL* __restrict__ length,
     const REAL* __restrict__ elevation, REAL* __restrict__ cs_depth,
-    const REAL* __restrict__ wse, const STO* __restrict__ total_storage,
+    const REAL* __restrict__ river_depth,
+    const REAL* __restrict__ river_height,
+    const REAL* __restrict__ catchment_elevation,
+    const STO* __restrict__ river_storage,
+    const STO* __restrict__ flood_storage,
     STO* __restrict__ outgoing_storage,
     REAL gravity, const REAL* __restrict__ time_step_ptr,
     long num_paths, int num_levels)
@@ -37,15 +39,17 @@ __global__ void k_bif_outflow(
     int di = dn_idx[t];
     REAL blen = __ldg(length + t);
 
-    REAL wse_c = __ldg(wse + ci);
-    REAL wse_d = __ldg(wse + di);
+    REAL wse_c = __ldg(river_depth + ci)
+        + __ldg(catchment_elevation + ci) - __ldg(river_height + ci);
+    REAL wse_d = __ldg(river_depth + di)
+        + __ldg(catchment_elevation + di) - __ldg(river_height + di);
     REAL max_wse = fmax(wse_c, wse_d);
 
     REAL slope = (wse_c - wse_d) / blen;
     slope = fmin(fmax(slope, (REAL)-0.005), (REAL)0.005);
 
-    REAL ts_c = (REAL)total_storage[ci];
-    REAL ts_d = (REAL)total_storage[di];
+    REAL ts_c = (REAL)(river_storage[ci] + flood_storage[ci]);
+    REAL ts_d = (REAL)(river_storage[di] + flood_storage[di]);
 
     // Carry the per-level updated flows in registers so each level is stored
     // exactly once, instead of storing then re-loading them for the limiter.
@@ -162,7 +166,9 @@ void launch_bif_outflow(
     at::Tensor bifurcation_width_ptr, at::Tensor bifurcation_length_ptr,
     at::Tensor bifurcation_elevation_ptr,
     at::Tensor bifurcation_cross_section_depth_ptr,
-    at::Tensor water_surface_elevation_ptr, at::Tensor total_storage_ptr,
+    at::Tensor river_depth_ptr, at::Tensor river_height_ptr,
+    at::Tensor catchment_elevation_ptr,
+    at::Tensor river_storage_ptr, at::Tensor flood_storage_ptr,
     at::Tensor outgoing_storage_ptr, double gravity,
     at::Tensor time_step_ptr, long num_catchments,
     long num_bifurcation_paths,
@@ -173,8 +179,8 @@ void launch_bif_outflow(
         num_bifurcation_paths + BLOCK_SIZE - 1
     ) / BLOCK_SIZE;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    bool real64 = (water_surface_elevation_ptr.scalar_type() == at::kDouble);
-    bool sto64 = (total_storage_ptr.scalar_type() == at::kDouble);
+    bool real64 = (river_depth_ptr.scalar_type() == at::kDouble);
+    bool sto64 = (river_storage_ptr.scalar_type() == at::kDouble);
 #define LAUNCH_BIF_OUT(REAL_T, STO_T) \
         k_bif_outflow<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
             bifurcation_catchment_idx_ptr.data_ptr<int>(), \
@@ -185,8 +191,11 @@ void launch_bif_outflow(
             bifurcation_length_ptr.data_ptr<REAL_T>(), \
             bifurcation_elevation_ptr.data_ptr<REAL_T>(), \
             bifurcation_cross_section_depth_ptr.data_ptr<REAL_T>(), \
-            water_surface_elevation_ptr.data_ptr<REAL_T>(), \
-            total_storage_ptr.data_ptr<STO_T>(), \
+            river_depth_ptr.data_ptr<REAL_T>(), \
+            river_height_ptr.data_ptr<REAL_T>(), \
+            catchment_elevation_ptr.data_ptr<REAL_T>(), \
+            river_storage_ptr.data_ptr<STO_T>(), \
+            flood_storage_ptr.data_ptr<STO_T>(), \
             outgoing_storage_ptr.data_ptr<STO_T>(), (REAL_T)gravity, \
             time_step_ptr.data_ptr<REAL_T>(), num_bifurcation_paths, \
             num_bifurcation_levels)

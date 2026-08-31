@@ -3,7 +3,7 @@
 from hydroforge.contracts import (
     KernelSpec,
     module_enabled,
-    module_flag,
+    output_requested,
 )
 
 
@@ -20,10 +20,12 @@ _RUNTIME_SCALARS = {
     "num_levees": "int32",
 }
 
+
 _STRUCTURAL_CONSTANTS = {
     "num_bifurcation_levels": "int32",
     "num_flood_levels": "int32",
 }
+
 
 _FEATURE_SOURCES = {
     "HAS_BIFURCATION": module_enabled("bifurcation"),
@@ -31,11 +33,7 @@ _FEATURE_SOURCES = {
     "HAS_LEVEE": module_enabled("levee"),
     "HAS_RESERVOIR": module_enabled("reservoir"),
     "HAS_SEA_LEVEL": module_enabled("sea_level"),
-    "HAS_TOTAL_STORAGE": module_flag("base", "has_total_storage"),
-    "HAS_WATER_SURFACE": module_flag("base", "has_water_surface"),
-    "HAS_PROTECTED_WATER_SURFACE": module_flag(
-        "base", "has_protected_water_surface"
-    ),
+    "HAS_TOTAL_STORAGE_OUTPUT": output_requested("base", "total_storage"),
 }
 
 
@@ -46,6 +44,7 @@ def _spec(
     *,
     optional=None,
     constants=None,
+    compile_time_masks=None,
     optional_values=None,
     read=(),
     write=(),
@@ -53,6 +52,8 @@ def _spec(
     atomic_add=(),
     atomic_max=(),
     block_sizes=None,
+    runtime=(),
+    runtime_kinds=None,
 ):
     pointer_names = {
         parameter for parameter in parameters if parameter.endswith("_ptr")
@@ -94,13 +95,20 @@ def _spec(
         {
             parameter: _STRUCTURAL_CONSTANTS[parameter]
             for parameter in parameters
-            if parameter in _STRUCTURAL_CONSTANTS
+            if parameter in _STRUCTURAL_CONSTANTS and parameter not in runtime
         }
     )
     scalar_names = set(parameters).difference(buffers, constants)
     unknown_scalars = scalar_names.difference(_RUNTIME_SCALARS)
     if unknown_scalars:
         raise ValueError(f"{name}: undefined runtime scalar kind(s): {unknown_scalars}")
+    runtime_kinds = dict(runtime_kinds or {})
+    unknown_runtime_kinds = set(runtime_kinds).difference(scalar_names)
+    if unknown_runtime_kinds:
+        raise ValueError(
+            f"{name}: runtime scalar kind override(s) are not runtime "
+            f"parameters: {unknown_runtime_kinds}"
+        )
     return KernelSpec(
         name=name,
         parameters=parameters,
@@ -108,13 +116,15 @@ def _spec(
         buffers=buffers,
         optional_buffers=optional or {},
         compile_time=constants,
+        compile_time_masks=compile_time_masks or {},
         feature_sources={
             parameter: _FEATURE_SOURCES[parameter]
             for parameter in constants
             if parameter in _FEATURE_SOURCES
         },
         runtime_scalars={
-            parameter: _RUNTIME_SCALARS[parameter] for parameter in scalar_names
+            parameter: runtime_kinds.get(parameter, _RUNTIME_SCALARS[parameter])
+            for parameter in scalar_names
         },
         optional_values=optional_values or {},
         block_sizes=block_sizes or {},
@@ -137,8 +147,6 @@ OUTFLOW = _spec(
         "flood_outflow_ptr",
         "flood_manning_ptr",
         "flood_depth_ptr",
-        "protected_depth_ptr",
-        "is_levee_ptr",
         "catchment_elevation_ptr",
         "downstream_distance_ptr",
         "flood_storage_ptr",
@@ -147,17 +155,11 @@ OUTFLOW = _spec(
         "flood_cross_section_depth_ptr",
         "flood_cross_section_area_ptr",
         "global_bifurcation_outflow_ptr",
-        "total_storage_ptr",
         "outgoing_storage_ptr",
-        "water_surface_elevation_ptr",
-        "protected_water_surface_elevation_ptr",
         "gravity",
         "time_step_ptr",
         "num_catchments",
         "HAS_BIFURCATION",
-        "HAS_TOTAL_STORAGE",
-        "HAS_WATER_SURFACE",
-        "HAS_PROTECTED_WATER_SURFACE",
         "HAS_LEVEE",
         "is_dam_upstream_ptr",
         "HAS_RESERVOIR",
@@ -179,19 +181,13 @@ OUTFLOW = _spec(
     "num_catchments",
     optional={
         "global_bifurcation_outflow_ptr": "HAS_BIFURCATION",
-        "total_storage_ptr": None,
-        "water_surface_elevation_ptr": None,
-        "protected_water_surface_elevation_ptr": None,
-        "is_levee_ptr": "HAS_LEVEE",
+        "protected_storage_ptr": "HAS_LEVEE",
         "is_dam_upstream_ptr": "HAS_RESERVOIR",
         "sea_surface_elevation_ptr": "HAS_SEA_LEVEL",
         "catchment_sea_level_idx_ptr": "HAS_SEA_LEVEL",
     },
     constants={
         "HAS_BIFURCATION": "bool",
-        "HAS_TOTAL_STORAGE": "bool",
-        "HAS_WATER_SURFACE": "bool",
-        "HAS_PROTECTED_WATER_SURFACE": "bool",
         "HAS_LEVEE": "bool",
         "HAS_RESERVOIR": "bool",
         "min_kinematic_slope": "precision",
@@ -216,8 +212,6 @@ OUTFLOW = _spec(
         "river_storage_ptr",
         "flood_manning_ptr",
         "flood_depth_ptr",
-        "protected_depth_ptr",
-        "is_levee_ptr",
         "catchment_elevation_ptr",
         "downstream_distance_ptr",
         "flood_storage_ptr",
@@ -231,9 +225,6 @@ OUTFLOW = _spec(
         "river_inflow_ptr",
         "flood_inflow_ptr",
         "global_bifurcation_outflow_ptr",
-        "total_storage_ptr",
-        "water_surface_elevation_ptr",
-        "protected_water_surface_elevation_ptr",
     ),
     read_write=(
         "river_outflow_ptr",
@@ -287,6 +278,7 @@ INFLOW = _spec(
     ),
 )
 
+
 ADAPTIVE_TIME = _spec(
     "compute_adaptive_time_step",
     (
@@ -315,6 +307,7 @@ ADAPTIVE_TIME = _spec(
     block_sizes={"metal": 256},
 )
 
+
 BIFURCATION_OUTFLOW = _spec(
     "compute_bifurcation_outflow",
     (
@@ -326,8 +319,11 @@ BIFURCATION_OUTFLOW = _spec(
         "bifurcation_length_ptr",
         "bifurcation_elevation_ptr",
         "bifurcation_cross_section_depth_ptr",
-        "water_surface_elevation_ptr",
-        "total_storage_ptr",
+        "river_depth_ptr",
+        "river_height_ptr",
+        "catchment_elevation_ptr",
+        "river_storage_ptr",
+        "flood_storage_ptr",
         "outgoing_storage_ptr",
         "gravity",
         "time_step_ptr",
@@ -339,6 +335,8 @@ BIFURCATION_OUTFLOW = _spec(
         "batched_bifurcation_width",
         "batched_bifurcation_length",
         "batched_bifurcation_elevation",
+        "batched_river_height",
+        "batched_catchment_elevation",
     ),
     "num_bifurcation_paths",
     constants={
@@ -346,6 +344,8 @@ BIFURCATION_OUTFLOW = _spec(
         "batched_bifurcation_width": "bool",
         "batched_bifurcation_length": "bool",
         "batched_bifurcation_elevation": "bool",
+        "batched_river_height": "bool",
+        "batched_catchment_elevation": "bool",
     },
     read=(
         "bifurcation_catchment_idx_ptr",
@@ -354,8 +354,11 @@ BIFURCATION_OUTFLOW = _spec(
         "bifurcation_width_ptr",
         "bifurcation_length_ptr",
         "bifurcation_elevation_ptr",
-        "water_surface_elevation_ptr",
-        "total_storage_ptr",
+        "river_depth_ptr",
+        "river_height_ptr",
+        "catchment_elevation_ptr",
+        "river_storage_ptr",
+        "flood_storage_ptr",
         "time_step_ptr",
     ),
     read_write=(
@@ -364,6 +367,7 @@ BIFURCATION_OUTFLOW = _spec(
     ),
     atomic_add=("outgoing_storage_ptr",),
 )
+
 
 BIFURCATION_INFLOW = _spec(
     "compute_bifurcation_inflow",
@@ -388,6 +392,7 @@ BIFURCATION_INFLOW = _spec(
     atomic_add=("global_bifurcation_outflow_ptr",),
 )
 
+
 RESERVOIR_OUTFLOW = _spec(
     "compute_reservoir_outflow",
     (
@@ -405,7 +410,6 @@ RESERVOIR_OUTFLOW = _spec(
         "adjustment_outflow_ptr",
         "flood_control_outflow_ptr",
         "runoff_ptr",
-        "total_storage_ptr",
         "outgoing_storage_ptr",
         "time_step_ptr",
         "num_reservoirs",
@@ -414,7 +418,9 @@ RESERVOIR_OUTFLOW = _spec(
         "batched_runoff",
     ),
     "num_reservoirs",
-    constants={"batched_runoff": "bool"},
+    constants={
+        "batched_runoff": "bool",
+    },
     read=(
         "reservoir_catchment_idx_ptr",
         "downstream_idx_ptr",
@@ -429,7 +435,6 @@ RESERVOIR_OUTFLOW = _spec(
         "runoff_ptr",
         "time_step_ptr",
     ),
-    write=("total_storage_ptr",),
     read_write=(
         "river_outflow_ptr",
         "flood_outflow_ptr",
@@ -437,6 +442,7 @@ RESERVOIR_OUTFLOW = _spec(
     ),
     atomic_add=("outgoing_storage_ptr",),
 )
+
 
 FLOOD_STAGE = _spec(
     "compute_flood_stage",
@@ -454,6 +460,7 @@ FLOOD_STAGE = _spec(
         "river_storage_ptr",
         "flood_storage_ptr",
         "protected_storage_ptr",
+        "total_storage_ptr",
         "river_depth_ptr",
         "flood_depth_ptr",
         "protected_depth_ptr",
@@ -467,6 +474,8 @@ FLOOD_STAGE = _spec(
         "num_flood_levels",
         "HAS_BIFURCATION",
         "HAS_INFLOW",
+        "HAS_LEVEE",
+        "HAS_TOTAL_STORAGE_OUTPUT",
         "num_trials",
         "batched_runoff",
         "batched_inflow",
@@ -482,10 +491,15 @@ FLOOD_STAGE = _spec(
         "global_bifurcation_outflow_ptr": "HAS_BIFURCATION",
         "inflow_ptr": "HAS_INFLOW",
         "catchment_inflow_idx_ptr": "HAS_INFLOW",
+        "protected_storage_ptr": "HAS_LEVEE",
+        "protected_depth_ptr": "HAS_LEVEE",
+        "total_storage_ptr": None,
     },
     constants={
         "HAS_BIFURCATION": "bool",
         "HAS_INFLOW": "bool",
+        "HAS_LEVEE": "bool",
+        "HAS_TOTAL_STORAGE_OUTPUT": "bool",
         "batched_runoff": "bool",
         "batched_inflow": "bool",
         "batched_river_height": "bool",
@@ -517,6 +531,7 @@ FLOOD_STAGE = _spec(
         "flood_depth_ptr",
         "protected_depth_ptr",
         "flood_fraction_ptr",
+        "total_storage_ptr",
     ),
     read_write=(
         "river_storage_ptr",
@@ -524,6 +539,7 @@ FLOOD_STAGE = _spec(
         "protected_storage_ptr",
     ),
 )
+
 
 FLOOD_STAGE_LOG = _spec(
     "compute_flood_stage_log",
@@ -541,6 +557,7 @@ FLOOD_STAGE_LOG = _spec(
         "river_storage_ptr",
         "flood_storage_ptr",
         "protected_storage_ptr",
+        "total_storage_ptr",
         "river_depth_ptr",
         "flood_depth_ptr",
         "protected_depth_ptr",
@@ -568,15 +585,24 @@ FLOOD_STAGE_LOG = _spec(
         "HAS_BIFURCATION",
         "HAS_INFLOW",
         "HAS_LEVEE",
+        "HAS_TOTAL_STORAGE_OUTPUT",
     ),
     "num_catchments",
     optional={
         "global_bifurcation_outflow_ptr": "HAS_BIFURCATION",
         "inflow_ptr": "HAS_INFLOW",
         "catchment_inflow_idx_ptr": "HAS_INFLOW",
+        "protected_storage_ptr": "HAS_LEVEE",
+        "protected_depth_ptr": "HAS_LEVEE",
         "is_levee_ptr": "HAS_LEVEE",
+        "total_storage_ptr": None,
     },
-    constants={"HAS_BIFURCATION": "bool", "HAS_INFLOW": "bool", "HAS_LEVEE": "bool"},
+    constants={
+        "HAS_BIFURCATION": "bool",
+        "HAS_INFLOW": "bool",
+        "HAS_LEVEE": "bool",
+        "HAS_TOTAL_STORAGE_OUTPUT": "bool",
+    },
     read=(
         "river_inflow_ptr",
         "flood_inflow_ptr",
@@ -601,6 +627,7 @@ FLOOD_STAGE_LOG = _spec(
         "flood_depth_ptr",
         "protected_depth_ptr",
         "flood_fraction_ptr",
+        "total_storage_ptr",
     ),
     read_write=(
         "river_storage_ptr",
@@ -624,6 +651,7 @@ FLOOD_STAGE_LOG = _spec(
     # memory, which needs a compile-time threadgroup width.
     block_sizes={"metal": 256},
 )
+
 
 LEVEE_STAGE = _spec(
     "compute_levee_stage",
@@ -689,6 +717,7 @@ LEVEE_STAGE = _spec(
     ),
 )
 
+
 LEVEE_STAGE_LOG = _spec(
     "compute_levee_stage_log",
     (
@@ -750,6 +779,7 @@ LEVEE_STAGE_LOG = _spec(
     block_sizes={"metal": 256},
 )
 
+
 LEVEE_BIFURCATION_OUTFLOW = _spec(
     "compute_levee_bifurcation_outflow",
     (
@@ -761,9 +791,14 @@ LEVEE_BIFURCATION_OUTFLOW = _spec(
         "bifurcation_length_ptr",
         "bifurcation_elevation_ptr",
         "bifurcation_cross_section_depth_ptr",
-        "water_surface_elevation_ptr",
-        "protected_water_surface_elevation_ptr",
-        "total_storage_ptr",
+        "river_depth_ptr",
+        "protected_depth_ptr",
+        "river_height_ptr",
+        "catchment_elevation_ptr",
+        "is_levee_ptr",
+        "river_storage_ptr",
+        "flood_storage_ptr",
+        "protected_storage_ptr",
         "outgoing_storage_ptr",
         "gravity",
         "time_step_ptr",
@@ -775,6 +810,8 @@ LEVEE_BIFURCATION_OUTFLOW = _spec(
         "batched_bifurcation_width",
         "batched_bifurcation_length",
         "batched_bifurcation_elevation",
+        "batched_river_height",
+        "batched_catchment_elevation",
     ),
     "num_bifurcation_paths",
     constants={
@@ -782,6 +819,8 @@ LEVEE_BIFURCATION_OUTFLOW = _spec(
         "batched_bifurcation_width": "bool",
         "batched_bifurcation_length": "bool",
         "batched_bifurcation_elevation": "bool",
+        "batched_river_height": "bool",
+        "batched_catchment_elevation": "bool",
     },
     read=(
         "bifurcation_catchment_idx_ptr",
@@ -790,9 +829,14 @@ LEVEE_BIFURCATION_OUTFLOW = _spec(
         "bifurcation_width_ptr",
         "bifurcation_length_ptr",
         "bifurcation_elevation_ptr",
-        "water_surface_elevation_ptr",
-        "protected_water_surface_elevation_ptr",
-        "total_storage_ptr",
+        "river_depth_ptr",
+        "protected_depth_ptr",
+        "river_height_ptr",
+        "catchment_elevation_ptr",
+        "is_levee_ptr",
+        "river_storage_ptr",
+        "flood_storage_ptr",
+        "protected_storage_ptr",
         "time_step_ptr",
     ),
     read_write=(

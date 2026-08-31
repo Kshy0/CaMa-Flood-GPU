@@ -38,7 +38,6 @@ def compute_reservoir_outflow_kernel(
 
     # Other catchment-level arrays
     runoff_ptr,                             # *f32  runoff (catchment-indexed)
-    total_storage_ptr,                      # *f64  total storage (catchment-indexed, in/out)
     outgoing_storage_ptr,                   # *f64  outgoing storage (catchment-indexed, in/out)
 
     time_step_ptr,                              # f32   scalar time step
@@ -167,7 +166,6 @@ def compute_reservoir_outflow_kernel(
     # ================================================================== #
     tl.store(river_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask)
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
-    tl.store(total_storage_ptr + catchment_idx, total_storage, mask=mask)
 
     # Re-add corrected contribution to outgoing_storage
     # Reservoir outflow is always >= 0 (clamped above), so only positive branch
@@ -200,7 +198,6 @@ def compute_reservoir_outflow_batched_kernel(
     adjustment_outflow_ptr,
     flood_control_outflow_ptr,
     runoff_ptr,
-    total_storage_ptr,
     outgoing_storage_ptr,
     time_step_ptr,
     num_reservoirs: tl.constexpr,
@@ -352,7 +349,6 @@ def compute_reservoir_outflow_batched_kernel(
         river_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask,
     )
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
-    tl.store(total_storage_ptr + catchment_idx, total_storage, mask=mask)
     tl.atomic_add(
         outgoing_storage_ptr + catchment_idx,
         tl.maximum(reservoir_outflow, 0.0) * time_step,

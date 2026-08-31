@@ -573,9 +573,14 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_length_ptr,                     # *f32: Bifurcation length
     bifurcation_elevation_ptr,                  # *f32: Bifurcation length
     bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
-    water_surface_elevation_ptr,                # *f32: River depth
-    protected_water_surface_elevation_ptr,      # *f32: Protected water surface elevation
-    total_storage_ptr,                          # *f64: Total storage (in/out)
+    river_depth_ptr,                            # *f32: River depth
+    protected_depth_ptr,                        # *f32: Protected depth
+    river_height_ptr,                           # *f32: River bank height
+    catchment_elevation_ptr,                    # *f32: Catchment elevation
+    is_levee_ptr,                               # *bool: Levee mask
+    river_storage_ptr,                          # *f64: River storage
+    flood_storage_ptr,                          # *f64: Flood storage
+    protected_storage_ptr,                      # *f64: Protected storage
     outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
     time_step_ptr,                                  # f32: Time step
@@ -598,14 +603,46 @@ def compute_levee_bifurcation_outflow_kernel(
     
     bifurcation_length = tl.load(bifurcation_length_ptr + offs, mask=mask, other=0.0)
     
-    # Load river properties for catchment and downstream
-    bifurcation_water_surface_elevation = tl.load(water_surface_elevation_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
-    bifurcation_water_surface_elevation_downstream = tl.load(water_surface_elevation_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+    # Derive diagnostics from persistent state.
+    catchment_elevation = tl.load(
+        catchment_elevation_ptr + bifurcation_catchment_idx,
+        mask=mask, other=0.0,
+    )
+    downstream_elevation = tl.load(
+        catchment_elevation_ptr + bifurcation_downstream_idx,
+        mask=mask, other=0.0,
+    )
+    bifurcation_water_surface_elevation = (
+        tl.load(river_depth_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
+        + catchment_elevation
+        - tl.load(river_height_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
+    )
+    bifurcation_water_surface_elevation_downstream = (
+        tl.load(river_depth_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+        + downstream_elevation
+        - tl.load(river_height_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+    )
     max_bifurcation_water_surface_elevation = tl.maximum(bifurcation_water_surface_elevation, bifurcation_water_surface_elevation_downstream)
 
-    # Load protected properties
-    bifurcation_protected_water_surface_elevation = tl.load(protected_water_surface_elevation_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
-    bifurcation_protected_water_surface_elevation_downstream = tl.load(protected_water_surface_elevation_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+    # Protected-side WSE is only distinct at levee catchments.
+    bifurcation_protected_water_surface_elevation = tl.where(
+        tl.load(is_levee_ptr + bifurcation_catchment_idx, mask=mask, other=False),
+        tl.minimum(
+            catchment_elevation
+            + tl.load(protected_depth_ptr + bifurcation_catchment_idx, mask=mask, other=0.0),
+            bifurcation_water_surface_elevation,
+        ),
+        bifurcation_water_surface_elevation,
+    )
+    bifurcation_protected_water_surface_elevation_downstream = tl.where(
+        tl.load(is_levee_ptr + bifurcation_downstream_idx, mask=mask, other=False),
+        tl.minimum(
+            downstream_elevation
+            + tl.load(protected_depth_ptr + bifurcation_downstream_idx, mask=mask, other=0.0),
+            bifurcation_water_surface_elevation_downstream,
+        ),
+        bifurcation_water_surface_elevation_downstream,
+    )
     max_bifurcation_protected_water_surface_elevation = tl.maximum(bifurcation_protected_water_surface_elevation, bifurcation_protected_water_surface_elevation_downstream)
 
     # Bifurcation slope (clamped similarly to flood slope)
@@ -613,8 +650,18 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = hpfloat_to_compute_inline(tl.load(total_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
-    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(tl.load(total_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage = hpfloat_to_compute_inline(
+        tl.load(river_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
+        + tl.load(flood_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
+        + tl.load(protected_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0),
+        bifurcation_length,
+    )
+    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(
+        tl.load(river_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+        + tl.load(flood_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
+        + tl.load(protected_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0),
+        bifurcation_length,
+    )
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     for level in tl.static_range(num_bifurcation_levels):
@@ -1000,9 +1047,14 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_length_ptr,                     # *f32: Bifurcation length
     bifurcation_elevation_ptr,                  # *f32: Bifurcation length
     bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
-    water_surface_elevation_ptr,                # *f32: River depth
-    protected_water_surface_elevation_ptr,      # *f32: Protected water surface elevation
-    total_storage_ptr,                          # *f64: Total storage (in/out)
+    river_depth_ptr,                            # *f32: River depth
+    protected_depth_ptr,                        # *f32: Protected depth
+    river_height_ptr,                           # *f32: River bank height
+    catchment_elevation_ptr,                    # *f32: Catchment elevation
+    is_levee_ptr,                               # *bool: Levee mask
+    river_storage_ptr,                          # *f64: River storage
+    flood_storage_ptr,                          # *f64: Flood storage
+    protected_storage_ptr,                      # *f64: Protected storage
     outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
     time_step_ptr,                                  # f32: Time step
@@ -1015,7 +1067,9 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     batched_bifurcation_manning: tl.constexpr,
     batched_bifurcation_width: tl.constexpr,
     batched_bifurcation_length: tl.constexpr,
-    batched_bifurcation_elevation: tl.constexpr
+    batched_bifurcation_elevation: tl.constexpr,
+    batched_river_height: tl.constexpr,
+    batched_catchment_elevation: tl.constexpr,
 ):
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -1039,14 +1093,61 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     # Load bifurcation properties
     bifurcation_length = tl.load(bifurcation_length_ptr + (trial_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)
     
-    # Load river properties for catchment and downstream
-    bifurcation_water_surface_elevation = tl.load(water_surface_elevation_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0)
-    bifurcation_water_surface_elevation_downstream = tl.load(water_surface_elevation_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0)
+    # Derive diagnostics from this trial's source fields.
+    catchment_cell = trial_offset_catchments + bifurcation_catchment_idx
+    downstream_cell = trial_offset_catchments + bifurcation_downstream_idx
+    catchment_height_idx = (
+        catchment_cell if batched_river_height else bifurcation_catchment_idx
+    )
+    downstream_height_idx = (
+        downstream_cell if batched_river_height else bifurcation_downstream_idx
+    )
+    catchment_elevation_idx = (
+        catchment_cell
+        if batched_catchment_elevation else bifurcation_catchment_idx
+    )
+    downstream_elevation_idx = (
+        downstream_cell
+        if batched_catchment_elevation else bifurcation_downstream_idx
+    )
+    catchment_elevation = tl.load(
+        catchment_elevation_ptr + catchment_elevation_idx,
+        mask=mask, other=0.0,
+    )
+    downstream_elevation = tl.load(
+        catchment_elevation_ptr + downstream_elevation_idx,
+        mask=mask, other=0.0,
+    )
+    bifurcation_water_surface_elevation = (
+        tl.load(river_depth_ptr + catchment_cell, mask=mask, other=0.0)
+        + catchment_elevation
+        - tl.load(river_height_ptr + catchment_height_idx, mask=mask, other=0.0)
+    )
+    bifurcation_water_surface_elevation_downstream = (
+        tl.load(river_depth_ptr + downstream_cell, mask=mask, other=0.0)
+        + downstream_elevation
+        - tl.load(river_height_ptr + downstream_height_idx, mask=mask, other=0.0)
+    )
     max_bifurcation_water_surface_elevation = tl.maximum(bifurcation_water_surface_elevation, bifurcation_water_surface_elevation_downstream)
 
-    # Load protected properties
-    bifurcation_protected_water_surface_elevation = tl.load(protected_water_surface_elevation_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0)
-    bifurcation_protected_water_surface_elevation_downstream = tl.load(protected_water_surface_elevation_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0)
+    bifurcation_protected_water_surface_elevation = tl.where(
+        tl.load(is_levee_ptr + bifurcation_catchment_idx, mask=mask, other=False),
+        tl.minimum(
+            catchment_elevation
+            + tl.load(protected_depth_ptr + catchment_cell, mask=mask, other=0.0),
+            bifurcation_water_surface_elevation,
+        ),
+        bifurcation_water_surface_elevation,
+    )
+    bifurcation_protected_water_surface_elevation_downstream = tl.where(
+        tl.load(is_levee_ptr + bifurcation_downstream_idx, mask=mask, other=False),
+        tl.minimum(
+            downstream_elevation
+            + tl.load(protected_depth_ptr + downstream_cell, mask=mask, other=0.0),
+            bifurcation_water_surface_elevation_downstream,
+        ),
+        bifurcation_water_surface_elevation_downstream,
+    )
     max_bifurcation_protected_water_surface_elevation = tl.maximum(bifurcation_protected_water_surface_elevation, bifurcation_protected_water_surface_elevation_downstream)
 
     # Bifurcation slope (clamped similarly to flood slope)
@@ -1054,8 +1155,18 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
 
     # Storage change limiter calculation
-    bifurcation_total_storage = hpfloat_to_compute_inline(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=0.0), bifurcation_length)
-    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(tl.load(total_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=0.0), bifurcation_length)
+    bifurcation_total_storage = hpfloat_to_compute_inline(
+        tl.load(river_storage_ptr + catchment_cell, mask=mask, other=0.0)
+        + tl.load(flood_storage_ptr + catchment_cell, mask=mask, other=0.0)
+        + tl.load(protected_storage_ptr + catchment_cell, mask=mask, other=0.0),
+        bifurcation_length,
+    )
+    bifurcation_total_storage_downstream = hpfloat_to_compute_inline(
+        tl.load(river_storage_ptr + downstream_cell, mask=mask, other=0.0)
+        + tl.load(flood_storage_ptr + downstream_cell, mask=mask, other=0.0)
+        + tl.load(protected_storage_ptr + downstream_cell, mask=mask, other=0.0),
+        bifurcation_length,
+    )
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     # Base offsets for level-dependent arrays

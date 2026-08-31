@@ -56,9 +56,20 @@ long num_paths = *args.num_bifurcation_paths;
     long length_idx = batched_bifurcation_length
         ? path_offset + path : path;
     float length = args.bifurcation_length_ptr[length_idx];
-    float water_surface = args.water_surface_elevation_ptr[catchment_cell];
-    float downstream_surface =
-        args.water_surface_elevation_ptr[downstream_cell];
+    long catchment_height_idx = batched_river_height
+        ? catchment_cell : (long)catchment;
+    long downstream_height_idx = batched_river_height
+        ? downstream_cell : (long)downstream;
+    long catchment_elevation_idx = batched_catchment_elevation
+        ? catchment_cell : (long)catchment;
+    long downstream_elevation_idx = batched_catchment_elevation
+        ? downstream_cell : (long)downstream;
+    float water_surface = args.river_depth_ptr[catchment_cell]
+        + args.catchment_elevation_ptr[catchment_elevation_idx]
+        - args.river_height_ptr[catchment_height_idx];
+    float downstream_surface = args.river_depth_ptr[downstream_cell]
+        + args.catchment_elevation_ptr[downstream_elevation_idx]
+        - args.river_height_ptr[downstream_height_idx];
     float maximum_surface = max(water_surface, downstream_surface);
     float slope = clamp(
         (water_surface - downstream_surface) / length, -0.005f, 0.005f);
@@ -87,8 +98,10 @@ long num_paths = *args.num_bifurcation_paths;
     }
 
     float available_storage = min(
-        args.total_storage_ptr[catchment_cell],
-        args.total_storage_ptr[downstream_cell]);
+        args.river_storage_ptr[catchment_cell]
+            + args.flood_storage_ptr[catchment_cell],
+        args.river_storage_ptr[downstream_cell]
+            + args.flood_storage_ptr[downstream_cell]);
     float limit = min(
         0.05f * available_storage / (fabs(total_outflow) * time_step),
         1.0f);

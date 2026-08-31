@@ -19,9 +19,11 @@ long num_catchments = *args.num_catchments;
     float river_storage = args.river_storage_ptr[cell];
     float flood_outflow = args.flood_outflow_ptr[cell];
     float flood_depth = args.flood_depth_ptr[cell];
-    float protected_depth = args.protected_depth_ptr[cell];
     float flood_storage = args.flood_storage_ptr[cell];
-    float protected_storage = args.protected_storage_ptr[cell];
+    float protected_storage = 0.0f;
+    if (HAS_LEVEE) {
+        protected_storage = args.protected_storage_ptr[cell];
+    }
     float river_xs_depth = args.river_cross_section_depth_ptr[cell];
     float flood_xs_depth = args.flood_cross_section_depth_ptr[cell];
     float flood_xs_area = args.flood_cross_section_area_ptr[cell];
@@ -45,11 +47,6 @@ long num_catchments = *args.num_catchments;
 
     float river_elevation = catchment_elevation - river_height;
     float water_surface = river_depth + river_elevation;
-    float protected_surface = water_surface;
-    if (HAS_LEVEE && args.is_levee_ptr[catchment]) {
-        protected_surface =
-            min(catchment_elevation + protected_depth, water_surface);
-    }
     float total_storage = river_storage + flood_storage + protected_storage;
 
     long downstream_height_idx = batched_river_height
@@ -153,18 +150,9 @@ long num_catchments = *args.num_catchments;
 
     args.river_outflow_ptr[cell] = updated_river_outflow;
     args.flood_outflow_ptr[cell] = updated_flood_outflow;
-    if (HAS_WATER_SURFACE) {
-        args.water_surface_elevation_ptr[cell] = water_surface;
-    }
-    if (HAS_PROTECTED_WATER_SURFACE) {
-        args.protected_water_surface_elevation_ptr[cell] = protected_surface;
-    }
     args.river_cross_section_depth_ptr[cell] = updated_river_xs;
     args.flood_cross_section_depth_ptr[cell] = updated_flood_xs;
     args.flood_cross_section_area_ptr[cell] = updated_flood_area;
-    if (HAS_TOTAL_STORAGE) {
-        args.total_storage_ptr[cell] = total_storage;
-    }
     args.river_inflow_ptr[cell] = 0.0f;
     args.flood_inflow_ptr[cell] = 0.0f;
     if (HAS_BIFURCATION) {

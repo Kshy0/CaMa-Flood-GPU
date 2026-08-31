@@ -139,7 +139,8 @@ long num_catchments = *args.num_catchments;
 
     float river_storage = args.river_storage_ptr[cell];
     float flood_storage = args.flood_storage_ptr[cell];
-    float protected_storage = args.protected_storage_ptr[cell];
+    float protected_storage = HAS_LEVEE
+        ? args.protected_storage_ptr[cell] : 0.0f;
     float river_inflow = args.river_inflow_ptr[cell];
     float flood_inflow = args.flood_inflow_ptr[cell];
     float river_outflow = args.river_outflow_ptr[cell];
@@ -196,10 +197,17 @@ long num_catchments = *args.num_catchments;
     args.outgoing_storage_ptr[cell] = 0.0f;
     args.river_storage_ptr[cell] = stage.river_storage;
     args.flood_storage_ptr[cell] = stage.flood_storage;
-    args.protected_storage_ptr[cell] = 0.0f;
+    if (HAS_TOTAL_STORAGE_OUTPUT) {
+        args.total_storage_ptr[cell] = total_storage;
+    }
+    if (HAS_LEVEE) {
+        args.protected_storage_ptr[cell] = 0.0f;
+    }
     args.river_depth_ptr[cell] = stage.river_depth;
     args.flood_depth_ptr[cell] = stage.flood_depth;
-    args.protected_depth_ptr[cell] = stage.flood_depth;
+    if (HAS_LEVEE) {
+        args.protected_depth_ptr[cell] = stage.flood_depth;
+    }
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
 // HYDROFORGE METAL KERNEL BODY: compute_flood_stage_log
 long num_catchments = *args.num_catchments;
@@ -230,7 +238,8 @@ long num_catchments = *args.num_catchments;
 
     float river_storage = args.river_storage_ptr[cell];
     float flood_storage = args.flood_storage_ptr[cell];
-    float protected_storage = args.protected_storage_ptr[cell];
+    float protected_storage = HAS_LEVEE
+        ? args.protected_storage_ptr[cell] : 0.0f;
     float river_inflow = args.river_inflow_ptr[cell];
     float flood_inflow = args.flood_inflow_ptr[cell];
     float river_outflow = args.river_outflow_ptr[cell];
@@ -299,10 +308,17 @@ long num_catchments = *args.num_catchments;
     args.outgoing_storage_ptr[cell] = 0.0f;
     args.river_storage_ptr[cell] = stage.river_storage;
     args.flood_storage_ptr[cell] = stage.flood_storage;
-    args.protected_storage_ptr[cell] = 0.0f;
+    if (HAS_TOTAL_STORAGE_OUTPUT) {
+        args.total_storage_ptr[cell] = total_storage;
+    }
+    if (HAS_LEVEE) {
+        args.protected_storage_ptr[cell] = 0.0f;
+    }
     args.river_depth_ptr[cell] = stage.river_depth;
     args.flood_depth_ptr[cell] = stage.flood_depth;
-    args.protected_depth_ptr[cell] = stage.flood_depth;
+    if (HAS_LEVEE) {
+        args.protected_depth_ptr[cell] = stage.flood_depth;
+    }
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
 
     }  // active_lane

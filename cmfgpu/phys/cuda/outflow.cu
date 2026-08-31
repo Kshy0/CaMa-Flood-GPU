@@ -27,18 +27,15 @@ __global__ void k_outflow(
     const REAL* __restrict__ river_height, const STO* __restrict__ river_storage,
     STO* __restrict__ flood_inflow, REAL* __restrict__ flood_outflow,
     const REAL* __restrict__ flood_manning, const REAL* __restrict__ flood_depth,
-    const REAL* __restrict__ protected_depth, const bool* __restrict__ is_levee,
     const REAL* __restrict__ catchment_elevation,
     const REAL* __restrict__ downstream_distance, const STO* __restrict__ flood_storage,
     const STO* __restrict__ protected_storage,
     REAL* __restrict__ river_cross_section_depth, REAL* __restrict__ flood_cross_section_depth,
     REAL* __restrict__ flood_cross_section_area,
-    STO* __restrict__ global_bifurcation_outflow, STO* __restrict__ total_storage,
-    STO* __restrict__ outgoing_storage, REAL* __restrict__ water_surface_elevation,
-    REAL* __restrict__ protected_water_surface_elevation,
+    STO* __restrict__ global_bifurcation_outflow,
+    STO* __restrict__ outgoing_storage,
     REAL gravity, const REAL* __restrict__ time_step_ptr,
-    long num_catchments, int has_bifurcation, int has_total_storage,
-    int has_water_surface, int has_protected_water_surface, int has_levee,
+    long num_catchments, int has_bifurcation, int has_levee,
     const bool* __restrict__ is_dam_upstream, int has_reservoir, REAL min_kinematic_slope,
     const REAL* __restrict__ sea_surface_elevation,
     const int* __restrict__ catchment_sea_level_idx, int has_sea_level)
@@ -60,7 +57,6 @@ __global__ void k_outflow(
     REAL f_out = flood_outflow[t];
     REAL f_man = __ldg(flood_manning + t);
     REAL f_dep = __ldg(flood_depth + t);
-    REAL p_dep = __ldg(protected_depth + t);
     REAL c_elv = __ldg(catchment_elevation + t);
     REAL dn_dist = __ldg(downstream_distance + t);
 
@@ -70,12 +66,10 @@ __global__ void k_outflow(
 
     REAL rs = (REAL)river_storage[t];
     REAL fs = (REAL)flood_storage[t];
-    REAL ps = (REAL)protected_storage[t];
+    REAL ps = has_levee ? (REAL)protected_storage[t] : (REAL)0;
 
     REAL river_elevation = c_elv - r_hgt;
     REAL wse = r_dep + river_elevation;
-    REAL pwse = (has_levee && is_levee[t])
-        ? fmin(c_elv + p_dep, wse) : wse;
     REAL total_storage_f = rs + fs + ps;
 
     REAL r_dep_dn = __ldg(river_depth + dn);
@@ -155,13 +149,9 @@ __global__ void k_outflow(
 
     river_outflow[t] = upd_r_out;
     flood_outflow[t] = upd_f_out;
-    if (has_water_surface) water_surface_elevation[t] = wse;
-    if (has_protected_water_surface)
-        protected_water_surface_elevation[t] = pwse;
     river_cross_section_depth[t] = upd_r_cs_dep;
     flood_cross_section_depth[t] = upd_f_cs_dep;
     flood_cross_section_area[t] = upd_f_cs_area;
-    if (has_total_storage) total_storage[t] = (STO)total_storage_f;
 
     river_inflow[t] = (STO)0;
     flood_inflow[t] = (STO)0;
@@ -239,15 +229,12 @@ template <typename REAL, typename STO>
 static void launch_outflow_t(
     at::Tensor& di, at::Tensor& ri, at::Tensor& ro, at::Tensor& rman, at::Tensor& rd,
     at::Tensor& rw, at::Tensor& rl, at::Tensor& rh, at::Tensor& rs,
-    at::Tensor& fi, at::Tensor& fo, at::Tensor& fman, at::Tensor& fd, at::Tensor& pd,
-    c10::optional<at::Tensor>& levee,
-    at::Tensor& ce, at::Tensor& dd, at::Tensor& fsto, at::Tensor& psto,
+    at::Tensor& fi, at::Tensor& fo, at::Tensor& fman, at::Tensor& fd,
+    at::Tensor& ce, at::Tensor& dd, at::Tensor& fsto,
+    c10::optional<at::Tensor>& psto,
     at::Tensor& rcsd, at::Tensor& fcsd, at::Tensor& fcsa,
-    c10::optional<at::Tensor>& gb, c10::optional<at::Tensor>& ts_out,
-    at::Tensor& outs, c10::optional<at::Tensor>& wse,
-    c10::optional<at::Tensor>& pwse,
-    REAL gravity, at::Tensor& tsp, long n, int has_bif, int has_total,
-    int has_water_surface, int has_protected_surface, int has_levee,
+    c10::optional<at::Tensor>& gb, at::Tensor& outs,
+    REAL gravity, at::Tensor& tsp, long n, int has_bif, int has_levee,
     c10::optional<at::Tensor>& dam, int has_res, REAL minslope,
     c10::optional<at::Tensor>& sea, c10::optional<at::Tensor>& sea_idx,
     int has_sea, int block)
@@ -257,11 +244,10 @@ static void launch_outflow_t(
 #define LAUNCH_OUTFLOW(BASE_ONLY) \
     k_outflow<BASE_ONLY, REAL, STO><<<grid, block, 0, stream>>>( \
         PI(di), PS<STO>(ri), PR<REAL>(ro), PR<REAL>(rman), PR<REAL>(rd), PR<REAL>(rw), PR<REAL>(rl), PR<REAL>(rh), PS<STO>(rs), \
-        PS<STO>(fi), PR<REAL>(fo), PR<REAL>(fman), PR<REAL>(fd), PR<REAL>(pd), PBO(levee), PR<REAL>(ce), PR<REAL>(dd), PS<STO>(fsto), PS<STO>(psto), \
+        PS<STO>(fi), PR<REAL>(fo), PR<REAL>(fman), PR<REAL>(fd), PR<REAL>(ce), PR<REAL>(dd), PS<STO>(fsto), PSO<STO>(psto), \
         PR<REAL>(rcsd), PR<REAL>(fcsd), PR<REAL>(fcsa), \
-        PSO<STO>(gb), PSO<STO>(ts_out), PS<STO>(outs), PRO<REAL>(wse), PRO<REAL>(pwse), \
-        gravity, PR<REAL>(tsp), n, has_bif, has_total, has_water_surface, \
-        has_protected_surface, has_levee, \
+        PSO<STO>(gb), PS<STO>(outs), \
+        gravity, PR<REAL>(tsp), n, has_bif, has_levee, \
         PBO(dam), has_res, minslope, \
         PRO<REAL>(sea), PIO(sea_idx), has_sea)
     if (!has_res && !has_sea) LAUNCH_OUTFLOW(true);
@@ -276,21 +262,17 @@ void launch_outflow(
     at::Tensor river_length_ptr, at::Tensor river_height_ptr,
     at::Tensor river_storage_ptr, at::Tensor flood_inflow_ptr,
     at::Tensor flood_outflow_ptr, at::Tensor flood_manning_ptr,
-    at::Tensor flood_depth_ptr, at::Tensor protected_depth_ptr,
-    c10::optional<at::Tensor> is_levee_ptr,
+    at::Tensor flood_depth_ptr,
     at::Tensor catchment_elevation_ptr, at::Tensor downstream_distance_ptr,
-    at::Tensor flood_storage_ptr, at::Tensor protected_storage_ptr,
+    at::Tensor flood_storage_ptr,
+    c10::optional<at::Tensor> protected_storage_ptr,
     at::Tensor river_cross_section_depth_ptr,
     at::Tensor flood_cross_section_depth_ptr,
     at::Tensor flood_cross_section_area_ptr,
     c10::optional<at::Tensor> global_bifurcation_outflow_ptr,
-    c10::optional<at::Tensor> total_storage_ptr,
     at::Tensor outgoing_storage_ptr,
-    c10::optional<at::Tensor> water_surface_elevation_ptr,
-    c10::optional<at::Tensor> protected_water_surface_elevation_ptr,
     double gravity, at::Tensor time_step_ptr, long num_catchments,
-    bool HAS_BIFURCATION, bool HAS_TOTAL_STORAGE,
-    bool HAS_WATER_SURFACE, bool HAS_PROTECTED_WATER_SURFACE, bool HAS_LEVEE,
+    bool HAS_BIFURCATION, bool HAS_LEVEE,
     c10::optional<at::Tensor> is_dam_upstream_ptr, bool HAS_RESERVOIR,
     double min_kinematic_slope,
     c10::optional<at::Tensor> sea_surface_elevation_ptr,
@@ -304,18 +286,14 @@ void launch_outflow(
             river_manning_ptr, river_depth_ptr, river_width_ptr,
             river_length_ptr, river_height_ptr, river_storage_ptr,
             flood_inflow_ptr, flood_outflow_ptr, flood_manning_ptr,
-            flood_depth_ptr, protected_depth_ptr, is_levee_ptr,
+            flood_depth_ptr,
             catchment_elevation_ptr,
             downstream_distance_ptr, flood_storage_ptr, protected_storage_ptr,
             river_cross_section_depth_ptr, flood_cross_section_depth_ptr,
             flood_cross_section_area_ptr, global_bifurcation_outflow_ptr,
-            total_storage_ptr, outgoing_storage_ptr,
-            water_surface_elevation_ptr,
-            protected_water_surface_elevation_ptr, (double)gravity,
+            outgoing_storage_ptr, (double)gravity,
             time_step_ptr, num_catchments, (int)HAS_BIFURCATION,
-            (int)HAS_TOTAL_STORAGE,
-            (int)HAS_WATER_SURFACE,
-            (int)HAS_PROTECTED_WATER_SURFACE, (int)HAS_LEVEE,
+            (int)HAS_LEVEE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
             (double)min_kinematic_slope, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
@@ -326,18 +304,14 @@ void launch_outflow(
             river_manning_ptr, river_depth_ptr, river_width_ptr,
             river_length_ptr, river_height_ptr, river_storage_ptr,
             flood_inflow_ptr, flood_outflow_ptr, flood_manning_ptr,
-            flood_depth_ptr, protected_depth_ptr, is_levee_ptr,
+            flood_depth_ptr,
             catchment_elevation_ptr,
             downstream_distance_ptr, flood_storage_ptr, protected_storage_ptr,
             river_cross_section_depth_ptr, flood_cross_section_depth_ptr,
             flood_cross_section_area_ptr, global_bifurcation_outflow_ptr,
-            total_storage_ptr, outgoing_storage_ptr,
-            water_surface_elevation_ptr,
-            protected_water_surface_elevation_ptr, gravity,
+            outgoing_storage_ptr, gravity,
             time_step_ptr, num_catchments, (int)HAS_BIFURCATION,
-            (int)HAS_TOTAL_STORAGE,
-            (int)HAS_WATER_SURFACE,
-            (int)HAS_PROTECTED_WATER_SURFACE, (int)HAS_LEVEE,
+            (int)HAS_LEVEE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
             min_kinematic_slope, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,
@@ -348,18 +322,14 @@ void launch_outflow(
             river_manning_ptr, river_depth_ptr, river_width_ptr,
             river_length_ptr, river_height_ptr, river_storage_ptr,
             flood_inflow_ptr, flood_outflow_ptr, flood_manning_ptr,
-            flood_depth_ptr, protected_depth_ptr, is_levee_ptr,
+            flood_depth_ptr,
             catchment_elevation_ptr,
             downstream_distance_ptr, flood_storage_ptr, protected_storage_ptr,
             river_cross_section_depth_ptr, flood_cross_section_depth_ptr,
             flood_cross_section_area_ptr, global_bifurcation_outflow_ptr,
-            total_storage_ptr, outgoing_storage_ptr,
-            water_surface_elevation_ptr,
-            protected_water_surface_elevation_ptr, gravity,
+            outgoing_storage_ptr, gravity,
             time_step_ptr, num_catchments, (int)HAS_BIFURCATION,
-            (int)HAS_TOTAL_STORAGE,
-            (int)HAS_WATER_SURFACE,
-            (int)HAS_PROTECTED_WATER_SURFACE, (int)HAS_LEVEE,
+            (int)HAS_LEVEE,
             is_dam_upstream_ptr, (int)HAS_RESERVOIR,
             min_kinematic_slope, sea_surface_elevation_ptr,
             catchment_sea_level_idx_ptr, (int)HAS_SEA_LEVEL,

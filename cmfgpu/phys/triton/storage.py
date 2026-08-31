@@ -30,6 +30,7 @@ def compute_flood_stage_kernel(
     river_storage_ptr,           # *f64: River storage (in/out)
     flood_storage_ptr,           # *f64: Flood storage (in/out)
     protected_storage_ptr,       # *f64: Protected storage (in/out)
+    total_storage_ptr,           # *f64: Final total storage (optional out)
     river_depth_ptr,             # *f32: River depth (out)
     flood_depth_ptr,             # *f32: Flood depth (out)
     protected_depth_ptr,         # *f32: Protected depth (out)
@@ -46,6 +47,8 @@ def compute_flood_stage_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
     HAS_INFLOW: tl.constexpr = False,
+    HAS_LEVEE: tl.constexpr = False,
+    HAS_TOTAL_STORAGE_OUTPUT: tl.constexpr = False,
 ):
     # --- Block and lane indexing ---
     pid = tl.program_id(0)
@@ -56,7 +59,11 @@ def compute_flood_stage_kernel(
     # ---- 1. Storage update ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
-    protected_storage = tl.load(protected_storage_ptr + offs, mask=mask, other=0.0)
+    protected_storage = tl.zeros_like(flood_storage)
+    if HAS_LEVEE:
+        protected_storage = tl.load(
+            protected_storage_ptr + offs, mask=mask, other=0.0,
+        )
     river_inflow = tl.load(river_inflow_ptr + offs, mask=mask, other=0.0)
     flood_inflow = tl.load(flood_inflow_ptr + offs, mask=mask, other=0.0)
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
@@ -186,10 +193,14 @@ def compute_flood_stage_kernel(
     # Store outputs (in-place update)
     tl.store(river_storage_ptr + offs, river_storage_final_hp, mask=mask)
     tl.store(flood_storage_ptr + offs, flood_storage_final_hp, mask=mask)
-    tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
+    if HAS_TOTAL_STORAGE_OUTPUT:
+        tl.store(total_storage_ptr + offs, total_storage_hp, mask=mask)
+    if HAS_LEVEE:
+        tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
-    tl.store(protected_depth_ptr  + offs, flood_depth, mask=mask)
+    if HAS_LEVEE:
+        tl.store(protected_depth_ptr + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)
     
 
@@ -210,6 +221,7 @@ def compute_flood_stage_log_kernel(
     river_storage_ptr,           # *f64: River storage (in/out)
     flood_storage_ptr,           # *f64: Flood storage (in/out)
     protected_storage_ptr,       # *f64: Protected storage (in/out)
+    total_storage_ptr,           # *f64: Final total storage (optional out)
     river_depth_ptr,             # *f32: River depth (in/out)
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
@@ -240,6 +252,7 @@ def compute_flood_stage_log_kernel(
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
     HAS_LEVEE: tl.constexpr = False,
     HAS_INFLOW: tl.constexpr = False,
+    HAS_TOTAL_STORAGE_OUTPUT: tl.constexpr = False,
 ):
     # --- Block and lane indexing ---
     pid = tl.program_id(0)
@@ -257,7 +270,11 @@ def compute_flood_stage_log_kernel(
     # ---- 1. Storage update ----
     river_storage = tl.load(river_storage_ptr + offs, mask=mask, other=0.0)
     flood_storage = tl.load(flood_storage_ptr + offs, mask=mask, other=0.0)
-    protected_storage = tl.load(protected_storage_ptr + offs, mask=mask, other=0.0)
+    protected_storage = tl.zeros_like(flood_storage)
+    if HAS_LEVEE:
+        protected_storage = tl.load(
+            protected_storage_ptr + offs, mask=mask, other=0.0,
+        )
     river_inflow = tl.load(river_inflow_ptr + offs, mask=mask, other=0.0)
     flood_inflow = tl.load(flood_inflow_ptr + offs, mask=mask, other=0.0)
     river_outflow = tl.load(river_outflow_ptr + offs, mask=mask, other=0.0)
@@ -418,10 +435,14 @@ def compute_flood_stage_log_kernel(
     # Store outputs (in-place update)
     tl.store(river_storage_ptr + offs, river_storage_final_hp, mask=mask)
     tl.store(flood_storage_ptr + offs, flood_storage_final_hp, mask=mask)
-    tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
+    if HAS_TOTAL_STORAGE_OUTPUT:
+        tl.store(total_storage_ptr + offs, total_storage_hp, mask=mask)
+    if HAS_LEVEE:
+        tl.store(protected_storage_ptr + offs, 0.0, mask=mask)
     tl.store(river_depth_ptr      + offs, river_depth, mask=mask)
     tl.store(flood_depth_ptr      + offs, flood_depth, mask=mask)
-    tl.store(protected_depth_ptr  + offs, flood_depth, mask=mask)
+    if HAS_LEVEE:
+        tl.store(protected_depth_ptr + offs, flood_depth, mask=mask)
     tl.store(flood_fraction_ptr   + offs, flood_fraction, mask=mask)
 
 
@@ -442,6 +463,7 @@ def compute_flood_stage_batched_kernel(
     river_storage_ptr,           # *f64: River storage (in/out)
     flood_storage_ptr,           # *f64: Flood storage (in/out)
     protected_storage_ptr,       # *f64: Protected storage (in/out)
+    total_storage_ptr,           # *f64: Final total storage (optional out)
     river_depth_ptr,             # *f32: River depth (in/out)
     flood_depth_ptr,             # *f32: Flood depth (in/out)
     protected_depth_ptr,         # *f32: Protected depth (in/out)
@@ -467,6 +489,8 @@ def compute_flood_stage_batched_kernel(
     batched_river_length: tl.constexpr,
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
     HAS_INFLOW: tl.constexpr = False,
+    HAS_LEVEE: tl.constexpr = False,
+    HAS_TOTAL_STORAGE_OUTPUT: tl.constexpr = False,
     num_inflow_gauges: tl.constexpr = 0,
 ):
     # --- Loop-based batched kernel ---
@@ -504,7 +528,11 @@ def compute_flood_stage_batched_kernel(
         # ---- 1. Storage update ----
         river_storage = tl.load(river_storage_ptr + idx, mask=mask, other=0.0)
         flood_storage = tl.load(flood_storage_ptr + idx, mask=mask, other=0.0)
-        protected_storage = tl.load(protected_storage_ptr + idx, mask=mask, other=0.0)
+        protected_storage = tl.zeros_like(flood_storage)
+        if HAS_LEVEE:
+            protected_storage = tl.load(
+                protected_storage_ptr + idx, mask=mask, other=0.0,
+            )
         river_inflow = tl.load(river_inflow_ptr + idx, mask=mask, other=0.0)
         flood_inflow = tl.load(flood_inflow_ptr + idx, mask=mask, other=0.0)
         river_outflow = tl.load(river_outflow_ptr + idx, mask=mask, other=0.0)
@@ -655,8 +683,12 @@ def compute_flood_stage_batched_kernel(
         # Store outputs
         tl.store(river_storage_ptr + idx, river_storage_final_hp, mask=mask)
         tl.store(flood_storage_ptr + idx, flood_storage_final_hp, mask=mask)
-        tl.store(protected_storage_ptr + idx, 0.0, mask=mask)
+        if HAS_TOTAL_STORAGE_OUTPUT:
+            tl.store(total_storage_ptr + idx, total_storage_hp, mask=mask)
+        if HAS_LEVEE:
+            tl.store(protected_storage_ptr + idx, 0.0, mask=mask)
         tl.store(river_depth_ptr      + idx, river_depth, mask=mask)
         tl.store(flood_depth_ptr      + idx, flood_depth, mask=mask)
-        tl.store(protected_depth_ptr  + idx, flood_depth, mask=mask)
+        if HAS_LEVEE:
+            tl.store(protected_depth_ptr + idx, flood_depth, mask=mask)
         tl.store(flood_fraction_ptr   + idx, flood_fraction, mask=mask)

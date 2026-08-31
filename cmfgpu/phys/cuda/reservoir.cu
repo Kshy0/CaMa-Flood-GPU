@@ -25,7 +25,7 @@ __global__ void k_reservoir_outflow(
     const REAL* __restrict__ conservation_volume, const REAL* __restrict__ emergency_volume,
     const REAL* __restrict__ adjustment_volume, const REAL* __restrict__ effective_normal_outflow,
     const REAL* __restrict__ adjustment_outflow, const REAL* __restrict__ flood_control_outflow,
-    const REAL* __restrict__ runoff, STO* __restrict__ total_storage,
+    const REAL* __restrict__ runoff,
     STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr,
     int num_reservoirs)
 {
@@ -84,7 +84,6 @@ __global__ void k_reservoir_outflow(
 
     river_outflow[ci] = ro;
     flood_outflow[ci] = (REAL)0.0;
-    total_storage[ci] = (STO)total;
 
     REAL new_pos = fmax(ro, (REAL)0.0);
     atomicAdd(outgoing_storage + ci, (STO)(new_pos * time_step));
@@ -101,7 +100,7 @@ void launch_reservoir_outflow(
     at::Tensor emergency_volume_ptr, at::Tensor adjustment_volume_ptr,
     at::Tensor effective_normal_outflow_ptr, at::Tensor adjustment_outflow_ptr,
     at::Tensor flood_control_outflow_ptr, at::Tensor runoff_ptr,
-    at::Tensor total_storage_ptr, at::Tensor outgoing_storage_ptr,
+    at::Tensor outgoing_storage_ptr,
     at::Tensor time_step_ptr, long num_catchments,
     int num_reservoirs, long BLOCK_SIZE)
 {
@@ -119,7 +118,7 @@ void launch_reservoir_outflow(
             emergency_volume_ptr.data_ptr<REAL_T>(), adjustment_volume_ptr.data_ptr<REAL_T>(), \
             effective_normal_outflow_ptr.data_ptr<REAL_T>(), adjustment_outflow_ptr.data_ptr<REAL_T>(), \
             flood_control_outflow_ptr.data_ptr<REAL_T>(), runoff_ptr.data_ptr<REAL_T>(), \
-            total_storage_ptr.data_ptr<STO_T>(), outgoing_storage_ptr.data_ptr<STO_T>(), \
+            outgoing_storage_ptr.data_ptr<STO_T>(), \
             time_step_ptr.data_ptr<REAL_T>(), num_reservoirs)
     if (real64) {
         LAUNCH_RESERVOIR(double, double);

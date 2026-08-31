@@ -266,8 +266,15 @@ __global__ void k_levee_bif_outflow(
     const REAL* __restrict__ manning, REAL* __restrict__ outflow,
     const REAL* __restrict__ width, const REAL* __restrict__ length,
     const REAL* __restrict__ elevation, REAL* __restrict__ cs_depth,
-    const REAL* __restrict__ wse, const REAL* __restrict__ protected_wse,
-    const STO* __restrict__ total_storage, STO* __restrict__ outgoing_storage,
+    const REAL* __restrict__ river_depth,
+    const REAL* __restrict__ protected_depth,
+    const REAL* __restrict__ river_height,
+    const REAL* __restrict__ catchment_elevation,
+    const bool* __restrict__ is_levee,
+    const STO* __restrict__ river_storage,
+    const STO* __restrict__ flood_storage,
+    const STO* __restrict__ protected_storage,
+    STO* __restrict__ outgoing_storage,
     REAL gravity, const REAL* __restrict__ time_step_ptr,
     long num_paths, int num_levels)
 {
@@ -280,18 +287,26 @@ __global__ void k_levee_bif_outflow(
     int di = __ldg(dn_idx + t);
     REAL blen = __ldg(length + t);
 
-    REAL wse_c = __ldg(wse + ci);
-    REAL wse_d = __ldg(wse + di);
+    REAL elevation_c = __ldg(catchment_elevation + ci);
+    REAL elevation_d = __ldg(catchment_elevation + di);
+    REAL wse_c = __ldg(river_depth + ci)
+        + elevation_c - __ldg(river_height + ci);
+    REAL wse_d = __ldg(river_depth + di)
+        + elevation_d - __ldg(river_height + di);
     REAL max_wse = fmax(wse_c, wse_d);
-    REAL pwse_c = __ldg(protected_wse + ci);
-    REAL pwse_d = __ldg(protected_wse + di);
+    REAL pwse_c = is_levee[ci]
+        ? fmin(elevation_c + __ldg(protected_depth + ci), wse_c) : wse_c;
+    REAL pwse_d = is_levee[di]
+        ? fmin(elevation_d + __ldg(protected_depth + di), wse_d) : wse_d;
     REAL max_pwse = fmax(pwse_c, pwse_d);
 
     REAL slope = (wse_c - wse_d) / blen;
     slope = fmin(fmax(slope, (REAL)-0.005), (REAL)0.005);
 
-    REAL ts_c = (REAL)total_storage[ci];
-    REAL ts_d = (REAL)total_storage[di];
+    REAL ts_c = (REAL)(
+        river_storage[ci] + flood_storage[ci] + protected_storage[ci]);
+    REAL ts_d = (REAL)(
+        river_storage[di] + flood_storage[di] + protected_storage[di]);
 
     REAL sum_out = (REAL)0.0;
     for (int lv = 0; lv < num_levels; ++lv) {
@@ -428,9 +443,11 @@ void launch_levee_bif_outflow(
     at::Tensor bifurcation_width_ptr, at::Tensor bifurcation_length_ptr,
     at::Tensor bifurcation_elevation_ptr,
     at::Tensor bifurcation_cross_section_depth_ptr,
-    at::Tensor water_surface_elevation_ptr,
-    at::Tensor protected_water_surface_elevation_ptr,
-    at::Tensor total_storage_ptr, at::Tensor outgoing_storage_ptr,
+    at::Tensor river_depth_ptr, at::Tensor protected_depth_ptr,
+    at::Tensor river_height_ptr, at::Tensor catchment_elevation_ptr,
+    at::Tensor is_levee_ptr,
+    at::Tensor river_storage_ptr, at::Tensor flood_storage_ptr,
+    at::Tensor protected_storage_ptr, at::Tensor outgoing_storage_ptr,
     double gravity, at::Tensor time_step_ptr,
     long num_catchments, long num_bifurcation_paths,
     int num_bifurcation_levels,
@@ -451,15 +468,20 @@ void launch_levee_bif_outflow(
             bifurcation_length_ptr.data_ptr<REAL_T>(), \
             bifurcation_elevation_ptr.data_ptr<REAL_T>(), \
             bifurcation_cross_section_depth_ptr.data_ptr<REAL_T>(), \
-            water_surface_elevation_ptr.data_ptr<REAL_T>(), \
-            protected_water_surface_elevation_ptr.data_ptr<REAL_T>(), \
-            total_storage_ptr.data_ptr<STO_T>(), \
+            river_depth_ptr.data_ptr<REAL_T>(), \
+            protected_depth_ptr.data_ptr<REAL_T>(), \
+            river_height_ptr.data_ptr<REAL_T>(), \
+            catchment_elevation_ptr.data_ptr<REAL_T>(), \
+            is_levee_ptr.data_ptr<bool>(), \
+            river_storage_ptr.data_ptr<STO_T>(), \
+            flood_storage_ptr.data_ptr<STO_T>(), \
+            protected_storage_ptr.data_ptr<STO_T>(), \
             outgoing_storage_ptr.data_ptr<STO_T>(), (REAL_T)gravity, \
             time_step_ptr.data_ptr<REAL_T>(), num_bifurcation_paths, \
             num_bifurcation_levels)
-    if (water_surface_elevation_ptr.scalar_type() == at::kDouble) {
+    if (river_depth_ptr.scalar_type() == at::kDouble) {
         LAUNCH_LEVEE_BIF(double, double);
-    } else if (total_storage_ptr.scalar_type() == at::kDouble) {
+    } else if (river_storage_ptr.scalar_type() == at::kDouble) {
         LAUNCH_LEVEE_BIF(float, double);
     } else {
         LAUNCH_LEVEE_BIF(float, float);

@@ -80,7 +80,6 @@
         reservoir_outflow, 0.0f, total_storage / time_step);
     args.river_outflow_ptr[catchment] = reservoir_outflow;
     args.flood_outflow_ptr[catchment] = 0.0f;
-    args.total_storage_ptr[catchment] = total_storage;
 
     atomic_fetch_add_explicit(
         &args.outgoing_storage_ptr[catchment],

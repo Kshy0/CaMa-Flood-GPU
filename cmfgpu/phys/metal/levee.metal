@@ -412,13 +412,33 @@ long num_paths = *args.num_bifurcation_paths;
     long length_idx = batched_bifurcation_length
         ? path_offset + path : path;
     float length = args.bifurcation_length_ptr[length_idx];
-    float water_surface = args.water_surface_elevation_ptr[catchment_cell];
-    float downstream_surface =
-        args.water_surface_elevation_ptr[downstream_cell];
-    float protected_surface =
-        args.protected_water_surface_elevation_ptr[catchment_cell];
-    float downstream_protected_surface =
-        args.protected_water_surface_elevation_ptr[downstream_cell];
+    long catchment_height_idx = batched_river_height
+        ? catchment_cell : (long)catchment;
+    long downstream_height_idx = batched_river_height
+        ? downstream_cell : (long)downstream;
+    long catchment_elevation_idx = batched_catchment_elevation
+        ? catchment_cell : (long)catchment;
+    long downstream_elevation_idx = batched_catchment_elevation
+        ? downstream_cell : (long)downstream;
+    float catchment_elevation =
+        args.catchment_elevation_ptr[catchment_elevation_idx];
+    float downstream_elevation =
+        args.catchment_elevation_ptr[downstream_elevation_idx];
+    float water_surface = args.river_depth_ptr[catchment_cell]
+        + catchment_elevation - args.river_height_ptr[catchment_height_idx];
+    float downstream_surface = args.river_depth_ptr[downstream_cell]
+        + downstream_elevation
+        - args.river_height_ptr[downstream_height_idx];
+    float protected_surface = args.is_levee_ptr[catchment]
+        ? min(
+            catchment_elevation + args.protected_depth_ptr[catchment_cell],
+            water_surface)
+        : water_surface;
+    float downstream_protected_surface = args.is_levee_ptr[downstream]
+        ? min(
+            downstream_elevation + args.protected_depth_ptr[downstream_cell],
+            downstream_surface)
+        : downstream_surface;
     float maximum_river_surface = max(water_surface, downstream_surface);
     float maximum_protected_surface = max(
         protected_surface, downstream_protected_surface);
@@ -449,8 +469,12 @@ long num_paths = *args.num_bifurcation_paths;
     }
 
     float available_storage = min(
-        args.total_storage_ptr[catchment_cell],
-        args.total_storage_ptr[downstream_cell]);
+        args.river_storage_ptr[catchment_cell]
+            + args.flood_storage_ptr[catchment_cell]
+            + args.protected_storage_ptr[catchment_cell],
+        args.river_storage_ptr[downstream_cell]
+            + args.flood_storage_ptr[downstream_cell]
+            + args.protected_storage_ptr[downstream_cell]);
     float limit = min(
         0.05f * available_storage / (fabs(total_outflow) * time_step),
         1.0f);

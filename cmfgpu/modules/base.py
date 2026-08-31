@@ -210,17 +210,19 @@ class BaseModule(AbstractModule):
         dtype="hpfloat",
     )
 
-    protected_storage: torch.Tensor = BaseField(
+    protected_storage: Optional[torch.Tensor] = BaseField(
         description="Current water volume stored in protected areas (m³)",
         default=0,
         category="init_state",
         dtype="hpfloat",
+        depends_on="levee",
     )
 
-    protected_depth: torch.Tensor = BaseField(
+    protected_depth: Optional[torch.Tensor] = BaseField(
         description="Current water depth on the protected side relative to river bed (m)",
         default=0,
         category="init_state",
+        depends_on="levee",
     )
     
     river_depth: torch.Tensor = BaseField(
@@ -296,29 +298,6 @@ class BaseModule(AbstractModule):
     def num_flood_levels(self) -> int:
         return self.flood_depth_table.shape[-1]
 
-    @computed_field(
-        description="Whether total-storage scratch state is materialized."
-    )
-    @cached_property
-    def has_total_storage(self) -> bool:
-        return bool(
-            {"bifurcation", "reservoir"}.intersection(self.opened_modules)
-        )
-
-    @computed_field(
-        description="Whether bifurcation water-surface state is materialized."
-    )
-    @cached_property
-    def has_water_surface(self) -> bool:
-        return "bifurcation" in self.opened_modules
-
-    @computed_field(
-        description="Whether protected water-surface state is materialized."
-    )
-    @cached_property
-    def has_protected_water_surface(self) -> bool:
-        return {"bifurcation", "levee"}.issubset(self.opened_modules)
-
     # ------------------------------------------------------------------ #
     # Computed tensor fields
     # ------------------------------------------------------------------ #
@@ -328,16 +307,15 @@ class BaseModule(AbstractModule):
         description="Total water storage per catchment (m³)",
         category="state",
         dtype="hpfloat",
-        required_by=("bifurcation", "reservoir"),
-        output="disabled",
+        output="auto",
+        output_only=True,
     )
     @cached_property
     def total_storage(self) -> Optional[torch.Tensor]:
-        if not {"bifurcation", "reservoir"}.intersection(
-            self.opened_modules,
-        ):
-            return None
-        return self.river_storage + self.flood_storage + self.protected_storage
+        total = self.river_storage + self.flood_storage
+        if self.protected_storage is not None:
+            total = total + self.protected_storage
+        return total
 
     # ---------------- Hidden / intermediate states ------------------- #
     @computed_base_field(
@@ -356,27 +334,12 @@ class BaseModule(AbstractModule):
 
     @computed_base_field(
         description="Water-surface elevation (m a.s.l.)",
-        category="state",
-        depends_on="bifurcation",
-        output="disabled",
+        category="virtual",
+        expr="river_depth + catchment_elevation - river_height",
     )
     @cached_property
     def water_surface_elevation(self) -> Optional[torch.Tensor]:
-        if "bifurcation" not in self.opened_modules:
-            return None
-        return torch.zeros_like(self.river_outflow)
-
-    @computed_base_field(
-        description="Protected water-surface elevation (m a.s.l.)",
-        category="state",
-        depends_on=("bifurcation", "levee"),
-        output="disabled",
-    )
-    @cached_property
-    def protected_water_surface_elevation(self) -> Optional[torch.Tensor]:
-        if not {"bifurcation", "levee"}.issubset(self.opened_modules):
-            return None
-        return torch.zeros_like(self.river_outflow)
+        return None
 
     @computed_base_field(
         description="Total inflow into river channels (m³ s⁻¹)",
@@ -518,8 +481,6 @@ class BaseModule(AbstractModule):
         nonnegative_state = {
             "river_storage": self.river_storage,
             "flood_storage": self.flood_storage,
-            "protected_storage": self.protected_storage,
-            "protected_depth": self.protected_depth,
             "river_depth": self.river_depth,
             "flood_depth": self.flood_depth,
             "river_cross_section_depth": self.river_cross_section_depth,
@@ -527,6 +488,10 @@ class BaseModule(AbstractModule):
             "flood_cross_section_area": self.flood_cross_section_area,
             "flood_fraction": self.flood_fraction,
         }
+        if self.protected_storage is not None:
+            nonnegative_state["protected_storage"] = self.protected_storage
+        if self.protected_depth is not None:
+            nonnegative_state["protected_depth"] = self.protected_depth
         invalid_state_counts = {
             name: int((~torch.isfinite(value) | (value < 0)).sum().item())
             for name, value in nonnegative_state.items()
