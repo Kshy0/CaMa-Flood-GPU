@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Self
+from typing import ClassVar, Literal, Self
 
 import torch
 from hydroforge.model import (
@@ -36,10 +36,8 @@ class InflowModule(AbstractModule):
         references="catchment_id",
     )
 
-    basin_shift_days: Optional[torch.Tensor] = TensorField(
-        description=(
-            "Per-gauge day offset applied when reading prescribed inflow."
-        ),
+    basin_shift_days: torch.Tensor | None = TensorField(
+        description=("Per-gauge day offset applied when reading prescribed inflow."),
         dtype="int",
         shape=("num_inflow_gauges",),
         dim_coords="inflow_catchment_id",
@@ -48,7 +46,7 @@ class InflowModule(AbstractModule):
         default=None,
     )
 
-    basin_valid_length_days: Optional[torch.Tensor] = TensorField(
+    basin_valid_length_days: torch.Tensor | None = TensorField(
         description="Per-gauge length of the contiguous valid observation span",
         dtype="int",
         shape=("num_inflow_gauges",),
@@ -65,13 +63,14 @@ class InflowModule(AbstractModule):
 
     inflow_catchment_idx = ReferenceIndexField("inflow_catchment_id")
     catchment_inflow_idx = ReferenceIndexField(
-        "inflow_catchment_id", inverse=True,
+        "inflow_catchment_id",
+        inverse=True,
     )
 
     def check_topology(
         self,
-        gauge_catchment_id: Optional[torch.Tensor] = None,
-        inflow_catchment_id: Optional[torch.Tensor] = None,
+        gauge_catchment_id: torch.Tensor | None = None,
+        inflow_catchment_id: torch.Tensor | None = None,
         *,
         placement: Literal["same", "downstream"] = "downstream",
         require_headwater: bool = True,
@@ -87,7 +86,8 @@ class InflowModule(AbstractModule):
         injection_id = inflow_catchment_id.to(self.base.catchment_id.device)
         if gauge_catchment_id is not None:
             gauge_id = gauge_catchment_id.to(
-                device=self.base.catchment_id.device, dtype=self.base.catchment_id.dtype,
+                device=self.base.catchment_id.device,
+                dtype=self.base.catchment_id.dtype,
             )
             if gauge_id.shape != injection_id.shape:
                 raise ValueError(
@@ -99,6 +99,7 @@ class InflowModule(AbstractModule):
                 expected = gauge_id
             else:
                 from hydroforge.data import find_indices_in_torch
+
                 gauge_idx = find_indices_in_torch(gauge_id, self.base.catchment_id)
                 if torch.any(gauge_idx < 0):
                     missing = gauge_id[gauge_idx < 0][:5].detach().cpu().tolist()
@@ -112,8 +113,7 @@ class InflowModule(AbstractModule):
                     for i in rows.detach().cpu().tolist()
                 ]
                 raise ValueError(
-                    "Inflow placement mismatch as (gauge, actual, expected): "
-                    f"{detail}"
+                    f"Inflow placement mismatch as (gauge, actual, expected): {detail}"
                 )
 
         if require_headwater:
@@ -122,9 +122,7 @@ class InflowModule(AbstractModule):
             downstream_id = self.base.downstream_id
             violations = []
             for cid in target.detach().cpu().tolist():
-                incoming = source_id[
-                    (downstream_id == cid) & (source_id != cid)
-                ]
+                incoming = source_id[(downstream_id == cid) & (source_id != cid)]
                 if incoming.numel():
                     violations.append((cid, incoming[:10].detach().cpu().tolist()))
             if violations:
@@ -149,16 +147,13 @@ class InflowModule(AbstractModule):
             return self
         if (
             self.basin_shift_days is not None
-            and self.basin_shift_days.numel()
-            != self.basin_valid_length_days.numel()
+            and self.basin_shift_days.numel() != self.basin_valid_length_days.numel()
         ):
             raise ValueError(
                 "basin_shift_days and basin_valid_length_days must have equal size"
             )
         if torch.any(self.basin_valid_length_days <= 0):
-            bad = self.inflow_catchment_id[
-                self.basin_valid_length_days <= 0
-            ].tolist()
+            bad = self.inflow_catchment_id[self.basin_valid_length_days <= 0].tolist()
             raise ValueError(
                 "basin_valid_length_days must be > 0 for inflow catchments; "
                 f"invalid catchment IDs: {bad}"

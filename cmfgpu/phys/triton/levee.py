@@ -15,6 +15,12 @@ from cmfgpu.phys.triton.utils import (
 )
 
 
+from cmfgpu import config as _constants
+
+BACKFLOW_STORAGE_FRACTION = tl.constexpr(_constants.BACKFLOW_STORAGE_FRACTION)
+ROUTING_SLOPE_LIMIT = tl.constexpr(_constants.ROUTING_SLOPE_LIMIT)
+
+
 @triton.jit
 def levee_storage_partition_inline(
     total_storage_hp,
@@ -647,7 +653,7 @@ def compute_levee_bifurcation_outflow_kernel(
 
     # Bifurcation slope (clamped similarly to flood slope)
     bifurcation_slope = (bifurcation_water_surface_elevation - bifurcation_water_surface_elevation_downstream) / bifurcation_length
-    bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
+    bifurcation_slope = tl.clamp(bifurcation_slope, -ROUTING_SLOPE_LIMIT, ROUTING_SLOPE_LIMIT)
 
     # Storage change limiter calculation
     bifurcation_total_storage = hpfloat_to_compute_inline(
@@ -717,7 +723,7 @@ def compute_levee_bifurcation_outflow_kernel(
         sum_bifurcation_outflow += updated_bifurcation_outflow
         tl.store(bifurcation_cross_section_depth_ptr + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
-    limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
+    limit_rate = tl.minimum(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
     sum_bifurcation_outflow *= limit_rate
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
@@ -751,7 +757,7 @@ def compute_levee_stage_batched_kernel(
     flood_fraction_ptr,
     num_levees: tl.constexpr,
     num_flood_levels: tl.constexpr,
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     num_catchments: tl.constexpr,
     # Batch flags
@@ -765,8 +771,8 @@ def compute_levee_stage_batched_kernel(
     batched_flood_depth_table: tl.constexpr
 ):
     # --- Loop-based batched kernel ---
-    # Grid = cdiv(num_levees, BLOCK_SIZE), each block loops over trials.
-    # Shared (non-trial) parameters are loaded once and reused across trials.
+    # Grid = cdiv(num_levees, BLOCK_SIZE), each block loops over members.
+    # Shared (non-member) parameters are loaded once and reused across members.
     pid = tl.program_id(0)
     levee_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = levee_offs < num_levees
@@ -774,7 +780,7 @@ def compute_levee_stage_batched_kernel(
     # Topology is never batched
     levee_catchment_idx = tl.load(levee_catchment_idx_ptr + levee_offs, mask=mask, other=0)
 
-    # ---- Load shared (non-trial) parameters once ----
+    # ---- Load shared (non-member) parameters once ----
     if not batched_river_length:
         river_length_shared = tl.load(river_length_ptr + levee_catchment_idx, mask=mask, other=1.0)
     if not batched_river_width:
@@ -790,7 +796,7 @@ def compute_levee_stage_batched_kernel(
     if not batched_levee_base_height:
         levee_base_height_shared = tl.load(levee_base_height_ptr + levee_offs, mask=mask, other=0.0)
 
-    # Pre-compute derived constants that don't change across trials
+    # Pre-compute derived constants that don't change across members
     if not batched_river_length and not batched_river_width and not batched_river_height:
         river_max_storage_shared = river_length_shared * river_width_shared * river_height_shared
     if not batched_catchment_area and not batched_river_length:
@@ -800,32 +806,32 @@ def compute_levee_stage_batched_kernel(
     if not batched_levee_fraction:
         ilev_shared = nonnegative_to_index_inline(levee_fraction_shared * num_flood_levels)
 
-    # ---- Loop over trials ----
-    for t in tl.static_range(num_trials):
-        trial_offset_catchments = t * num_catchments
-        trial_offset_levees = t * num_levees
+    # ---- Loop over members ----
+    for t in tl.static_range(ensemble_size):
+        member_offset_catchments = t * num_catchments
+        member_offset_levees = t * num_levees
 
-        # Use pre-loaded shared values or load per-trial batched values
-        river_length = tl.load(river_length_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=1.0) if batched_river_length else river_length_shared
-        river_width = tl.load(river_width_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=1.0) if batched_river_width else river_width_shared
-        river_height = tl.load(river_height_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0) if batched_river_height else river_height_shared
-        catchment_area = tl.load(catchment_area_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0) if batched_catchment_area else catchment_area_shared
-        levee_crown_height = tl.load(levee_crown_height_ptr + trial_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_crown_height else levee_crown_height_shared
-        levee_fraction = tl.load(levee_fraction_ptr + trial_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_fraction else levee_fraction_shared
-        levee_base_height = tl.load(levee_base_height_ptr + trial_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_base_height else levee_base_height_shared
+        # Use pre-loaded shared values or load per-member batched values
+        river_length = tl.load(river_length_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=1.0) if batched_river_length else river_length_shared
+        river_width = tl.load(river_width_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=1.0) if batched_river_width else river_width_shared
+        river_height = tl.load(river_height_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=0.0) if batched_river_height else river_height_shared
+        catchment_area = tl.load(catchment_area_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=0.0) if batched_catchment_area else catchment_area_shared
+        levee_crown_height = tl.load(levee_crown_height_ptr + member_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_crown_height else levee_crown_height_shared
+        levee_fraction = tl.load(levee_fraction_ptr + member_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_fraction else levee_fraction_shared
+        levee_base_height = tl.load(levee_base_height_ptr + member_offset_levees + levee_offs, mask=mask, other=0.0) if batched_levee_base_height else levee_base_height_shared
 
         # Load current state
         river_storage_curr_hp = tl.load(
-            river_storage_ptr + trial_offset_catchments + levee_catchment_idx,
+            river_storage_ptr + member_offset_catchments + levee_catchment_idx,
             mask=mask,
             other=0.0,
         )
         flood_storage_curr_hp = tl.load(
-            flood_storage_ptr + trial_offset_catchments + levee_catchment_idx,
+            flood_storage_ptr + member_offset_catchments + levee_catchment_idx,
             mask=mask,
             other=0.0,
         )
-        flood_depth_curr = tl.load(flood_depth_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
+        flood_depth_curr = tl.load(flood_depth_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
 
         total_storage_hp = river_storage_curr_hp + flood_storage_curr_hp
         # Downcast hpfloat storage to computation dtype
@@ -878,7 +884,7 @@ def compute_levee_stage_batched_kernel(
 
         # Table offset
         if batched_flood_depth_table:
-            table_base_offset = trial_offset_catchments * num_flood_levels
+            table_base_offset = member_offset_catchments * num_flood_levels
         else:
             table_base_offset = 0
 
@@ -992,7 +998,7 @@ def compute_levee_stage_batched_kernel(
         p_dph_c4 = f_dph_c4
 
         # --- Select Results ---
-        r_dph_curr = tl.load(river_depth_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
+        r_dph_curr = tl.load(river_depth_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)
 
         r_sto_candidate = tl.where(is_case2, r_sto_c2,
                 tl.where(is_case3, r_sto_c3,
@@ -1024,16 +1030,16 @@ def compute_levee_stage_batched_kernel(
 
         f_frc = tl.where(is_case2, f_frc_c2,
                 tl.where(is_case3, f_frc_c3,
-                tl.load(flood_fraction_ptr + trial_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)))
+                tl.load(flood_fraction_ptr + member_offset_catchments + levee_catchment_idx, mask=mask, other=0.0)))
 
         # Store results
-        tl.store(river_storage_ptr + trial_offset_catchments + levee_catchment_idx, r_sto, mask=mask)
-        tl.store(flood_storage_ptr + trial_offset_catchments + levee_catchment_idx, f_sto, mask=mask)
-        tl.store(protected_storage_ptr + trial_offset_catchments + levee_catchment_idx, p_sto, mask=mask)
-        tl.store(river_depth_ptr + trial_offset_catchments + levee_catchment_idx, r_dph, mask=mask)
-        tl.store(flood_depth_ptr + trial_offset_catchments + levee_catchment_idx, f_dph, mask=mask)
-        tl.store(protected_depth_ptr + trial_offset_catchments + levee_catchment_idx, p_dph, mask=mask)
-        tl.store(flood_fraction_ptr + trial_offset_catchments + levee_catchment_idx, f_frc, mask=mask)
+        tl.store(river_storage_ptr + member_offset_catchments + levee_catchment_idx, r_sto, mask=mask)
+        tl.store(flood_storage_ptr + member_offset_catchments + levee_catchment_idx, f_sto, mask=mask)
+        tl.store(protected_storage_ptr + member_offset_catchments + levee_catchment_idx, p_sto, mask=mask)
+        tl.store(river_depth_ptr + member_offset_catchments + levee_catchment_idx, r_dph, mask=mask)
+        tl.store(flood_depth_ptr + member_offset_catchments + levee_catchment_idx, f_dph, mask=mask)
+        tl.store(protected_depth_ptr + member_offset_catchments + levee_catchment_idx, p_dph, mask=mask)
+        tl.store(flood_fraction_ptr + member_offset_catchments + levee_catchment_idx, f_frc, mask=mask)
 
 
 @triton.jit
@@ -1060,7 +1066,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     time_step_ptr,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                    # Block size
     num_catchments: tl.constexpr,
     # Batch flags
@@ -1074,16 +1080,16 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Calculate trial and path indices
-    trial_idx = idx // num_bifurcation_paths
+    # Calculate member and path indices
+    member_index = idx // num_bifurcation_paths
     offs = idx % num_bifurcation_paths
     
-    mask = idx < (num_bifurcation_paths * num_trials)
+    mask = idx < (num_bifurcation_paths * ensemble_size)
     time_step = tl.load(time_step_ptr)
     
-    trial_offset_paths = trial_idx * num_bifurcation_paths
-    trial_offset_catchments = trial_idx * num_catchments
-    trial_offset_levels = trial_idx * num_bifurcation_paths * num_bifurcation_levels
+    member_offset_paths = member_index * num_bifurcation_paths
+    member_offset_catchments = member_index * num_catchments
+    member_offset_levels = member_index * num_bifurcation_paths * num_bifurcation_levels
     
     # Load indices
     # Topology is never batched
@@ -1091,11 +1097,11 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
     
     # Load bifurcation properties
-    bifurcation_length = tl.load(bifurcation_length_ptr + (trial_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)
+    bifurcation_length = tl.load(bifurcation_length_ptr + (member_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)
     
-    # Derive diagnostics from this trial's source fields.
-    catchment_cell = trial_offset_catchments + bifurcation_catchment_idx
-    downstream_cell = trial_offset_catchments + bifurcation_downstream_idx
+    # Derive diagnostics from this member's source fields.
+    catchment_cell = member_offset_catchments + bifurcation_catchment_idx
+    downstream_cell = member_offset_catchments + bifurcation_downstream_idx
     catchment_height_idx = (
         catchment_cell if batched_river_height else bifurcation_catchment_idx
     )
@@ -1152,7 +1158,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
 
     # Bifurcation slope (clamped similarly to flood slope)
     bifurcation_slope = (bifurcation_water_surface_elevation - bifurcation_water_surface_elevation_downstream) / bifurcation_length
-    bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
+    bifurcation_slope = tl.clamp(bifurcation_slope, -ROUTING_SLOPE_LIMIT, ROUTING_SLOPE_LIMIT)
 
     # Storage change limiter calculation
     bifurcation_total_storage = hpfloat_to_compute_inline(
@@ -1170,15 +1176,15 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     # Base offsets for level-dependent arrays
-    manning_base = (trial_offset_levels if batched_bifurcation_manning else 0)
-    width_base = (trial_offset_levels if batched_bifurcation_width else 0)
-    elevation_base = (trial_offset_levels if batched_bifurcation_elevation else 0)
+    manning_base = (member_offset_levels if batched_bifurcation_manning else 0)
+    width_base = (member_offset_levels if batched_bifurcation_width else 0)
+    elevation_base = (member_offset_levels if batched_bifurcation_elevation else 0)
 
     for level in tl.static_range(num_bifurcation_levels):
         
         level_idx = offs * num_bifurcation_levels + level
         bifurcation_manning = tl.load(bifurcation_manning_ptr + manning_base + level_idx, mask=mask, other=0.0)
-        bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + trial_offset_levels + level_idx, mask=mask, other=0.0)
+        bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
         bifurcation_elevation = tl.load(bifurcation_elevation_ptr + elevation_base + level_idx, mask=mask, other=0.0)
         
         # Calculate bifurcation cross-section depth
@@ -1210,7 +1216,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth
         
         bifurcation_width = tl.load(bifurcation_width_ptr + width_base + level_idx, mask=mask, other=0.0)
-        bifurcation_outflow = tl.load(bifurcation_outflow_ptr + trial_offset_levels + level_idx, mask=mask, other=0.0)
+        bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
 
         unit_bifurcation_outflow = bifurcation_outflow / bifurcation_width
 
@@ -1225,17 +1231,17 @@ def compute_levee_bifurcation_outflow_batched_kernel(
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
         updated_bifurcation_outflow = tl.where(bifurcation_condition, updated_bifurcation_outflow, 0.0)
         sum_bifurcation_outflow += updated_bifurcation_outflow
-        tl.store(bifurcation_cross_section_depth_ptr + trial_offset_levels + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
-        tl.store(bifurcation_outflow_ptr + trial_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
-    limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
+        tl.store(bifurcation_cross_section_depth_ptr + member_offset_levels + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
+        tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
+    limit_rate = tl.minimum(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
     sum_bifurcation_outflow *= limit_rate
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
-        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + trial_offset_levels + level_idx, mask=mask)
+        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask)
         updated_bifurcation_outflow *= limit_rate
-        tl.store(bifurcation_outflow_ptr + trial_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
+        tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
 
     pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
     neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, pos_flow * time_step, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, -neg_flow * time_step, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_catchment_idx, pos_flow * time_step, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_downstream_idx, -neg_flow * time_step, mask=mask)

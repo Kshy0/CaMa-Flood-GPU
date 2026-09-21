@@ -26,21 +26,30 @@ Typical usage
 >>> hires.build_level_gauges()            # level-gauge allocation
 >>> mapping = hires.catchment_to_gauge_mapping(kind="flow")
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional
+from typing import ClassVar
 
 import numpy as np
 from hydroforge.data import binread, read_map
-from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
-                      model_validator)
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    DirectoryPath,
+    Field,
+    FilePath,
+    model_validator,
+)
 
 from cmfgpu.params.allocation.alloc_dam import DamAllocMixin
 from cmfgpu.params.allocation.alloc_flow_gauge import FlowGaugeMixin
 from cmfgpu.params.allocation.alloc_level_gauge import LevelGaugeAllocMixin
-from cmfgpu.params.allocation.hires_kernels import (build_upstream_table,
-                                                    calc_outlet_pixels)
+from cmfgpu.params.allocation.hires_kernels import (
+    build_upstream_table,
+    calc_outlet_pixels,
+)
 
 # ---------------------------------------------------------------------------
 # Pydantic data class
@@ -69,7 +78,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         description="Low-resolution CaMa-Flood map directory (contains params.txt, nextxy.bin, uparea.bin, etc.)"
     )
 
-    gauge_list: Optional[FilePath] = Field(
+    gauge_list: FilePath | None = Field(
         default=None,
         description=(
             "Path to gauge list file.  Each line (after header) must start with: "
@@ -105,7 +114,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         description="Output file name for the allocation results.",
     )
 
-    out_dir: Optional[Path] = Field(
+    out_dir: Path | None = Field(
         default=None,
         description="Output directory.  Defaults to map_dir if not specified.",
     )
@@ -148,17 +157,25 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         self.north = float(lines[7].split()[0])
         self.is_global = abs(self.east - self.west - 360.0) < 1e-3
 
-        print(f"Low-res grid: {self.nXX}×{self.nYY}, gsize={self.gsize}°, global={self.is_global}")
+        print(
+            f"Low-res grid: {self.nXX}×{self.nYY}, gsize={self.gsize}°, global={self.is_global}"
+        )
 
         # Upstream area (convert m² → km²)
         uparea_raw = read_map(
-            self.map_dir / "uparea.bin", (self.nXX, self.nYY), precision=self.map_precision
+            self.map_dir / "uparea.bin",
+            (self.nXX, self.nYY),
+            precision=self.map_precision,
         )
-        self.uparea = np.where(uparea_raw > 0, uparea_raw * 1e-6, uparea_raw).astype(np.float32)
+        self.uparea = np.where(uparea_raw > 0, uparea_raw * 1e-6, uparea_raw).astype(
+            np.float32
+        )
 
         # Downstream pointers (1-based → Python 0-based)
         nextxy = binread(
-            self.map_dir / "nextxy.bin", (self.nXX, self.nYY, 2), dtype_str=self.lowres_idx_precision
+            self.map_dir / "nextxy.bin",
+            (self.nXX, self.nYY, 2),
+            dtype_str=self.lowres_idx_precision,
         )
         self.nextXX = nextxy[:, :, 0].astype(np.int32)
         self.nextYY = nextxy[:, :, 1].astype(np.int32)
@@ -179,12 +196,18 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         Call *after* :meth:`load_lowres`.
         """
         ctmare_raw = read_map(
-            self.map_dir / "ctmare.bin", (self.nXX, self.nYY), precision=self.map_precision
+            self.map_dir / "ctmare.bin",
+            (self.nXX, self.nYY),
+            precision=self.map_precision,
         )
-        self.ctmare = np.where(ctmare_raw > 0, ctmare_raw * 1e-6, ctmare_raw).astype(np.float32)
+        self.ctmare = np.where(ctmare_raw > 0, ctmare_raw * 1e-6, ctmare_raw).astype(
+            np.float32
+        )
 
         self.elevtn = read_map(
-            self.map_dir / "elevtn.bin", (self.nXX, self.nYY), precision=self.map_precision
+            self.map_dir / "elevtn.bin",
+            (self.nXX, self.nYY),
+            precision=self.map_precision,
         ).astype(np.float32)
 
         print(f"Loaded ctmare + elevtn (low-res, {self.nXX}×{self.nYY})")
@@ -206,7 +229,9 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         self.hires_ny = int(parts[7])
         self.csize = (self.east2 - self.west2) / self.hires_nx
 
-        print(f"Hi-res grid ({tag}): {self.hires_nx}×{self.hires_ny}, csize={self.csize:.10f}°")
+        print(
+            f"Hi-res grid ({tag}): {self.hires_nx}×{self.hires_ny}, csize={self.csize:.10f}°"
+        )
 
         nx, ny = self.hires_nx, self.hires_ny
 
@@ -215,13 +240,17 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         ).astype(np.float32)
 
         catmxy = read_map(
-            hires_dir / f"{tag}.catmxy.bin", (nx, ny, 2), precision=self.hires_idx_precision
+            hires_dir / f"{tag}.catmxy.bin",
+            (nx, ny, 2),
+            precision=self.hires_idx_precision,
         )
         self.ctx1m = (catmxy[:, :, 0] - 1).astype(np.int16)
         self.cty1m = (catmxy[:, :, 1] - 1).astype(np.int16)
 
         downxy = read_map(
-            hires_dir / f"{tag}.downxy.bin", (nx, ny, 2), precision=self.hires_idx_precision
+            hires_dir / f"{tag}.downxy.bin",
+            (nx, ny, 2),
+            precision=self.hires_idx_precision,
         )
         self.dwx1m = downxy[:, :, 0].astype(np.int16)
         self.dwy1m = downxy[:, :, 1].astype(np.int16)
@@ -229,8 +258,13 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         self.hires_lon = self.west2 + self.csize * (np.arange(nx) + 0.5)
         self.hires_lat = self.north2 - self.csize * (np.arange(ny) + 0.5)
 
-        mem_mb = (self.upa1m.nbytes + self.ctx1m.nbytes + self.cty1m.nbytes +
-                  self.dwx1m.nbytes + self.dwy1m.nbytes) / 1e6
+        mem_mb = (
+            self.upa1m.nbytes
+            + self.ctx1m.nbytes
+            + self.cty1m.nbytes
+            + self.dwx1m.nbytes
+            + self.dwy1m.nbytes
+        ) / 1e6
         print(f"Hi-res maps cached: {mem_mb:.1f} MB")
 
     def load_hires_elevtn(self) -> None:
@@ -260,18 +294,25 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         """Find each unit-catchment's outlet pixel on the hi-res grid."""
         print("Calculating outlet pixels ...")
         self.outx, self.outy = calc_outlet_pixels(
-            self.ctx1m, self.cty1m, self.dwx1m, self.dwy1m, self.upa1m,
-            self.nXX, self.nYY,
+            self.ctx1m,
+            self.cty1m,
+            self.dwx1m,
+            self.dwy1m,
+            self.upa1m,
+            self.nXX,
+            self.nYY,
         )
         n_valid = int(np.sum(self.outx != self.MISSING))
-        print(f"Outlet pixels computed: {n_valid}/{self.nXX * self.nYY} catchments have outlets.")
+        print(
+            f"Outlet pixels computed: {n_valid}/{self.nXX * self.nYY} catchments have outlets."
+        )
 
     def load_gauge_list(self) -> None:
         """Parse gauge list file (ID, Lat, Lon, Uparea in km²)."""
-        ids: List[int] = []
-        lats: List[float] = []
-        lons: List[float] = []
-        areas: List[float] = []
+        ids: list[int] = []
+        lats: list[float] = []
+        lons: list[float] = []
+        areas: list[float] = []
 
         with open(self.gauge_list) as f:  # type: ignore[arg-type]
             header = f.readline()  # noqa: F841 — skip header
@@ -299,7 +340,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
     def catchment_to_gauge_mapping(
         self,
         kind: str = "flow",
-    ) -> Dict[int, Dict]:
+    ) -> dict[int, dict]:
         """Return the fundamental catchment_id → gauge_id mapping with error.
 
         Parameters
@@ -316,17 +357,17 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
             with the smallest absolute allocation error is retained; ties are
             resolved by the smallest gauge or dam ID.
         """
-        mapping: Dict[int, Dict] = {}
+        mapping: dict[int, dict] = {}
         shape = (self.nXX, self.nYY)
 
-        def add_candidate(cid: int, candidate: Dict) -> None:
+        def add_candidate(cid: int, candidate: dict) -> None:
             """Keep the deterministically best allocation for a catchment."""
             existing = mapping.get(cid)
             if existing is None:
                 mapping[cid] = candidate
                 return
 
-            def rank(item: Dict) -> tuple[float, int]:
+            def rank(item: dict) -> tuple[float, int]:
                 error = float(item["error"])
                 absolute_error = abs(error) if np.isfinite(error) else np.inf
                 return absolute_error, int(item["gauge_id"])
@@ -351,15 +392,25 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                     if sn >= 2:
                         area_cmf += float(row["area2"])
                 err = (area_cmf - area_in) / area_in if area_in > 0 else 0.0
-                add_candidate(cid1, {
-                    "gauge_id": gid, "error": err,
-                    "area_gauge": area_in, "area_cama": float(row["area1"]),
-                })
+                add_candidate(
+                    cid1,
+                    {
+                        "gauge_id": gid,
+                        "error": err,
+                        "area_gauge": area_in,
+                        "area_cama": float(row["area1"]),
+                    },
+                )
                 if cid2 >= 0:
-                    add_candidate(cid2, {
-                        "gauge_id": gid, "error": err,
-                        "area_gauge": area_in, "area_cama": float(row["area2"]),
-                    })
+                    add_candidate(
+                        cid2,
+                        {
+                            "gauge_id": gid,
+                            "error": err,
+                            "area_gauge": area_in,
+                            "area_cama": float(row["area2"]),
+                        },
+                    )
 
         elif kind == "dam":
             for i in range(len(self.dam_ids)):
@@ -367,12 +418,15 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                 if ix == self.MISSING:
                     continue
                 cid = int(np.ravel_multi_index((ix, iy), shape))
-                add_candidate(cid, {
-                    "gauge_id": int(self.dam_ids[i]),
-                    "error": float(self.dam_err_rel[i]),
-                    "area_gauge": float(self.dam_areas[i]),  # already km²
-                    "area_cama": float(self.dam_area_cmf[i]),
-                })
+                add_candidate(
+                    cid,
+                    {
+                        "gauge_id": int(self.dam_ids[i]),
+                        "error": float(self.dam_err_rel[i]),
+                        "area_gauge": float(self.dam_areas[i]),  # already km²
+                        "area_cama": float(self.dam_area_cmf[i]),
+                    },
+                )
 
         elif kind == "level":
             for i in range(len(self.gauge_ids)):
@@ -383,18 +437,23 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
                 area_in_km2 = float(self.gauge_areas[i])  # already km²
                 area_cmf = float(self.uparea[ix, iy])
                 err = (area_cmf - area_in_km2) / area_in_km2 if area_in_km2 > 0 else 0.0
-                add_candidate(cid, {
-                    "gauge_id": int(self.gauge_ids[i]),
-                    "error": err,
-                    "area_gauge": area_in_km2,
-                    "area_cama": area_cmf,
-                    "gauge_type": int(self.lvl_gtype[i]),
-                    "dst_outlet_km": float(self.lvl_dst_outlet[i]),
-                    "elv_outlet": float(self.lvl_elv_outlet[i]),
-                    "elv_gauge": float(self.lvl_elv_gauge[i]),
-                })
+                add_candidate(
+                    cid,
+                    {
+                        "gauge_id": int(self.gauge_ids[i]),
+                        "error": err,
+                        "area_gauge": area_in_km2,
+                        "area_cama": area_cmf,
+                        "gauge_type": int(self.lvl_gtype[i]),
+                        "dst_outlet_km": float(self.lvl_dst_outlet[i]),
+                        "elv_outlet": float(self.lvl_elv_outlet[i]),
+                        "elv_gauge": float(self.lvl_elv_gauge[i]),
+                    },
+                )
         else:
-            raise ValueError(f"Unknown kind={kind!r}; expected 'flow', 'dam', or 'level'")
+            raise ValueError(
+                f"Unknown kind={kind!r}; expected 'flow', 'dam', or 'level'"
+            )
 
         return mapping
 
@@ -460,7 +519,7 @@ class HiResMap(FlowGaugeMixin, DamAllocMixin, LevelGaugeAllocMixin, BaseModel):
         print("Level-gauge pipeline complete.")
 
     @model_validator(mode="after")
-    def _set_defaults(self) -> "HiResMap":
+    def _set_defaults(self) -> HiResMap:
         if self.out_dir is None:
             object.__setattr__(self, "out_dir", Path(self.map_dir))
         else:

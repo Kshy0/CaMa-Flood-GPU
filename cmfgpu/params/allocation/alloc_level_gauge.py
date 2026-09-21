@@ -7,16 +7,20 @@
 """
 Level-gauge allocation kernel and mixin for :class:`HiResMap`.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numba import njit
 
-from cmfgpu.params.allocation.hires_kernels import (nextxy_hires, rgetlen,
-                                                    search_best_pixel)
+from cmfgpu.params.allocation.hires_kernels import (
+    nextxy_hires,
+    rgetlen,
+    search_best_pixel,
+)
 
 if TYPE_CHECKING:
     from cmfgpu.params.allocation.hires_map import HiResMap
@@ -26,36 +30,51 @@ if TYPE_CHECKING:
 # Numba kernel
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def allocate_all_level_gauges(
     gauge_ids: np.ndarray,
     gauge_lats: np.ndarray,
     gauge_lons: np.ndarray,
-    gauge_areas: np.ndarray,      # m²
+    gauge_areas: np.ndarray,  # m²
     upa1m: np.ndarray,
     ctx1m: np.ndarray,
     cty1m: np.ndarray,
     dwx1m: np.ndarray,
     dwy1m: np.ndarray,
-    uparea: np.ndarray,           # km²
-    elevtn: np.ndarray,           # low-res elevation
-    elv1m: np.ndarray,            # hi-res elevation
-    hires_lon: np.ndarray,        # (nx,) pixel centre longitudes
-    hires_lat: np.ndarray,        # (ny,) pixel centre latitudes
+    uparea: np.ndarray,  # km²
+    elevtn: np.ndarray,  # low-res elevation
+    elv1m: np.ndarray,  # hi-res elevation
+    hires_lon: np.ndarray,  # (nx,) pixel centre longitudes
+    hires_lat: np.ndarray,  # (ny,) pixel centre latitudes
     upstXX: np.ndarray,
     upstYY: np.ndarray,
     outx: np.ndarray,
     outy: np.ndarray,
-    west: float, north: float, gsize: float,
-    west2: float, north2: float, csize: float,
-    nx: int, ny: int, nXX: int, nYY: int,
-    nn: int, n_ups: int, is_global: bool,
-) -> Tuple[
-    np.ndarray, np.ndarray,  # staX, staY
-    np.ndarray,              # gauge_type (1=main, 2=trib, 3=small)
-    np.ndarray, np.ndarray,  # upstream grid (jXX0, jYY0)
-    np.ndarray, np.ndarray, np.ndarray,  # elv_outlet, elv_gauge, elv_upstream
-    np.ndarray, np.ndarray,  # dst_outlet, dst_upstream
+    west: float,
+    north: float,
+    gsize: float,
+    west2: float,
+    north2: float,
+    csize: float,
+    nx: int,
+    ny: int,
+    nXX: int,
+    nYY: int,
+    nn: int,
+    n_ups: int,
+    is_global: bool,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,  # staX, staY
+    np.ndarray,  # gauge_type (1=main, 2=trib, 3=small)
+    np.ndarray,
+    np.ndarray,  # upstream grid (jXX0, jYY0)
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,  # elv_outlet, elv_gauge, elv_upstream
+    np.ndarray,
+    np.ndarray,  # dst_outlet, dst_upstream
 ]:
     """Level-gauge allocation — determines position type, distance, elevation.
 
@@ -122,8 +141,9 @@ def allocate_all_level_gauges(
             nix, niy = nextxy_hires(cur_ix, cur_iy, dwx1m, dwy1m, nx)
             if nix < 0 or nix >= nx or niy < 0 or niy >= ny:
                 break
-            dst += rgetlen(hires_lon[cur_ix], hires_lat[cur_iy],
-                            hires_lon[nix], hires_lat[niy])
+            dst += rgetlen(
+                hires_lon[cur_ix], hires_lat[cur_iy], hires_lon[nix], hires_lat[niy]
+            )
             if ctx1m[nix, niy] != iXX0 or cty1m[nix, niy] != iYY0:
                 break
             cur_ix = nix
@@ -144,8 +164,9 @@ def allocate_all_level_gauges(
 
             # Follow from upstream outlet to see if we reach gauge pixel
             t_jx, t_jy = nextxy_hires(oix, oiy, dwx1m, dwy1m, nx)
-            d = rgetlen(hires_lon[oix], hires_lat[oiy],
-                         hires_lon[t_jx], hires_lat[t_jy])
+            d = rgetlen(
+                hires_lon[oix], hires_lat[oiy], hires_lon[t_jx], hires_lat[t_jy]
+            )
             found_it = False
             for _ in range(max_steps):
                 if t_jx < 0 or t_jx >= nx or t_jy < 0 or t_jy >= ny:
@@ -158,8 +179,9 @@ def allocate_all_level_gauges(
                     found_it = True
                     break
                 n_jx, n_jy = nextxy_hires(t_jx, t_jy, dwx1m, dwy1m, nx)
-                d += rgetlen(hires_lon[t_jx], hires_lat[t_jy],
-                              hires_lon[n_jx], hires_lat[n_jy])
+                d += rgetlen(
+                    hires_lon[t_jx], hires_lat[t_jy], hires_lon[n_jx], hires_lat[n_jy]
+                )
                 t_jx = n_jx
                 t_jy = n_jy
 
@@ -178,7 +200,18 @@ def allocate_all_level_gauges(
             found_type = 3  # small stream
         gtype[g] = found_type
 
-    return staX, staY, gtype, upsX, upsY, elv_outlet, elv_gauge, elv_upst, dst_outlet, dst_upst
+    return (
+        staX,
+        staY,
+        gtype,
+        upsX,
+        upsY,
+        elv_outlet,
+        elv_gauge,
+        elv_upst,
+        dst_outlet,
+        dst_upst,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -264,21 +297,23 @@ class LevelGaugeAllocMixin:
         dst_outlet, dst_upstream     : distances (km)
         """
         N = len(self.gauge_ids)
-        dtype = np.dtype([
-            ("id", np.int64),
-            ("lat", np.float64),
-            ("lon", np.float64),
-            ("area_input", np.float64),
-            ("ix", np.int32),
-            ("iy", np.int32),
-            ("catchment_id", np.int64),
-            ("gauge_type", np.int32),
-            ("elv_outlet", np.float64),
-            ("elv_gauge", np.float64),
-            ("elv_upstream", np.float64),
-            ("dst_outlet", np.float64),
-            ("dst_upstream", np.float64),
-        ])
+        dtype = np.dtype(
+            [
+                ("id", np.int64),
+                ("lat", np.float64),
+                ("lon", np.float64),
+                ("area_input", np.float64),
+                ("ix", np.int32),
+                ("iy", np.int32),
+                ("catchment_id", np.int64),
+                ("gauge_type", np.int32),
+                ("elv_outlet", np.float64),
+                ("elv_gauge", np.float64),
+                ("elv_upstream", np.float64),
+                ("dst_outlet", np.float64),
+                ("dst_upstream", np.float64),
+            ]
+        )
         arr = np.empty(N, dtype=dtype)
         arr["id"] = self.gauge_ids
         arr["lat"] = self.gauge_lats
@@ -302,7 +337,9 @@ class LevelGaugeAllocMixin:
         arr["catchment_id"] = cid
         return arr
 
-    def write_level_gauge_alloc_file(self: HiResMap, out_path: str | Path | None = None) -> Path:
+    def write_level_gauge_alloc_file(
+        self: HiResMap, out_path: str | Path | None = None
+    ) -> Path:
         """Write level-gauge allocation results to text file."""
         if out_path is None:
             out_path = (self.out_dir or self.map_dir) / "level_gauge_alloc.txt"
@@ -324,9 +361,11 @@ class LevelGaugeAllocMixin:
             gt = self.lvl_gtype[i]
             ix_out = self.lvl_staX[i]
             iy_out = self.lvl_staY[i]
-            cid = int(np.ravel_multi_index(
-                (ix_out, iy_out), (self.nXX, self.nYY)
-            )) if ix_out >= 0 else -1
+            cid = (
+                int(np.ravel_multi_index((ix_out, iy_out), (self.nXX, self.nYY)))
+                if ix_out >= 0
+                else -1
+            )
 
             lines.append(
                 f"{gid:10d}{lat:10.3f}{lon:10.3f}{area_in:12.2f}"

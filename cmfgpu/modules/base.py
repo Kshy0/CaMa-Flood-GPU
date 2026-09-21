@@ -8,29 +8,33 @@
 Base module for CaMa-Flood-GPU using the TensorField / computed_tensor_field
 helpers for concise tensor metadata.
 """
+
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Self
 
 import torch
-from hydroforge.model import (AbstractModule, CoordinateField,
-                                        ReferenceField, ReferenceIndexField,
-                                        SelectionField, TensorField,
-                                        computed_tensor_field)
+from hydroforge.model import (
+    AbstractModule,
+    CoordinateField,
+    ReferenceField,
+    ReferenceIndexField,
+    SelectionField,
+    TensorField,
+    computed_tensor_field,
+)
 from pydantic import Field, computed_field, model_validator
 
 
 def BaseField(
     description: str,
-    shape: Tuple[str, ...] = ("num_catchments",),
+    shape: tuple[str, ...] = ("num_catchments",),
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    dim_coords: Optional[str] = "catchment_id",
-    category: Literal[
-        "topology", "param", "forcing", "init_state", "state"
-    ] = "param",
+    dim_coords: str | None = "catchment_id",
+    category: Literal["topology", "param", "forcing", "init_state", "state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
-    **kwargs
+    **kwargs,
 ):
 
     return TensorField(
@@ -40,18 +44,21 @@ def BaseField(
         dim_coords=dim_coords,
         category=category,
         mode=mode,
-        **kwargs
+        **kwargs,
     )
+
 
 def computed_base_field(
     description: str,
-    shape: Tuple[str, ...] = ("num_catchments",),
+    shape: tuple[str, ...] = ("num_catchments",),
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    dim_coords: Optional[str] = "catchment_id",
-    category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
-    expr: Optional[str] = None,
-    depends_on: Optional[str] = None,
-    **kwargs
+    dim_coords: str | None = "catchment_id",
+    category: Literal[
+        "topology", "derived_param", "state", "virtual"
+    ] = "derived_param",
+    expr: str | None = None,
+    depends_on: str | None = None,
+    **kwargs,
 ):
     return computed_tensor_field(
         description=description,
@@ -61,8 +68,9 @@ def computed_base_field(
         category=category,
         expr=expr,
         depends_on=depends_on,
-        **kwargs
+        **kwargs,
     )
+
 
 class BaseModule(AbstractModule):
     # --------------------------------------------------------------------- #
@@ -106,7 +114,6 @@ class BaseModule(AbstractModule):
         category="topology",
         mode="cpu",
     )
-
 
     downstream_id: torch.Tensor = ReferenceField(
         description="ID of immediate downstream catchment (points to self at river mouth)",
@@ -210,7 +217,7 @@ class BaseModule(AbstractModule):
         dtype="hpfloat",
     )
 
-    protected_storage: Optional[torch.Tensor] = BaseField(
+    protected_storage: torch.Tensor | None = BaseField(
         description="Current water volume stored in protected areas (m³)",
         default=0,
         category="init_state",
@@ -218,13 +225,13 @@ class BaseModule(AbstractModule):
         depends_on="levee",
     )
 
-    protected_depth: Optional[torch.Tensor] = BaseField(
+    protected_depth: torch.Tensor | None = BaseField(
         description="Current water depth on the protected side relative to river bed (m)",
         default=0,
         category="init_state",
         depends_on="levee",
     )
-    
+
     river_depth: torch.Tensor = BaseField(
         description="Current water depth in rivers (m)",
         default=0,
@@ -277,9 +284,7 @@ class BaseModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
-    @computed_field(
-        description="Total number of catchments."
-    )
+    @computed_field(description="Total number of catchments.")
     @cached_property
     def num_catchments(self) -> int:
         return self.catchment_id.shape[0]
@@ -290,7 +295,7 @@ class BaseModule(AbstractModule):
     @cached_property
     def num_output_catchments(self) -> int:
         return self.output_catchment_id.shape[0]
-    
+
     @computed_field(
         description="Number of flood levels represented in the lookup tables."
     )
@@ -311,7 +316,7 @@ class BaseModule(AbstractModule):
         output_only=True,
     )
     @cached_property
-    def total_storage(self) -> Optional[torch.Tensor]:
+    def total_storage(self) -> torch.Tensor | None:
         total = self.river_storage + self.flood_storage
         if self.protected_storage is not None:
             total = total + self.protected_storage
@@ -319,8 +324,10 @@ class BaseModule(AbstractModule):
 
     # ---------------- Hidden / intermediate states ------------------- #
     @computed_base_field(
-        description=("Total outgoing storage from each catchment (m³)"
-                     "Can not be saved, as it is a temporary state."),
+        description=(
+            "Total outgoing storage from each catchment (m³)"
+            "Can not be saved, as it is a temporary state."
+        ),
         output="disabled",
         category="state",
         dtype="hpfloat",
@@ -338,7 +345,7 @@ class BaseModule(AbstractModule):
         expr="river_depth + catchment_elevation - river_height",
     )
     @cached_property
-    def water_surface_elevation(self) -> Optional[torch.Tensor]:
+    def water_surface_elevation(self) -> torch.Tensor | None:
         return None
 
     @computed_base_field(
@@ -356,10 +363,10 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Total flooded area (m²)",
         category="virtual",
-        expr="flood_fraction * catchment_area"
+        expr="flood_fraction * catchment_area",
     )
     @cached_property
-    def flood_area(self) -> Optional[torch.Tensor]:
+    def flood_area(self) -> torch.Tensor | None:
         return None
 
     @computed_base_field(
@@ -380,7 +387,7 @@ class BaseModule(AbstractModule):
         expr="river_outflow + flood_outflow",
     )
     @cached_property
-    def total_outflow(self) -> Optional[torch.Tensor]:
+    def total_outflow(self) -> torch.Tensor | None:
         return None
 
     # ------------------------------------------------------------------ #
@@ -388,7 +395,7 @@ class BaseModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @computed_base_field(
         description="Current sub-step time step (seconds). "
-                    "Updated via .fill_() before each sub-step loop.",
+        "Updated via .fill_() before each sub-step loop.",
         shape=(1,),
         output="disabled",
         category="shared_state",
@@ -409,7 +416,7 @@ class BaseModule(AbstractModule):
 
     @computed_base_field(
         description="Current sub-step index within the time step. "
-                    "Updated via .fill_() before each sub-step for log kernels.",
+        "Updated via .fill_() before each sub-step for log kernels.",
         shape=(1,),
         output="disabled",
         category="shared_state",
@@ -418,8 +425,6 @@ class BaseModule(AbstractModule):
     @cached_property
     def current_step(self) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.int32, device=self.device)
-
-
 
     # ------------------------------------------------------------------ #
     # Post-init validation
@@ -497,14 +502,11 @@ class BaseModule(AbstractModule):
             for name, value in nonnegative_state.items()
         }
         invalid_state_counts = {
-            name: count
-            for name, count in invalid_state_counts.items()
-            if count
+            name: count for name, count in invalid_state_counts.items() if count
         }
         if invalid_state_counts:
             details = ", ".join(
-                f"{name}={count}"
-                for name, count in invalid_state_counts.items()
+                f"{name}={count}" for name, count in invalid_state_counts.items()
             )
             raise ValueError(
                 "Initial storage, depth, and cross-section state must contain "
@@ -526,14 +528,11 @@ class BaseModule(AbstractModule):
             }.items()
         }
         nonfinite_flow_counts = {
-            name: count
-            for name, count in nonfinite_flow_counts.items()
-            if count
+            name: count for name, count in nonfinite_flow_counts.items() if count
         }
         if nonfinite_flow_counts:
             details = ", ".join(
-                f"{name}={count}"
-                for name, count in nonfinite_flow_counts.items()
+                f"{name}={count}" for name, count in nonfinite_flow_counts.items()
             )
             raise ValueError(
                 "Initial river and flood outflow must contain only finite "

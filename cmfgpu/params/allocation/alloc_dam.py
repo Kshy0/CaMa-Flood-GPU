@@ -7,16 +7,19 @@
 """
 Dam allocation kernel and mixin for :class:`HiResMap`.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numba import njit
 
-from cmfgpu.params.allocation.hires_kernels import (search_best_pixel,
-                                                    trace_gauge_downstream)
+from cmfgpu.params.allocation.hires_kernels import (
+    search_best_pixel,
+    trace_gauge_downstream,
+)
 
 if TYPE_CHECKING:
     from cmfgpu.params.allocation.hires_map import HiResMap
@@ -34,28 +37,38 @@ def _find_col(header_lower: list[str], aliases: list[str]) -> int | None:
 # Numba kernel
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def allocate_all_dams(
-    dam_ids: np.ndarray,        # (N,) int64
-    dam_lats: np.ndarray,       # (N,) float64
-    dam_lons: np.ndarray,       # (N,) float64
-    dam_areas: np.ndarray,      # (N,) float64  — upstream area in km²
+    dam_ids: np.ndarray,  # (N,) int64
+    dam_lats: np.ndarray,  # (N,) float64
+    dam_lons: np.ndarray,  # (N,) float64
+    dam_areas: np.ndarray,  # (N,) float64  — upstream area in km²
     upa1m: np.ndarray,
     ctx1m: np.ndarray,
     cty1m: np.ndarray,
     dwx1m: np.ndarray,
     dwy1m: np.ndarray,
-    uparea: np.ndarray,         # km²
-    ctmare: np.ndarray,         # km²  (catchment area)
+    uparea: np.ndarray,  # km²
+    ctmare: np.ndarray,  # km²  (catchment area)
     upstXX: np.ndarray,
     upstYY: np.ndarray,
     outx: np.ndarray,
     outy: np.ndarray,
-    west: float, north: float, gsize: float,
-    west2: float, north2: float, csize: float,
-    nx: int, ny: int, nXX: int, nYY: int,
-    nn: int, n_ups: int, is_global: bool,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    west: float,
+    north: float,
+    gsize: float,
+    west2: float,
+    north2: float,
+    csize: float,
+    nx: int,
+    ny: int,
+    nXX: int,
+    nYY: int,
+    nn: int,
+    n_ups: int,
+    is_global: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Dam allocation — single-mode upstream, with sub-grid dam detection.
 
     Returns 5 arrays of length N:
@@ -75,7 +88,7 @@ def allocate_all_dams(
     for g in range(N):
         lat0 = dam_lats[g]
         lon0 = dam_lons[g]
-        area0 = dam_areas[g]   # km²
+        area0 = dam_areas[g]  # km²
 
         east = west + nXX * gsize
         south = north - nYY * gsize
@@ -117,7 +130,7 @@ def allocate_all_dams(
         err1 = (uparea[iXX0, iYY0] - area0_km2) / area0_km2
 
         snum = 0
-        if abs(err1) > 0.2:   # dam uses 20% threshold (vs 5% for gauges)
+        if abs(err1) > 0.2:  # dam uses 20% threshold (vs 5% for gauges)
             for i_ups in range(n_ups):
                 jXX = upstXX[iXX0, iYY0, i_ups]
                 jYY = upstYY[iXX0, iYY0, i_ups]
@@ -185,13 +198,13 @@ class DamAllocMixin:
         name if present.
         """
         dam_list_path = Path(dam_list_path)
-        ids: List[int] = []
-        lats: List[float] = []
-        lons: List[float] = []
-        areas: List[float] = []
-        names: List[str] = []
-        cap_mcm_list: List[float] = []
-        year_list: List[int] = []
+        ids: list[int] = []
+        lats: list[float] = []
+        lons: list[float] = []
+        areas: list[float] = []
+        names: list[str] = []
+        cap_mcm_list: list[float] = []
+        year_list: list[int] = []
 
         with open(dam_list_path, encoding="utf-8-sig") as f:
             header = f.readline()
@@ -303,7 +316,9 @@ class DamAllocMixin:
         n_river = int(np.sum((self.dam_staX != self.MISSING) & (self.dam_area_cmf > 0)))
         n_small = int(np.sum(self.dam_area_cmf == -888.0))
         n_fail = int(np.sum(self.dam_staX == self.MISSING))
-        print(f"Dam allocation done: {n_river} river, {n_small} sub-grid, {n_fail} failed")
+        print(
+            f"Dam allocation done: {n_river} river, {n_small} sub-grid, {n_fail} failed"
+        )
 
     def dam_results_as_structured_array(self: HiResMap) -> np.ndarray:
         """Pack dam allocation results into a structured NumPy array.
@@ -320,20 +335,22 @@ class DamAllocMixin:
         year                    : construction year, -99 if unavailable
         """
         N = len(self.dam_ids)
-        dtype = np.dtype([
-            ("id", np.int64),
-            ("lat", np.float64),
-            ("lon", np.float64),
-            ("area_input", np.float64),
-            ("ix", np.int32),
-            ("iy", np.int32),
-            ("catchment_id", np.int64),
-            ("area_cama", np.float64),
-            ("error", np.float64),
-            ("snum", np.int32),
-            ("cap_mcm", np.float64),
-            ("year", np.int64),
-        ])
+        dtype = np.dtype(
+            [
+                ("id", np.int64),
+                ("lat", np.float64),
+                ("lon", np.float64),
+                ("area_input", np.float64),
+                ("ix", np.int32),
+                ("iy", np.int32),
+                ("catchment_id", np.int64),
+                ("area_cama", np.float64),
+                ("error", np.float64),
+                ("snum", np.int32),
+                ("cap_mcm", np.float64),
+                ("year", np.int64),
+            ]
+        )
         arr = np.empty(N, dtype=dtype)
         arr["id"] = self.dam_ids
         arr["lat"] = self.dam_lats
@@ -344,10 +361,10 @@ class DamAllocMixin:
         arr["area_cama"] = self.dam_area_cmf
         arr["error"] = self.dam_err_rel
         arr["snum"] = self.dam_snum
-        arr["cap_mcm"] = getattr(self, "dam_cap_mcm",
-                                  np.full(N, -999.0, dtype=np.float64))
-        arr["year"] = getattr(self, "dam_years",
-                               np.full(N, -99, dtype=np.int64))
+        arr["cap_mcm"] = getattr(
+            self, "dam_cap_mcm", np.full(N, -999.0, dtype=np.float64)
+        )
+        arr["year"] = getattr(self, "dam_years", np.full(N, -99, dtype=np.int64))
 
         cid = np.full(N, -1, dtype=np.int64)
         ok = (self.dam_staX >= 0) & (self.dam_staY >= 0)
@@ -358,7 +375,9 @@ class DamAllocMixin:
         arr["catchment_id"] = cid
         return arr
 
-    def write_dam_alloc_file(self: HiResMap, out_path: str | Path | None = None) -> Path:
+    def write_dam_alloc_file(
+        self: HiResMap, out_path: str | Path | None = None
+    ) -> Path:
         """Write dam allocation results to text file."""
         if out_path is None:
             out_path = (self.out_dir or self.map_dir) / "dam_alloc.txt"
@@ -387,9 +406,11 @@ class DamAllocMixin:
             else:
                 tag = "RIV"
 
-            cid = int(np.ravel_multi_index(
-                (ix_out, iy_out), (self.nXX, self.nYY)
-            )) if ix_out >= 0 else -1
+            cid = (
+                int(np.ravel_multi_index((ix_out, iy_out), (self.nXX, self.nYY)))
+                if ix_out >= 0
+                else -1
+            )
 
             lines.append(
                 f"{gid:10d}{lat:10.3f}{lon:10.3f}{area_in:12.2f}"

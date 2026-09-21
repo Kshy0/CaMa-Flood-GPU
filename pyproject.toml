@@ -3,6 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
+requires-python = ">=3.11"
 name = "cmfgpu"
 version = "0.1"
 description = ""
@@ -10,7 +11,7 @@ authors = [
     {name = "Shengyu Kang", email = "kshy0204@whu.edu.cn"}
 ]
 dependencies = [
-    "hydroforge>=0.2.0",
+    "hydroforge>=0.3.0",
     "netCDF4",
     "scipy",
     "numba",
@@ -28,3 +29,10 @@ include = ["cmfgpu*"]
 
 [project.optional-dependencies]
 dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "meson", "ninja"]
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["inp", "out", "private"]
+
+[tool.ruff.lint]
+select = ["UP006", "UP007", "UP035", "UP045"]

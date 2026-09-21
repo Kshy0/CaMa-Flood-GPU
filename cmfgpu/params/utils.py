@@ -7,7 +7,7 @@
 import fnmatch
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import numpy as np
 from hydroforge.data import find_indices_in
@@ -137,6 +137,7 @@ def topological_sort(catchment_id, downstream_id):
 
     return result_idx
 
+
 @njit
 def compute_init_river_depth(catchment_elevation, river_height, downstream_idx):
     num_catchments = len(catchment_elevation)
@@ -149,8 +150,7 @@ def compute_init_river_depth(catchment_elevation, river_height, downstream_idx):
             river_depth[i] = river_height[i]
         else:
             river_depth[i] = max(
-                river_depth[j] + river_elevation[j] - river_elevation[i],
-                0.0
+                river_depth[j] + river_elevation[j] - river_elevation[i], 0.0
             )
         river_depth[i] = min(river_depth[i], river_height[i])
 
@@ -252,14 +252,21 @@ def _uf_find_nb(parent, x):
 
 @njit(cache=True)
 def _bif_merge_one_round(
-    bif_up_bidx, bif_dn_bidx, bsize, parent,
-    grid_thrs, thrs2, num_basins, reverse_paths, reverse_resolve,
+    bif_up_bidx,
+    bif_dn_bidx,
+    bsize,
+    parent,
+    grid_thrs,
+    thrs2,
+    num_basins,
+    reverse_paths,
+    reverse_resolve,
 ):
     """One round of proposal + chain-resolution + apply.
 
-      1. Scan paths (forward or reverse) → collect basin merge proposals
-      2. Resolve chains (forward or reverse) → apply with size checks
-      3. Return whether any merge happened
+    1. Scan paths (forward or reverse) → collect basin merge proposals
+    2. Resolve chains (forward or reverse) → apply with size checks
+    3. Return whether any merge happened
     """
     num_paths = len(bif_up_bidx)
     bnew = np.full(num_basins, -9999, dtype=np.int64)
@@ -349,21 +356,22 @@ def _build_river_only_paths(bif_up_bidx, bif_dn_bidx, bif_is_river):
 
 
 @njit(cache=True)
-def _merge_and_count(river_up, river_dn, bif_up, bif_dn,
-                     init_sizes, grid_thrs, thrs2):
+def _merge_and_count(river_up, river_dn, bif_up, bif_dn, init_sizes, grid_thrs, thrs2):
     """Run two-step merge at given thresholds; return (parent, bsize, count)."""
     N = len(init_sizes)
     bsize = init_sizes.copy()
     parent = np.arange(N, dtype=np.int64)
     # STEP1: river forward scan, forward resolve
     for _ in range(200):
-        if not _bif_merge_one_round(river_up, river_dn, bsize, parent,
-                                     grid_thrs, thrs2, N, False, False):
+        if not _bif_merge_one_round(
+            river_up, river_dn, bsize, parent, grid_thrs, thrs2, N, False, False
+        ):
             break
     # STEP2: all paths forward scan, reverse resolve
     for _ in range(200):
-        if not _bif_merge_one_round(bif_up, bif_dn, bsize, parent,
-                                     grid_thrs, thrs2, N, False, True):
+        if not _bif_merge_one_round(
+            bif_up, bif_dn, bsize, parent, grid_thrs, thrs2, N, False, True
+        ):
             break
     # Flatten
     for i in range(N):
@@ -422,15 +430,27 @@ def merge_basins_bifurcation_thresholds(
     thrs2 = np.int64(allgrid * 0.001)
 
     river_up, river_dn = _build_river_only_paths(bif_up_bidx, bif_dn_bidx, bif_is_river)
-    parent, bsize, _ = _merge_and_count(river_up, river_dn, bif_up_bidx, bif_dn_bidx,
-                                         initial_basin_sizes, grid_thrs, thrs2)
+    parent, bsize, _ = _merge_and_count(
+        river_up,
+        river_dn,
+        bif_up_bidx,
+        bif_dn_bidx,
+        initial_basin_sizes,
+        grid_thrs,
+        thrs2,
+    )
     return parent, bsize
 
 
 @njit(cache=True)
-def search_optimal_merge_rate(bif_up_bidx, bif_dn_bidx, bif_is_river,
-                              initial_basin_sizes, target_basins,
-                              max_iter=25):
+def search_optimal_merge_rate(
+    bif_up_bidx,
+    bif_dn_bidx,
+    bif_is_river,
+    initial_basin_sizes,
+    target_basins,
+    max_iter=25,
+):
     """Binary-search rate to get basin count closest to target_basins.
 
     All computation stays inside numba; river-only path arrays are built once.
@@ -443,8 +463,7 @@ def search_optimal_merge_rate(bif_up_bidx, bif_dn_bidx, bif_is_river,
         allgrid += initial_basin_sizes[i]
     thrs2 = np.int64(allgrid * 0.001)
 
-    river_up, river_dn = _build_river_only_paths(
-        bif_up_bidx, bif_dn_bidx, bif_is_river)
+    river_up, river_dn = _build_river_only_paths(bif_up_bidx, bif_dn_bidx, bif_is_river)
 
     lo = 0.001
     hi = 1.0
@@ -459,8 +478,14 @@ def search_optimal_merge_rate(bif_up_bidx, bif_dn_bidx, bif_is_river,
         grid_thrs = np.int64(allgrid * mid)
 
         parent, bsize, count = _merge_and_count(
-            river_up, river_dn, bif_up_bidx, bif_dn_bidx,
-            initial_basin_sizes, grid_thrs, thrs2)
+            river_up,
+            river_dn,
+            bif_up_bidx,
+            bif_dn_bidx,
+            initial_basin_sizes,
+            grid_thrs,
+            thrs2,
+        )
 
         diff = abs(count - target_basins)
         if diff < best_diff:
@@ -473,9 +498,9 @@ def search_optimal_merge_rate(bif_up_bidx, bif_dn_bidx, bif_is_river,
         if count == target_basins:
             break
         elif count > target_basins:
-            lo = mid   # too many basins → increase rate → more merging
+            lo = mid  # too many basins → increase rate → more merging
         else:
-            hi = mid   # too few → decrease rate → less merging
+            hi = mid  # too few → decrease rate → less merging
 
     return best_rate, best_parent, best_bsize, best_count
 
@@ -498,11 +523,14 @@ def reorder_by_basin_size(topo_idx: np.ndarray, basin_id: np.ndarray):
     topo_rank = rank[inverse]
 
     # Stable sort topo_idx by basin rank (preserves topological order within basin)
-    new_order = topo_idx[np.argsort(topo_rank, kind='stable')]
+    new_order = topo_idx[np.argsort(topo_rank, kind="stable")]
 
     return (new_order.astype(np.int64), basin_sizes)
 
-def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_to_keep: int):
+
+def read_bifori(
+    bifori_file: Path, rivhgt_2d: np.ndarray | None, bif_levels_to_keep: int
+):
     """
     Vectorized reader for bifori.txt:
       - Keep only paths where any width>0 within the first keepN levels
@@ -516,7 +544,7 @@ def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_t
       up/down indices are 0-based; wth/elv have shape (npath_kept, keepN)
     """
     # Read header to get npth, nlev
-    with open(bifori_file, "r") as f:
+    with open(bifori_file) as f:
         head = f.readline().split()
         if len(head) < 2:
             raise ValueError("Invalid bifori header")
@@ -539,7 +567,9 @@ def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_t
         ndmin=2,
     )
     if data.shape[0] != npth:
-        raise ValueError(f"Expected {npth} paths, but got {data.shape[0]} rows in bifori")
+        raise ValueError(
+            f"Expected {npth} paths, but got {data.shape[0]} rows in bifori"
+        )
 
     # Unpack and shift to 0-based indices
     ij = data[:, 0:4].astype(np.int64) - 1
@@ -601,18 +631,19 @@ def read_bifori(bifori_file: Path, rivhgt_2d: Optional[np.ndarray], bif_levels_t
         elv,
     )
 
+
 def resolve_target_cids_from_poi(
-    poi: Dict[str, Any],
+    poi: dict[str, Any],
     catchment_id: np.ndarray,
     catchment_x: np.ndarray,
     catchment_y: np.ndarray,
-    gauge_info: Optional[Dict[str, Any]] = None,
+    gauge_info: dict[str, Any] | None = None,
     # nc_src: Optional[Dataset] = None # Optional: if looking up gauges from NC
 ) -> np.ndarray:
     """
     Resolve Points of Interest (POI) dict to a list of unique target catchment IDs.
     """
-    target_cids: List[int] = []
+    target_cids: list[int] = []
 
     # 1) Gauges
     gauges_val = poi.get("gauges")
@@ -627,44 +658,52 @@ def resolve_target_cids_from_poi(
                 for g_id_pattern in gauges_val:
                     pattern = str(g_id_pattern)
                     # Check if it contains wildcard characters
-                    if '*' in pattern or '?' in pattern or '[' in pattern:
-                         matched = False
-                         for g_key, info in gauge_info.items():
-                              if fnmatch.fnmatch(g_key, pattern):
-                                   target_cids.extend(info.get("upstream_id", []))
-                                   matched = True
-                         if not matched:
-                              raise ValueError(f"No gauges matched pattern '{pattern}'.")
+                    if "*" in pattern or "?" in pattern or "[" in pattern:
+                        matched = False
+                        for g_key, info in gauge_info.items():
+                            if fnmatch.fnmatch(g_key, pattern):
+                                target_cids.extend(info.get("upstream_id", []))
+                                matched = True
+                        if not matched:
+                            raise ValueError(f"No gauges matched pattern '{pattern}'.")
                     else:
                         if pattern in gauge_info:
-                            target_cids.extend(gauge_info[pattern].get("upstream_id", []))
+                            target_cids.extend(
+                                gauge_info[pattern].get("upstream_id", [])
+                            )
                         else:
-                            raise ValueError(f"Gauge '{pattern}' not found in loaded gauge info.")
+                            raise ValueError(
+                                f"Gauge '{pattern}' not found in loaded gauge info."
+                            )
         else:
-             raise ValueError("'gauges' POI requested but gauge_info not provided or available.")
+            raise ValueError(
+                "'gauges' POI requested but gauge_info not provided or available."
+            )
 
     # 2) Coordinates
-    coords_cids: List[int] = []
+    coords_cids: list[int] = []
     coords_val = poi.get("coords")
     if coords_val is not None:
         for val in coords_val:
-             if len(val) == 2:
-                  x, y = val
-                  mask = (catchment_x == x) & (catchment_y == y)
-                  cids_found = catchment_id[mask]
-                  if cids_found.size > 0:
-                       cid = cids_found[0]
-                       coords_cids.append(cid)
-                       target_cids.append(cid)
-                  else:
-                       raise ValueError(f"No catchment found at coords ({x}, {y}). "
-                                        f"Check the map coordinates and try again.")
+            if len(val) == 2:
+                x, y = val
+                mask = (catchment_x == x) & (catchment_y == y)
+                cids_found = catchment_id[mask]
+                if cids_found.size > 0:
+                    cid = cids_found[0]
+                    coords_cids.append(cid)
+                    target_cids.append(cid)
+                else:
+                    raise ValueError(
+                        f"No catchment found at coords ({x}, {y}). "
+                        f"Check the map coordinates and try again."
+                    )
 
     # 3) Explicit Catchment IDs
     catches_val = poi.get("catchments")
     if catches_val is not None:
-         target_cids.extend(catches_val)
-    
+        target_cids.extend(catches_val)
+
     # Cross-check: If both Coords and Catchments are provided, ensure strict consistency.
     # Every coordinate MUST map to a catchment ID that is present in the provided catchments list.
     if coords_val is not None and catches_val is not None:
@@ -675,13 +714,12 @@ def resolve_target_cids_from_poi(
                     f"Consistency Check Failed: Coordinate mapped to CID {cid}, "
                     f"but this CID is not in the provided 'catchments' list."
                 )
-    
+
     return np.unique(np.array(target_cids, dtype=np.int64))
 
+
 def get_kept_basin_ids(
-    target_cids: np.ndarray,
-    catchment_id: np.ndarray,
-    catchment_basin_id: np.ndarray
+    target_cids: np.ndarray, catchment_id: np.ndarray, catchment_basin_id: np.ndarray
 ) -> np.ndarray:
     """
     Given target catchment IDs, find which basins they belong to.
@@ -738,27 +776,30 @@ def _build_upstream_adj(catchment_id, downstream_id):
     grid_to_idx[cid_arr] = np.arange(len(cid_arr), dtype=np.int64)
     return indptr, indices, grid_to_idx, cid_arr
 
+
 def plot_basins_common(
-    map_shape: Tuple[int, int],
+    map_shape: tuple[int, int],
     catchment_x: np.ndarray,
     catchment_y: np.ndarray,
     catchment_basin_id: np.ndarray,
-    save_path: Optional[Path] = None,
+    save_path: Path | None = None,
     # Optional overlays
-    gauges_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    levees_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    bifurcations: Optional[Dict[str, np.ndarray]] = None, # keys: x1, y1, x2, y2
-    removed_bifurcations: Optional[Dict[str, np.ndarray]] = None,
-    pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None, # Points of interest markers
-    river_mouths_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None, # River mouths markers
-    dams_xyc: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None, # (x, y, capacity_mcm)
+    gauges_xy: tuple[np.ndarray, np.ndarray] | None = None,
+    levees_xy: tuple[np.ndarray, np.ndarray] | None = None,
+    bifurcations: dict[str, np.ndarray] | None = None,  # keys: x1, y1, x2, y2
+    removed_bifurcations: dict[str, np.ndarray] | None = None,
+    pois_xy: tuple[np.ndarray, np.ndarray] | None = None,  # Points of interest markers
+    river_mouths_xy: tuple[np.ndarray, np.ndarray]
+    | None = None,  # River mouths markers
+    dams_xyc: tuple[np.ndarray, np.ndarray, np.ndarray]
+    | None = None,  # (x, y, capacity_mcm)
     # Configuration
-    longitude: Optional[np.ndarray] = None,
-    latitude: Optional[np.ndarray] = None,
+    longitude: np.ndarray | None = None,
+    latitude: np.ndarray | None = None,
     title: str = "Basin Visualization",
-    upstream_area: Optional[np.ndarray] = None,
+    upstream_area: np.ndarray | None = None,
     color_by_upstream_area: bool = False,
-    query_outline: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    query_outline: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> None:
     """
     Shared plotting logic for basins.
@@ -772,28 +813,37 @@ def plot_basins_common(
         return
 
     nx, ny = map_shape
-    
+
     # Coordinate system setup
     use_lonlat = (longitude is not None) and (latitude is not None)
-    
+
     if use_lonlat and len(catchment_x) > 1:
         slope_x, intercept_x = np.polyfit(catchment_x, longitude, 1)
         slope_y, intercept_y = np.polyfit(catchment_y, latitude, 1)
-        
+
         left = intercept_x + slope_x * (-0.5)
         right = intercept_x + slope_x * (nx - 0.5)
         bottom = intercept_y + slope_y * (ny - 0.5)
         top = intercept_y + slope_y * (-0.5)
         extent = (left, right, bottom, top)
         xlabel, ylabel = "Longitude", "Latitude"
-        def idx_to_lon(x): return intercept_x + slope_x * x
-        def idx_to_lat(y): return intercept_y + slope_y * y
+
+        def idx_to_lon(x):
+            return intercept_x + slope_x * x
+
+        def idx_to_lat(y):
+            return intercept_y + slope_y * y
     else:
         use_lonlat = False
         extent = None
         xlabel, ylabel = "X Index", "Y Index"
-        def idx_to_lon(x): return x
-        def idx_to_lat(y): return y
+
+        def idx_to_lon(x):
+            return x
+
+        def idx_to_lat(y):
+            return y
+
         slope_x = slope_y = intercept_x = intercept_y = 0
 
     # Basin Map
@@ -802,7 +852,7 @@ def plot_basins_common(
     if len(catchment_x) > 0:
         basin_map[catchment_x, catchment_y] = catchment_basin_id
         num_basins = int(catchment_basin_id.max()) + 1
-        
+
         if upstream_area is not None:
             uparea_map = np.full(map_shape, fill_value=np.nan, dtype=float)
             uparea_map[catchment_x, catchment_y] = upstream_area
@@ -816,7 +866,9 @@ def plot_basins_common(
         rng = np.random.RandomState(42)
         while len(colors) < N:
             color = rng.rand(3)
-            if len(avoid_rgb_colors) == 0 or np.all(np.linalg.norm(avoid_rgb_colors - color, axis=1) > 0.7):
+            if len(avoid_rgb_colors) == 0 or np.all(
+                np.linalg.norm(avoid_rgb_colors - color, axis=1) > 0.7
+            ):
                 colors.append(color)
         return np.array(colors)
 
@@ -835,22 +887,35 @@ def plot_basins_common(
     # Plot
     display_dpi = 150
     plt.figure(figsize=(12, 10), dpi=display_dpi)
-    
+
     if color_by_upstream_area and uparea_map is not None:
-         # Use LogNorm for better visualization of large ranges in upstream area
-         valid_uparea = uparea_map[uparea_map > 0]
-         vmin = np.nanmin(valid_uparea) if valid_uparea.size > 0 else 1.0
-         vmax = np.nanmax(uparea_map) if np.nanmax(uparea_map) > vmin else vmin + 1.0
-         
-         norm = LogNorm(vmin=vmin, vmax=vmax)
-         img_data = np.ma.masked_invalid(uparea_map).T
-         
-         plt.imshow(img_data, origin='upper', cmap='plasma', interpolation='nearest',
-                   norm=norm, extent=extent)
-         plt.colorbar(label='Upstream Area ($m^2$)', shrink=0.5)
+        # Use LogNorm for better visualization of large ranges in upstream area
+        valid_uparea = uparea_map[uparea_map > 0]
+        vmin = np.nanmin(valid_uparea) if valid_uparea.size > 0 else 1.0
+        vmax = np.nanmax(uparea_map) if np.nanmax(uparea_map) > vmin else vmin + 1.0
+
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+        img_data = np.ma.masked_invalid(uparea_map).T
+
+        plt.imshow(
+            img_data,
+            origin="upper",
+            cmap="plasma",
+            interpolation="nearest",
+            norm=norm,
+            extent=extent,
+        )
+        plt.colorbar(label="Upstream Area ($m^2$)", shrink=0.5)
     else:
-        plt.imshow(np.ma.masked_invalid(basin_map).T, origin='upper', cmap=default_cmap, interpolation='nearest',
-                vmin=-0.5, vmax=num_basins - 0.5, extent=extent)
+        plt.imshow(
+            np.ma.masked_invalid(basin_map).T,
+            origin="upper",
+            cmap=default_cmap,
+            interpolation="nearest",
+            vmin=-0.5,
+            vmax=num_basins - 0.5,
+            extent=extent,
+        )
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
@@ -863,25 +928,32 @@ def plot_basins_common(
         x1_idx = min(nx - 1, int(catchment_x.max()) + margin)
         y0_idx = max(0, int(catchment_y.min()) - margin)
         y1_idx = min(ny - 1, int(catchment_y.max()) + margin)
-        
+
         if use_lonlat:
-             xlim_min = idx_to_lon(x0_idx - 0.5)
-             xlim_max = idx_to_lon(x1_idx + 0.5)
-             ylim_min = idx_to_lat(y1_idx + 0.5)
-             ylim_max = idx_to_lat(y0_idx - 0.5)
-             plt.xlim(xlim_min, xlim_max)
-             plt.ylim(ylim_min, ylim_max)
-             def within_extent(xv, yv):
-                return (xv >= min(xlim_min, xlim_max)) & (xv <= max(xlim_min, xlim_max)) & \
-                       (yv >= min(ylim_min, ylim_max)) & (yv <= max(ylim_min, ylim_max))
+            xlim_min = idx_to_lon(x0_idx - 0.5)
+            xlim_max = idx_to_lon(x1_idx + 0.5)
+            ylim_min = idx_to_lat(y1_idx + 0.5)
+            ylim_max = idx_to_lat(y0_idx - 0.5)
+            plt.xlim(xlim_min, xlim_max)
+            plt.ylim(ylim_min, ylim_max)
+
+            def within_extent(xv, yv):
+                return (
+                    (xv >= min(xlim_min, xlim_max))
+                    & (xv <= max(xlim_min, xlim_max))
+                    & (yv >= min(ylim_min, ylim_max))
+                    & (yv <= max(ylim_min, ylim_max))
+                )
         else:
-             plt.xlim(x0_idx - 0.5, x1_idx + 0.5)
-             plt.ylim(y1_idx + 0.5, y0_idx - 0.5)
-             def within_extent(xv, yv):
-                 return (xv >= x0_idx) & (xv <= x1_idx) & (yv >= y0_idx) & (yv <= y1_idx)
+            plt.xlim(x0_idx - 0.5, x1_idx + 0.5)
+            plt.ylim(y1_idx + 0.5, y0_idx - 0.5)
+
+            def within_extent(xv, yv):
+                return (xv >= x0_idx) & (xv <= x1_idx) & (yv >= y0_idx) & (yv <= y1_idx)
     else:
-         def within_extent(xv, yv):
-             return np.zeros_like(xv, dtype=bool)
+
+        def within_extent(xv, yv):
+            return np.zeros_like(xv, dtype=bool)
 
     # Overlays
     if gauges_xy:
@@ -890,7 +962,7 @@ def plot_basins_common(
             gx, gy = idx_to_lon(gx), idx_to_lat(gy)
         m = within_extent(gx, gy)
         if np.any(m):
-            plt.scatter(gx[m], gy[m], c='#00FF00', s=0.5, label='Gauges', zorder=5)
+            plt.scatter(gx[m], gy[m], c="#00FF00", s=0.5, label="Gauges", zorder=5)
 
     if levees_xy:
         lx, ly = levees_xy
@@ -898,15 +970,17 @@ def plot_basins_common(
             lx, ly = idx_to_lon(lx), idx_to_lat(ly)
         m = within_extent(lx, ly)
         if np.any(m):
-            plt.scatter(lx[m], ly[m], c='#800080', s=0.2, label='Levees', zorder=4)
-            
+            plt.scatter(lx[m], ly[m], c="#800080", s=0.2, label="Levees", zorder=4)
+
     if pois_xy:
         px, py = pois_xy
         if use_lonlat:
             px, py = idx_to_lon(px), idx_to_lat(py)
         m = within_extent(px, py)
         if np.any(m):
-            plt.scatter(px[m], py[m], c="#C10000", s=5.0, label='Points of Interest', zorder=6)
+            plt.scatter(
+                px[m], py[m], c="#C10000", s=5.0, label="Points of Interest", zorder=6
+            )
 
     if river_mouths_xy:
         rmx, rmy = river_mouths_xy
@@ -914,7 +988,17 @@ def plot_basins_common(
             rmx, rmy = idx_to_lon(rmx), idx_to_lat(rmy)
         m = within_extent(rmx, rmy)
         if np.any(m):
-             plt.scatter(rmx[m], rmy[m], c='red', edgecolors='black', s=20.0, marker='*', linewidths=0.3, label='River Mouth', zorder=7)
+            plt.scatter(
+                rmx[m],
+                rmy[m],
+                c="red",
+                edgecolors="black",
+                s=20.0,
+                marker="*",
+                linewidths=0.3,
+                label="River Mouth",
+                zorder=7,
+            )
 
     if dams_xyc is not None:
         dx, dy, dcap = dams_xyc
@@ -927,79 +1011,113 @@ def plot_basins_common(
             cap_pos = np.maximum(cap_m, 1.0)
             sizes = np.clip(np.log10(cap_pos) * 3.0, 1.0, 30.0)
             plt.scatter(
-                dx[m], dy[m], s=sizes, c='#FF6600', marker='^',
-                edgecolors='#993300', linewidths=0.3, alpha=0.8,
-                label='Dams', zorder=8,
+                dx[m],
+                dy[m],
+                s=sizes,
+                c="#FF6600",
+                marker="^",
+                edgecolors="#993300",
+                linewidths=0.3,
+                alpha=0.8,
+                label="Dams",
+                zorder=8,
             )
 
     def plot_bifs(bifs, color, linestyle, label):
         if not bifs:
             return
-        x1, y1 = bifs['x1'], bifs['y1']
-        x2, y2 = bifs['x2'], bifs['y2']
+        x1, y1 = bifs["x1"], bifs["y1"]
+        x2, y2 = bifs["x2"], bifs["y2"]
         if use_lonlat:
             x1, y1 = idx_to_lon(x1), idx_to_lat(y1)
             x2, y2 = idx_to_lon(x2), idx_to_lat(y2)
             limit = 180.0
         else:
             limit = nx / 2
-        
-        mask = (np.abs(x1 - x2) <= limit) & (within_extent(x1, y1) | within_extent(x2, y2))
-        
+
+        mask = (np.abs(x1 - x2) <= limit) & (
+            within_extent(x1, y1) | within_extent(x2, y2)
+        )
+
         if np.any(mask):
             x1k, y1k = x1[mask], y1[mask]
             x2k, y2k = x2[mask], y2[mask]
-            segs = np.array([[[x1k[i], y1k[i]], [x2k[i], y2k[i]]] for i in range(len(x1k))])
-            lines = LineCollection(segs, colors=color, linestyles=linestyle, linewidths=0.5, alpha=0.6, zorder=3)
+            segs = np.array(
+                [[[x1k[i], y1k[i]], [x2k[i], y2k[i]]] for i in range(len(x1k))]
+            )
+            lines = LineCollection(
+                segs,
+                colors=color,
+                linestyles=linestyle,
+                linewidths=0.5,
+                alpha=0.6,
+                zorder=3,
+            )
             plt.gca().add_collection(lines)
-            plt.plot([], [], color=color, linestyle=linestyle, linewidth=0.5, alpha=0.6, label=label)
+            plt.plot(
+                [],
+                [],
+                color=color,
+                linestyle=linestyle,
+                linewidth=0.5,
+                alpha=0.6,
+                label=label,
+            )
 
-    plot_bifs(bifurcations, '#0000FF', '--', 'Bifurcation Paths')
-    plot_bifs(removed_bifurcations, '#FF0000', ':', 'Removed Paths')
+    plot_bifs(bifurcations, "#0000FF", "--", "Bifurcation Paths")
+    plot_bifs(removed_bifurcations, "#FF0000", ":", "Removed Paths")
 
     # Crop source outline (lon/lat rings). Only drawn when the axes are in
     # lon/lat coordinates, which is the case for region-cropped files.
     if query_outline is not None and use_lonlat:
         for ring_idx, (ring_x, ring_y) in enumerate(query_outline):
-            plt.plot(ring_x, ring_y, color='red', linewidth=1.5, linestyle='-',
-                     zorder=10, label='Crop source' if ring_idx == 0 else None)
+            plt.plot(
+                ring_x,
+                ring_y,
+                color="red",
+                linewidth=1.5,
+                linestyle="-",
+                zorder=10,
+                label="Crop source" if ring_idx == 0 else None,
+            )
 
     handles, labels = plt.gca().get_legend_handles_labels()
     if labels:
-        plt.legend(loc='lower right')
+        plt.legend(loc="lower right")
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=600, bbox_inches='tight')
+        plt.savefig(save_path, dpi=600, bbox_inches="tight")
         print(f"Saved visualization to {save_path}")
     else:
         plt.show()
         return
     plt.close()
 
+
 def visualize_nc_basins(
-    nc_path: Union[str, Path],
-    save_path: Optional[Union[str, Path]] = None,
+    nc_path: str | Path,
+    save_path: str | Path | None = None,
     visualize_gauges: bool = True,
     visualize_bifurcations: bool = True,
     visualize_levees: bool = True,
     visualize_dams: bool = True,
     visualize_river_mouths: bool = False,
-    pois_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    pois_xy: tuple[np.ndarray, np.ndarray] | None = None,
     color_by_upstream_area: bool = False,
-    query_outline: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    query_outline: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> None:
     """
     Visualize basins from a generated NetCDF parameter file using shared plotting logic.
     """
-    with Dataset(nc_path, 'r') as ds:
+    with Dataset(nc_path, "r") as ds:
         # Load necessary arrays
-        catchment_x = ds['catchment_x'][:]
-        catchment_y = ds['catchment_y'][:]
-        catchment_basin_id = ds['catchment_basin_id'][:]
-        
+        catchment_x = ds["catchment_x"][:]
+        catchment_y = ds["catchment_y"][:]
+        catchment_basin_id = ds["catchment_basin_id"][:]
+
         # Determine map shape
-        if hasattr(ds, 'nx') and hasattr(ds, 'ny'):
+        if hasattr(ds, "nx") and hasattr(ds, "ny"):
             nx, ny = ds.nx, ds.ny
         else:
             nx = int(catchment_x.max() + 1)
@@ -1009,48 +1127,56 @@ def visualize_nc_basins(
         # Optional LAT/LON
         longitude = None
         latitude = None
-        if 'longitude' in ds.variables and 'latitude' in ds.variables:
-            longitude = ds['longitude'][:]
-            latitude = ds['latitude'][:]
-        
+        if "longitude" in ds.variables and "latitude" in ds.variables:
+            longitude = ds["longitude"][:]
+            latitude = ds["latitude"][:]
+
         # Gather Optional Data
         gauges_xy = None
-        if visualize_gauges and 'gauge_catchment_id' in ds.variables and 'catchment_id' in ds.variables:
-            g_cids = ds['gauge_catchment_id'][:]
-            c_ids = ds['catchment_id'][:]
+        if (
+            visualize_gauges
+            and "gauge_catchment_id" in ds.variables
+            and "catchment_id" in ds.variables
+        ):
+            g_cids = ds["gauge_catchment_id"][:]
+            c_ids = ds["catchment_id"][:]
             idx = find_indices_in(g_cids, c_ids)
             idx = idx[idx >= 0]
             if idx.size > 0:
                 gauges_xy = (catchment_x[idx], catchment_y[idx])
 
         bifurcations = None
-        if visualize_bifurcations and 'bifurcation_catchment_x' in ds.variables:
+        if visualize_bifurcations and "bifurcation_catchment_x" in ds.variables:
             bifurcations = {
-                'x1': ds['bifurcation_catchment_x'][:],
-                'y1': ds['bifurcation_catchment_y'][:],
-                'x2': ds['bifurcation_downstream_x'][:],
-                'y2': ds['bifurcation_downstream_y'][:]
+                "x1": ds["bifurcation_catchment_x"][:],
+                "y1": ds["bifurcation_catchment_y"][:],
+                "x2": ds["bifurcation_downstream_x"][:],
+                "y2": ds["bifurcation_downstream_y"][:],
             }
-        
+
         levees_xy = None
-        if visualize_levees and 'levee_catchment_x' in ds.variables:
-            levees_xy = (ds['levee_catchment_x'][:], ds['levee_catchment_y'][:])
+        if visualize_levees and "levee_catchment_x" in ds.variables:
+            levees_xy = (ds["levee_catchment_x"][:], ds["levee_catchment_y"][:])
 
         upstream_area = None
-        if 'upstream_area' in ds.variables:
-            upstream_area = ds['upstream_area'][:]
+        if "upstream_area" in ds.variables:
+            upstream_area = ds["upstream_area"][:]
 
         dams_xyc = None
-        if visualize_dams and 'reservoir_catchment_id' in ds.variables and 'catchment_id' in ds.variables:
-            res_cids = np.asarray(ds['reservoir_catchment_id'][:]).astype(np.int64)
-            all_cids = np.asarray(ds['catchment_id'][:]).astype(np.int64)
+        if (
+            visualize_dams
+            and "reservoir_catchment_id" in ds.variables
+            and "catchment_id" in ds.variables
+        ):
+            res_cids = np.asarray(ds["reservoir_catchment_id"][:]).astype(np.int64)
+            all_cids = np.asarray(ds["catchment_id"][:]).astype(np.int64)
             res_idx = find_indices_in(res_cids, all_cids)
             valid = res_idx >= 0
             if np.any(valid):
                 rx = catchment_x[res_idx[valid]]
                 ry = catchment_y[res_idx[valid]]
-                if 'reservoir_capacity' in ds.variables:
-                    cap_m3 = np.asarray(ds['reservoir_capacity'][:])[valid]
+                if "reservoir_capacity" in ds.variables:
+                    cap_m3 = np.asarray(ds["reservoir_capacity"][:])[valid]
                     cap_mcm = cap_m3 / 1.0e6
                 else:
                     cap_mcm = np.ones(int(valid.sum()), dtype=np.float64)
@@ -1059,19 +1185,19 @@ def visualize_nc_basins(
         river_mouths_xy = None
         if visualize_river_mouths:
             # User requested identification by catchment_id == downstream_id
-            if 'catchment_id' in ds.variables and 'downstream_id' in ds.variables:
-                cid = ds['catchment_id'][:]
-                did = ds['downstream_id'][:]
+            if "catchment_id" in ds.variables and "downstream_id" in ds.variables:
+                cid = ds["catchment_id"][:]
+                did = ds["downstream_id"][:]
                 # Mouth condition: downstream is self or invalid (-1)
                 mask = (cid == did) | (did < 0)
                 if np.any(mask):
                     river_mouths_xy = (catchment_x[mask], catchment_y[mask])
-            elif 'is_river_mouth' in ds.variables:
-                is_mouth = ds['is_river_mouth'][:]
+            elif "is_river_mouth" in ds.variables:
+                is_mouth = ds["is_river_mouth"][:]
                 if np.any(is_mouth):
-                     # is_river_mouth is a boolean mask or 1/0
-                     mask = is_mouth == 1
-                     river_mouths_xy = (catchment_x[mask], catchment_y[mask])
+                    # is_river_mouth is a boolean mask or 1/0
+                    mask = is_mouth == 1
+                    river_mouths_xy = (catchment_x[mask], catchment_y[mask])
 
         plot_basins_common(
             map_shape=map_shape,
@@ -1171,9 +1297,9 @@ def _create_variable_like(dst, name, source, dimensions=None):
 
 
 def crop_parameters_nc(
-    input_nc: Union[str, Path],
-    output_nc: Union[str, Path],
-    points_of_interest: Optional[Dict[str, Any]] = None,
+    input_nc: str | Path,
+    output_nc: str | Path,
+    points_of_interest: dict[str, Any] | None = None,
     *,
     only_save_pois: bool = False,
     crop_upstream: bool = False,
@@ -1184,17 +1310,17 @@ def crop_parameters_nc(
 ) -> None:
     """
     Crops an existing parameter NetCDF to a subset of basins covering specific points of interest.
-    
+
     If crop_upstream=True, only the upstream catchments of each POI are kept, and the POI
     catchments are turned into river mouths (downstream_id = self). Upstream tracing follows
     main-stem downstream_id links only; bifurcation paths whose both endpoints survive the
     crop are preserved in the output.
-    
+
     If crop_downstream=True, each outlet gauge's catchment and its upstream
     network are removed. The prescribed outlet discharge is injected into the
     first retained downstream catchment, avoiding a one-reach placement offset
     and double counting of the gauged catchment's own runoff.
-    
+
     If crop_interval=True, each POI acts as a gauge defining an interval sub-basin. The
     upstream BFS from each POI stops when it encounters another POI (included but not
     traversed further). Each POI's downstream_id is set to self (river mouth), creating
@@ -1207,49 +1333,45 @@ def crop_parameters_nc(
     subgraph is copied as ghost catchments. Ghost rows use fresh catchment_id
     values, keep the outlet basin id, and record their original full-grid cid
     in catchment_source_id for runoff/feature lookup.
-    
+
     crop_upstream, crop_downstream, and crop_interval are mutually exclusive.
     For crop_upstream and crop_downstream, overlapping POIs are not allowed.
     """
     input_nc = Path(input_nc)
     output_nc = Path(output_nc)
     if sum([crop_upstream, crop_downstream, crop_interval]) > 1:
-        raise ValueError("Only one of crop_upstream, crop_downstream, crop_interval can be True.")
-    with Dataset(input_nc, 'r') as src:
+        raise ValueError(
+            "Only one of crop_upstream, crop_downstream, crop_interval can be True."
+        )
+    with Dataset(input_nc, "r") as src:
         # Load connectivity
         catchment_id = _require_unmasked_array(
-            src['catchment_id'][:], name="catchment_id"
+            src["catchment_id"][:], name="catchment_id"
         )
-        catchment_x = _require_unmasked_array(
-            src['catchment_x'][:], name="catchment_x"
-        )
-        catchment_y = _require_unmasked_array(
-            src['catchment_y'][:], name="catchment_y"
-        )
+        catchment_x = _require_unmasked_array(src["catchment_x"][:], name="catchment_x")
+        catchment_y = _require_unmasked_array(src["catchment_y"][:], name="catchment_y")
         catchment_basin_id = _require_unmasked_array(
-            src['catchment_basin_id'][:], name="catchment_basin_id"
+            src["catchment_basin_id"][:], name="catchment_basin_id"
         )
         downstream_id = (
-            _require_unmasked_array(src['downstream_id'][:], name="downstream_id")
-            if 'downstream_id' in src.variables
+            _require_unmasked_array(src["downstream_id"][:], name="downstream_id")
+            if "downstream_id" in src.variables
             else None
         )
 
         # In cut mode, use the pre-merge main-stem basins so a POI does not
         # pull in a basin connected only through a bifurcation.
         if split_bif_basins:
-            if 'catchment_mainstem_basin_id' in src.variables:
+            if "catchment_mainstem_basin_id" in src.variables:
                 catchment_basin_id = np.asarray(
-                    src['catchment_mainstem_basin_id'][:], dtype=np.int64
+                    src["catchment_mainstem_basin_id"][:], dtype=np.int64
                 )
             elif downstream_id is not None:
                 cid_i64 = np.asarray(catchment_id, dtype=np.int64)
                 ds_for_trace = np.asarray(downstream_id, dtype=np.int64).copy()
                 ds_for_trace[ds_for_trace == cid_i64] = -1
                 river_mouth_id = trace_outlets(cid_i64, ds_for_trace)
-                _, catchment_basin_id = np.unique(
-                    river_mouth_id, return_inverse=True
-                )
+                _, catchment_basin_id = np.unique(river_mouth_id, return_inverse=True)
                 catchment_basin_id = catchment_basin_id.astype(np.int64)
             else:
                 raise ValueError(
@@ -1260,41 +1382,53 @@ def crop_parameters_nc(
         # Resolve target CIDs using shared logic
         if points_of_interest:
             target_cids = resolve_target_cids_from_poi(
-                points_of_interest, 
-                catchment_id, 
-                catchment_x, 
+                points_of_interest,
+                catchment_id,
+                catchment_x,
                 catchment_y,
-                gauge_info=None 
+                gauge_info=None,
             )
-            
+
             if len(target_cids) == 0:
-                raise ValueError("No valid target catchments found from points_of_interest.")
+                raise ValueError(
+                    "No valid target catchments found from points_of_interest."
+                )
 
             # Find basins containing these catchments
-            kept_basin_ids = get_kept_basin_ids(target_cids, catchment_id, catchment_basin_id)
-            
+            kept_basin_ids = get_kept_basin_ids(
+                target_cids, catchment_id, catchment_basin_id
+            )
+
             if len(kept_basin_ids) == 0:
-                 raise ValueError("Target catchments not found in map — basin lookup failed.")
+                raise ValueError(
+                    "Target catchments not found in map — basin lookup failed."
+                )
         else:
             print("No points_of_interest provided or empty. Keeping all basins.")
             target_cids = np.array([], dtype=np.int64)
             kept_basin_ids = np.unique(catchment_basin_id)
             if only_save_pois:
-                 print("Warning: only_save_pois=True but no POIs provided. Switching to saving all catchments.")
-                 only_save_pois = False
+                print(
+                    "Warning: only_save_pois=True but no POIs provided. Switching to saving all catchments."
+                )
+                only_save_pois = False
 
         # ── crop_upstream mode: keep only upstream of POIs, turn POIs into outlets ──
         outlet_cids = np.array([], dtype=np.int64)  # CIDs that will become river mouths
         if crop_upstream and len(target_cids) > 0:
             if downstream_id is None:
-                print("Error: crop_upstream requires 'downstream_id' in the input NC. Aborting.")
+                print(
+                    "Error: crop_upstream requires 'downstream_id' in the input NC. Aborting."
+                )
                 return
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
             grid_to_idx = upstream_adj[2]
 
             effective_outlets = sorted(int(c) for c in target_cids)
-            poi_upstream_list = [_trace_upstream_bfs(int(cid), upstream_adj) for cid in effective_outlets]
+            poi_upstream_list = [
+                _trace_upstream_bfs(int(cid), upstream_adj) for cid in effective_outlets
+            ]
 
             _check_poi_overlap(effective_outlets, poi_upstream_list, grid_to_idx)
 
@@ -1317,30 +1451,38 @@ def crop_parameters_nc(
 
             # For catchments that belong to multiple outlet upstream sets (shouldn't happen
             # after dedup, but just in case from bifurcation), assign to the first.
-            
+
             kept_basin_ids_upstream = np.arange(len(effective_outlets), dtype=np.int64)
-            catchment_basin_id = new_basin_assignment  # Override basin assignment globally
+            catchment_basin_id = (
+                new_basin_assignment  # Override basin assignment globally
+            )
             keep_mask = keep_mask_upstream
             kept_basin_ids = kept_basin_ids_upstream
             num_kept_catchments = int(np.sum(keep_mask))
 
             # Mark effective outlets for downstream_id modification later
             target_cids = outlet_cids
-            
-            print(f"crop_upstream: Keeping {num_kept_catchments} upstream catchments across {len(effective_outlets)} sub-basins")
+
+            print(
+                f"crop_upstream: Keeping {num_kept_catchments} upstream catchments across {len(effective_outlets)} sub-basins"
+            )
 
         # ── crop_downstream mode: remove the gauged upstream network and
         # inject its outlet discharge into the first retained downstream cell. ──
         removed_mask_dn = np.zeros(len(catchment_id), dtype=bool)
         if crop_downstream and len(target_cids) > 0:
             if downstream_id is None:
-                print("Error: crop_downstream requires 'downstream_id' in the input NC. Aborting.")
+                print(
+                    "Error: crop_downstream requires 'downstream_id' in the input NC. Aborting."
+                )
                 return
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
 
             sorted_pois_dn = sorted(int(c) for c in target_cids)
-            poi_upstream_list_dn = [_trace_upstream_bfs(int(cid), upstream_adj) for cid in sorted_pois_dn]
+            poi_upstream_list_dn = [
+                _trace_upstream_bfs(int(cid), upstream_adj) for cid in sorted_pois_dn
+            ]
 
             _check_poi_overlap(sorted_pois_dn, poi_upstream_list_dn, upstream_adj[2])
 
@@ -1362,7 +1504,9 @@ def crop_parameters_nc(
         # ── crop_interval mode: split river network into interval sub-basins at POIs ──
         if crop_interval and len(target_cids) > 0:
             if downstream_id is None:
-                print("Error: crop_interval requires 'downstream_id' in the input NC. Aborting.")
+                print(
+                    "Error: crop_interval requires 'downstream_id' in the input NC. Aborting."
+                )
                 return
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
@@ -1396,7 +1540,9 @@ def crop_parameters_nc(
                     raise ValueError(
                         f"Start catchment ID {poi_value} is not in the map"
                     )
-                visited = trace_upstream_bfs_csr(start_idx, indptr, indices, n, stop_mask)
+                visited = trace_upstream_bfs_csr(
+                    start_idx, indptr, indices, n, stop_mask
+                )
                 member_cids = cid_arr[visited]
                 # Assign non-POI members (POIs overwritten in second pass)
                 cid_to_poi_basin[member_cids] = pi
@@ -1418,7 +1564,9 @@ def crop_parameters_nc(
             num_kept_catchments = int(np.sum(keep_mask))
             target_cids = outlet_cids
 
-            print(f"crop_interval: {len(sorted_pois)} interval basins, {num_kept_catchments} catchments kept")
+            print(
+                f"crop_interval: {len(sorted_pois)} interval basins, {num_kept_catchments} catchments kept"
+            )
 
         if crop_upstream or crop_interval:
             # In crop_upstream mode, basins are already reassigned above.
@@ -1432,89 +1580,103 @@ def crop_parameters_nc(
             old_to_new_id[kept_basin_ids] = kept_basin_ids.astype(np.int64)
             # keep_mask and num_kept_catchments were already set above
             num_kept_catchments = int(np.sum(keep_mask))
-            print(f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})")
+            print(
+                f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})"
+            )
         else:
-            if (not split_bif_basins
-                    and 'bifurcation_catchment_id' in src.variables
-                    and 'bifurcation_downstream_id' in src.variables):
-                bif_up_cid = src['bifurcation_catchment_id'][:]
-                bif_dn_cid = src['bifurcation_downstream_id'][:]
-                
+            if (
+                not split_bif_basins
+                and "bifurcation_catchment_id" in src.variables
+                and "bifurcation_downstream_id" in src.variables
+            ):
+                bif_up_cid = src["bifurcation_catchment_id"][:]
+                bif_dn_cid = src["bifurcation_downstream_id"][:]
+
                 # Flat array: catchment_id → basin_id
                 grid_to_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
                 grid_to_basin[catchment_id] = catchment_basin_id
-                
+
                 basin_adj = defaultdict(set)
                 for u_cid, d_cid in zip(
-                    bif_up_cid, bif_dn_cid, strict=True,
+                    bif_up_cid,
+                    bif_dn_cid,
+                    strict=True,
                 ):
                     u_basin = grid_to_basin[int(u_cid)]
                     d_basin = grid_to_basin[int(d_cid)]
-                    
+
                     if u_basin >= 0 and d_basin >= 0 and u_basin != d_basin:
                         basin_adj[u_basin].add(d_basin)
                         basin_adj[d_basin].add(u_basin)
-                
+
                 queue = list(kept_basin_ids)
                 visited = set(kept_basin_ids)
-                
+
                 while queue:
                     curr = queue.pop(0)
                     for neighbor in basin_adj[curr]:
                         if neighbor not in visited:
                             visited.add(neighbor)
                             queue.append(neighbor)
-                
-                kept_basin_ids = np.array(sorted(list(visited)), dtype=kept_basin_ids.dtype)
+
+                kept_basin_ids = np.array(
+                    sorted(list(visited)), dtype=kept_basin_ids.dtype
+                )
 
             # Union-Find with flat array
             max_basin_id = int(kept_basin_ids.max()) if len(kept_basin_ids) > 0 else 0
             parent_arr = np.full(max_basin_id + 1, -1, dtype=np.int64)
             for b in kept_basin_ids:
                 parent_arr[b] = b
+
             def find_set(x):
                 while parent_arr[x] != x:
                     parent_arr[x] = parent_arr[parent_arr[x]]  # path compression
                     x = parent_arr[x]
                 return x
+
             def union_sets(x, y):
                 rootX, rootY = find_set(x), find_set(y)
                 if rootX != rootY:
                     parent_arr[rootX] = rootY
 
-            if (not split_bif_basins
-                    and 'bifurcation_catchment_id' in src.variables
-                    and 'bifurcation_downstream_id' in src.variables):
-                 for b in kept_basin_ids:
-                     for neighbor in basin_adj[b]:
-                         if parent_arr[neighbor] >= 0:
-                             union_sets(b, neighbor)
-            
+            if (
+                not split_bif_basins
+                and "bifurcation_catchment_id" in src.variables
+                and "bifurcation_downstream_id" in src.variables
+            ):
+                for b in kept_basin_ids:
+                    for neighbor in basin_adj[b]:
+                        if parent_arr[neighbor] >= 0:
+                            union_sets(b, neighbor)
+
             roots = sorted(list(set(find_set(b) for b in kept_basin_ids)))
-            
+
             # Flat arrays for root→new_id and old→new_id
             root_to_new = np.full(max_basin_id + 1, -1, dtype=np.int64)
             for i, r in enumerate(roots):
                 root_to_new[r] = i
-            
+
             old_to_new_id = np.full(max_basin_id + 1, -1, dtype=np.int64)
             for b in kept_basin_ids:
                 old_to_new_id[b] = root_to_new[find_set(b)]
-            
+
             num_merged_basins = len(roots)
-            
+
             keep_mask = np.isin(catchment_basin_id, kept_basin_ids)
             # In crop_downstream, additionally exclude the removed upstream catchments
             if crop_downstream and removed_mask_dn.any():
                 keep_mask = keep_mask & ~removed_mask_dn
             num_kept_catchments = int(np.sum(keep_mask))
-            print(f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})")
-        
+            print(
+                f"Cropping from {len(catchment_id)} to {num_kept_catchments} catchments (Merged Basins: {num_merged_basins})"
+            )
+
         # Prepare output_catchment_id based on only_save_pois logic
         # We need to compute it for the KEPT catchments only.
         kept_catchment_ids = catchment_id[keep_mask]
         kept_catchment_basin_ids = catchment_basin_id[keep_mask]
-        
+
         if only_save_pois:
             # Filter target_cids to those in kept catchments, preserving order
             save_mask = np.isin(target_cids, kept_catchment_ids)
@@ -1558,7 +1720,8 @@ def crop_parameters_nc(
             full_idx_of_arr = np.full(max_cid_lookup + 2, -1, dtype=np.int64)
             full_idx_of_arr[catchment_id] = np.arange(len(catchment_id), dtype=np.int64)
             indptr_ext, indices_ext, grid_to_idx_ext, cid_arr_ext = _build_upstream_adj(
-                catchment_id, downstream_id,
+                catchment_id,
+                downstream_id,
             )
             stop_mask_base = np.zeros(len(catchment_id), dtype=np.bool_)
             kept_idx_ext = full_idx_of_arr[kept_catchment_ids]
@@ -1594,8 +1757,11 @@ def crop_parameters_nc(
                     if current_fidx < 0:
                         break
                     src_ds_cid = int(downstream_id[current_fidx])
-                    if src_ds_cid == current_src_cid or src_ds_cid < 0 \
-                            or src_ds_cid > max_cid_lookup:
+                    if (
+                        src_ds_cid == current_src_cid
+                        or src_ds_cid < 0
+                        or src_ds_cid > max_cid_lookup
+                    ):
                         break
                     src_fidx = int(full_idx_of_arr[src_ds_cid])
                     if src_fidx < 0:
@@ -1610,22 +1776,28 @@ def crop_parameters_nc(
                 selected_level: dict[int, int] = {}
                 for src_cid, src_fidx, level in corridor:
                     selected_level[src_cid] = min(
-                        selected_level.get(src_cid, level), level)
+                        selected_level.get(src_cid, level), level
+                    )
                     if src_cid in poi_set_ext:
                         continue
                     visited = trace_upstream_bfs_csr(
-                        src_fidx, indptr_ext, indices_ext,
-                        len(cid_arr_ext), stop_mask_base,
+                        src_fidx,
+                        indptr_ext,
+                        indices_ext,
+                        len(cid_arr_ext),
+                        stop_mask_base,
                     )
                     # Drop the already-kept sources with a mask instead of a
                     # per-node set lookup.
                     for upstream_cid in cid_arr_ext[visited & ~kept_source_mask]:
                         upstream_cid = int(upstream_cid)
                         selected_level[upstream_cid] = min(
-                            selected_level.get(upstream_cid, level), level)
+                            selected_level.get(upstream_cid, level), level
+                        )
 
                 selected_sources = np.asarray(
-                    list(selected_level.keys()), dtype=np.int64)
+                    list(selected_level.keys()), dtype=np.int64
+                )
                 selected_full_idx = np.asarray(
                     [full_idx_of_arr[int(c)] for c in selected_sources],
                     dtype=np.int64,
@@ -1648,7 +1820,9 @@ def crop_parameters_nc(
                     g_outlet.append(poi_cid_v)
                     g_entry.append(local_new_cid[first_corridor_cid])
                 for src_cid, src_fidx in zip(
-                    selected_sources, selected_full_idx, strict=True,
+                    selected_sources,
+                    selected_full_idx,
+                    strict=True,
                 ):
                     src_cid = int(src_cid)
                     src_fidx = int(src_fidx)
@@ -1669,13 +1843,15 @@ def crop_parameters_nc(
                 ghost_entry_cid = np.asarray(g_entry, dtype=np.int64)
                 ghost_downstream_cid = np.asarray(g_downstream, dtype=np.int64)
                 ghost_level = np.asarray(g_level, dtype=np.int64)
-            print("extend_downstream_steps="
-                  f"{extend_downstream_steps}: prepared {n_ghost} "
-                  "ghost catchment(s)")
+            print(
+                "extend_downstream_steps="
+                f"{extend_downstream_steps}: prepared {n_ghost} "
+                "ghost catchment(s)"
+            )
 
-        with Dataset(output_nc, 'w') as dst:
+        with Dataset(output_nc, "w") as dst:
             dst.setncatts(src.__dict__)
-            
+
             old_unique_basins = np.sort(kept_basin_ids)
             map_idx_to_new = old_to_new_id[old_unique_basins]
 
@@ -1685,83 +1861,102 @@ def crop_parameters_nc(
             kept_catchment_basin_ids = catchment_basin_id[keep_mask]
             idx_in_kept = np.searchsorted(old_unique_basins, kept_catchment_basin_ids)
             mapped_basin_ids = map_idx_to_new[idx_in_kept]
-            new_basin_sizes = np.bincount(mapped_basin_ids, minlength=num_merged_basins).astype(np.int64)
+            new_basin_sizes = np.bincount(
+                mapped_basin_ids, minlength=num_merged_basins
+            ).astype(np.int64)
             if n_ghost > 0:
                 ghost_basin_counts = np.bincount(
                     ghost_basin_id.astype(np.int64), minlength=num_merged_basins
                 ).astype(np.int64)
-                new_basin_sizes = new_basin_sizes + ghost_basin_counts[:num_merged_basins]
+                new_basin_sizes = (
+                    new_basin_sizes + ghost_basin_counts[:num_merged_basins]
+                )
 
             for name, dim in src.dimensions.items():
-                if name == 'catchment':
+                if name == "catchment":
                     dst.createDimension(name, num_kept_catchments + n_ghost)
-                elif name == 'basin':
+                elif name == "basin":
                     dst.createDimension(name, num_merged_basins)
-                elif name in ('bifurcation_path', 'bifurcation_level'):
+                elif name in ("bifurcation_path", "bifurcation_level"):
                     pass
-                elif name == 'levee':
+                elif name == "levee":
                     pass
-                elif name == 'reservoir':
+                elif name == "reservoir":
                     pass
-                elif name == 'gauge':
+                elif name == "gauge":
                     pass
-                elif name == 'saved_points':
+                elif name == "saved_points":
                     pass  # Will be created below
                 else:
-                    dst.createDimension(name, len(dim) if not dim.isunlimited() else None)
-            
+                    dst.createDimension(
+                        name, len(dim) if not dim.isunlimited() else None
+                    )
+
             # Create saved_points dimension (always present now)
-            dst.createDimension('saved_points', len(new_save_ids))
-            
+            dst.createDimension("saved_points", len(new_save_ids))
+
             bif_mask = None
-            if ('bifurcation_catchment_id' in src.variables
-                    and 'bifurcation_downstream_id' in src.variables):
-                 bif_up_i = np.asarray(src['bifurcation_catchment_id'][:], dtype=np.int64)
-                 bif_dn_i = np.asarray(src['bifurcation_downstream_id'][:], dtype=np.int64)
-                 is_kept_cid = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
-                 is_kept_cid[kept_catchment_ids] = True
-                 bif_mask = is_kept_cid[bif_up_i] & is_kept_cid[bif_dn_i]
-                 if crop_interval:
-                     grid_to_new_basin = np.full(int(catchment_id.max()) + 1, -1, dtype=np.int64)
-                     grid_to_new_basin[catchment_id[keep_mask]] = catchment_basin_id[keep_mask]
-                     bif_mask &= (
-                         grid_to_new_basin[bif_up_i] == grid_to_new_basin[bif_dn_i]
-                     )
-                 num_kept_bifurcations = int(np.sum(bif_mask))
-                 if num_kept_bifurcations > 0:
-                      dst.createDimension(
-                          'bifurcation_path', num_kept_bifurcations,
-                      )
-                      if 'bifurcation_level' in src.dimensions:
-                          dst.createDimension(
-                              'bifurcation_level',
-                              len(src.dimensions['bifurcation_level']),
-                          )
-            
+            if (
+                "bifurcation_catchment_id" in src.variables
+                and "bifurcation_downstream_id" in src.variables
+            ):
+                bif_up_i = np.asarray(
+                    src["bifurcation_catchment_id"][:], dtype=np.int64
+                )
+                bif_dn_i = np.asarray(
+                    src["bifurcation_downstream_id"][:], dtype=np.int64
+                )
+                is_kept_cid = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
+                is_kept_cid[kept_catchment_ids] = True
+                bif_mask = is_kept_cid[bif_up_i] & is_kept_cid[bif_dn_i]
+                if crop_interval:
+                    grid_to_new_basin = np.full(
+                        int(catchment_id.max()) + 1, -1, dtype=np.int64
+                    )
+                    grid_to_new_basin[catchment_id[keep_mask]] = catchment_basin_id[
+                        keep_mask
+                    ]
+                    bif_mask &= (
+                        grid_to_new_basin[bif_up_i] == grid_to_new_basin[bif_dn_i]
+                    )
+                num_kept_bifurcations = int(np.sum(bif_mask))
+                if num_kept_bifurcations > 0:
+                    dst.createDimension(
+                        "bifurcation_path",
+                        num_kept_bifurcations,
+                    )
+                    if "bifurcation_level" in src.dimensions:
+                        dst.createDimension(
+                            "bifurcation_level",
+                            len(src.dimensions["bifurcation_level"]),
+                        )
+
             lev_mask = None
-            if 'levee_catchment_id' in src.variables:
-                 lev_mask = np.isin(src['levee_catchment_id'][:], kept_catchment_ids)
-                 num_kept_levees = int(np.sum(lev_mask))
-                 if num_kept_levees > 0:
-                      dst.createDimension('levee', num_kept_levees)
+            if "levee_catchment_id" in src.variables:
+                lev_mask = np.isin(src["levee_catchment_id"][:], kept_catchment_ids)
+                num_kept_levees = int(np.sum(lev_mask))
+                if num_kept_levees > 0:
+                    dst.createDimension("levee", num_kept_levees)
 
             reservoir_mask = None
-            if ('reservoir_catchment_id' in src.variables
-                    and 'reservoir' in src.dimensions):
-                 reservoir_mask = np.isin(
-                     src['reservoir_catchment_id'][:], kept_catchment_ids
-                 )
-                 num_kept_reservoirs = int(np.sum(reservoir_mask))
-                 if num_kept_reservoirs > 0:
-                     dst.createDimension('reservoir', num_kept_reservoirs)
+            if (
+                "reservoir_catchment_id" in src.variables
+                and "reservoir" in src.dimensions
+            ):
+                reservoir_mask = np.isin(
+                    src["reservoir_catchment_id"][:], kept_catchment_ids
+                )
+                num_kept_reservoirs = int(np.sum(reservoir_mask))
+                if num_kept_reservoirs > 0:
+                    dst.createDimension("reservoir", num_kept_reservoirs)
 
             gauge_mask = None
-            if 'gauge_catchment_id' in src.variables:
-                gauge_cids = src['gauge_catchment_id'][:]
+            if "gauge_catchment_id" in src.variables:
+                gauge_cids = src["gauge_catchment_id"][:]
                 gauge_mask = np.isin(gauge_cids, kept_catchment_ids)
                 num_kept_gauges = int(np.sum(gauge_mask))
                 if num_kept_gauges > 0:
-                    dst.createDimension('gauge', num_kept_gauges)
+                    dst.createDimension("gauge", num_kept_gauges)
 
             # Do not carry an empty optional module into the cropped file.
             drop_module_vars = set()
@@ -1775,8 +1970,7 @@ def crop_parameters_nc(
                     module_cids = np.asarray(src[id_var][:]).reshape(-1)
                     if not np.any(np.isin(module_cids, kept_catchment_ids)):
                         drop_module_vars.update(
-                            PARAMETER_MODULE_FIELDS[prefix]
-                            & src.variables.keys()
+                            PARAMETER_MODULE_FIELDS[prefix] & src.variables.keys()
                         )
             for prefix, mask in (
                 ("bifurcation", bif_mask),
@@ -1786,134 +1980,153 @@ def crop_parameters_nc(
             ):
                 if mask is not None and not np.any(mask):
                     drop_module_vars.update(
-                        PARAMETER_MODULE_FIELDS[prefix]
-                        & src.variables.keys()
+                        PARAMETER_MODULE_FIELDS[prefix] & src.variables.keys()
                     )
 
             for name, var in src.variables.items():
                 if name in drop_module_vars:
                     continue
                 dims = var.dimensions
-                data = var[:] 
+                data = var[:]
                 primary_dim = dims[0] if dims else None
-                
-                if name == 'num_basins':
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = np.array(num_merged_basins, dtype=var.dtype)
-                     continue
+
+                if name == "num_basins":
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = np.array(num_merged_basins, dtype=var.dtype)
+                    continue
 
                 # The output selection is rebuilt after catchment filtering.
-                if name == 'output_catchment_id':
+                if name == "output_catchment_id":
                     continue
 
                 if name in (
-                    'bifurcation_basin_id', 'levee_basin_id',
-                    'reservoir_basin_id',
+                    "bifurcation_basin_id",
+                    "levee_basin_id",
+                    "reservoir_basin_id",
                 ):
                     continue
 
-                if primary_dim == 'catchment':
-                     new_data = data[keep_mask]
-                     if crop_upstream or crop_interval:
-                         if name == 'catchment_basin_id':
-                             # Already reassigned in new_basin_assignment
-                             new_data = catchment_basin_id[keep_mask].astype(new_data.dtype)
-                         elif name == 'downstream_id':
-                             # Set outlet POIs' downstream_id to self (river mouth)
-                             # Also set any catchment whose downstream is not in kept set to self
-                             is_kept_arr = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
-                             is_kept_arr[kept_catchment_ids] = True
-                             is_outlet = np.zeros(int(catchment_id.max()) + 1, dtype=np.bool_)
-                             if len(outlet_cids) > 0:
-                                 is_outlet[outlet_cids] = True
-                             new_cids = catchment_id[keep_mask]
-                             # Vectorized: set to self where outlet or downstream not kept
-                             need_self = is_outlet[new_cids] | ~is_kept_arr[new_data.astype(np.int64)]
-                             new_data[need_self] = new_cids[need_self]
-                             # Ghost rewire: redirect outlet POIs from self-loop to
-                             # their ghost catchment id (overrides the self-loop set above).
-                             if n_ghost > 0:
-                                 poi_to_ghost = np.full(
-                                     int(catchment_id.max()) + 2, -1, dtype=np.int64,
-                                 )
-                                 poi_to_ghost[ghost_outlet_cid] = ghost_entry_cid
-                                 mapped = poi_to_ghost[new_cids.astype(np.int64)]
-                                 mask_g = mapped >= 0
-                                 new_data[mask_g] = mapped[mask_g].astype(new_data.dtype)
-                     else:
-                         if name == 'catchment_basin_id':
-                             # Use the possibly rebuilt main-stem basin ids.
-                             source_basin = catchment_basin_id[keep_mask]
-                             idx_in_kept = np.searchsorted(old_unique_basins, source_basin)
-                             new_data = map_idx_to_new[idx_in_kept].astype(new_data.dtype)
-                     # Append ghost rows by copying from the source NC. For the
-                     # three special catchment-axis variables ghost values are
-                     # overridden to enforce the (cid_new / basin_id / self-loop)
-                     # contract; everything else inherits from the source row.
-                     if n_ghost > 0:
-                         ghost_data = data[ghost_full_idx]
-                         if name == 'catchment_id':
-                             ghost_data = ghost_new_cid.astype(new_data.dtype)
-                         elif name == 'catchment_basin_id':
-                             ghost_data = ghost_basin_id.astype(new_data.dtype)
-                         elif name == 'downstream_id':
-                             ghost_data = ghost_downstream_cid.astype(new_data.dtype)
-                         new_data = np.concatenate([new_data, ghost_data.astype(new_data.dtype)])
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = new_data
-                     
-                elif primary_dim == 'basin':
-                     if name == 'basin_sizes':
-                          new_data = new_basin_sizes.astype(data.dtype)
-                     elif crop_upstream or crop_interval:
-                          # In crop_upstream/interval, basins are newly defined; skip old basin-dim vars
-                          # that don't have a meaningful mapping (e.g. basin_start_offsets).
-                          continue
-                     else:
-                          new_data = data[roots]
-                          
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = new_data
+                if primary_dim == "catchment":
+                    new_data = data[keep_mask]
+                    if crop_upstream or crop_interval:
+                        if name == "catchment_basin_id":
+                            # Already reassigned in new_basin_assignment
+                            new_data = catchment_basin_id[keep_mask].astype(
+                                new_data.dtype
+                            )
+                        elif name == "downstream_id":
+                            # Set outlet POIs' downstream_id to self (river mouth)
+                            # Also set any catchment whose downstream is not in kept set to self
+                            is_kept_arr = np.zeros(
+                                int(catchment_id.max()) + 1, dtype=np.bool_
+                            )
+                            is_kept_arr[kept_catchment_ids] = True
+                            is_outlet = np.zeros(
+                                int(catchment_id.max()) + 1, dtype=np.bool_
+                            )
+                            if len(outlet_cids) > 0:
+                                is_outlet[outlet_cids] = True
+                            new_cids = catchment_id[keep_mask]
+                            # Vectorized: set to self where outlet or downstream not kept
+                            need_self = (
+                                is_outlet[new_cids]
+                                | ~is_kept_arr[new_data.astype(np.int64)]
+                            )
+                            new_data[need_self] = new_cids[need_self]
+                            # Ghost rewire: redirect outlet POIs from self-loop to
+                            # their ghost catchment id (overrides the self-loop set above).
+                            if n_ghost > 0:
+                                poi_to_ghost = np.full(
+                                    int(catchment_id.max()) + 2,
+                                    -1,
+                                    dtype=np.int64,
+                                )
+                                poi_to_ghost[ghost_outlet_cid] = ghost_entry_cid
+                                mapped = poi_to_ghost[new_cids.astype(np.int64)]
+                                mask_g = mapped >= 0
+                                new_data[mask_g] = mapped[mask_g].astype(new_data.dtype)
+                    else:
+                        if name == "catchment_basin_id":
+                            # Use the possibly rebuilt main-stem basin ids.
+                            source_basin = catchment_basin_id[keep_mask]
+                            idx_in_kept = np.searchsorted(
+                                old_unique_basins, source_basin
+                            )
+                            new_data = map_idx_to_new[idx_in_kept].astype(
+                                new_data.dtype
+                            )
+                    # Append ghost rows by copying from the source NC. For the
+                    # three special catchment-axis variables ghost values are
+                    # overridden to enforce the (cid_new / basin_id / self-loop)
+                    # contract; everything else inherits from the source row.
+                    if n_ghost > 0:
+                        ghost_data = data[ghost_full_idx]
+                        if name == "catchment_id":
+                            ghost_data = ghost_new_cid.astype(new_data.dtype)
+                        elif name == "catchment_basin_id":
+                            ghost_data = ghost_basin_id.astype(new_data.dtype)
+                        elif name == "downstream_id":
+                            ghost_data = ghost_downstream_cid.astype(new_data.dtype)
+                        new_data = np.concatenate(
+                            [new_data, ghost_data.astype(new_data.dtype)]
+                        )
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = new_data
 
-                elif primary_dim == 'bifurcation_path' and bif_mask is not None:
-                     new_data = data[bif_mask]
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = new_data
-                     
-                elif primary_dim == 'levee' and lev_mask is not None:
-                     new_data = data[lev_mask]
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = new_data
+                elif primary_dim == "basin":
+                    if name == "basin_sizes":
+                        new_data = new_basin_sizes.astype(data.dtype)
+                    elif crop_upstream or crop_interval:
+                        # In crop_upstream/interval, basins are newly defined; skip old basin-dim vars
+                        # that don't have a meaningful mapping (e.g. basin_start_offsets).
+                        continue
+                    else:
+                        new_data = data[roots]
 
-                elif primary_dim == 'reservoir' and reservoir_mask is not None:
-                     new_data = data[reservoir_mask]
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = new_data
-                
-                elif primary_dim == 'gauge' and gauge_mask is not None:
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = new_data
+
+                elif primary_dim == "bifurcation_path" and bif_mask is not None:
+                    new_data = data[bif_mask]
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = new_data
+
+                elif primary_dim == "levee" and lev_mask is not None:
+                    new_data = data[lev_mask]
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = new_data
+
+                elif primary_dim == "reservoir" and reservoir_mask is not None:
+                    new_data = data[reservoir_mask]
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = new_data
+
+                elif primary_dim == "gauge" and gauge_mask is not None:
                     new_data = data[gauge_mask]
                     out = _create_variable_like(dst, name, var)
                     out[:] = new_data
 
                 else:
-                     # Skip variables whose dimensions were not created in dst
-                     if any(d not in dst.dimensions for d in dims):
-                         continue
-                     out = _create_variable_like(dst, name, var)
-                     out[:] = data
-            
+                    # Skip variables whose dimensions were not created in dst
+                    if any(d not in dst.dimensions for d in dims):
+                        continue
+                    out = _create_variable_like(dst, name, var)
+                    out[:] = data
+
             # Output points are partitioned directly by catchment ID.
-            if 'output_catchment_id' in src.variables:
+            if "output_catchment_id" in src.variables:
                 var = _create_variable_like(
                     dst,
-                    'output_catchment_id',
-                    src.variables['output_catchment_id'],
-                    dimensions=('saved_points',),
+                    "output_catchment_id",
+                    src.variables["output_catchment_id"],
+                    dimensions=("saved_points",),
                 )
             else:
                 var = dst.createVariable(
-                    'output_catchment_id', np.int64,
-                    ('saved_points',), zlib=True,
+                    "output_catchment_id",
+                    np.int64,
+                    ("saved_points",),
+                    zlib=True,
                 )
             var[:] = new_save_ids
 
@@ -1928,8 +2141,12 @@ def crop_parameters_nc(
                 src_id_arr = np.empty(n_total, dtype=np.int64)
                 src_id_arr[:num_kept_catchments] = kept_catchment_ids.astype(np.int64)
                 if n_ghost > 0:
-                    src_id_arr[num_kept_catchments:] = catchment_id[ghost_full_idx].astype(np.int64)
-                v = dst.createVariable('catchment_source_id', 'i8', ('catchment',), zlib=True)
+                    src_id_arr[num_kept_catchments:] = catchment_id[
+                        ghost_full_idx
+                    ].astype(np.int64)
+                v = dst.createVariable(
+                    "catchment_source_id", "i8", ("catchment",), zlib=True
+                )
                 v[:] = src_id_arr
                 v.long_name = (
                     "catchment_id in pre-crop full parameters that this row "
@@ -1939,7 +2156,9 @@ def crop_parameters_nc(
                 level_arr = np.zeros(n_total, dtype=np.int64)
                 if n_ghost > 0:
                     level_arr[num_kept_catchments:] = ghost_level
-                v = dst.createVariable('catchment_ghost_level', 'i8', ('catchment',), zlib=True)
+                v = dst.createVariable(
+                    "catchment_ghost_level", "i8", ("catchment",), zlib=True
+                )
                 v[:] = level_arr
                 v.long_name = (
                     "0 for real catchments; for ghost rows, downstream corridor "
@@ -1972,14 +2191,17 @@ def crop_parameters_nc(
                         inject_list.append(ds)
                     # The model axis is unique by injection catchment. Gauge
                     # columns sharing a target are aggregated by the Dataset.
-                    inflow_cids = np.unique(
-                        np.asarray(inject_list, dtype=np.int64)
-                    )
+                    inflow_cids = np.unique(np.asarray(inject_list, dtype=np.int64))
 
                 if len(inflow_cids) > 0:
-                    dst.createDimension('inflow_gauge', len(inflow_cids))
-                    v = dst.createVariable('inflow_catchment_id', 'i8',
-                                           ('inflow_gauge',), zlib=True, complevel=4)
+                    dst.createDimension("inflow_gauge", len(inflow_cids))
+                    v = dst.createVariable(
+                        "inflow_catchment_id",
+                        "i8",
+                        ("inflow_gauge",),
+                        zlib=True,
+                        complevel=4,
+                    )
                     v[:] = inflow_cids
                     v.long_name = "catchment id where gauge inflow is injected"
                     print(f"  Written {len(inflow_cids)} inflow gauges")
@@ -1989,9 +2211,9 @@ def crop_parameters_nc(
 
 
 def visualize_runoff_mapping(
-    npz_path: Union[str, Path],
-    parameter_nc: Union[str, Path],
-    save_path: Optional[Union[str, Path]] = None,
+    npz_path: str | Path,
+    parameter_nc: str | Path,
+    save_path: str | Path | None = None,
 ) -> None:
     """
     Visualize a runoff mapping table (npz).
@@ -2043,15 +2265,18 @@ def visualize_runoff_mapping(
     # Coordinate edges for pcolormesh
     dlon = abs(coord_lon[1] - coord_lon[0]) if nlon > 1 else 1.0
     dlat = abs(coord_lat[1] - coord_lat[0]) if nlat > 1 else 1.0
-    lon_edges = np.append(coord_lon[ix_lo:ix_hi] - 0.5 * dlon,
-                          coord_lon[ix_hi - 1] + 0.5 * dlon)
+    lon_edges = np.append(
+        coord_lon[ix_lo:ix_hi] - 0.5 * dlon, coord_lon[ix_hi - 1] + 0.5 * dlon
+    )
     lat_ascending = coord_lat[1] > coord_lat[0] if nlat > 1 else True
     if lat_ascending:
-        lat_edges = np.append(coord_lat[iy_lo:iy_hi] - 0.5 * dlat,
-                              coord_lat[iy_hi - 1] + 0.5 * dlat)
+        lat_edges = np.append(
+            coord_lat[iy_lo:iy_hi] - 0.5 * dlat, coord_lat[iy_hi - 1] + 0.5 * dlat
+        )
     else:
-        lat_edges = np.append(coord_lat[iy_lo:iy_hi] + 0.5 * dlat,
-                              coord_lat[iy_hi - 1] - 0.5 * dlat)
+        lat_edges = np.append(
+            coord_lat[iy_lo:iy_hi] + 0.5 * dlat, coord_lat[iy_hi - 1] - 0.5 * dlat
+        )
 
     # --- Panel 2: Catchment coverage ratio ---
     row_sum = np.array(mat.sum(axis=1)).ravel()  # m²
@@ -2061,8 +2286,12 @@ def visualize_runoff_mapping(
         cx = ds["catchment_x"][:]
         cy = ds["catchment_y"][:]
         catchment_area = np.asarray(ds["catchment_area"][:])  # m²
-        lon_param = np.asarray(ds["longitude"][:]) if "longitude" in ds.variables else None
-        lat_param = np.asarray(ds["latitude"][:]) if "latitude" in ds.variables else None
+        lon_param = (
+            np.asarray(ds["longitude"][:]) if "longitude" in ds.variables else None
+        )
+        lat_param = (
+            np.asarray(ds["latitude"][:]) if "latitude" in ds.variables else None
+        )
         nx_attr = getattr(ds, "nx", None)
         ny_attr = getattr(ds, "ny", None)
 
@@ -2085,8 +2314,10 @@ def visualize_runoff_mapping(
         sx, ix_c = np.polyfit(cx, lon_param, 1)
         sy, iy_c = np.polyfit(cy, lat_param, 1)
         cama_extent = (
-            ix_c + sx * (-0.5), ix_c + sx * (nx - 0.5),
-            iy_c + sy * (ny - 0.5), iy_c + sy * (-0.5),
+            ix_c + sx * (-0.5),
+            ix_c + sx * (nx - 0.5),
+            iy_c + sy * (ny - 0.5),
+            iy_c + sy * (-0.5),
         )
         cama_xlabel, cama_ylabel = "Longitude", "Latitude"
     else:
@@ -2132,8 +2363,12 @@ def visualize_runoff_mapping(
     if vmin1 == vmax1:
         vmin1, vmax1 = vmin1 * 0.5, vmax1 * 2.0
     im1 = ax1.pcolormesh(
-        lon_edges, lat_edges, np.ma.masked_invalid(src_crop),
-        cmap="YlOrRd", norm=LogNorm(vmin=vmin1, vmax=vmax1), shading="flat",
+        lon_edges,
+        lat_edges,
+        np.ma.masked_invalid(src_crop),
+        cmap="YlOrRd",
+        norm=LogNorm(vmin=vmin1, vmax=vmax1),
+        shading="flat",
     )
     fig.colorbar(im1, ax=ax1, label="Mapped area (km²)", shrink=0.7)
     ax1.set_title("Source grid: mapped area per cell")
@@ -2154,8 +2389,12 @@ def visualize_runoff_mapping(
     else:
         norm2 = None
     im2 = ax2.imshow(
-        masked_ratio, origin="upper", cmap="RdYlGn_r", interpolation="nearest",
-        norm=norm2, extent=cama_extent,
+        masked_ratio,
+        origin="upper",
+        cmap="RdYlGn_r",
+        interpolation="nearest",
+        norm=norm2,
+        extent=cama_extent,
     )
     fig.colorbar(im2, ax=ax2, label="Mapped / Catchment area", shrink=0.7)
     ax2.set_title("Catchment: coverage ratio")

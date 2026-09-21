@@ -127,14 +127,14 @@ static inline void cmf_block_atomic_add(
 
 // HYDROFORGE METAL KERNEL BODY: compute_flood_stage
 long num_catchments = *args.num_catchments;
-    long num_trials = *args.num_trials;
-    long total = num_catchments * num_trials;
+    long ensemble_size = *args.ensemble_size;
+    long total = num_catchments * ensemble_size;
     if ((long)i >= total) return;
 
     long catchment = (long)i % num_catchments;
-    long trial = (long)i / num_catchments;
-    long trial_offset = trial * num_catchments;
-    long cell = trial_offset + catchment;
+    long member = (long)i / num_catchments;
+    long member_offset = member * num_catchments;
+    long cell = member_offset + catchment;
     float time_step = args.time_step_ptr[0];
 
     float river_storage = args.river_storage_ptr[cell];
@@ -153,10 +153,10 @@ long num_catchments = *args.num_catchments;
     if (HAS_INFLOW) {
         int inflow_idx = args.catchment_inflow_idx_ptr[catchment];
         if (inflow_idx >= 0) {
-            long inflow_trial_offset = batched_inflow
-                ? trial * (long)(*args.num_inflow_gauges) : 0;
+            long inflow_member_offset = batched_inflow
+                ? member * (long)(*args.num_inflow_gauges) : 0;
             prescribed_inflow = args.inflow_ptr[
-                inflow_trial_offset + inflow_idx];
+                inflow_member_offset + inflow_idx];
         }
     }
 
@@ -184,10 +184,10 @@ long num_catchments = *args.num_catchments;
     float catchment_area = args.catchment_area_ptr[catchment_area_idx];
     float river_width = args.river_width_ptr[river_width_idx];
     float river_length = args.river_length_ptr[river_length_idx];
-    long table_trial_offset = batched_flood_depth_table
-        ? trial_offset * (long)num_flood_levels : 0;
+    long table_member_offset = batched_flood_depth_table
+        ? member_offset * (long)num_flood_levels : 0;
     long table_cell_offset =
-        table_trial_offset + catchment * (long)num_flood_levels;
+        table_member_offset + catchment * (long)num_flood_levels;
     FloodStageResult stage = flood_stage_inline(
         total_storage, river_height, catchment_area,
         river_width, river_length,

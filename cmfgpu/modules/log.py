@@ -14,7 +14,7 @@ import math
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar, List, Literal, Optional, Tuple, Union
+from typing import ClassVar, Literal
 
 import cftime
 import numpy as np
@@ -32,10 +32,10 @@ from cmfgpu.modules.base import BaseModule
 
 def computed_log_field(
     description: str,
-    shape: Tuple[str, ...] = ("log_buffer_size",),
+    shape: tuple[str, ...] = ("log_buffer_size",),
     dtype: Literal["float", "int", "bool"] = "float",
     category: Literal["topology", "derived_param", "state", "virtual"] = "state",
-    expr: Optional[str] = None,
+    expr: str | None = None,
     **kwargs,
 ):
     return computed_tensor_field(
@@ -65,7 +65,7 @@ class LogModule(AbstractModule):
     _time_step: float = PrivateAttr()
     _num_steps: int = PrivateAttr()
     _current_time: datetime = PrivateAttr()
-    _times: List[datetime] = PrivateAttr(default_factory=list)
+    _times: list[datetime] = PrivateAttr(default_factory=list)
     _log_initialized: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
@@ -86,10 +86,10 @@ class LogModule(AbstractModule):
     # Methods
     # ------------------------------------------------------------------ #
     @cached_property
-    def log_vars(self) -> List[str]:
+    def log_vars(self) -> list[str]:
         return list(type(self).model_computed_fields.keys())
 
-    def extra_log_columns(self) -> Tuple[Tuple[str, str], ...]:
+    def extra_log_columns(self) -> tuple[tuple[str, str], ...]:
         """Return subclass-owned ``(header, printf-format)`` log columns."""
 
         return ()
@@ -124,7 +124,7 @@ class LogModule(AbstractModule):
         self,
         time_step: float,
         num_steps: int,
-        current_time: Union[datetime, cftime.datetime],
+        current_time: datetime | cftime.datetime,
     ) -> None:
         if type(time_step) not in {int, float}:
             raise TypeError("time_step must be an exact int or float")
@@ -142,16 +142,13 @@ class LogModule(AbstractModule):
                 "log module configuration."
             )
         if not isinstance(current_time, (datetime, cftime.datetime)):
-            raise TypeError(
-                "current_time must be a datetime or cftime.datetime value"
-            )
+            raise TypeError("current_time must be a datetime or cftime.datetime value")
 
         # Build the complete replacement before mutating private state.  A
         # datetime overflow (or any other construction failure) therefore
         # leaves the previous log interval intact.
         times = [
-            current_time + timedelta(seconds=time_step * i)
-            for i in range(num_steps)
+            current_time + timedelta(seconds=time_step * i) for i in range(num_steps)
         ]
         self._time_step = time_step
         self._num_steps = num_steps
@@ -169,7 +166,8 @@ class LogModule(AbstractModule):
         """
         reduce_many_(
             [getattr(self, field) for field in self.log_vars],
-            destination=0, reduction="sum",
+            destination=0,
+            reduction="sum",
         )
 
     def clear_buffers(self) -> None:
@@ -203,10 +201,7 @@ class LogModule(AbstractModule):
             + ["%16.3e"]
             + ["%16.6g"] * 3
         )
-        fmt.extend(
-            column_format
-            for _header, column_format in self.extra_log_columns()
-        )
+        fmt.extend(column_format for _header, column_format in self.extra_log_columns())
         with log_path.open("a") as f:
             for i in range(num_steps):
                 row = [time_strs[i]] + [

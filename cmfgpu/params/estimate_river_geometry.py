@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Optional, Union
 
 import numba
 import numpy as np
@@ -73,6 +72,7 @@ from cmfgpu.params.utils import compute_init_river_depth
 # ---------------------------------------------------------------------------
 # Numba-accelerated kernels
 # ---------------------------------------------------------------------------
+
 
 @numba.njit(cache=True)
 def _accumulate_discharge(
@@ -143,8 +143,8 @@ def _power_law(
     for i in numba.prange(n):
         q = discharge[i] if discharge[i] > 0.0 else 0.0
         if q > 0.0:
-            height[i] = max(HMIN, HC * q ** HP + HO)
-            width[i] = max(WMIN, WC * q ** WP + WO)
+            height[i] = max(HMIN, HC * q**HP + HO)
+            width[i] = max(WMIN, WC * q**WP + WO)
         else:
             height[i] = HMIN
             width[i] = WMIN
@@ -282,19 +282,18 @@ def _infer_catchment_dim(ds: Dataset, n_catch: int) -> tuple:
     for dim_name, dim in ds.dimensions.items():
         if len(dim) == n_catch:
             return (dim_name,)
-    raise ValueError(
-        f"Cannot find a dimension of size {n_catch} in the NetCDF file."
-    )
+    raise ValueError(f"Cannot find a dimension of size {n_catch} in the NetCDF file.")
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def accumulate_discharge(
-    climatology_nc: Union[str, Path],
-    parameter_nc: Union[str, Path],
-    output_nc: Optional[Union[str, Path]] = None,
+    climatology_nc: str | Path,
+    parameter_nc: str | Path,
+    output_nc: str | Path | None = None,
     clm_var: str = "runoff_clm",
     runoff_to_m3s: float = 1.0,
     verbose: bool = True,
@@ -364,8 +363,10 @@ def accumulate_discharge(
         clm_vals = np.asarray(ds.variables[clm_var][:]).astype(np.float64)
 
     if verbose:
-        print(f"[accumulate] Loaded climatology: {len(clm_cids)} catchments "
-              f"from {climatology_nc.name}")
+        print(
+            f"[accumulate] Loaded climatology: {len(clm_cids)} catchments "
+            f"from {climatology_nc.name}"
+        )
 
     # ------------------------------------------------------------------
     # 2. Read river network from parameters.nc
@@ -377,8 +378,10 @@ def accumulate_discharge(
     n_catch = len(param_cids)
 
     if verbose:
-        print(f"[accumulate] Loaded parameters: {n_catch} catchments "
-              f"from {parameter_nc.name}")
+        print(
+            f"[accumulate] Loaded parameters: {n_catch} catchments "
+            f"from {parameter_nc.name}"
+        )
 
     # ------------------------------------------------------------------
     # 3. Map climatology values onto the parameter catchment array
@@ -387,8 +390,10 @@ def accumulate_discharge(
     valid = clm_to_param >= 0
     if not np.all(valid):
         n_miss = int((~valid).sum())
-        print(f"[accumulate] Warning: {n_miss} climatology catchments "
-              "not found in parameter file — ignored.")
+        print(
+            f"[accumulate] Warning: {n_miss} climatology catchments "
+            "not found in parameter file — ignored."
+        )
 
     local_runoff = np.zeros(n_catch, dtype=np.float64)
     local_runoff[clm_to_param[valid]] = clm_vals[valid] * runoff_to_m3s
@@ -403,9 +408,11 @@ def accumulate_discharge(
     if verbose:
         q_pos = discharge[discharge > 0]
         if len(q_pos) > 0:
-            print(f"[accumulate] Discharge stats (m³/s): "
-                  f"min={q_pos.min():.4f}, median={np.median(q_pos):.4f}, "
-                  f"max={q_pos.max():.4f}")
+            print(
+                f"[accumulate] Discharge stats (m³/s): "
+                f"min={q_pos.min():.4f}, median={np.median(q_pos):.4f}, "
+                f"max={q_pos.max():.4f}"
+            )
         else:
             print("[accumulate] Warning: all discharge values are zero!")
 
@@ -418,20 +425,32 @@ def accumulate_discharge(
         with Dataset(str(out_path), "w") as ds:
             ds.createDimension("catchment", n_catch)
             v_cid = ds.createVariable(
-                "catchment_id", "i8", ("catchment",), zlib=True, complevel=4,
+                "catchment_id",
+                "i8",
+                ("catchment",),
+                zlib=True,
+                complevel=4,
             )
             v_cid[:] = param_cids
             v_cid.setncattr("long_name", "catchment identifier")
 
             v_q = ds.createVariable(
-                "discharge", "f8", ("catchment",), zlib=True, complevel=4,
+                "discharge",
+                "f8",
+                ("catchment",),
+                zlib=True,
+                complevel=4,
             )
             v_q[:] = discharge
             v_q.setncattr("units", "m3/s")
             v_q.setncattr("long_name", "accumulated mean annual discharge")
 
             v_lr = ds.createVariable(
-                "local_runoff", "f8", ("catchment",), zlib=True, complevel=4,
+                "local_runoff",
+                "f8",
+                ("catchment",),
+                zlib=True,
+                complevel=4,
             )
             v_lr[:] = local_runoff
             v_lr.setncattr("units", "m3/s")
@@ -448,10 +467,10 @@ def accumulate_discharge(
 
 
 def estimate_river_geometry(
-    climatology_nc: Union[str, Path],
-    parameter_nc: Union[str, Path],
-    output_nc: Optional[Union[str, Path]] = None,
-    discharge_nc: Optional[Union[str, Path]] = None,
+    climatology_nc: str | Path,
+    parameter_nc: str | Path,
+    output_nc: str | Path | None = None,
+    discharge_nc: str | Path | None = None,
     clm_var: str = "runoff_clm",
     runoff_to_m3s: float = 1.0,
     HC: float = 0.1,
@@ -531,18 +550,28 @@ def estimate_river_geometry(
     # 2. Compute river width and height via power law
     # ------------------------------------------------------------------
     new_width, new_height = _power_law(
-        discharge, HC, HP, HO, HMIN, WC, WP, WO, WMIN,
+        discharge,
+        HC,
+        HP,
+        HO,
+        HMIN,
+        WC,
+        WP,
+        WO,
+        WMIN,
     )
 
     if verbose:
-        print(f"[calc_rivwth] Height: "
-              f"H = max({HMIN}, {HC}*Q^{HP}+{HO})")
-        print(f"[calc_rivwth] Width:  "
-              f"W = max({WMIN}, {WC}*Q^{WP}+{WO})")
-        print(f"[calc_rivwth] Result height range: "
-              f"[{new_height.min():.2f}, {new_height.max():.2f}] m")
-        print(f"[calc_rivwth] Power-law width range: "
-              f"[{new_width.min():.2f}, {new_width.max():.2f}] m")
+        print(f"[calc_rivwth] Height: H = max({HMIN}, {HC}*Q^{HP}+{HO})")
+        print(f"[calc_rivwth] Width:  W = max({WMIN}, {WC}*Q^{WP}+{WO})")
+        print(
+            f"[calc_rivwth] Result height range: "
+            f"[{new_height.min():.2f}, {new_height.max():.2f}] m"
+        )
+        print(
+            f"[calc_rivwth] Power-law width range: "
+            f"[{new_width.min():.2f}, {new_width.max():.2f}] m"
+        )
 
     # ------------------------------------------------------------------
     # 2b. Fuse with satellite-derived width (if present in parameter_nc)
@@ -556,28 +585,38 @@ def estimate_river_geometry(
         new_width = _fuse_satellite_width(new_width, sat)
         if verbose:
             n_sat = int(np.count_nonzero(sat > 0))
-            print(f"[calc_rivwth] Fused with satellite width "
-                  f"({n_sat}/{n_catch} cells have satellite observations) → "
-                  f"final width range [{new_width.min():.2f}, {new_width.max():.2f}] m")
+            print(
+                f"[calc_rivwth] Fused with satellite width "
+                f"({n_sat}/{n_catch} cells have satellite observations) → "
+                f"final width range [{new_width.min():.2f}, {new_width.max():.2f}] m"
+            )
 
     # ------------------------------------------------------------------
     # 3. Recompute river_depth and river_storage
     #    (they depend on river_height and river_width)
     # ------------------------------------------------------------------
     with Dataset(str(parameter_nc), "r") as ds:
-        catchment_elevation = np.asarray(ds.variables["catchment_elevation"][:]).astype(np.float32)
+        catchment_elevation = np.asarray(ds.variables["catchment_elevation"][:]).astype(
+            np.float32
+        )
         river_length = np.asarray(ds.variables["river_length"][:]).astype(np.float32)
 
     new_depth = compute_init_river_depth(
-        catchment_elevation, new_height, downstream_idx,
+        catchment_elevation,
+        new_height,
+        downstream_idx,
     )
     new_storage = river_length * new_width * new_depth
 
     if verbose:
-        print(f"[calc_rivwth] Recomputed river_depth  range: "
-              f"[{new_depth.min():.4f}, {new_depth.max():.4f}] m")
-        print(f"[calc_rivwth] Recomputed river_storage range: "
-              f"[{new_storage.min():.2f}, {new_storage.max():.2f}] m³")
+        print(
+            f"[calc_rivwth] Recomputed river_depth  range: "
+            f"[{new_depth.min():.4f}, {new_depth.max():.4f}] m"
+        )
+        print(
+            f"[calc_rivwth] Recomputed river_storage range: "
+            f"[{new_storage.min():.2f}, {new_storage.max():.2f}] m³"
+        )
 
     # ------------------------------------------------------------------
     # 4. Optionally update bifurcation_elevation level-0
@@ -589,20 +628,34 @@ def estimate_river_geometry(
     with Dataset(str(parameter_nc), "r") as ds:
         has_bif = "bifurcation_elevation" in ds.variables
         if has_bif:
-            bif_elv = np.asarray(ds.variables["bifurcation_elevation"][:]).astype(np.float64)
-            bif_wth = np.asarray(ds.variables["bifurcation_width"][:]).astype(np.float64)
-            bif_cid = np.asarray(ds.variables["bifurcation_catchment_id"][:]).astype(np.int64)
-            bif_did = np.asarray(ds.variables["bifurcation_downstream_id"][:]).astype(np.int64)
+            bif_elv = np.asarray(ds.variables["bifurcation_elevation"][:]).astype(
+                np.float64
+            )
+            bif_wth = np.asarray(ds.variables["bifurcation_width"][:]).astype(
+                np.float64
+            )
+            bif_cid = np.asarray(ds.variables["bifurcation_catchment_id"][:]).astype(
+                np.int64
+            )
+            bif_did = np.asarray(ds.variables["bifurcation_downstream_id"][:]).astype(
+                np.int64
+            )
 
     if has_bif:
         new_bif_elv = _update_bifurcation_elevation(
-            bif_elv, bif_wth, bif_cid, bif_did,
-            param_cids, new_height,
+            bif_elv,
+            bif_wth,
+            bif_cid,
+            bif_did,
+            param_cids,
+            new_height,
         )
         if verbose:
             changed = np.count_nonzero(bif_elv[:, 0] != new_bif_elv[:, 0])
-            print(f"[calc_rivwth] Updated {changed}/{len(bif_elv)} "
-                  "bifurcation level-0 elevations")
+            print(
+                f"[calc_rivwth] Updated {changed}/{len(bif_elv)} "
+                "bifurcation level-0 elevations"
+            )
 
     # ------------------------------------------------------------------
     # 5. Write results to NetCDF
@@ -623,7 +676,11 @@ def estimate_river_geometry(
         else:
             dims = _infer_catchment_dim(ds, n_catch)
             var = ds.createVariable(
-                "river_width", "f4", dims, zlib=True, complevel=4,
+                "river_width",
+                "f4",
+                dims,
+                zlib=True,
+                complevel=4,
             )
             var[:] = new_width
             var.setncattr("units", "m")
@@ -635,7 +692,11 @@ def estimate_river_geometry(
         else:
             dims = _infer_catchment_dim(ds, n_catch)
             var = ds.createVariable(
-                "river_height", "f4", dims, zlib=True, complevel=4,
+                "river_height",
+                "f4",
+                dims,
+                zlib=True,
+                complevel=4,
             )
             var[:] = new_height
             var.setncattr("units", "m")
@@ -647,7 +708,11 @@ def estimate_river_geometry(
         else:
             dims = _infer_catchment_dim(ds, n_catch)
             var = ds.createVariable(
-                "river_depth", "f4", dims, zlib=True, complevel=4,
+                "river_depth",
+                "f4",
+                dims,
+                zlib=True,
+                complevel=4,
             )
             var[:] = new_depth
             var.setncattr("units", "m")
@@ -659,7 +724,11 @@ def estimate_river_geometry(
         else:
             dims = _infer_catchment_dim(ds, n_catch)
             var = ds.createVariable(
-                "river_storage", "f4", dims, zlib=True, complevel=4,
+                "river_storage",
+                "f4",
+                dims,
+                zlib=True,
+                complevel=4,
             )
             var[:] = new_storage
             var.setncattr("units", "m3")
@@ -675,8 +744,10 @@ def estimate_river_geometry(
         ds.setncattr("runoff_to_m3s", runoff_to_m3s)
 
     if verbose:
-        print(f"[calc_rivwth] Written river_width, river_height, "
-              f"river_depth, river_storage to {target}")
+        print(
+            f"[calc_rivwth] Written river_width, river_height, "
+            f"river_depth, river_storage to {target}"
+        )
 
     return target
 

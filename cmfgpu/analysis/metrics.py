@@ -5,17 +5,15 @@
 #
 
 """Streamflow comparison metrics (NSE, KGE, PBias) operating on 1-D series."""
+
 from __future__ import annotations
 
-from typing import Tuple
-
 import numpy as np
-
 
 _MIN_VALID = 10
 
 
-def _aligned_pair(pred: np.ndarray, obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _aligned_pair(pred: np.ndarray, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     pred = np.asarray(pred)
     obs = np.asarray(obs)
     mask = np.isfinite(pred) & np.isfinite(obs)
@@ -61,7 +59,7 @@ def pbias(pred: np.ndarray, obs: np.ndarray) -> float:
 def compute_per_gauge_metrics(
     pred: np.ndarray,
     obs: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(NSE, KGE, PBias)`` arrays computed column-wise.
 
     Parameters
@@ -73,9 +71,7 @@ def compute_per_gauge_metrics(
     pred = np.asarray(pred)
     obs = np.asarray(obs)
     if pred.shape != obs.shape:
-        raise ValueError(
-            f"pred shape {pred.shape} != obs shape {obs.shape}"
-        )
+        raise ValueError(f"pred shape {pred.shape} != obs shape {obs.shape}")
     n_gauges = pred.shape[1]
     out = np.full((3, n_gauges), np.nan, dtype=np.float64)
     for i in range(n_gauges):

@@ -7,16 +7,23 @@
 """
 Reservoir module for CaMa-Flood-GPU using TensorField / computed_tensor_field helpers.
 """
+
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Self
 
 import torch
-from hydroforge.model import (AbstractModule, CoordinateField,
-                                        ReferenceField, ReferenceIndexField,
-                                        TensorField, computed_tensor_field,
-                                        module_ref, optional_module_ref)
+from hydroforge.model import (
+    AbstractModule,
+    CoordinateField,
+    ReferenceField,
+    ReferenceIndexField,
+    TensorField,
+    computed_tensor_field,
+    module_ref,
+    optional_module_ref,
+)
 from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
@@ -25,12 +32,12 @@ from cmfgpu.modules.bifurcation import BifurcationModule
 
 def ReservoirField(
     description: str,
-    shape: Tuple[str, ...] = ("num_reservoirs",),
+    shape: tuple[str, ...] = ("num_reservoirs",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "reservoir_id",
+    dim_coords: str | None = "reservoir_id",
     category: Literal["topology", "param"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
-    **kwargs
+    **kwargs,
 ):
     return TensorField(
         description=description,
@@ -39,17 +46,20 @@ def ReservoirField(
         dim_coords=dim_coords,
         category=category,
         mode=mode,
-        **kwargs
+        **kwargs,
     )
+
 
 def computed_reservoir_field(
     description: str,
-    shape: Tuple[str, ...] = ("num_reservoirs",),
+    shape: tuple[str, ...] = ("num_reservoirs",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "reservoir_id",
-    category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
-    expr: Optional[str] = None,
-    **kwargs
+    dim_coords: str | None = "reservoir_id",
+    category: Literal[
+        "topology", "derived_param", "state", "virtual"
+    ] = "derived_param",
+    expr: str | None = None,
+    **kwargs,
 ):
     return computed_tensor_field(
         description=description,
@@ -58,15 +68,18 @@ def computed_reservoir_field(
         dim_coords=dim_coords,
         category=category,
         expr=expr,
-        **kwargs
+        **kwargs,
     )
+
 
 class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Metadata
     # ------------------------------------------------------------------ #
     module_name: ClassVar[str] = "reservoir"
-    description: ClassVar[str] = "Reservoir operation module with storage and outflow regulation"
+    description: ClassVar[str] = (
+        "Reservoir operation module with storage and outflow regulation"
+    )
     base = module_ref(BaseModule)
     bifurcation = optional_module_ref(BifurcationModule)
 
@@ -128,13 +141,16 @@ class ReservoirModule(AbstractModule):
 
     @computed_tensor_field(
         description="Boolean mask for reservoir catchments",
-        shape=("base.num_catchments",), dtype="bool",
-        dim_coords="base.catchment_id", category="topology",
+        shape=("base.num_catchments",),
+        dtype="bool",
+        dim_coords="base.catchment_id",
+        category="topology",
     )
     @cached_property
     def is_reservoir(self) -> torch.Tensor:
         mask = torch.zeros(
-            self.base.num_catchments, dtype=torch.bool,
+            self.base.num_catchments,
+            dtype=torch.bool,
             device=self.base.catchment_id.device,
         )
         mask[self.reservoir_catchment_idx] = True
@@ -142,21 +158,27 @@ class ReservoirModule(AbstractModule):
 
     @computed_tensor_field(
         description="Mask for reservoir cells and their immediate upstream cells",
-        shape=("base.num_catchments",), dtype="bool",
-        dim_coords="base.catchment_id", category="topology",
+        shape=("base.num_catchments",),
+        dtype="bool",
+        dim_coords="base.catchment_id",
+        category="topology",
     )
     @cached_property
     def is_dam_related(self) -> torch.Tensor:
         downstream_is_dam = self.is_reservoir[self.base.downstream_idx]
-        idx = torch.arange(self.base.num_catchments, device=self.base.catchment_id.device)
+        idx = torch.arange(
+            self.base.num_catchments, device=self.base.catchment_id.device
+        )
         not_mouth = self.base.downstream_idx != idx
         upstream = (~self.is_reservoir) & not_mouth & downstream_is_dam
         return self.is_reservoir | upstream
 
     @computed_tensor_field(
         description="Mask for immediate upstream-of-reservoir cells",
-        shape=("base.num_catchments",), dtype="bool",
-        dim_coords="base.catchment_id", category="topology",
+        shape=("base.num_catchments",),
+        dtype="bool",
+        dim_coords="base.catchment_id",
+        category="topology",
     )
     @cached_property
     def is_dam_upstream(self) -> torch.Tensor:
@@ -164,8 +186,11 @@ class ReservoirModule(AbstractModule):
 
     reservoir_total_inflow: torch.Tensor = TensorField(
         description="Accumulated reservoir total inflow from upstream (m³ s⁻¹)",
-        shape=("base.num_catchments",), dtype="hpfloat",
-        dim_coords="base.catchment_id", category="init_state", default=0,
+        shape=("base.num_catchments",),
+        dtype="hpfloat",
+        dim_coords="base.catchment_id",
+        category="init_state",
+        default=0,
     )
 
     # ------------------------------------------------------------------ #
@@ -188,7 +213,7 @@ class ReservoirModule(AbstractModule):
 
     @computed_reservoir_field(
         description="Effective normal outflow after Yamazaki & Funato modification (m³ s⁻¹). "
-                    "Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days).",
+        "Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days).",
     )
     @cached_property
     def effective_normal_outflow(self) -> torch.Tensor:
@@ -215,10 +240,14 @@ class ReservoirModule(AbstractModule):
         if not update.any():
             return 0
         self.base.river_storage[..., idx] = torch.where(
-            update, conservation, river,
+            update,
+            conservation,
+            river,
         )
         self.base.flood_storage[..., idx] = torch.where(
-            update, torch.zeros_like(flood), flood,
+            update,
+            torch.zeros_like(flood),
+            flood,
         )
         return int(update.sum().item())
 

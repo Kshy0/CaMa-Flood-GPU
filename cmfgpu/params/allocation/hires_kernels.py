@@ -11,10 +11,10 @@ allocation on CaMa-Flood grids.
 These are pure functions with no class dependency — they operate solely on
 NumPy arrays and scalars and are imported by the allocation mixin modules.
 """
+
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import numpy as np
 from numba import njit
@@ -23,13 +23,14 @@ from numba import njit
 # Upstream table builder
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def build_upstream_table(
-    nextXX: np.ndarray,   # (nXX, nYY) int32, 0-based downstream X (-9999 = mouth/invalid)
-    nextYY: np.ndarray,   # (nXX, nYY) int32
-    uparea: np.ndarray,   # (nXX, nYY) float32, upstream area in km²
+    nextXX: np.ndarray,  # (nXX, nYY) int32, 0-based downstream X (-9999 = mouth/invalid)
+    nextYY: np.ndarray,  # (nXX, nYY) int32
+    uparea: np.ndarray,  # (nXX, nYY) float32, upstream area in km²
     n_ups: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Build upstream grid table (up to *n_ups* largest upstream grids per cell).
 
     Iterates *n_ups* passes: in each pass, for every valid cell, register it at
@@ -58,7 +59,10 @@ def build_upstream_table(
                 # skip if already registered in a previous pass
                 already = False
                 for j_ups in range(i_ups):
-                    if iXX == upstXX[jXX, jYY, j_ups] and iYY == upstYY[jXX, jYY, j_ups]:
+                    if (
+                        iXX == upstXX[jXX, jYY, j_ups]
+                        and iYY == upstYY[jXX, jYY, j_ups]
+                    ):
                         already = True
                         break
                 if already:
@@ -74,16 +78,17 @@ def build_upstream_table(
 # Outlet pixel detection
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def calc_outlet_pixels(
-    ctx1m: np.ndarray,   # (nx, ny) int16, 0-based unit-catchment X for each hi-res pixel
-    cty1m: np.ndarray,   # (nx, ny) int16
-    dwx1m: np.ndarray,   # (nx, ny) int16, downstream pixel offset dx
-    dwy1m: np.ndarray,   # (nx, ny) int16, downstream pixel offset dy
-    upa1m: np.ndarray,   # (nx, ny) float32, hi-res upstream area
+    ctx1m: np.ndarray,  # (nx, ny) int16, 0-based unit-catchment X for each hi-res pixel
+    cty1m: np.ndarray,  # (nx, ny) int16
+    dwx1m: np.ndarray,  # (nx, ny) int16, downstream pixel offset dx
+    dwy1m: np.ndarray,  # (nx, ny) int16, downstream pixel offset dy
+    upa1m: np.ndarray,  # (nx, ny) float32, hi-res upstream area
     nXX: int,
     nYY: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Find the outlet pixel (in hi-res coords) of each unit-catchment.
 
     A pixel is an *outlet* if either:
@@ -145,8 +150,11 @@ def calc_outlet_pixels(
 # Hi-res pixel navigation
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
-def nextxy_hires(ix: int, iy: int, dwx1m: np.ndarray, dwy1m: np.ndarray, nx: int) -> Tuple[int, int]:
+def nextxy_hires(
+    ix: int, iy: int, dwx1m: np.ndarray, dwy1m: np.ndarray, nx: int
+) -> tuple[int, int]:
     """Compute next hi-res pixel, wrapping in x for global domain."""
     jx = ix + dwx1m[ix, iy]
     jy = iy + dwy1m[ix, iy]
@@ -161,6 +169,7 @@ def nextxy_hires(ix: int, iy: int, dwx1m: np.ndarray, dwy1m: np.ndarray, nx: int
 # Neighbourhood search
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def search_best_pixel(
     ix_center: int,
@@ -171,7 +180,7 @@ def search_best_pixel(
     nx: int,
     ny: int,
     is_global: bool,
-) -> Tuple[int, int, float, float, float]:
+) -> tuple[int, int, float, float, float]:
     """Search ±nn neighbourhood of (ix_center, iy_center) on the hi-res grid.
 
 
@@ -224,6 +233,7 @@ def search_best_pixel(
 # Downstream river tracing
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def trace_gauge_downstream(
     ix0: int,
@@ -262,6 +272,7 @@ def trace_gauge_downstream(
 # Geodesic distance
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def rgetlen(rlon1: float, rlat1: float, rlon2: float, rlat2: float) -> float:
     """Geodesic distance between two lon/lat points [km].
@@ -270,8 +281,8 @@ def rgetlen(rlon1: float, rlat1: float, rlon2: float, rlat2: float) -> float:
     axis, eccentricity²=0.006694470).
     """
     PI = 3.141592653589793
-    DA = 6378137.0          # semi-major axis [m]
-    DE2 = 0.006694470       # eccentricity²
+    DA = 6378137.0  # semi-major axis [m]
+    DE2 = 0.006694470  # eccentricity²
 
     rlat1_r = rlat1 * PI / 180.0
     rlon1_r = rlon1 * PI / 180.0
@@ -300,4 +311,4 @@ def rgetlen(rlon1: float, rlat1: float, rlon2: float, rlat2: float) -> float:
 
     dlen = math.sqrt((dx1 - dx2) ** 2 + (dy1 - dy2) ** 2 + (dz1 - dz2) ** 2)
     drad = math.asin(min(dlen / (2.0 * DA), 1.0))
-    return drad * 2.0 * DA * 0.001   # m → km
+    return drad * 2.0 * DA * 0.001  # m → km

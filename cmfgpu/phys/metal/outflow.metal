@@ -1,15 +1,15 @@
 // HYDROFORGE METAL KERNEL BODY: compute_outflow
 long num_catchments = *args.num_catchments;
-    long num_trials = *args.num_trials;
-    long total = num_catchments * num_trials;
+    long ensemble_size = *args.ensemble_size;
+    long total = num_catchments * ensemble_size;
     if ((long)i >= total) return;
 
     long catchment = (long)i % num_catchments;
-    long trial = (long)i / num_catchments;
-    long trial_offset = trial * num_catchments;
-    long cell = trial_offset + catchment;
+    long member = (long)i / num_catchments;
+    long member_offset = member * num_catchments;
+    long cell = member_offset + catchment;
     int downstream = args.downstream_idx_ptr[catchment];
-    long downstream_cell = trial_offset + (long)downstream;
+    long downstream_cell = member_offset + (long)downstream;
     bool is_mouth = downstream == (int)catchment;
     float time_step = args.time_step_ptr[0];
     float gravity = *args.gravity;
@@ -63,16 +63,16 @@ long num_catchments = *args.num_catchments;
     if (HAS_SEA_LEVEL) {
         int sea_level = args.catchment_sea_level_idx_ptr[catchment];
         if (sea_level >= 0) {
-            long sea_trial_offset = batched_sea_surface_elevation
-                ? trial * *args.num_sea_level_boundaries : 0;
+            long sea_member_offset = batched_sea_surface_elevation
+                ? member * *args.num_sea_level_boundaries : 0;
             effective_downstream_surface = args.sea_surface_elevation_ptr[
-                sea_trial_offset + sea_level];
+                sea_member_offset + sea_level];
         }
     }
     float maximum_surface = max(water_surface, effective_downstream_surface);
     float river_slope =
         (water_surface - effective_downstream_surface) / downstream_distance;
-    float flood_slope = clamp(river_slope, -0.005f, 0.005f);
+    float flood_slope = clamp(river_slope, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
 
     // The mouth boundary level controls slope, while CaMa-Flood uses the
     // local river depth itself for the mouth's hydraulic cross-section.
@@ -122,7 +122,7 @@ long num_catchments = *args.num_catchments;
     if (updated_river_outflow < 0.0f && !is_mouth) {
         float negative_volume =
             (-updated_river_outflow - updated_flood_outflow) * time_step;
-        float limit = min(0.05f * total_storage / negative_volume, 1.0f);
+        float limit = min(CMF_BACKFLOW_STORAGE_FRACTION * total_storage / negative_volume, 1.0f);
         updated_river_outflow *= limit;
         updated_flood_outflow *= limit;
     }
@@ -140,7 +140,7 @@ long num_catchments = *args.num_catchments;
             river_width * river_depth * river_velocity,
             0.0f, river_storage / time_step);
 
-        float flood_velocity = sqrt(min(bed_slope, 0.005f))
+        float flood_velocity = sqrt(min(bed_slope, CMF_ROUTING_SLOPE_LIMIT))
             * pow(flood_depth * flood_depth, 1.0f / 3.0f) / flood_manning;
         float flood_area = max(
             flood_storage / river_length - flood_depth * river_width, 0.0f);
@@ -174,13 +174,13 @@ long num_catchments = *args.num_catchments;
 
 // HYDROFORGE METAL KERNEL BODY: compute_inflow
 long num_catchments = *args.num_catchments;
-    long num_trials = *args.num_trials;
-    long total = num_catchments * num_trials;
+    long ensemble_size = *args.ensemble_size;
+    long total = num_catchments * ensemble_size;
     if ((long)i >= total) return;
 
     long catchment = (long)i % num_catchments;
-    long trial_offset = ((long)i / num_catchments) * num_catchments;
-    long cell = trial_offset + catchment;
+    long member_offset = ((long)i / num_catchments) * num_catchments;
+    long cell = member_offset + catchment;
 
     float river_outflow = args.river_outflow_ptr[cell];
     float flood_outflow = args.flood_outflow_ptr[cell];
@@ -192,7 +192,7 @@ long num_catchments = *args.num_catchments;
         : 1.0f;
 
     int downstream = args.downstream_idx_ptr[catchment];
-    long downstream_cell = trial_offset + (long)downstream;
+    long downstream_cell = member_offset + (long)downstream;
     float downstream_outgoing = args.outgoing_storage_ptr[downstream_cell];
     float downstream_available =
         args.river_storage_ptr[downstream_cell]

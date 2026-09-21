@@ -8,16 +8,23 @@
 Bifurcation module for CaMa-Flood-GPU using TensorField / computed_tensor_field
 for concise tensor metadata.
 """
+
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Tuple
+from typing import ClassVar, Literal
 
 import torch
-from hydroforge.model import (AbstractModule, CoordinateField,
-                                        ReferenceField, ReferenceIndexField,
-                                        SelectionField, TensorField,
-                                        computed_tensor_field, module_ref)
+from hydroforge.model import (
+    AbstractModule,
+    CoordinateField,
+    ReferenceField,
+    ReferenceIndexField,
+    SelectionField,
+    TensorField,
+    computed_tensor_field,
+    module_ref,
+)
 from pydantic import computed_field
 
 from cmfgpu.modules.base import BaseModule
@@ -25,12 +32,12 @@ from cmfgpu.modules.base import BaseModule
 
 def BifurcationField(
     description: str,
-    shape: Tuple[str, ...] = ("num_bifurcation_paths",),
+    shape: tuple[str, ...] = ("num_bifurcation_paths",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "bifurcation_path_id",
+    dim_coords: str | None = "bifurcation_path_id",
     category: Literal["topology", "param", "init_state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
-    **kwargs
+    **kwargs,
 ):
     return TensorField(
         description=description,
@@ -39,17 +46,20 @@ def BifurcationField(
         dim_coords=dim_coords,
         category=category,
         mode=mode,
-        **kwargs
+        **kwargs,
     )
+
 
 def computed_bifurcation_field(
     description: str,
-    shape: Tuple[str, ...] = ("num_bifurcation_paths",),
+    shape: tuple[str, ...] = ("num_bifurcation_paths",),
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    dim_coords: Optional[str] = "bifurcation_path_id",
-    category: Literal["topology", "derived_param", "state", "virtual"] = "derived_param",
-    expr: Optional[str] = None,
-    **kwargs
+    dim_coords: str | None = "bifurcation_path_id",
+    category: Literal[
+        "topology", "derived_param", "state", "virtual"
+    ] = "derived_param",
+    expr: str | None = None,
+    **kwargs,
 ):
     return computed_tensor_field(
         description=description,
@@ -58,15 +68,18 @@ def computed_bifurcation_field(
         dim_coords=dim_coords,
         category=category,
         expr=expr,
-        **kwargs
+        **kwargs,
     )
+
 
 class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Metadata
     # ------------------------------------------------------------------ #
     module_name: ClassVar[str] = "bifurcation"
-    description: ClassVar[str] = "Bifurcation flow module with multi-level channel calculations"
+    description: ClassVar[str] = (
+        "Bifurcation flow module with multi-level channel calculations"
+    )
     base = module_ref(BaseModule)
 
     # ------------------------------------------------------------------ #
@@ -82,9 +95,9 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Bifurcation topology
     # ------------------------------------------------------------------ #
-    output_bifurcation_path_id: Optional[torch.Tensor] = SelectionField(
+    output_bifurcation_path_id: torch.Tensor | None = SelectionField(
         description="Bifurcation path IDs to save in output. "
-                    "None means save all paths.",
+        "None means save all paths.",
         dtype="int",
         shape=("num_output_bifurcation_paths",),
         selects="bifurcation_path_id",
@@ -190,25 +203,19 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
-    @computed_field(
-        description="Number of paths saved in output."
-    )
+    @computed_field(description="Number of paths saved in output.")
     @cached_property
     def num_output_bifurcation_paths(self) -> int:
         if self.output_bifurcation_path_id is None:
             return self.num_bifurcation_paths
         return self.output_bifurcation_path_id.shape[0]
 
-    @computed_field(
-        description="Total number of bifurcation paths."
-    )
+    @computed_field(description="Total number of bifurcation paths.")
     @cached_property
     def num_bifurcation_paths(self) -> int:
         return self.bifurcation_path_id.shape[0]
 
-    @computed_field(
-        description="Number of levels in each bifurcation path."
-    )
+    @computed_field(description="Number of levels in each bifurcation path.")
     @cached_property
     def num_bifurcation_levels(self) -> int:
         return self.bifurcation_width.shape[-1]

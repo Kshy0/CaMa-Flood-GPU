@@ -11,7 +11,7 @@ Levee module definitions for CaMa-Flood-GPU.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Self
 
 import torch
 from hydroforge.model import (
@@ -30,9 +30,9 @@ from cmfgpu.modules.base import BaseModule
 
 def LeveeField(
     description: str,
-    shape: Tuple[str, ...] = ("num_levees",),
+    shape: tuple[str, ...] = ("num_levees",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "levee_id",
+    dim_coords: str | None = "levee_id",
     category: Literal["topology", "param", "init_state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     **kwargs,
@@ -50,13 +50,13 @@ def LeveeField(
 
 def computed_levee_field(
     description: str,
-    shape: Tuple[str, ...] = ("num_levees",),
+    shape: tuple[str, ...] = ("num_levees",),
     dtype: Literal["float", "int", "idx", "bool"] = "float",
-    dim_coords: Optional[str] = "levee_id",
+    dim_coords: str | None = "levee_id",
     category: Literal[
         "topology", "derived_param", "state", "virtual"
     ] = "derived_param",
-    expr: Optional[str] = None,
+    expr: str | None = None,
     **kwargs,
 ):
     return computed_tensor_field(

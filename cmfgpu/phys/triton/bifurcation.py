@@ -10,6 +10,12 @@ import triton.language as tl
 from cmfgpu.phys.triton.utils import cbrt_compat_inline, hpfloat_to_compute_inline
 
 
+from cmfgpu import config as _constants
+
+BACKFLOW_STORAGE_FRACTION = tl.constexpr(_constants.BACKFLOW_STORAGE_FRACTION)
+ROUTING_SLOPE_LIMIT = tl.constexpr(_constants.ROUTING_SLOPE_LIMIT)
+
+
 @triton.jit
 def compute_bifurcation_outflow_kernel(
     # Indices and configuration
@@ -63,7 +69,7 @@ def compute_bifurcation_outflow_kernel(
 
     # Bifurcation slope (clamped similarly to flood slope)
     bifurcation_slope = (bifurcation_water_surface_elevation - bifurcation_water_surface_elevation_downstream) / bifurcation_length
-    bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
+    bifurcation_slope = tl.clamp(bifurcation_slope, -ROUTING_SLOPE_LIMIT, ROUTING_SLOPE_LIMIT)
 
     # Storage change limiter calculation
     bifurcation_total_storage = hpfloat_to_compute_inline(
@@ -109,7 +115,7 @@ def compute_bifurcation_outflow_kernel(
         sum_bifurcation_outflow += updated_bifurcation_outflow
         tl.store(bifurcation_cross_section_depth_ptr + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
-    limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
+    limit_rate = tl.minimum(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
     sum_bifurcation_outflow *= limit_rate
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
@@ -191,7 +197,7 @@ def compute_bifurcation_outflow_batched_kernel(
     time_step_ptr,                                  # f32: Time step
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                    # Block size
     num_catchments: tl.constexpr,               # Need this for stride of catchment arrays
     # Batch flags
@@ -205,16 +211,16 @@ def compute_bifurcation_outflow_batched_kernel(
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Calculate trial and path indices
-    trial_idx = idx // num_bifurcation_paths
+    # Calculate member and path indices
+    member_index = idx // num_bifurcation_paths
     offs = idx % num_bifurcation_paths
     
-    mask = idx < (num_bifurcation_paths * num_trials)
+    mask = idx < (num_bifurcation_paths * ensemble_size)
     time_step = tl.load(time_step_ptr)
     
-    trial_offset_paths = trial_idx * num_bifurcation_paths
-    trial_offset_catchments = trial_idx * num_catchments
-    trial_offset_levels = trial_idx * num_bifurcation_paths * num_bifurcation_levels
+    member_offset_paths = member_index * num_bifurcation_paths
+    member_offset_catchments = member_index * num_catchments
+    member_offset_levels = member_index * num_bifurcation_paths * num_bifurcation_levels
     
     # Load indices
     # Topology is never batched
@@ -222,11 +228,11 @@ def compute_bifurcation_outflow_batched_kernel(
     bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
     
     # Load bifurcation properties
-    bifurcation_length = tl.load(bifurcation_length_ptr + (trial_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)
+    bifurcation_length = tl.load(bifurcation_length_ptr + (member_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)
     
-    # Derive diagnostics from this trial's source fields.
-    catchment_cell = trial_offset_catchments + bifurcation_catchment_idx
-    downstream_cell = trial_offset_catchments + bifurcation_downstream_idx
+    # Derive diagnostics from this member's source fields.
+    catchment_cell = member_offset_catchments + bifurcation_catchment_idx
+    downstream_cell = member_offset_catchments + bifurcation_downstream_idx
     catchment_height_idx = (
         catchment_cell if batched_river_height else bifurcation_catchment_idx
     )
@@ -255,7 +261,7 @@ def compute_bifurcation_outflow_batched_kernel(
 
     # Bifurcation slope (clamped similarly to flood slope)
     bifurcation_slope = (bifurcation_water_surface_elevation - bifurcation_water_surface_elevation_downstream) / bifurcation_length
-    bifurcation_slope = tl.clamp(bifurcation_slope, -0.005, 0.005)
+    bifurcation_slope = tl.clamp(bifurcation_slope, -ROUTING_SLOPE_LIMIT, ROUTING_SLOPE_LIMIT)
 
     # Storage change limiter calculation
     bifurcation_total_storage = hpfloat_to_compute_inline(
@@ -271,16 +277,16 @@ def compute_bifurcation_outflow_batched_kernel(
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
     
     # Base offsets for level-dependent arrays
-    manning_base = (trial_offset_levels if batched_bifurcation_manning else 0)
-    width_base = (trial_offset_levels if batched_bifurcation_width else 0)
-    elevation_base = (trial_offset_levels if batched_bifurcation_elevation else 0)
+    manning_base = (member_offset_levels if batched_bifurcation_manning else 0)
+    width_base = (member_offset_levels if batched_bifurcation_width else 0)
+    elevation_base = (member_offset_levels if batched_bifurcation_elevation else 0)
     
     for level in tl.static_range(num_bifurcation_levels):
         
         level_idx = offs * num_bifurcation_levels + level
         
         bifurcation_manning = tl.load(bifurcation_manning_ptr + manning_base + level_idx, mask=mask, other=0.0)
-        bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + trial_offset_levels + level_idx, mask=mask, other=0.0)
+        bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
         bifurcation_elevation = tl.load(bifurcation_elevation_ptr + elevation_base + level_idx, mask=mask, other=0.0)
         # Calculate bifurcation cross-section depth
         updated_bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
@@ -290,7 +296,7 @@ def compute_bifurcation_outflow_batched_kernel(
             tl.sqrt(updated_bifurcation_cross_section_depth * 0.01)
         )
         bifurcation_width = tl.load(bifurcation_width_ptr + width_base + level_idx, mask=mask, other=0.0)
-        bifurcation_outflow = tl.load(bifurcation_outflow_ptr + trial_offset_levels + level_idx, mask=mask, other=0.0)
+        bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
 
         unit_bifurcation_outflow = bifurcation_outflow / bifurcation_width
 
@@ -305,20 +311,20 @@ def compute_bifurcation_outflow_batched_kernel(
         bifurcation_condition = (bifurcation_semi_implicit_flow_depth > 1e-5)
         updated_bifurcation_outflow = tl.where(bifurcation_condition, updated_bifurcation_outflow, 0.0)
         sum_bifurcation_outflow += updated_bifurcation_outflow
-        tl.store(bifurcation_cross_section_depth_ptr + trial_offset_levels + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
-        tl.store(bifurcation_outflow_ptr + trial_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
-    limit_rate = tl.minimum(0.05 * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
+        tl.store(bifurcation_cross_section_depth_ptr + member_offset_levels + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
+        tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
+    limit_rate = tl.minimum(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream) / (tl.abs(sum_bifurcation_outflow) * time_step), 1.0)
     sum_bifurcation_outflow *= limit_rate
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
-        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + trial_offset_levels + level_idx, mask=mask)
+        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask)
         updated_bifurcation_outflow *= limit_rate
-        tl.store(bifurcation_outflow_ptr + trial_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
+        tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
 
     pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
     neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + trial_offset_catchments + bifurcation_catchment_idx, pos_flow * time_step, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + trial_offset_catchments + bifurcation_downstream_idx, -neg_flow * time_step, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_catchment_idx, pos_flow * time_step, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_downstream_idx, -neg_flow * time_step, mask=mask)
 
 
 @triton.jit
@@ -331,21 +337,21 @@ def compute_bifurcation_inflow_batched_kernel(
     global_bifurcation_outflow_ptr,            # *f64: Global bifurcation outflow
     num_bifurcation_paths: tl.constexpr,                    # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                     # Block size
     num_catchments: tl.constexpr,
 ):
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Calculate trial and path indices
-    trial_idx = idx // num_bifurcation_paths
+    # Calculate member and path indices
+    member_index = idx // num_bifurcation_paths
     offs = idx % num_bifurcation_paths
     
-    mask = idx < (num_bifurcation_paths * num_trials)
+    mask = idx < (num_bifurcation_paths * ensemble_size)
     
-    trial_offset_catchments = trial_idx * num_catchments
-    trial_offset_levels = trial_idx * num_bifurcation_paths * num_bifurcation_levels
+    member_offset_catchments = member_index * num_catchments
+    member_offset_levels = member_index * num_bifurcation_paths * num_bifurcation_levels
     
     # Load indices
     # Topology is never batched
@@ -353,14 +359,14 @@ def compute_bifurcation_inflow_batched_kernel(
     bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
     
     # Load limit rate
-    limit_rate = tl.load(limit_rate_ptr + trial_offset_catchments + bifurcation_catchment_idx, mask=mask, other=1.0)
-    limit_rate_downstream = tl.load(limit_rate_ptr + trial_offset_catchments + bifurcation_downstream_idx, mask=mask, other=1.0)
+    limit_rate = tl.load(limit_rate_ptr + member_offset_catchments + bifurcation_catchment_idx, mask=mask, other=1.0)
+    limit_rate_downstream = tl.load(limit_rate_ptr + member_offset_catchments + bifurcation_downstream_idx, mask=mask, other=1.0)
     raw_sum_bifurcation_outflow = tl.zeros_like(limit_rate)
 
     for level in tl.static_range(num_bifurcation_levels):
         level_idx = offs * num_bifurcation_levels + level
         raw_bifurcation_outflow = tl.load(
-            bifurcation_outflow_ptr + trial_offset_levels + level_idx,
+            bifurcation_outflow_ptr + member_offset_levels + level_idx,
             mask=mask,
         )
         raw_sum_bifurcation_outflow += raw_bifurcation_outflow
@@ -369,12 +375,12 @@ def compute_bifurcation_inflow_batched_kernel(
             raw_bifurcation_outflow * limit_rate,
             raw_bifurcation_outflow * limit_rate_downstream,
         )
-        tl.store(bifurcation_outflow_ptr + trial_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
+        tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
 
     net_bifurcation_outflow = tl.where(
         raw_sum_bifurcation_outflow >= 0.0,
         raw_sum_bifurcation_outflow * limit_rate,
         raw_sum_bifurcation_outflow * limit_rate_downstream,
     )
-    tl.atomic_add(global_bifurcation_outflow_ptr + trial_offset_catchments + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask)
-    tl.atomic_add(global_bifurcation_outflow_ptr + trial_offset_catchments + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + member_offset_catchments + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + member_offset_catchments + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask)

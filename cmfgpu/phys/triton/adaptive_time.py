@@ -60,7 +60,7 @@ def compute_adaptive_time_step_batched_kernel(
     adaptive_time_factor: tl.constexpr ,
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                # block size
     # Batch flags
     batched_downstream_distance: tl.constexpr,
@@ -69,25 +69,25 @@ def compute_adaptive_time_step_batched_kernel(
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Calculate trial and catchment indices
-    trial_idx = idx // num_catchments
+    # Calculate member and catchment indices
+    member_index = idx // num_catchments
     offs = idx % num_catchments
     
-    mask = idx < (num_catchments * num_trials)
+    mask = idx < (num_catchments * ensemble_size)
     
     # Skip dam-related cells from the CFL calculation.
     if HAS_RESERVOIR:
         is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
         mask = mask & (~is_dam)
 
-    trial_offset = trial_idx * num_catchments
+    member_offset = member_index * num_catchments
 
     downstream_distance = tl.load(
         downstream_distance_ptr
-        + (trial_offset if batched_downstream_distance else 0) + offs,
+        + (member_offset if batched_downstream_distance else 0) + offs,
         mask=mask, other=1.0,
     )
-    river_depth = tl.load(river_depth_ptr + trial_offset + offs, mask=mask, other=0)
+    river_depth = tl.load(river_depth_ptr + member_offset + offs, mask=mask, other=0)
 
     depth = tl.maximum(river_depth, 0.01)
     factor = tl.full(depth.shape, adaptive_time_factor, depth.dtype)

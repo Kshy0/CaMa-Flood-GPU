@@ -9,9 +9,9 @@ from pathlib import Path
 from hydroforge.kernels.backends.cuda import (
     CudaExtensionGroup,
     CudaExtensionSpec,
-    CudaNativeProjection,
     CudaRoute,
 )
+from cmfgpu import config as constants
 from cmfgpu.phys.specs import (
     ADAPTIVE_TIME,
     BIFURCATION_INFLOW,
@@ -26,10 +26,16 @@ from cmfgpu.phys.specs import (
     RESERVOIR_OUTFLOW,
 )
 
+PHYSICAL_CONSTANT_FLAGS = tuple(
+    f"-DCMF_{name}={value!r}"
+    for name, value in vars(constants).items() if name.isupper()
+)
+
 _DIR = Path(__file__).resolve().parent
 # Block-level reductions shared by the kernels that fold per-catchment values
 # into a single global scalar.
 _BLOCK_REDUCE = _DIR / "block_reduce.cuh"
+_ROUTING_CFLAGS = ("-O3", "--use_fast_math", "--ftz=false", *PHYSICAL_CONSTANT_FLAGS)
 _MODULE_EXTENSIONS = {
     "base": {"storage", "outflow"},
     "inflow": {"outflow"},
@@ -42,37 +48,35 @@ _MODULE_EXTENSIONS = {
 }
 
 
-def _shared(
-    disabled: tuple[str, ...] = (),
-) -> CudaNativeProjection:
-    """Declare only the non-inferable single-trial preconditions."""
-    return CudaNativeProjection(
-        fixed={"num_trials": 1, **dict.fromkeys(disabled, False)},
-    )
-
 
 _CUDA = CudaExtensionGroup(
     owner_module=__name__,
     specs={
         "storage": CudaExtensionSpec(
             source=_DIR / "storage.cu",
+            cflags=_ROUTING_CFLAGS,
             inline_includes=(_BLOCK_REDUCE,),
         ),
         "outflow": CudaExtensionSpec(
             source=_DIR / "outflow.cu",
+            cflags=_ROUTING_CFLAGS,
         ),
         "adaptive": CudaExtensionSpec(
             source=_DIR / "adaptive_time.cu",
+            cflags=("-O3", "--use_fast_math", *PHYSICAL_CONSTANT_FLAGS),
             inline_includes=(_BLOCK_REDUCE,),
         ),
         "bifurcation": CudaExtensionSpec(
             source=_DIR / "bifurcation.cu",
+            cflags=_ROUTING_CFLAGS,
         ),
         "reservoir": CudaExtensionSpec(
             source=_DIR / "reservoir.cu",
+            cflags=("-O3", "--use_fast_math", *PHYSICAL_CONSTANT_FLAGS),
         ),
         "levee": CudaExtensionSpec(
             source=_DIR / "levee.cu",
+            cflags=_ROUTING_CFLAGS,
             inline_includes=(_BLOCK_REDUCE,),
         ),
     },
@@ -81,17 +85,6 @@ _CUDA = CudaExtensionGroup(
             extension="storage",
             launch="launch_flood_stage",
             spec=FLOOD_STAGE,
-            projection=_shared(
-                disabled=(
-                    "batched_catchment_area",
-                    "batched_flood_depth_table",
-                    "batched_river_height",
-                    "batched_river_length",
-                    "batched_river_width",
-                    "batched_runoff",
-                    "batched_inflow",
-                ),
-            ),
         ),
         CudaRoute(
             extension="storage",
@@ -102,74 +95,36 @@ _CUDA = CudaExtensionGroup(
             extension="outflow",
             launch="launch_outflow",
             spec=OUTFLOW,
-            projection=_shared(
-                disabled=(
-                    "batched_catchment_elevation",
-                    "batched_downstream_distance",
-                    "batched_flood_manning",
-                    "batched_river_height",
-                    "batched_river_length",
-                    "batched_river_manning",
-                    "batched_river_width",
-                    "batched_sea_surface_elevation",
-                ),
-            ),
         ),
         CudaRoute(
             extension="outflow",
             launch="launch_inflow",
             spec=INFLOW,
-            projection=_shared(),
         ),
         CudaRoute(
             extension="adaptive",
             launch="launch_adaptive_time",
             spec=ADAPTIVE_TIME,
-            projection=_shared(disabled=("batched_downstream_distance",)),
         ),
         CudaRoute(
             extension="bifurcation",
             launch="launch_bif_outflow",
             spec=BIFURCATION_OUTFLOW,
-            projection=_shared(
-                disabled=(
-                    "batched_bifurcation_elevation",
-                    "batched_bifurcation_length",
-                    "batched_bifurcation_manning",
-                    "batched_bifurcation_width",
-                    "batched_catchment_elevation",
-                    "batched_river_height",
-                ),
-            ),
         ),
         CudaRoute(
             extension="bifurcation",
             launch="launch_bif_inflow",
             spec=BIFURCATION_INFLOW,
-            projection=_shared(),
         ),
         CudaRoute(
             extension="reservoir",
             launch="launch_reservoir_outflow",
             spec=RESERVOIR_OUTFLOW,
-            projection=_shared(disabled=("batched_runoff",)),
         ),
         CudaRoute(
             extension="levee",
             launch="launch_levee_stage",
             spec=LEVEE_STAGE,
-            projection=_shared(
-                disabled=(
-                    "batched_catchment_area",
-                    "batched_flood_depth_table",
-                    "batched_levee_base_height",
-                    "batched_levee_crown_height",
-                    "batched_levee_fraction",
-                    "batched_river_height",
-                    "batched_river_length",
-                    "batched_river_width",
-                ),
-            ),
         ),
         CudaRoute(
             extension="levee",
@@ -180,16 +135,6 @@ _CUDA = CudaExtensionGroup(
             extension="levee",
             launch="launch_levee_bif_outflow",
             spec=LEVEE_BIFURCATION_OUTFLOW,
-            projection=_shared(
-                disabled=(
-                    "batched_bifurcation_elevation",
-                    "batched_bifurcation_length",
-                    "batched_bifurcation_manning",
-                    "batched_bifurcation_width",
-                    "batched_catchment_elevation",
-                    "batched_river_height",
-                ),
-            ),
         ),
     ),
     binary_prefix="cmfgpu_cuda",

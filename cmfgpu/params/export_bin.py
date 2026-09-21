@@ -50,10 +50,10 @@ Usage example
 ...     crop_to_bbox=True,   # shrink grid to catchment bounding box
 ... )
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple, Union
 
 import numpy as np
 from netCDF4 import Dataset
@@ -62,6 +62,7 @@ from scipy.sparse import csr_matrix
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
+
 
 def _compute_bbox(
     catchment_x: np.ndarray,
@@ -72,7 +73,7 @@ def _compute_bbox(
     full_east: float = 180.0,
     full_north: float = 90.0,
     full_south: float = -90.0,
-) -> Tuple[int, int, int, int, int, int, float, float, float, float]:
+) -> tuple[int, int, int, int, int, int, float, float, float, float]:
     """Compute the bounding box of the catchment subset.
 
     Returns
@@ -91,7 +92,7 @@ def _compute_bbox(
     crop_nx = x_max - x_min + 1
     crop_ny = y_max - y_min + 1
 
-    dlon = (full_east - full_west) / full_nx   # e.g. 0.25° for global 1440
+    dlon = (full_east - full_west) / full_nx  # e.g. 0.25° for global 1440
     dlat = (full_north - full_south) / full_ny  # e.g. 0.25° for global 720
     west = full_west + x_min * dlon
     east = full_west + (x_max + 1) * dlon
@@ -99,6 +100,7 @@ def _compute_bbox(
     south = full_north - (y_max + 1) * dlat
 
     return x_min, x_max, y_min, y_max, crop_nx, crop_ny, west, east, north, south
+
 
 def _write_bin(path: Path, data: np.ndarray) -> None:
     """Write *data* as a column-major flat binary file (no record markers)."""
@@ -141,7 +143,7 @@ def _scatter_1d_to_3d(
 # nextxy reconstruction
 # ---------------------------------------------------------------------------
 
-_MOUTH_OCEAN = -9     # CaMa-Flood convention for ocean outlet
+_MOUTH_OCEAN = -9  # CaMa-Flood convention for ocean outlet
 
 
 def _rebuild_nextxy(
@@ -183,16 +185,17 @@ def _rebuild_nextxy(
 
     nextxy[ix[~resolvable], iy[~resolvable], :] = _MOUTH_OCEAN
     linked = np.flatnonzero(resolvable)
-    nextxy[ix[linked], iy[linked], 0] = (
-        grid_to_x[ds_id[linked]] + 1).astype("<i4")  # 1-based
-    nextxy[ix[linked], iy[linked], 1] = (
-        grid_to_y[ds_id[linked]] + 1).astype("<i4")
+    nextxy[ix[linked], iy[linked], 0] = (grid_to_x[ds_id[linked]] + 1).astype(
+        "<i4"
+    )  # 1-based
+    nextxy[ix[linked], iy[linked], 1] = (grid_to_y[ds_id[linked]] + 1).astype("<i4")
     return nextxy
 
 
 # ---------------------------------------------------------------------------
 # bifprm.txt writer
 # ---------------------------------------------------------------------------
+
 
 def _write_bifprm(
     path: Path,
@@ -203,13 +206,13 @@ def _write_bifprm(
     bif_length: np.ndarray,
     bif_elevation: np.ndarray,
     bif_width: np.ndarray,
-    longitude: Optional[np.ndarray],
-    latitude: Optional[np.ndarray],
+    longitude: np.ndarray | None,
+    latitude: np.ndarray | None,
     catchment_x: np.ndarray,
     catchment_y: np.ndarray,
     catchment_id: np.ndarray,
-    river_mouth_id: Optional[np.ndarray],
-    catchment_elevation: Optional[np.ndarray] = None,
+    river_mouth_id: np.ndarray | None,
+    catchment_elevation: np.ndarray | None = None,
     missing_int: int = -9999,
 ) -> None:
     """Write CaMa-Flood v4 ``bifprm.txt``.
@@ -235,8 +238,16 @@ def _write_bifprm(
     n_levels = bif_width.shape[1] if bif_width.ndim == 2 else 1
 
     # Build 2D grid lookups (avoids dict altogether)
-    max_x = int(max(catchment_x.max(), bif_cx.max(), bif_dx.max())) if n_paths > 0 else int(catchment_x.max())
-    max_y = int(max(catchment_y.max(), bif_cy.max(), bif_dy.max())) if n_paths > 0 else int(catchment_y.max())
+    max_x = (
+        int(max(catchment_x.max(), bif_cx.max(), bif_dx.max()))
+        if n_paths > 0
+        else int(catchment_x.max())
+    )
+    max_y = (
+        int(max(catchment_y.max(), bif_cy.max(), bif_dy.max()))
+        if n_paths > 0
+        else int(catchment_y.max())
+    )
     grid_shape = (max_x + 1, max_y + 1)
 
     cid_grid = np.full(grid_shape, -1, dtype=np.int64)
@@ -260,7 +271,9 @@ def _write_bifprm(
 
     elevtn_grid = np.full(grid_shape, np.nan, dtype=np.float64)
     if catchment_elevation is not None:
-        elevtn_grid[catchment_x.astype(int), catchment_y.astype(int)] = catchment_elevation
+        elevtn_grid[catchment_x.astype(int), catchment_y.astype(int)] = (
+            catchment_elevation
+        )
 
     with open(path, "w") as f:
         f.write(
@@ -269,7 +282,7 @@ def _write_bifprm(
             "(width1, width2, ... width_nlev), (lat,lon), (basins)\n"
         )
         for i in range(n_paths):
-            ix = int(bif_cx[i]) + 1   # 1-based
+            ix = int(bif_cx[i]) + 1  # 1-based
             iy = int(bif_cy[i]) + 1
             jx = int(bif_dx[i]) + 1
             jy = int(bif_dy[i]) + 1
@@ -292,7 +305,7 @@ def _write_bifprm(
             else:
                 elvs = np.array([float(bif_elevation[i])])
 
-            elev_val = -9999.0   # PELV
+            elev_val = -9999.0  # PELV
             depth_val = -9999.0  # PDPH
 
             # Try to recover PELV from a valid higher level (0-based k>=1)
@@ -300,7 +313,7 @@ def _write_bifprm(
                 _w = float(bif_width[i, _k]) if bif_width.ndim == 2 else 0.0
                 _e = float(elvs[_k])
                 if _w > 0 and abs(_e) < 1e10:
-                    elev_val = _e - (_k + 1 - 2)   # PELV
+                    elev_val = _e - (_k + 1 - 2)  # PELV
                     break
 
             # Fallback: use catchment_elevation at the upstream cell
@@ -321,8 +334,9 @@ def _write_bifprm(
 
             # Widths – also clamp fill values
             if bif_width.ndim == 2:
-                widths = [float(w) if abs(float(w)) < 1e10 else 0.0
-                          for w in bif_width[i, :]]
+                widths = [
+                    float(w) if abs(float(w)) < 1e10 else 0.0 for w in bif_width[i, :]
+                ]
             else:
                 w0 = float(bif_width[i])
                 widths = [w0 if abs(w0) < 1e10 else 0.0]
@@ -339,8 +353,16 @@ def _write_bifprm(
             # Basin IDs from river mouths via 2D grid
             dn_x, dn_y = int(bif_dx[i]), int(bif_dy[i])
             if has_mouth:
-                basin_up = int(mouth_grid[up_x, up_y]) if cid_grid[up_x, up_y] >= 0 else missing_int
-                basin_dn = int(mouth_grid[dn_x, dn_y]) if cid_grid[dn_x, dn_y] >= 0 else missing_int
+                basin_up = (
+                    int(mouth_grid[up_x, up_y])
+                    if cid_grid[up_x, up_y] >= 0
+                    else missing_int
+                )
+                basin_dn = (
+                    int(mouth_grid[dn_x, dn_y])
+                    if cid_grid[dn_x, dn_y] >= 0
+                    else missing_int
+                )
             else:
                 basin_up = missing_int
                 basin_dn = missing_int
@@ -368,6 +390,7 @@ def _write_bifprm(
 # dam_params.csv writer
 # ---------------------------------------------------------------------------
 
+
 def _write_dam_params_csv(
     path: Path,
     reservoir_catchment_id: np.ndarray,
@@ -382,10 +405,10 @@ def _write_dam_params_csv(
     y_min: int = 0,
     out_nx: int = 0,
     out_ny: int = 0,
-    longitude: Optional[np.ndarray] = None,
-    latitude: Optional[np.ndarray] = None,
-    upstream_area: Optional[np.ndarray] = None,
-    reservoir_id: Optional[np.ndarray] = None,
+    longitude: np.ndarray | None = None,
+    latitude: np.ndarray | None = None,
+    upstream_area: np.ndarray | None = None,
+    reservoir_id: np.ndarray | None = None,
 ) -> None:
     """Write ``dam_params.csv`` in the CaMa-Flood dam-parameter CSV format.
 
@@ -447,10 +470,7 @@ def _write_dam_params_csv(
     dam_cy = full_y - y_min
 
     # ---- Filter to dams inside the output grid ----
-    inside = (
-        (dam_cx >= 0) & (dam_cx < out_nx) &
-        (dam_cy >= 0) & (dam_cy < out_ny)
-    )
+    inside = (dam_cx >= 0) & (dam_cx < out_nx) & (dam_cy >= 0) & (dam_cy < out_ny)
     idx_keep = np.nonzero(inside)[0]
     n_kept = len(idx_keep)
     if n_kept == 0:
@@ -468,18 +488,16 @@ def _write_dam_params_csv(
     # ---- Write CSV ----
     with open(path, "w") as f:
         f.write(f"{n_kept}\n")
-        f.write("DamID DamName DamLat DamLon upreal "
-                "DamIX DamIY FldVol_mcm ConVol_mcm TotVol_mcm Qn Qf\n")
+        f.write(
+            "DamID DamName DamLat DamLon upreal "
+            "DamIX DamIY FldVol_mcm ConVol_mcm TotVol_mcm Qn Qf\n"
+        )
 
         for rank, i in enumerate(idx_keep):
-            dam_id = (
-                int(reservoir_id[i])
-                if reservoir_id is not None
-                else rank + 1
-            )
+            dam_id = int(reservoir_id[i]) if reservoir_id is not None else rank + 1
             dam_name = f"DAM_{dam_id}"
 
-            ix_out = int(dam_cx[i]) + 1              # 1-based output index
+            ix_out = int(dam_cx[i]) + 1  # 1-based output index
             iy_out = int(dam_cy[i]) + 1
 
             fld_mcm = float(flood_volume[i]) / 1.0e6
@@ -490,7 +508,11 @@ def _write_dam_params_csv(
 
             # Lat / Lon / upstream area from catchment arrays
             cid_int = int(reservoir_catchment_id[i])
-            catch_idx = int(grid_to_idx[cid_int]) if cid_int < len(grid_to_idx) and grid_to_idx[cid_int] >= 0 else -1
+            catch_idx = (
+                int(grid_to_idx[cid_int])
+                if cid_int < len(grid_to_idx) and grid_to_idx[cid_int] >= 0
+                else -1
+            )
             if catch_idx >= 0 and latitude is not None:
                 lat_val = float(latitude[catch_idx])
                 lon_val = float(longitude[catch_idx])
@@ -510,14 +532,17 @@ def _write_dam_params_csv(
                 f"{qn_val:.4f} {qf_val:.4f}\n"
             )
 
-    print(f"  Wrote dam_params.csv  ({n_kept} dams"
-          + (f", {n_total - n_kept} outside crop" if n_kept < n_total else "")
-          + ")")
+    print(
+        f"  Wrote dam_params.csv  ({n_kept} dams"
+        + (f", {n_total - n_kept} outside crop" if n_kept < n_total else "")
+        + ")"
+    )
 
 
 # ---------------------------------------------------------------------------
 # mapdim / diminfo writers
 # ---------------------------------------------------------------------------
+
 
 def _write_mapdim(path: Path, nx: int, ny: int, nlfp: int) -> None:
     with open(path, "w") as f:
@@ -564,8 +589,10 @@ def _write_crop_info(
         f.write(f"{y_min:10d}    !! y_min\n")
         f.write(f"{crop_nx:10d}    !! crop_nx  (cropped grid size)\n")
         f.write(f"{crop_ny:10d}    !! crop_ny\n")
-    print(f"  Wrote crop_info.txt  (offset=({x_min},{y_min}), "
-          f"full={full_nx}×{full_ny} → crop={crop_nx}×{crop_ny})")
+    print(
+        f"  Wrote crop_info.txt  (offset=({x_min},{y_min}), "
+        f"full={full_nx}×{full_ny} → crop={crop_nx}×{crop_ny})"
+    )
 
 
 def _write_diminfo(
@@ -601,9 +628,10 @@ def _write_diminfo(
 # Main: export NC → binary map files
 # ===========================================================================
 
+
 def export_map_params(
-    nc_path: Union[str, Path],
-    out_dir: Union[str, Path],
+    nc_path: str | Path,
+    out_dir: str | Path,
     *,
     crop_to_bbox: bool = False,
     river_manning_default: float = 0.03,
@@ -613,7 +641,7 @@ def export_map_params(
     south: float = -90.0,
     missing_float: float = -9999.0,
     missing_int: int = -9999,
-) -> Tuple[Path, int, int, int, float, float, float, float]:
+) -> tuple[Path, int, int, int, float, float, float, float]:
     """Convert a CaMa-Flood-GPU ``parameters.nc`` back to CaMa-Flood v4 binary files.
 
     Generates the following files in *out_dir*:
@@ -694,22 +722,39 @@ def export_map_params(
 
         # --- Determine output grid (full or cropped) ---
         if crop_to_bbox and n_catch < full_nx * full_ny:
-            (x_min, x_max, y_min, y_max,
-             out_nx, out_ny,
-             out_west, out_east, out_north, out_south,
-             ) = _compute_bbox(
-                catchment_x, catchment_y, full_nx, full_ny,
-                full_west=west, full_east=east,
-                full_north=north, full_south=south,
+            (
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+                out_nx,
+                out_ny,
+                out_west,
+                out_east,
+                out_north,
+                out_south,
+            ) = _compute_bbox(
+                catchment_x,
+                catchment_y,
+                full_nx,
+                full_ny,
+                full_west=west,
+                full_east=east,
+                full_north=north,
+                full_south=south,
             )
             # Offset coordinates to the cropped grid
             cx = catchment_x - x_min
             cy = catchment_y - y_min
-            print(f"    Full grid: {full_nx}×{full_ny}  →  "
-                  f"Cropped bbox: x=[{x_min},{x_max}] y=[{y_min},{y_max}]  "
-                  f"→  {out_nx}×{out_ny}")
-            print(f"    Geographic extent: W={out_west:.3f} E={out_east:.3f} "
-                  f"N={out_north:.3f} S={out_south:.3f}")
+            print(
+                f"    Full grid: {full_nx}×{full_ny}  →  "
+                f"Cropped bbox: x=[{x_min},{x_max}] y=[{y_min},{y_max}]  "
+                f"→  {out_nx}×{out_ny}"
+            )
+            print(
+                f"    Geographic extent: W={out_west:.3f} E={out_east:.3f} "
+                f"N={out_north:.3f} S={out_south:.3f}"
+            )
         else:
             out_nx, out_ny = full_nx, full_ny
             cx, cy = catchment_x, catchment_y
@@ -717,13 +762,19 @@ def export_map_params(
             out_west, out_east = west, east
             out_north, out_south = north, south
 
-        print(f"    Output grid: {out_nx}×{out_ny},  catchments: {n_catch},  "
-              f"flood levels: {nlfp}")
+        print(
+            f"    Output grid: {out_nx}×{out_ny},  catchments: {n_catch},  "
+            f"flood levels: {nlfp}"
+        )
 
         # ---- nextxy.bin ----
         nextxy = _rebuild_nextxy(
-            out_nx, out_ny, catchment_id, downstream_id,
-            cx, cy,
+            out_nx,
+            out_ny,
+            catchment_id,
+            downstream_id,
+            cx,
+            cy,
             missing_int=missing_int,
         )
         _write_bin(out_dir / "nextxy.bin", nextxy)
@@ -738,8 +789,9 @@ def export_map_params(
         for fname, var_name in _2d_fields.items():
             if var_name in ds.variables:
                 vals = ds.variables[var_name][:].astype("<f4")
-                grid = _scatter_1d_to_2d(out_nx, out_ny, cx, cy, vals,
-                                         fill=missing_float, dtype="<f4")
+                grid = _scatter_1d_to_2d(
+                    out_nx, out_ny, cx, cy, vals, fill=missing_float, dtype="<f4"
+                )
                 _write_bin(out_dir / fname, grid)
 
         # ---- Optional 2-D float maps ----
@@ -751,21 +803,28 @@ def export_map_params(
         for fname, var_name in _optional_2d.items():
             if var_name in ds.variables:
                 vals = ds.variables[var_name][:].astype("<f4")
-                grid = _scatter_1d_to_2d(out_nx, out_ny, cx, cy, vals,
-                                         fill=missing_float, dtype="<f4")
+                grid = _scatter_1d_to_2d(
+                    out_nx, out_ny, cx, cy, vals, fill=missing_float, dtype="<f4"
+                )
                 _write_bin(out_dir / fname, grid)
 
         # ---- rivman.bin (uniform Manning coefficient) ----
         man_vals = np.full(n_catch, river_manning_default, dtype="<f4")
-        grid = _scatter_1d_to_2d(out_nx, out_ny, cx, cy, man_vals,
-                                 fill=missing_float, dtype="<f4")
+        grid = _scatter_1d_to_2d(
+            out_nx, out_ny, cx, cy, man_vals, fill=missing_float, dtype="<f4"
+        )
         _write_bin(out_dir / "rivman.bin", grid)
 
         # ---- fldhgt.bin (3-D) ----
         fld_grid = _scatter_1d_to_3d(
-            out_nx, out_ny, nlfp, cx, cy,
+            out_nx,
+            out_ny,
+            nlfp,
+            cx,
+            cy,
             flood_depth_table.astype("<f4"),
-            fill=missing_float, dtype="<f4",
+            fill=missing_float,
+            dtype="<f4",
         )
         _write_bin(out_dir / "fldhgt.bin", fld_grid)
 
@@ -785,10 +844,12 @@ def export_map_params(
             lev_cx = ds.variables["levee_catchment_x"][:].astype(np.int64) - x_min
             lev_cy = ds.variables["levee_catchment_y"][:].astype(np.int64) - y_min
             # Scatter onto 2-D grid (non-levee cells get fill=0)
-            grid_hgt = _scatter_1d_to_2d(out_nx, out_ny, lev_cx, lev_cy, lev_hgt,
-                                         fill=0.0, dtype="<f4")
-            grid_frc = _scatter_1d_to_2d(out_nx, out_ny, lev_cx, lev_cy, lev_frc,
-                                         fill=-1.0, dtype="<f4")
+            grid_hgt = _scatter_1d_to_2d(
+                out_nx, out_ny, lev_cx, lev_cy, lev_hgt, fill=0.0, dtype="<f4"
+            )
+            grid_frc = _scatter_1d_to_2d(
+                out_nx, out_ny, lev_cx, lev_cy, lev_frc, fill=-1.0, dtype="<f4"
+            )
             _write_bin(out_dir / "levhgt.bin", grid_hgt)
             _write_bin(out_dir / "levfrc.bin", grid_frc)
 
@@ -796,13 +857,19 @@ def export_map_params(
         if "bifurcation_catchment_x" in ds.variables:
             bif_cx = ds.variables["bifurcation_catchment_x"][:].astype(np.int64) - x_min
             bif_cy = ds.variables["bifurcation_catchment_y"][:].astype(np.int64) - y_min
-            bif_dx = ds.variables["bifurcation_downstream_x"][:].astype(np.int64) - x_min
-            bif_dy = ds.variables["bifurcation_downstream_y"][:].astype(np.int64) - y_min
+            bif_dx = (
+                ds.variables["bifurcation_downstream_x"][:].astype(np.int64) - x_min
+            )
+            bif_dy = (
+                ds.variables["bifurcation_downstream_y"][:].astype(np.int64) - y_min
+            )
             bif_len = ds.variables["bifurcation_length"][:].astype("<f4")
             bif_elv = ds.variables["bifurcation_elevation"][:]
             bif_wth = ds.variables["bifurcation_width"][:]
 
-            lon_1d = ds.variables["longitude"][:] if "longitude" in ds.variables else None
+            lon_1d = (
+                ds.variables["longitude"][:] if "longitude" in ds.variables else None
+            )
             lat_1d = ds.variables["latitude"][:] if "latitude" in ds.variables else None
             mouth_id = (
                 ds.variables["river_mouth_id"][:].astype(np.int64)
@@ -812,29 +879,41 @@ def export_map_params(
 
             _write_bifprm(
                 out_dir / "bifprm.txt",
-                bif_cx, bif_cy, bif_dx, bif_dy,
-                bif_len, bif_elv, bif_wth,
-                longitude=lon_1d, latitude=lat_1d,
-                catchment_x=cx, catchment_y=cy,
+                bif_cx,
+                bif_cy,
+                bif_dx,
+                bif_dy,
+                bif_len,
+                bif_elv,
+                bif_wth,
+                longitude=lon_1d,
+                latitude=lat_1d,
+                catchment_x=cx,
+                catchment_y=cy,
                 catchment_id=catchment_id,
                 river_mouth_id=mouth_id,
                 catchment_elevation=(
                     ds.variables["catchment_elevation"][:].data
-                    if "catchment_elevation" in ds.variables else None
+                    if "catchment_elevation" in ds.variables
+                    else None
                 ),
                 missing_int=missing_int,
             )
 
         # ---- dam_params.csv (reservoir parameters) ----
         _required_dam_vars = (
-            "reservoir_catchment_id", "reservoir_capacity",
-            "conservation_volume", "emergency_volume",
-            "normal_outflow", "flood_control_outflow",
+            "reservoir_catchment_id",
+            "reservoir_capacity",
+            "conservation_volume",
+            "emergency_volume",
+            "normal_outflow",
+            "flood_control_outflow",
         )
         if all(v in ds.variables for v in _required_dam_vars):
             res_id = (
                 ds.variables["reservoir_id"][:].astype(np.int64)
-                if "reservoir_id" in ds.variables else None
+                if "reservoir_id" in ds.variables
+                else None
             )
             res_cid = ds.variables["reservoir_catchment_id"][:].astype(np.int64)
             res_cap = ds.variables["reservoir_capacity"][:].astype("<f4")
@@ -845,15 +924,18 @@ def export_map_params(
 
             up_area = (
                 ds.variables["upstream_area"][:].astype("<f4")
-                if "upstream_area" in ds.variables else None
+                if "upstream_area" in ds.variables
+                else None
             )
             lon_1d = (
                 ds.variables["longitude"][:].astype("<f4")
-                if "longitude" in ds.variables else None
+                if "longitude" in ds.variables
+                else None
             )
             lat_1d = (
                 ds.variables["latitude"][:].astype("<f4")
-                if "latitude" in ds.variables else None
+                if "latitude" in ds.variables
+                else None
             )
 
             _write_dam_params_csv(
@@ -883,7 +965,12 @@ def export_map_params(
         if crop_to_bbox and (out_nx != full_nx or out_ny != full_ny):
             _write_crop_info(
                 out_dir / "crop_info.txt",
-                full_nx, full_ny, x_min, y_min, out_nx, out_ny,
+                full_nx,
+                full_ny,
+                x_min,
+                y_min,
+                out_nx,
+                out_ny,
             )
 
     print(f"=== Map export complete → {out_dir} ===\n")
@@ -894,16 +981,17 @@ def export_map_params(
 # Main: export NPZ → inpmat binary + diminfo
 # ===========================================================================
 
+
 def export_inpmat(
-    npz_path: Union[str, Path],
-    nc_path: Union[str, Path],
-    out_dir: Union[str, Path],
+    npz_path: str | Path,
+    nc_path: str | Path,
+    out_dir: str | Path,
     *,
     inpmat_name: str = "inpmat.bin",
     diminfo_name: str = "diminfo.txt",
-    out_nx: Optional[int] = None,
-    out_ny: Optional[int] = None,
-    nlfp: Optional[int] = None,
+    out_nx: int | None = None,
+    out_ny: int | None = None,
+    nlfp: int | None = None,
     west: float = -180.0,
     east: float = 180.0,
     north: float = 90.0,
@@ -1005,17 +1093,27 @@ def export_inpmat(
         # We still need x_min/y_min to offset catchment coordinates
         if out_nx != full_nx or out_ny != full_ny:
             bbox = _compute_bbox(
-                nc_cx, nc_cy, full_nx, full_ny,
-                full_west=west, full_east=east,
-                full_north=north, full_south=south,
+                nc_cx,
+                nc_cy,
+                full_nx,
+                full_ny,
+                full_west=west,
+                full_east=east,
+                full_north=north,
+                full_south=south,
             )
             x_min = bbox[0]  # x_min
             y_min = bbox[2]  # y_min
     elif crop_to_bbox:
         bbox = _compute_bbox(
-            nc_cx, nc_cy, full_nx, full_ny,
-            full_west=west, full_east=east,
-            full_north=north, full_south=south,
+            nc_cx,
+            nc_cy,
+            full_nx,
+            full_ny,
+            full_west=west,
+            full_east=east,
+            full_north=north,
+            full_south=south,
         )
         x_min = bbox[0]
         y_min = bbox[2]
@@ -1033,7 +1131,9 @@ def export_inpmat(
     # Build npz_catchment_id → row-index with flat array
     max_npz_cid = int(npz_catchment_ids.max())
     npz_grid_to_row = np.full(max_npz_cid + 1, -1, dtype=np.int64)
-    npz_grid_to_row[npz_catchment_ids.astype(np.int64)] = np.arange(len(npz_catchment_ids), dtype=np.int64)
+    npz_grid_to_row[npz_catchment_ids.astype(np.int64)] = np.arange(
+        len(npz_catchment_ids), dtype=np.int64
+    )
 
     # Build catchment_id → (cx, cy) in output grid coordinates with flat arrays
     max_nc_cid = int(nc_cid.max())
@@ -1067,8 +1167,10 @@ def export_inpmat(
     entry_ix = np.where(keep, nc_grid_cx[np.where(keep, entry_cid, 0)], -1)
     entry_iy = np.where(keep, nc_grid_cy[np.where(keep, entry_cid, 0)], -1)
     keep &= (
-        (entry_ix >= 0) & (entry_ix < out_nx)
-        & (entry_iy >= 0) & (entry_iy < out_ny)  # outside cropped grid
+        (entry_ix >= 0)
+        & (entry_ix < out_nx)
+        & (entry_iy >= 0)
+        & (entry_iy < out_ny)  # outside cropped grid
     )
 
     sel = np.flatnonzero(keep)
@@ -1101,15 +1203,26 @@ def export_inpmat(
         raise RuntimeError(
             f"inpmat size mismatch: expected {expected_size}, got {actual_size}"
         )
-    print(f"  Wrote {inpmat_name}  ({actual_size / 1e6:.1f} MB,  "
-          f"{3 * inpn} records of {record_bytes} bytes)")
+    print(
+        f"  Wrote {inpmat_name}  ({actual_size / 1e6:.1f} MB,  "
+        f"{3 * inpn} records of {record_bytes} bytes)"
+    )
 
     # --- Write diminfo ---
     diminfo_path = out_dir / diminfo_name
     _write_diminfo(
-        diminfo_path, out_nx, out_ny, nlfp,
-        nxin, nyin, inpn, inpmat_name,
-        west, east, north, south,
+        diminfo_path,
+        out_nx,
+        out_ny,
+        nlfp,
+        nxin,
+        nyin,
+        inpn,
+        inpmat_name,
+        west,
+        east,
+        north,
+        south,
     )
 
     print(f"=== inpmat export complete → {out_dir} ===\n")
@@ -1120,11 +1233,12 @@ def export_inpmat(
 # Convenience wrapper
 # ===========================================================================
 
+
 def export_to_cama_bin(
-    nc_path: Union[str, Path],
-    out_dir: Union[str, Path],
+    nc_path: str | Path,
+    out_dir: str | Path,
     *,
-    npz_path: Optional[Union[str, Path]] = None,
+    npz_path: str | Path | None = None,
     river_manning_default: float = 0.03,
     inpmat_name: str = "inpmat.bin",
     diminfo_name: str = "diminfo.txt",
@@ -1166,23 +1280,31 @@ def export_to_cama_bin(
     out_dir = Path(out_dir)
 
     result = export_map_params(
-        nc_path, out_dir,
+        nc_path,
+        out_dir,
         river_manning_default=river_manning_default,
-        west=west, east=east, north=north, south=south,
+        west=west,
+        east=east,
+        north=north,
+        south=south,
         crop_to_bbox=crop_to_bbox,
     )
     _, out_nx, out_ny, nlfp, c_west, c_east, c_north, c_south = result
 
     if npz_path is not None:
         export_inpmat(
-            npz_path, nc_path, out_dir,
+            npz_path,
+            nc_path,
+            out_dir,
             inpmat_name=inpmat_name,
             diminfo_name=diminfo_name,
             out_nx=out_nx,
             out_ny=out_ny,
             nlfp=nlfp,
-            west=c_west, east=c_east,
-            north=c_north, south=c_south,
+            west=c_west,
+            east=c_east,
+            north=c_north,
+            south=c_south,
             crop_to_bbox=crop_to_bbox,
         )
 
@@ -1201,17 +1323,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("nc_path", help="Path to parameters.nc")
     parser.add_argument("out_dir", help="Output directory for binary files")
-    parser.add_argument("--npz", default=None, help="Path to runoff_mapping.npz (optional)")
-    parser.add_argument("--river-manning", type=float, default=0.03,
-                        help="River Manning coefficient (default 0.03)")
-    parser.add_argument("--inpmat-name", default="inpmat.bin", help="inpmat output filename")
-    parser.add_argument("--diminfo-name", default="diminfo.txt", help="diminfo output filename")
+    parser.add_argument(
+        "--npz", default=None, help="Path to runoff_mapping.npz (optional)"
+    )
+    parser.add_argument(
+        "--river-manning",
+        type=float,
+        default=0.03,
+        help="River Manning coefficient (default 0.03)",
+    )
+    parser.add_argument(
+        "--inpmat-name", default="inpmat.bin", help="inpmat output filename"
+    )
+    parser.add_argument(
+        "--diminfo-name", default="diminfo.txt", help="diminfo output filename"
+    )
     parser.add_argument("--west", type=float, default=-180.0)
     parser.add_argument("--east", type=float, default=180.0)
     parser.add_argument("--north", type=float, default=90.0)
     parser.add_argument("--south", type=float, default=-90.0)
     parser.add_argument(
-        "--crop-to-bbox", action="store_true",
+        "--crop-to-bbox",
+        action="store_true",
         help="Shrink output grid to the bounding box of catchments for minimal file size.",
     )
 

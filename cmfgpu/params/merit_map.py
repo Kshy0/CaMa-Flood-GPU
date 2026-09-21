@@ -7,6 +7,7 @@
 """
 MERIT-based map parameter generation using Pydantic v2.
 """
+
 from __future__ import annotations
 
 import csv
@@ -14,25 +15,38 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Optional, Union
+from typing import Any, ClassVar
 
 import numpy as np
 from hydroforge.data import find_indices_in
 from netCDF4 import Dataset
-from pydantic import (BaseModel, ConfigDict, DirectoryPath, Field, FilePath,
-                      model_validator)
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    DirectoryPath,
+    Field,
+    FilePath,
+    model_validator,
+)
 
-from cmfgpu.params.schema import (PARAMETER_FIELD_DIMS,
-                                  PARAMETER_MODULE_FIELDS,
-                                  PARAMETER_OPTIONAL_FIELDS,
-                                  PARAMETER_REQUIRED_FIELDS)
-from cmfgpu.params.utils import (compute_init_river_depth, get_kept_basin_ids,
-                                 merge_basins_bifurcation_thresholds,
-                                 plot_basins_common, read_bifori,
-                                 reorder_by_basin_size,
-                                 resolve_target_cids_from_poi,
-                                 search_optimal_merge_rate, topological_sort,
-                                 trace_outlets)
+from cmfgpu.params.schema import (
+    PARAMETER_FIELD_DIMS,
+    PARAMETER_MODULE_FIELDS,
+    PARAMETER_OPTIONAL_FIELDS,
+    PARAMETER_REQUIRED_FIELDS,
+)
+from cmfgpu.params.utils import (
+    compute_init_river_depth,
+    get_kept_basin_ids,
+    merge_basins_bifurcation_thresholds,
+    plot_basins_common,
+    read_bifori,
+    reorder_by_basin_size,
+    resolve_target_cids_from_poi,
+    search_optimal_merge_rate,
+    topological_sort,
+    trace_outlets,
+)
 
 
 @contextmanager
@@ -67,9 +81,7 @@ class MERITMap(BaseModel):
 
     # Pydantic configuration
     model_config = ConfigDict(
-        arbitrary_types_allowed=True,
-        validate_assignment=False,
-        extra='allow'
+        arbitrary_types_allowed=True, validate_assignment=False, extra="allow"
     )
 
     # === Input Configuration Fields ===
@@ -77,26 +89,23 @@ class MERITMap(BaseModel):
         description="Directory containing map files (nextxy.bin, rivlen.bin, etc.)"
     )
 
-    out_dir: Path = Field(
-        description="Output directory for generated input files"
-    )
+    out_dir: Path = Field(description="Output directory for generated input files")
 
     out_file: str = Field(
         description="Name of the output NetCDF file for storing map parameters",
-        default="parameters.nc"
+        default="parameters.nc",
     )
 
-    bifori_file: Optional[FilePath] = Field(
-        default=None,
-        description="Path to original bifurcation table (bifori.txt)."
+    bifori_file: FilePath | None = Field(
+        default=None, description="Path to original bifurcation table (bifori.txt)."
     )
 
     bif_levels_to_keep: int = Field(
         default=5,
-        description="Keep first N levels from bifori; filter out paths with all zero widths in [1..N]"
+        description="Keep first N levels from bifori; filter out paths with all zero widths in [1..N]",
     )
-    
-    basin_merge_rate: Optional[Union[float, str]] = Field(
+
+    basin_merge_rate: float | str | None = Field(
         default="auto",
         description=(
             "Basin merge strategy. 'auto': merge as aggressively as possible "
@@ -105,7 +114,7 @@ class MERITMap(BaseModel):
         ),
     )
 
-    satellite_width_file: Optional[str] = Field(
+    satellite_width_file: str | None = Field(
         default="width.bin",
         description=(
             "Filename (relative to map_dir) of satellite-derived river width "
@@ -115,23 +124,20 @@ class MERITMap(BaseModel):
     )
 
     levee_flag: bool = Field(
-        default=False,
-        description="If True, merge levee data into map parameters."
+        default=False, description="If True, merge levee data into map parameters."
     )
 
     reservoir_flag: bool = Field(
-        default=False,
-        description="If True, merge reservoir data into map parameters."
+        default=False, description="If True, merge reservoir data into map parameters."
     )
 
-    dam_file: Optional[FilePath] = Field(
+    dam_file: FilePath | None = Field(
         default=None,
-        description="Path to dam/reservoir parameter CSV file (CaMa-Flood format)."
+        description="Path to dam/reservoir parameter CSV file (CaMa-Flood format).",
     )
-    
-    gauge_file: Optional[FilePath] = Field(
-        default=None,
-        description="Path to gauge information file"
+
+    gauge_file: FilePath | None = Field(
+        default=None, description="Path to gauge information file"
     )
 
     skip_secondary_gauges: bool = Field(
@@ -140,28 +146,21 @@ class MERITMap(BaseModel):
             "If True, skip any gauge file row whose secondary coordinates (ix2, iy2) "
             "are valid. This removes multi-catchment (type 2) gauge entries entirely instead "
             "of registering their primary cell."
-        )
+        ),
     )
 
     # === Physical Parameters ===
-    gravity: float = Field(
-        default=9.8,
-        description="Gravitational acceleration [m/s²]"
-    )
+    gravity: float = Field(default=9.8, description="Gravitational acceleration [m/s²]")
 
     river_mouth_distance: float = Field(
-        default=10000.0,
-        description="Distance to river mouth [m]"
+        default=10000.0, description="Distance to river mouth [m]"
     )
 
-    visualized: bool = Field(
-        default=True,
-        description="Generate basin visualization"
-    )
+    visualized: bool = Field(default=True, description="Generate basin visualization")
 
     only_save_pois: bool = Field(
         default=False,
-        description="If True, only save catchments that are points of interest (POI); otherwise save all catchments."
+        description="If True, only save catchments that are points of interest (POI); otherwise save all catchments.",
     )
     # Allow selecting a minimal subset of basins via points of interest (POI)
     # Structure example:
@@ -170,7 +169,7 @@ class MERITMap(BaseModel):
     #   "coords": [(x, y), ...],               # 0-based grid indices; will be validated and mapped to catchment IDs
     #   "catchments": [int, int, ...]          # explicit catchment_id list
     # }
-    points_of_interest: Optional[Dict[str, Any]] = Field(
+    points_of_interest: dict[str, Any] | None = Field(
         default=None,
         description=(
             "Optional POI selector to reduce simulated area: gauges ('all', string IDs, or wildcard patterns), "
@@ -180,7 +179,7 @@ class MERITMap(BaseModel):
 
     target_gpus: int = Field(
         default=4,
-        description="Desired number of GPUs (MPI ranks) for load-balanced assignment"
+        description="Desired number of GPUs (MPI ranks) for load-balanced assignment",
     )
 
     # === File Mapping ===
@@ -196,19 +195,20 @@ class MERITMap(BaseModel):
         """Load map dimensions from mapdim.txt file."""
         mapdim_path = self.map_dir / "mapdim.txt"
 
-        with open(mapdim_path, "r") as f:
+        with open(mapdim_path) as f:
             lines = f.readlines()
-            self.nx = int(lines[0].split('!!')[0].strip())
-            self.ny = int(lines[1].split('!!')[0].strip())
-            self.num_flood_levels = int(lines[2].split('!!')[0].strip())
+            self.nx = int(lines[0].split("!!")[0].strip())
+            self.ny = int(lines[1].split("!!")[0].strip())
+            self.num_flood_levels = int(lines[2].split("!!")[0].strip())
 
-        print(f"Loaded map dimensions: nx={self.nx}, ny={self.ny}, num_flood_levels={self.num_flood_levels}")
+        print(
+            f"Loaded map dimensions: nx={self.nx}, ny={self.ny}, num_flood_levels={self.num_flood_levels}"
+        )
 
     @staticmethod
     def _open_memmap(path, dtype, shape):
         """Memory-map a column-major binary file (read-only)."""
-        return np.memmap(str(path), dtype=dtype, mode='r',
-                         shape=shape, order='F')
+        return np.memmap(str(path), dtype=dtype, mode="r", shape=shape, order="F")
 
     def load_catchment_id(self) -> None:
         """Load catchment IDs and connectivity from nextxy.bin."""
@@ -232,8 +232,7 @@ class MERITMap(BaseModel):
         downstream_id = np.full_like(next_catchment_x, -1, dtype=np.int64)
         valid_next = (next_catchment_x >= 0) & (next_catchment_y >= 0)
         downstream_id[valid_next] = np.ravel_multi_index(
-            (next_catchment_x[valid_next], next_catchment_y[valid_next]),
-            self.map_shape
+            (next_catchment_x[valid_next], next_catchment_y[valid_next]), self.map_shape
         )
 
         del nextxy_data  # release memory map
@@ -248,12 +247,11 @@ class MERITMap(BaseModel):
         self.downstream_id = downstream_id
         self.num_catchments = len(catchment_id)
         self.river_mouth_id = river_mouth_id
-        self.is_river_mouth = (self.downstream_id < 0)
+        self.is_river_mouth = self.downstream_id < 0
         # Default: save all catchments (will be updated in filter_to_poi_basins if only_save_pois)
         self.output_catchment_id = catchment_id.copy()
         self.num_reservoirs = 0
         self.reservoir_catchment_id = np.array([], dtype=np.int64)
-        
 
         print(f"Loaded {len(catchment_id)} catchments")
 
@@ -271,7 +269,7 @@ class MERITMap(BaseModel):
         gauge_id_set = set()
         self.gauge_info = {}
 
-        with open(self.gauge_file, "r") as f:
+        with open(self.gauge_file) as f:
             lines = f.readlines()
 
         if not lines:
@@ -365,8 +363,10 @@ class MERITMap(BaseModel):
                 prev = cid_to_best.get(cid)
                 if prev is None or abs(info["alloc_error"]) < abs(prev[1]):
                     cid_to_best[cid] = (
-                        gname, info["alloc_error"],
-                        info["reported_area_km2"], info["allocated_area_km2"],
+                        gname,
+                        info["alloc_error"],
+                        info["reported_area_km2"],
+                        info["allocated_area_km2"],
                     )
 
         sorted_cids = sorted(cid_to_best.keys())
@@ -386,7 +386,9 @@ class MERITMap(BaseModel):
             [cid_to_best[c][1] for c in sorted_cids], dtype=np.float32
         )
 
-        print(f"Loaded {len(self.gauge_info)} gauges covering {self.num_gauges} catchments")
+        print(
+            f"Loaded {len(self.gauge_info)} gauges covering {self.num_gauges} catchments"
+        )
 
     def _slice_arr(self, name: str, mask: np.ndarray):
         arr = getattr(self, name)
@@ -428,27 +430,29 @@ class MERITMap(BaseModel):
         sorted_idx, basin_sizes = reorder_by_basin_size(topo_idx, root_mouth)
 
         # 2) Apply ordering to per-catchment arrays
-        self.catchment_id   = self.catchment_id[sorted_idx]
-        self.downstream_id  = self.downstream_id[sorted_idx]
-        self.catchment_x    = self.catchment_x[sorted_idx]
-        self.catchment_y    = self.catchment_y[sorted_idx]
+        self.catchment_id = self.catchment_id[sorted_idx]
+        self.downstream_id = self.downstream_id[sorted_idx]
+        self.catchment_x = self.catchment_x[sorted_idx]
+        self.catchment_y = self.catchment_y[sorted_idx]
         self.river_mouth_id = self.river_mouth_id[sorted_idx]
-        self.root_mouth     = root_mouth[sorted_idx]
+        self.root_mouth = root_mouth[sorted_idx]
 
         # 3) Basin stats and ids
         self.basin_sizes = basin_sizes
-        self.num_basins  = len(basin_sizes)
+        self.num_basins = len(basin_sizes)
         # Assign basin IDs from contiguous group boundaries (size-descending order)
         changes = np.concatenate(([True], self.root_mouth[1:] != self.root_mouth[:-1]))
         self.catchment_basin_id = (np.cumsum(changes) - 1).astype(np.int64)
         _, self.catchment_mainstem_basin_id = np.unique(
             self.river_mouth_id, return_inverse=True
         )
-        self.catchment_mainstem_basin_id = self.catchment_mainstem_basin_id.astype(np.int64)
+        self.catchment_mainstem_basin_id = self.catchment_mainstem_basin_id.astype(
+            np.int64
+        )
 
         # 4) Downstream indices and mouth fix-up
         self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
-        self.is_river_mouth = (self.downstream_idx < 0)
+        self.is_river_mouth = self.downstream_idx < 0
         # Mouths should point to themselves
         self.downstream_id[self.is_river_mouth] = self.catchment_id[self.is_river_mouth]
 
@@ -465,18 +469,21 @@ class MERITMap(BaseModel):
         # Read maps needed by bifurcation parsing (memory-mapped)
         rivhgt_path = self.map_dir / "rivhgt.bin"
         rivhgt_2d = (
-            self._open_memmap(
-                rivhgt_path, self.map_precision, (self.nx, self.ny)
-            )
+            self._open_memmap(rivhgt_path, self.map_precision, (self.nx, self.ny))
             if rivhgt_path.exists()
             else None
         )
-        pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifori(self.bifori_file, rivhgt_2d, self.bif_levels_to_keep)
+        pth_upst, pth_down, pth_dst, pth_wth, pth_elv = read_bifori(
+            self.bifori_file, rivhgt_2d, self.bif_levels_to_keep
+        )
         del rivhgt_2d
 
         # Initialize arrays
         self.num_bifurcation_paths = len(pth_upst)
-        self.bifurcation_manning = np.tile([0.03] + [0.1] * (self.bif_levels_to_keep - 1), (self.num_bifurcation_paths, 1)).astype(self.numpy_precision)
+        self.bifurcation_manning = np.tile(
+            [0.03] + [0.1] * (self.bif_levels_to_keep - 1),
+            (self.num_bifurcation_paths, 1),
+        ).astype(self.numpy_precision)
         pth_upst = np.array(pth_upst, dtype=np.int64)
         pth_down = np.array(pth_down, dtype=np.int64)
         self.bifurcation_catchment_x = pth_upst[:, 0]
@@ -487,16 +494,25 @@ class MERITMap(BaseModel):
         self.bifurcation_length = np.array(pth_dst, dtype=self.numpy_precision)
         self.bifurcation_elevation = np.array(pth_elv, dtype=self.numpy_precision)
         self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
-        self.bifurcation_catchment_id = np.ravel_multi_index((self.bifurcation_catchment_x, self.bifurcation_catchment_y), self.map_shape)
-        self.bifurcation_downstream_id = np.ravel_multi_index((self.bifurcation_downstream_x, self.bifurcation_downstream_y), self.map_shape)
+        self.bifurcation_catchment_id = np.ravel_multi_index(
+            (self.bifurcation_catchment_x, self.bifurcation_catchment_y), self.map_shape
+        )
+        self.bifurcation_downstream_id = np.ravel_multi_index(
+            (self.bifurcation_downstream_x, self.bifurcation_downstream_y),
+            self.map_shape,
+        )
 
         # --- Basin merging / pruning strategy ---
         n_before = int(self.num_bifurcation_paths)
 
         if self.basin_merge_rate is not None:
             # ===== Threshold merge ('auto' or manual rate) =====
-            tmp_idx_up = find_indices_in(self.bifurcation_catchment_id, self.catchment_id)
-            tmp_idx_dn = find_indices_in(self.bifurcation_downstream_id, self.catchment_id)
+            tmp_idx_up = find_indices_in(
+                self.bifurcation_catchment_id, self.catchment_id
+            )
+            tmp_idx_dn = find_indices_in(
+                self.bifurcation_downstream_id, self.catchment_id
+            )
             valid_bif = (tmp_idx_up >= 0) & (tmp_idx_dn >= 0)
 
             if np.any(valid_bif):
@@ -510,18 +526,22 @@ class MERITMap(BaseModel):
                 raw_idx = np.searchsorted(unique_mouths_raw, self.river_mouth_id)
                 num_unique = len(unique_mouths_raw)
                 raw_sizes = np.bincount(raw_idx, minlength=num_unique).astype(np.int64)
-                size_order = np.argsort(-raw_sizes)            # [largest, ..., smallest]
+                size_order = np.argsort(-raw_sizes)  # [largest, ..., smallest]
                 unique_mouths = unique_mouths_raw[size_order]  # reordered mouth IDs
                 inv_order = np.empty_like(size_order)
                 inv_order[size_order] = np.arange(num_unique)  # old→new mapping
-                mouth_to_idx = inv_order[raw_idx]              # per-catchment new index
+                mouth_to_idx = inv_order[raw_idx]  # per-catchment new index
 
                 # Basin sizes in new (descending-size) order
                 basin_sizes_arr = raw_sizes[size_order]
 
                 # Map bif endpoints to basin indices (new order)
-                bif_up_bidx = inv_order[np.searchsorted(unique_mouths_raw, bif_up_mouth)]
-                bif_dn_bidx = inv_order[np.searchsorted(unique_mouths_raw, bif_dn_mouth)]
+                bif_up_bidx = inv_order[
+                    np.searchsorted(unique_mouths_raw, bif_up_mouth)
+                ]
+                bif_dn_bidx = inv_order[
+                    np.searchsorted(unique_mouths_raw, bif_dn_mouth)
+                ]
 
                 # River-channel flag: wth[0] > 0
                 if self.bifurcation_width.ndim > 1:
@@ -529,31 +549,49 @@ class MERITMap(BaseModel):
                 else:
                     bif_is_river = np.ones(int(np.sum(valid_bif)), dtype=np.bool_)
 
-                if isinstance(self.basin_merge_rate, str) and self.basin_merge_rate == "auto":
+                if (
+                    isinstance(self.basin_merge_rate, str)
+                    and self.basin_merge_rate == "auto"
+                ):
                     # Max merge first (rate=1.0); fall back to binary search only if needed
                     parent_arr, merged_sizes = merge_basins_bifurcation_thresholds(
-                        bif_up_bidx, bif_dn_bidx, bif_is_river,
-                        basin_sizes_arr, 1.0,
+                        bif_up_bidx,
+                        bif_dn_bidx,
+                        bif_is_river,
+                        basin_sizes_arr,
+                        1.0,
                     )
                     n_merged_basins = len(np.unique(parent_arr))
                     best_rate = 1.0
                     if n_merged_basins < self.target_gpus:
                         # Too few basins for the requested GPUs → search for a smaller rate
-                        best_rate, parent_arr, merged_sizes, n_merged_basins = search_optimal_merge_rate(
-                            bif_up_bidx, bif_dn_bidx, bif_is_river,
-                            basin_sizes_arr, self.target_gpus,
+                        best_rate, parent_arr, merged_sizes, n_merged_basins = (
+                            search_optimal_merge_rate(
+                                bif_up_bidx,
+                                bif_dn_bidx,
+                                bif_is_river,
+                                basin_sizes_arr,
+                                self.target_gpus,
+                            )
                         )
-                    print(f"Auto merge (target_gpus={self.target_gpus}): "
-                          f"rate={best_rate:.6f}, {num_unique} → {n_merged_basins} basins")
+                    print(
+                        f"Auto merge (target_gpus={self.target_gpus}): "
+                        f"rate={best_rate:.6f}, {num_unique} → {n_merged_basins} basins"
+                    )
                 else:
                     # Manual rate
                     parent_arr, merged_sizes = merge_basins_bifurcation_thresholds(
-                        bif_up_bidx, bif_dn_bidx, bif_is_river,
-                        basin_sizes_arr, float(self.basin_merge_rate),
+                        bif_up_bidx,
+                        bif_dn_bidx,
+                        bif_is_river,
+                        basin_sizes_arr,
+                        float(self.basin_merge_rate),
                     )
                     n_merged_basins = len(np.unique(parent_arr))
-                    print(f"Manual merge (rate={self.basin_merge_rate}): "
-                          f"{num_unique} → {n_merged_basins} basins")
+                    print(
+                        f"Manual merge (rate={self.basin_merge_rate}): "
+                        f"{num_unique} → {n_merged_basins} basins"
+                    )
 
                 # Map back to root_mouth for each catchment
                 root_basin_idx = parent_arr[mouth_to_idx]
@@ -562,7 +600,7 @@ class MERITMap(BaseModel):
                 # Determine which bif paths cross basin boundaries after merge
                 all_bif_up_root = parent_arr[bif_up_bidx]
                 all_bif_dn_root = parent_arr[bif_dn_bidx]
-                keep_valid = (all_bif_up_root == all_bif_dn_root)
+                keep_valid = all_bif_up_root == all_bif_dn_root
 
                 # Build full keep_mask (valid_bif positions get keep_valid, invalid stay True)
                 keep_mask = np.ones(self.num_bifurcation_paths, dtype=bool)
@@ -573,15 +611,27 @@ class MERITMap(BaseModel):
 
             # Set removed for visualization
             removed_mask = ~keep_mask
-            self.removed_bifurcation_catchment_x = self.bifurcation_catchment_x[removed_mask]
-            self.removed_bifurcation_catchment_y = self.bifurcation_catchment_y[removed_mask]
-            self.removed_bifurcation_downstream_x = self.bifurcation_downstream_x[removed_mask]
-            self.removed_bifurcation_downstream_y = self.bifurcation_downstream_y[removed_mask]
+            self.removed_bifurcation_catchment_x = self.bifurcation_catchment_x[
+                removed_mask
+            ]
+            self.removed_bifurcation_catchment_y = self.bifurcation_catchment_y[
+                removed_mask
+            ]
+            self.removed_bifurcation_downstream_x = self.bifurcation_downstream_x[
+                removed_mask
+            ]
+            self.removed_bifurcation_downstream_y = self.bifurcation_downstream_y[
+                removed_mask
+            ]
 
         else:
             # ===== Default: merge ALL bifurcation-connected basins (no threshold) =====
-            tmp_idx_up = find_indices_in(self.bifurcation_catchment_id, self.catchment_id)
-            tmp_idx_dn = find_indices_in(self.bifurcation_downstream_id, self.catchment_id)
+            tmp_idx_up = find_indices_in(
+                self.bifurcation_catchment_id, self.catchment_id
+            )
+            tmp_idx_dn = find_indices_in(
+                self.bifurcation_downstream_id, self.catchment_id
+            )
             valid_bif = (tmp_idx_up >= 0) & (tmp_idx_dn >= 0)
 
             if np.any(valid_bif):
@@ -651,7 +701,9 @@ class MERITMap(BaseModel):
         self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
         n_cut = n_before - self.num_bifurcation_paths
         if n_cut > 0:
-            print(f"Pruned {n_cut}/{n_before} bifurcation paths crossing basin boundaries ({(n_cut/n_before)*100:.2f}%).")
+            print(
+                f"Pruned {n_cut}/{n_before} bifurcation paths crossing basin boundaries ({(n_cut / n_before) * 100:.2f}%)."
+            )
 
         # Finalize connectivity
         self._finalize_connectivity(root_mouth=self.root_mouth)
@@ -706,20 +758,26 @@ class MERITMap(BaseModel):
             self.catchment_id,
             self.catchment_x,
             self.catchment_y,
-            gauge_info=gauge_info_str_keys
+            gauge_info=gauge_info_str_keys,
         )
 
         if len(self.target_cids) == 0:
-            raise ValueError("points_of_interest produced an empty target set; nothing to keep.")
-        
+            raise ValueError(
+                "points_of_interest produced an empty target set; nothing to keep."
+            )
+
         target_idx = find_indices_in(self.target_cids, self.catchment_id)
         if np.any(target_idx < 0):
-             missing = self.target_cids[target_idx < 0]
-             raise ValueError(f"Internal error: target catchment IDs {missing} not found in current catchment_id array.")
+            missing = self.target_cids[target_idx < 0]
+            raise ValueError(
+                f"Internal error: target catchment IDs {missing} not found in current catchment_id array."
+            )
 
         # Find basins
-        kept_basin_ids = get_kept_basin_ids(self.target_cids, self.catchment_id, self.catchment_basin_id)
-        
+        kept_basin_ids = get_kept_basin_ids(
+            self.target_cids, self.catchment_id, self.catchment_basin_id
+        )
+
         # Apply common filtering given kept_basin_ids
         keep_mask = np.isin(self.catchment_basin_id, kept_basin_ids)
 
@@ -738,7 +796,9 @@ class MERITMap(BaseModel):
         idx_in_sorted = np.searchsorted(old, self.catchment_basin_id)
         self.catchment_basin_id = idx_in_sorted.astype(np.int64)
 
-        self.basin_sizes = np.bincount(self.catchment_basin_id, minlength=old.size).astype(np.int64)
+        self.basin_sizes = np.bincount(
+            self.catchment_basin_id, minlength=old.size
+        ).astype(np.int64)
         self.num_basins = int(self.basin_sizes.shape[0])
         self.downstream_idx = find_indices_in(self.downstream_id, self.catchment_id)
         self.downstream_idx[self.is_river_mouth] = -1
@@ -763,25 +823,52 @@ class MERITMap(BaseModel):
             self._slice_declared_axis("bifurcation_path", keep_bif)
 
             self.num_bifurcation_paths = int(np.sum(keep_bif))
-            self.bifurcation_path_id = np.arange(self.num_bifurcation_paths, dtype=np.int64)
+            self.bifurcation_path_id = np.arange(
+                self.num_bifurcation_paths, dtype=np.int64
+            )
 
         # Also filter removed bifurcations (for visualization) to kept basins
-        if hasattr(self, 'removed_bifurcation_catchment_x') and len(self.removed_bifurcation_catchment_x) > 0:
+        if (
+            hasattr(self, "removed_bifurcation_catchment_x")
+            and len(self.removed_bifurcation_catchment_x) > 0
+        ):
             # self.catchment_id now contains only catchments in kept basins.
-            
-            rem_up_cid = np.ravel_multi_index((self.removed_bifurcation_catchment_x, self.removed_bifurcation_catchment_y), self.map_shape)
-            rem_dn_cid = np.ravel_multi_index((self.removed_bifurcation_downstream_x, self.removed_bifurcation_downstream_y), self.map_shape)
-            
+
+            rem_up_cid = np.ravel_multi_index(
+                (
+                    self.removed_bifurcation_catchment_x,
+                    self.removed_bifurcation_catchment_y,
+                ),
+                self.map_shape,
+            )
+            rem_dn_cid = np.ravel_multi_index(
+                (
+                    self.removed_bifurcation_downstream_x,
+                    self.removed_bifurcation_downstream_y,
+                ),
+                self.map_shape,
+            )
+
             # Check if upstream or downstream is in kept catchments
             # Using isin is efficient enough
-            keep_rem = np.isin(rem_up_cid, self.catchment_id) | np.isin(rem_dn_cid, self.catchment_id)
-            
-            self.removed_bifurcation_catchment_x = self.removed_bifurcation_catchment_x[keep_rem]
-            self.removed_bifurcation_catchment_y = self.removed_bifurcation_catchment_y[keep_rem]
-            self.removed_bifurcation_downstream_x = self.removed_bifurcation_downstream_x[keep_rem]
-            self.removed_bifurcation_downstream_y = self.removed_bifurcation_downstream_y[keep_rem]
+            keep_rem = np.isin(rem_up_cid, self.catchment_id) | np.isin(
+                rem_dn_cid, self.catchment_id
+            )
 
-        if self.num_gauges > 0 and hasattr(self, 'gauge_catchment_id'):
+            self.removed_bifurcation_catchment_x = self.removed_bifurcation_catchment_x[
+                keep_rem
+            ]
+            self.removed_bifurcation_catchment_y = self.removed_bifurcation_catchment_y[
+                keep_rem
+            ]
+            self.removed_bifurcation_downstream_x = (
+                self.removed_bifurcation_downstream_x[keep_rem]
+            )
+            self.removed_bifurcation_downstream_y = (
+                self.removed_bifurcation_downstream_y[keep_rem]
+            )
+
+        if self.num_gauges > 0 and hasattr(self, "gauge_catchment_id"):
             gauge_mask = np.isin(self.gauge_catchment_id, self.catchment_id)
             self._slice_declared_axis("gauge", gauge_mask)
             self.gauge_id = self.gauge_catchment_id
@@ -802,13 +889,19 @@ class MERITMap(BaseModel):
         Only dams that fall within the current catchment domain are retained.
         """
         if self.dam_file is None:
-            print("reservoir_flag is True but dam_file not specified; skipping reservoir loading")
+            print(
+                "reservoir_flag is True but dam_file not specified; skipping reservoir loading"
+            )
             return
 
-        dam_path = Path(self.dam_file) if not isinstance(self.dam_file, Path) else self.dam_file
+        dam_path = (
+            Path(self.dam_file)
+            if not isinstance(self.dam_file, Path)
+            else self.dam_file
+        )
         print(f"Loading dam parameters from {dam_path}")
 
-        with open(dam_path, "r", newline="", encoding="utf-8-sig") as f:
+        with open(dam_path, newline="", encoding="utf-8-sig") as f:
             ndam = int(f.readline().strip().split()[0])
             header = f.readline()
             if "," in header:
@@ -835,8 +928,8 @@ class MERITMap(BaseModel):
                 dam_ids.append(int(parts[0]))
                 # parts[1] = DamName, parts[2] = DamLat, parts[3] = DamLon
                 upreal_list.append(float(parts[4]))
-                dam_ix.append(int(parts[5]))    # 1-based
-                dam_iy.append(int(parts[6]))    # 1-based
+                dam_ix.append(int(parts[5]))  # 1-based
+                dam_iy.append(int(parts[6]))  # 1-based
                 fld_vol_mcm.append(float(parts[7]))
                 con_vol_mcm.append(float(parts[8]))
                 tot_vol_mcm.append(float(parts[9]))
@@ -844,7 +937,7 @@ class MERITMap(BaseModel):
                 qf_list.append(float(parts[11]))
 
         dam_ids = np.array(dam_ids, dtype=np.int64)
-        dam_ix = np.array(dam_ix, dtype=np.int64) - 1   # 1-based → 0-based
+        dam_ix = np.array(dam_ix, dtype=np.int64) - 1  # 1-based → 0-based
         dam_iy = np.array(dam_iy, dtype=np.int64) - 1
         fld_vol_mcm = np.array(fld_vol_mcm, dtype=self.numpy_precision)
         con_vol_mcm = np.array(con_vol_mcm, dtype=self.numpy_precision)
@@ -886,9 +979,9 @@ class MERITMap(BaseModel):
         qf = qf[keep]
 
         # Compute storage volumes (MCM → m³)
-        fld_vol = fld_vol_mcm * 1.0e6      # flood control storage
-        con_vol = con_vol_mcm * 1.0e6       # conservation storage
-        tot_vol = tot_vol_mcm * 1.0e6       # total capacity
+        fld_vol = fld_vol_mcm * 1.0e6  # flood control storage
+        con_vol = con_vol_mcm * 1.0e6  # conservation storage
+        tot_vol = tot_vol_mcm * 1.0e6  # total capacity
         eme_vol = con_vol + fld_vol * 0.95  # emergency threshold
 
         # Reservoir area: not available from CSV; set to 0 (can be overridden later)
@@ -915,10 +1008,12 @@ class MERITMap(BaseModel):
             """Read a 2D map variable and extract catchment values via memory mapping."""
             file_path = self.map_dir / filename
             data = self._open_memmap(file_path, self.map_precision, (self.nx, self.ny))
-            result = np.array(data[self.catchment_x, self.catchment_y],
-                              dtype=self.numpy_precision)
+            result = np.array(
+                data[self.catchment_x, self.catchment_y], dtype=self.numpy_precision
+            )
             del data
             return result
+
         self.river_length = _read_2d_map("rivlen.bin")
 
         # River height (optional — will be estimated by update_river_params if missing)
@@ -939,7 +1034,9 @@ class MERITMap(BaseModel):
             if sat_path.exists():
                 self.satellite_width = _read_2d_map(self.satellite_width_file)
                 n_sat = int(np.count_nonzero(self.satellite_width > 0))
-                print(f"Loaded satellite_width ({n_sat}/{self.num_catchments} valid cells)")
+                print(
+                    f"Loaded satellite_width ({n_sat}/{self.num_catchments} valid cells)"
+                )
         self.catchment_elevation = _read_2d_map("elevtn.bin")
         self.catchment_area = _read_2d_map("ctmare.bin")
         self.upstream_area = _read_2d_map("uparea.bin")
@@ -966,7 +1063,8 @@ class MERITMap(BaseModel):
             self._load_reservoir_parameters()
 
         data = self._open_memmap(
-            self.map_dir / "fldhgt.bin", self.map_precision,
+            self.map_dir / "fldhgt.bin",
+            self.map_precision,
             (self.nx, self.ny, self.num_flood_levels),
         )
         self.flood_depth_table = np.array(
@@ -989,9 +1087,7 @@ class MERITMap(BaseModel):
         flood_depth_diffs = np.diff(self.flood_depth_table, axis=-1)
         num_regressions = int(np.sum(flood_depth_diffs < 0))
         if num_regressions:
-            affected_catchments = int(
-                np.sum(np.any(flood_depth_diffs < 0, axis=-1))
-            )
+            affected_catchments = int(np.sum(np.any(flood_depth_diffs < 0, axis=-1)))
             self.flood_depth_table = np.maximum.accumulate(
                 self.flood_depth_table, axis=-1
             )
@@ -1015,19 +1111,15 @@ class MERITMap(BaseModel):
             lower = np.floor(position).astype(np.int64)
             upper = np.minimum(lower + 1, self.num_flood_levels)
             row = np.arange(len(self.catchment_id))
-            lower_value = np.zeros(
-                len(self.catchment_id), dtype=self.numpy_precision
-            )
+            lower_value = np.zeros(len(self.catchment_id), dtype=self.numpy_precision)
             has_lower_level = lower > 0
             lower_value[has_lower_level] = self.flood_depth_table[
                 row[has_lower_level], lower[has_lower_level] - 1
             ]
-            upper_value = self.flood_depth_table[
-                row, np.maximum(upper - 1, 0)
-            ]
-            levee_base_height = lower_value + (
-                position - lower
-            ) * (upper_value - lower_value)
+            upper_value = self.flood_depth_table[row, np.maximum(upper - 1, 0)]
+            levee_base_height = lower_value + (position - lower) * (
+                upper_value - lower_value
+            )
 
             levee_mask = (
                 np.isfinite(levee_fraction)
@@ -1064,20 +1156,24 @@ class MERITMap(BaseModel):
         """Validate flow direction consistency."""
         non_mouth = ~self.is_river_mouth
         if not (self.downstream_idx[non_mouth] > np.flatnonzero(non_mouth)).all():
-            raise ValueError("Flow direction error: downstream catchment should have higher index")
+            raise ValueError(
+                "Flow direction error: downstream catchment should have higher index"
+            )
 
         if not (self.downstream_idx[self.is_river_mouth] == -1).all():
-            raise ValueError("Flow direction error: river mouths should point to themselves")
+            raise ValueError(
+                "Flow direction error: river mouths should point to themselves"
+            )
 
     def init_river_depth(self) -> None:
         """Initialize river depth based on elevation gradients."""
-        if not hasattr(self, 'river_height') or not hasattr(self, 'river_width'):
-            print("Skipping init_river_depth (river_height/river_width not yet estimated)")
+        if not hasattr(self, "river_height") or not hasattr(self, "river_width"):
+            print(
+                "Skipping init_river_depth (river_height/river_width not yet estimated)"
+            )
             return
         self.river_depth = compute_init_river_depth(
-            self.catchment_elevation,
-            self.river_height,
-            self.downstream_idx
+            self.catchment_elevation, self.river_height, self.downstream_idx
         ).astype(self.numpy_precision)
 
         self.river_storage = self.river_length * self.river_width * self.river_depth
@@ -1098,10 +1194,12 @@ class MERITMap(BaseModel):
 
             if self.num_bifurcation_paths > 0:
                 ds.createDimension(
-                    "bifurcation_path", self.num_bifurcation_paths,
+                    "bifurcation_path",
+                    self.num_bifurcation_paths,
                 )
                 ds.createDimension(
-                    "bifurcation_level", self.bif_levels_to_keep,
+                    "bifurcation_level",
+                    self.bif_levels_to_keep,
                 )
 
             if self.levee_flag and self.num_levees > 0:
@@ -1118,9 +1216,7 @@ class MERITMap(BaseModel):
                 raise ValueError("output_catchment_id must be one-dimensional")
             if np.unique(output_ids).size != output_ids.size:
                 raise ValueError("output_catchment_id must contain unique IDs")
-            missing_output_ids = output_ids[
-                ~np.isin(output_ids, self.catchment_id)
-            ]
+            missing_output_ids = output_ids[~np.isin(output_ids, self.catchment_id)]
             if missing_output_ids.size:
                 raise ValueError(
                     "output_catchment_id contains IDs absent from catchment_id: "
@@ -1152,60 +1248,114 @@ class MERITMap(BaseModel):
                         raise ValueError(f"Missing required field: {key}")
                     yield key
                 for key in getattr(self, "output_optional", []):
-                    if key in PARAMETER_MODULE_FIELDS["bifurcation"] \
-                            and self.num_bifurcation_paths == 0:
+                    if (
+                        key in PARAMETER_MODULE_FIELDS["bifurcation"]
+                        and self.num_bifurcation_paths == 0
+                    ):
                         continue
-                    if key in PARAMETER_MODULE_FIELDS["levee"] \
-                            and (not self.levee_flag or self.num_levees == 0):
+                    if key in PARAMETER_MODULE_FIELDS["levee"] and (
+                        not self.levee_flag or self.num_levees == 0
+                    ):
                         continue
                     if key in PARAMETER_MODULE_FIELDS["reservoir"] and (
                         not self.reservoir_flag or self.num_reservoirs == 0
                     ):
                         continue
-                    if key in PARAMETER_MODULE_FIELDS["gauge"] \
-                            and self.num_gauges == 0:
+                    if key in PARAMETER_MODULE_FIELDS["gauge"] and self.num_gauges == 0:
                         continue
                     if hasattr(self, key) and getattr(self, key) is not None:
                         yield key
 
             # Variable metadata (units, long_name)
-            _var_attrs: Dict[str, Dict[str, str]] = {
-                "catchment_id":        {"long_name": "Linear catchment index (ix*ny+iy)"},
-                "downstream_id":       {"long_name": "Downstream catchment index"},
-                "catchment_x":         {"long_name": "Grid column index (0-based)"},
-                "catchment_y":         {"long_name": "Grid row index (0-based)"},
-                "catchment_basin_id":  {"long_name": "Basin ID"},
-                "catchment_mainstem_basin_id": {"long_name": "Basin ID before bifurcation basin merge"},
-                "basin_sizes":         {"long_name": "Number of catchments per basin"},
-                "river_length":        {"units": "m",  "long_name": "River channel length"},
-                "catchment_elevation": {"units": "m",  "long_name": "Mean catchment elevation"},
-                "catchment_area":      {"units": "m2", "long_name": "Catchment area"},
-                "upstream_area":       {"units": "m2", "long_name": "Total upstream drainage area"},
-                "downstream_distance": {"units": "m",  "long_name": "Distance to downstream catchment"},
-                "flood_depth_table":   {"units": "m",  "long_name": "Flood depth lookup table"},
-                "longitude":           {"units": "degrees_east",  "long_name": "Longitude"},
-                "latitude":            {"units": "degrees_north", "long_name": "Latitude"},
-                "river_width":         {"units": "m",  "long_name": "River channel width"},
-                "river_height":        {"units": "m",  "long_name": "River bank height"},
-                "river_depth":         {"units": "m",  "long_name": "Initial river depth"},
-                "river_storage":       {"units": "m3", "long_name": "Initial river storage"},
-                "satellite_width":     {"units": "m",  "long_name": "Satellite-derived river width"},
-                "gauge_catchment_id":       {"long_name": "Catchment ID for each gauge"},
-                "gauge_station_id":         {"long_name": "GRDC station ID"},
-                "gauge_reported_area_km2":  {"units": "km2", "long_name": "GRDC reported drainage area"},
-                "gauge_allocated_area_km2": {"units": "km2", "long_name": "CaMa-allocated drainage area"},
-                "gauge_alloc_error":        {"long_name": "Relative area allocation error"},
-                "bifurcation_length":       {"units": "m",  "long_name": "Bifurcation channel length"},
-                "bifurcation_width":        {"units": "m",  "long_name": "Bifurcation channel width"},
-                "bifurcation_elevation":    {"units": "m",  "long_name": "Bifurcation elevation"},
-                "reservoir_capacity":       {"units": "m3", "long_name": "Reservoir total capacity"},
-                "conservation_volume":      {"units": "m3", "long_name": "Reservoir conservation volume"},
-                "emergency_volume":         {"units": "m3", "long_name": "Reservoir emergency volume"},
-                "normal_outflow":           {"units": "m3/s", "long_name": "Reservoir normal outflow"},
-                "flood_control_outflow":    {"units": "m3/s", "long_name": "Reservoir flood control outflow"},
-                "reservoir_area":           {"units": "m2", "long_name": "Reservoir surface area"},
-                "levee_crown_height":       {"units": "m",  "long_name": "Levee crown height"},
-                "levee_fraction":           {"long_name": "Levee-protected fraction of floodplain"},
+            _var_attrs: dict[str, dict[str, str]] = {
+                "catchment_id": {"long_name": "Linear catchment index (ix*ny+iy)"},
+                "downstream_id": {"long_name": "Downstream catchment index"},
+                "catchment_x": {"long_name": "Grid column index (0-based)"},
+                "catchment_y": {"long_name": "Grid row index (0-based)"},
+                "catchment_basin_id": {"long_name": "Basin ID"},
+                "catchment_mainstem_basin_id": {
+                    "long_name": "Basin ID before bifurcation basin merge"
+                },
+                "basin_sizes": {"long_name": "Number of catchments per basin"},
+                "river_length": {"units": "m", "long_name": "River channel length"},
+                "catchment_elevation": {
+                    "units": "m",
+                    "long_name": "Mean catchment elevation",
+                },
+                "catchment_area": {"units": "m2", "long_name": "Catchment area"},
+                "upstream_area": {
+                    "units": "m2",
+                    "long_name": "Total upstream drainage area",
+                },
+                "downstream_distance": {
+                    "units": "m",
+                    "long_name": "Distance to downstream catchment",
+                },
+                "flood_depth_table": {
+                    "units": "m",
+                    "long_name": "Flood depth lookup table",
+                },
+                "longitude": {"units": "degrees_east", "long_name": "Longitude"},
+                "latitude": {"units": "degrees_north", "long_name": "Latitude"},
+                "river_width": {"units": "m", "long_name": "River channel width"},
+                "river_height": {"units": "m", "long_name": "River bank height"},
+                "river_depth": {"units": "m", "long_name": "Initial river depth"},
+                "river_storage": {"units": "m3", "long_name": "Initial river storage"},
+                "satellite_width": {
+                    "units": "m",
+                    "long_name": "Satellite-derived river width",
+                },
+                "gauge_catchment_id": {"long_name": "Catchment ID for each gauge"},
+                "gauge_station_id": {"long_name": "GRDC station ID"},
+                "gauge_reported_area_km2": {
+                    "units": "km2",
+                    "long_name": "GRDC reported drainage area",
+                },
+                "gauge_allocated_area_km2": {
+                    "units": "km2",
+                    "long_name": "CaMa-allocated drainage area",
+                },
+                "gauge_alloc_error": {"long_name": "Relative area allocation error"},
+                "bifurcation_length": {
+                    "units": "m",
+                    "long_name": "Bifurcation channel length",
+                },
+                "bifurcation_width": {
+                    "units": "m",
+                    "long_name": "Bifurcation channel width",
+                },
+                "bifurcation_elevation": {
+                    "units": "m",
+                    "long_name": "Bifurcation elevation",
+                },
+                "reservoir_capacity": {
+                    "units": "m3",
+                    "long_name": "Reservoir total capacity",
+                },
+                "conservation_volume": {
+                    "units": "m3",
+                    "long_name": "Reservoir conservation volume",
+                },
+                "emergency_volume": {
+                    "units": "m3",
+                    "long_name": "Reservoir emergency volume",
+                },
+                "normal_outflow": {
+                    "units": "m3/s",
+                    "long_name": "Reservoir normal outflow",
+                },
+                "flood_control_outflow": {
+                    "units": "m3/s",
+                    "long_name": "Reservoir flood control outflow",
+                },
+                "reservoir_area": {
+                    "units": "m2",
+                    "long_name": "Reservoir surface area",
+                },
+                "levee_crown_height": {"units": "m", "long_name": "Levee crown height"},
+                "levee_fraction": {
+                    "long_name": "Levee-protected fraction of floodplain"
+                },
             }
 
             for key in _vars_to_write():
@@ -1216,8 +1366,8 @@ class MERITMap(BaseModel):
 
                 # Choose dtype; convert booleans to unsigned byte (u1) for compatibility
                 if arr.dtype == np.bool_:
-                    vdtype = 'u1'
-                    arr_to_write = arr.astype('u1')
+                    vdtype = "u1"
+                    arr_to_write = arr.astype("u1")
                 else:
                     vdtype = arr.dtype
                     arr_to_write = arr
@@ -1243,7 +1393,7 @@ class MERITMap(BaseModel):
         visualize_gauges: bool = True,
         visualize_bifurcations: bool = True,
         visualize_removed_bifurcations: bool = True,
-        visualize_levees: bool = True
+        visualize_levees: bool = True,
     ) -> None:
         """Generate basin visualization if requested, including removed bifurcation paths.
 
@@ -1251,54 +1401,73 @@ class MERITMap(BaseModel):
         """
         if self.visualized is False:
             return
-            
+
         gauges_xy = None
         if visualize_gauges and self.num_gauges > 0:
             # We need gauge coordinates.
             # MERITMap loads them implicitly via catchment locations?
             # Actually code above did: gauge_x = self.catchment_x[gauge_indices]
-            
+
             gauge_catchment_ids = []
             for info in self.gauge_info.values():
                 gauge_catchment_ids.extend(info["upstream_id"])
             gauge_catchment_ids = np.unique(gauge_catchment_ids)
-            
+
             grid_to_idx = np.full(int(self.catchment_id.max()) + 1, -1, dtype=np.int64)
-            grid_to_idx[self.catchment_id] = np.arange(len(self.catchment_id), dtype=np.int64)
-            gauge_idx_vals = grid_to_idx[gauge_catchment_ids[gauge_catchment_ids < len(grid_to_idx)]]
+            grid_to_idx[self.catchment_id] = np.arange(
+                len(self.catchment_id), dtype=np.int64
+            )
+            gauge_idx_vals = grid_to_idx[
+                gauge_catchment_ids[gauge_catchment_ids < len(grid_to_idx)]
+            ]
             gauge_indices = list(gauge_idx_vals[gauge_idx_vals >= 0])
-            
+
             if gauge_indices:
-                 gauges_xy = (self.catchment_x[gauge_indices], self.catchment_y[gauge_indices])
+                gauges_xy = (
+                    self.catchment_x[gauge_indices],
+                    self.catchment_y[gauge_indices],
+                )
 
         levees_xy = None
-        if visualize_levees and hasattr(self, 'levee_catchment_x') and self.num_levees > 0:
-             levees_xy = (self.levee_catchment_x, self.levee_catchment_y)
+        if (
+            visualize_levees
+            and hasattr(self, "levee_catchment_x")
+            and self.num_levees > 0
+        ):
+            levees_xy = (self.levee_catchment_x, self.levee_catchment_y)
 
         bifurcations = None
         if visualize_bifurcations and self.num_bifurcation_paths > 0:
-             bifurcations = {
-                'x1': self.bifurcation_catchment_x,
-                'y1': self.bifurcation_catchment_y,
-                'x2': self.bifurcation_downstream_x,
-                'y2': self.bifurcation_downstream_y
-             }
-        
+            bifurcations = {
+                "x1": self.bifurcation_catchment_x,
+                "y1": self.bifurcation_catchment_y,
+                "x2": self.bifurcation_downstream_x,
+                "y2": self.bifurcation_downstream_y,
+            }
+
         removed_bifurcations = None
-        if visualize_removed_bifurcations and hasattr(self, "removed_bifurcation_catchment_x") and self.removed_bifurcation_catchment_x.size > 0:
-             removed_bifurcations = {
-                'x1': self.removed_bifurcation_catchment_x,
-                'y1': self.removed_bifurcation_catchment_y,
-                'x2': self.removed_bifurcation_downstream_x,
-                'y2': self.removed_bifurcation_downstream_y
-             }
-             
+        if (
+            visualize_removed_bifurcations
+            and hasattr(self, "removed_bifurcation_catchment_x")
+            and self.removed_bifurcation_catchment_x.size > 0
+        ):
+            removed_bifurcations = {
+                "x1": self.removed_bifurcation_catchment_x,
+                "y1": self.removed_bifurcation_catchment_y,
+                "x2": self.removed_bifurcation_downstream_x,
+                "y2": self.removed_bifurcation_downstream_y,
+            }
+
         pois_xy = None
-        if hasattr(self, "target_cids") and isinstance(self.target_cids, np.ndarray) and self.target_cids.size > 0:
+        if (
+            hasattr(self, "target_cids")
+            and isinstance(self.target_cids, np.ndarray)
+            and self.target_cids.size > 0
+        ):
             poi_idx = find_indices_in(self.target_cids, self.catchment_id)
             poi_idx = poi_idx[poi_idx >= 0]
             if poi_idx.size > 0:
-                 pois_xy = (self.catchment_x[poi_idx], self.catchment_y[poi_idx])
+                pois_xy = (self.catchment_x[poi_idx], self.catchment_y[poi_idx])
 
         plot_basins_common(
             map_shape=self.map_shape,
@@ -1311,12 +1480,14 @@ class MERITMap(BaseModel):
             bifurcations=bifurcations,
             removed_bifurcations=removed_bifurcations,
             pois_xy=pois_xy,
-            longitude=self.longitude if hasattr(self, 'longitude') else None,
-            latitude=self.latitude if hasattr(self, 'latitude') else None,
+            longitude=self.longitude if hasattr(self, "longitude") else None,
+            latitude=self.latitude if hasattr(self, "latitude") else None,
             title="MERIT Global Basins with Bifurcation Paths",
-            upstream_area=self.upstream_area if hasattr(self, 'upstream_area') else None,
+            upstream_area=self.upstream_area
+            if hasattr(self, "upstream_area")
+            else None,
         )
-        
+
         print(f"Saved basin visualization to {self.out_dir / 'basin_map.png'}")
 
     def print_summary(self) -> None:
@@ -1357,6 +1528,7 @@ class MERITMap(BaseModel):
             self.out_dir.mkdir(parents=True, exist_ok=True)
         return self
 
+
 if __name__ == "__main__":
     map_resolution = "glb_15min"
     merit_map = MERITMap(
@@ -1372,5 +1544,3 @@ if __name__ == "__main__":
         out_file="parameters.nc",
     )
     merit_map.build_input()
-
-    

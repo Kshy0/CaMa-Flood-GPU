@@ -6,11 +6,11 @@ with dims ``(time, station)`` and variables ``catchment_id_{resolution}``,
 downstream consumer is ``qualify_inflow`` which collapses stations to one
 series per catchment and finds the longest contiguous valid segment.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Union
 
 import numpy as np
 import torch
@@ -34,7 +34,7 @@ class GaugeDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        path: Union[str, Path],
+        path: str | Path,
         *,
         start_date: datetime,
         end_date: datetime,
@@ -69,13 +69,15 @@ class GaugeDataset(torch.utils.data.Dataset):
             raw_cids = ds.variables[cid_var][:]
             cids_all = np.asarray(
                 raw_cids.filled(-1)
-                if isinstance(raw_cids, np.ma.MaskedArray) else raw_cids,
+                if isinstance(raw_cids, np.ma.MaskedArray)
+                else raw_cids,
                 dtype=np.int64,
             )
             raw_area = ds.variables[area_var][:]
             area_all = np.asarray(
                 raw_area.filled(np.nan)
-                if isinstance(raw_area, np.ma.MaskedArray) else raw_area,
+                if isinstance(raw_area, np.ma.MaskedArray)
+                else raw_area,
                 dtype=np.float64,
             )
             if cids_all.ndim != 1 or area_all.shape != cids_all.shape:
@@ -102,21 +104,28 @@ class GaugeDataset(torch.utils.data.Dataset):
                     f"but {cid_var} has {cids_all.size}"
                 )
             raw_times = num2date(
-                time_var[:], units=time_var.units,
+                time_var[:],
+                units=time_var.units,
                 calendar=getattr(time_var, "calendar", "standard"),
             )
-            times = np.array([
-                datetime(
-                    t.year, t.month, t.day, t.hour, t.minute, t.second,
-                    getattr(t, "microsecond", 0),
-                )
-                for t in raw_times
-            ])
+            times = np.array(
+                [
+                    datetime(
+                        t.year,
+                        t.month,
+                        t.day,
+                        t.hour,
+                        t.minute,
+                        t.second,
+                        getattr(t, "microsecond", 0),
+                    )
+                    for t in raw_times
+                ]
+            )
 
             mask = (times >= start_date) & (times <= end_date)
             if not np.any(mask):
-                raise ValueError(
-                    f"No data in [{start_date}, {end_date}] in {path}")
+                raise ValueError(f"No data in [{start_date}, {end_date}] in {path}")
             time_idx = np.where(mask)[0]
 
             expected_count = duration // time_interval + 1
@@ -132,8 +141,11 @@ class GaugeDataset(torch.utils.data.Dataset):
                 )
 
             raw = discharge_var[time_idx, :]
-            obs = raw.filled(np.nan) if isinstance(raw, np.ma.MaskedArray) \
+            obs = (
+                raw.filled(np.nan)
+                if isinstance(raw, np.ma.MaskedArray)
                 else np.asarray(raw, dtype=np.float32)
+            )
             obs = obs.astype(np.float32)
             obs[~np.isfinite(obs)] = np.nan
 
@@ -151,8 +163,7 @@ class GaugeDataset(torch.utils.data.Dataset):
                 f"reported_area_km2; invalid station indices "
                 f"{bad[:5].tolist()}"
             )
-        print(f"[GaugeDataset] {n_alloc}/{n_total} stations allocated "
-              f"on {resolution}")
+        print(f"[GaugeDataset] {n_alloc}/{n_total} stations allocated on {resolution}")
 
         self._gauge_catchment_ids = cids_all[allocated]
         self._data = obs[:, allocated]
@@ -189,8 +200,7 @@ class GaugeDataset(torch.utils.data.Dataset):
             is_nan = np.isnan(col)
             if not is_nan.any():
                 continue
-            diff = np.diff(
-                np.concatenate(([False], is_nan, [False])).astype(np.int8))
+            diff = np.diff(np.concatenate(([False], is_nan, [False])).astype(np.int8))
             starts = np.where(diff == 1)[0]
             ends = np.where(diff == -1)[0]
             for s, e in zip(starts, ends, strict=True):
@@ -282,7 +292,8 @@ class GaugeDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"qualify_inflow: {(~keep).sum()} catchments have no valid "
                 f"data in [{self._start_date}, {self._end_date}]: "
-                f"{unique_cid[~keep].tolist()[:10]}")
+                f"{unique_cid[~keep].tolist()[:10]}"
+            )
 
         # Preserve NaN until the overlay has derived its validity interval.
         data = np.where(nan_any, np.nan, merged_q).astype(np.float32)

@@ -14,6 +14,11 @@ import triton.language as tl
 from cmfgpu.phys.triton.utils import hpfloat_to_compute_inline
 
 
+from cmfgpu import config as _constants
+
+RESERVOIR_RELEASE_EXPONENT = tl.constexpr(_constants.RESERVOIR_RELEASE_EXPONENT)
+
+
 @triton.jit
 def compute_reservoir_outflow_kernel(
     reservoir_catchment_idx_ptr,            # *i32  reservoir → catchment index
@@ -136,13 +141,13 @@ def compute_reservoir_outflow_kernel(
         (total_storage - conservation_volume) / (emergency_volume - conservation_volume)
     ) * (reservoir_inflow - normal_outflow)
     frac3 = (total_storage - adjustment_volume) / (emergency_volume - adjustment_volume)
-    outflow_tmp = adjustment_outflow + tl.exp(0.1 * tl.log(frac3)) * (
+    outflow_tmp = adjustment_outflow + tl.exp(RESERVOIR_RELEASE_EXPONENT * tl.log(frac3)) * (
         flood_control_outflow - adjustment_outflow
     )
     outflow_combined = tl.maximum(outflow_flood, outflow_tmp)
 
     # Non-flood period
-    outflow_nonflood = adjustment_outflow + tl.exp(0.1 * tl.log(frac3)) * (
+    outflow_nonflood = adjustment_outflow + tl.exp(RESERVOIR_RELEASE_EXPONENT * tl.log(frac3)) * (
         flood_control_outflow - adjustment_outflow
     )
 
@@ -202,16 +207,16 @@ def compute_reservoir_outflow_batched_kernel(
     time_step_ptr,
     num_reservoirs: tl.constexpr,
     num_catchments: tl.constexpr,
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     batched_runoff: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    total = num_reservoirs * num_trials
+    total = num_reservoirs * ensemble_size
     mask = idx < total
     reservoir_idx = idx % num_reservoirs
-    trial_idx = idx // num_reservoirs
-    trial_offset = trial_idx * num_catchments
+    member_index = idx // num_reservoirs
+    member_offset = member_index * num_catchments
     time_step = tl.load(time_step_ptr)
 
     local_catchment = tl.load(
@@ -221,8 +226,8 @@ def compute_reservoir_outflow_batched_kernel(
         downstream_idx_ptr + local_catchment, mask=mask, other=0,
     )
     is_river_mouth = local_downstream == local_catchment
-    catchment_idx = trial_offset + local_catchment
-    downstream_idx = trial_offset + local_downstream
+    catchment_idx = member_offset + local_catchment
+    downstream_idx = member_offset + local_downstream
 
     old_river_outflow = tl.load(
         river_outflow_ptr + catchment_idx, mask=mask, other=0.0,
@@ -323,7 +328,7 @@ def compute_reservoir_outflow_batched_kernel(
     frac3 = (total_storage - adjustment_volume) / (
         emergency_volume - adjustment_volume
     )
-    outflow_nonflood = adjustment_outflow + tl.exp(0.1 * tl.log(frac3)) * (
+    outflow_nonflood = adjustment_outflow + tl.exp(RESERVOIR_RELEASE_EXPONENT * tl.log(frac3)) * (
         flood_control_outflow - adjustment_outflow
     )
     reservoir_outflow = tl.where(

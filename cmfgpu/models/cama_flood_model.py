@@ -8,20 +8,22 @@
 Master controller class for managing all CaMa-Flood-GPU modules using Pydantic v2.
 """
 
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
-from hydroforge.model import (
-    AbstractModel,
-    module_ref,
-    optional_module_ref,
-)
 from hydroforge.contracts import BackendRequirement, ModuleRequirement
 from hydroforge.execution import (
     ManagedStep,
     all_reduce_,
     between_steps,
     managed_step,
+)
+from hydroforge.model import (
+    AbstractModel,
+    copy_tensor_inputs,
+    module_ref,
+    optional_module_ref,
 )
 
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
@@ -64,10 +66,10 @@ class CaMaFlood(AbstractModel):
     partition_group: ClassVar[str] = "catchment_basin_id"
     cuda_extension_modules: ClassVar[tuple[str, ...]] = ("cmfgpu.phys.cuda",)
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {
-        "cuda": BackendRequirement(trials=False),
+        "cuda": BackendRequirement(),
     }
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {
-        "log": ModuleRequirement(trials=False),
+        "log": ModuleRequirement(ensemble=False),
     }
 
     def initialize_model_state(self) -> None:
@@ -81,12 +83,13 @@ class CaMaFlood(AbstractModel):
         self,
         *,
         runoff: torch.Tensor,
-        inflow: Optional[torch.Tensor] = None,
-        sea_surface_elevation: Optional[torch.Tensor] = None,
+        inflow: torch.Tensor | None = None,
+        sea_surface_elevation: torch.Tensor | None = None,
     ) -> None:
         """Stage all public dynamic forcing without rebinding model buffers."""
 
-        self.base.runoff.copy_(runoff)
+        staged_inputs = {}
+        staged_inputs["runoff"] = (runoff, self.base.runoff)
         inflow_module = self.inflow
         if inflow_module is None:
             if inflow is not None:
@@ -94,8 +97,7 @@ class CaMaFlood(AbstractModel):
         else:
             if inflow is None:
                 raise ValueError("the inflow module requires inflow forcing")
-            inflow_module.inflow.copy_(inflow)
-
+            staged_inputs["inflow"] = (inflow, inflow_module.inflow)
         sea_level_module = self.sea_level
         if sea_level_module is None:
             if sea_surface_elevation is not None:
@@ -107,7 +109,10 @@ class CaMaFlood(AbstractModel):
                 raise ValueError(
                     "the sea_level module requires sea_surface_elevation forcing"
                 )
-            sea_level_module.sea_surface_elevation.copy_(sea_surface_elevation)
+            staged_inputs["sea_surface_elevation"] = (
+                sea_surface_elevation, sea_level_module.sea_surface_elevation,
+            )
+        copy_tensor_inputs(staged_inputs)
 
     @managed_step
     @torch.inference_mode()
@@ -124,8 +129,10 @@ class CaMaFlood(AbstractModel):
         if adaptive_time is not None:
             adaptive_time.max_sub_steps.zero_()
             compute_adaptive_time_step()
-            if self.world_size > 1:
+            if self.spatial_world_size > 1:
                 all_reduce_(adaptive_time.max_sub_steps, reduction="max")
+            if self.parallel is not None and self.parallel.ensemble_partitions > 1:
+                all_reduce_(adaptive_time.max_sub_steps, reduction="max", scope="ensemble")
             fixed_substeps = step.fixed(
                 count=int(adaptive_time.max_sub_steps.item()),
             )
@@ -173,9 +180,9 @@ class CaMaFlood(AbstractModel):
             self.base.current_step.fill_(fixed_count - 1)
 
         if log is not None:
-            if self.world_size > 1:
+            if self.spatial_world_size > 1:
                 log.gather_results()
-            if self.rank == 0 and step.output_enabled:
+            if self.spatial_rank == 0 and step.output_enabled:
                 log.write_step(self.log_path)
             else:
                 log.clear_buffers()

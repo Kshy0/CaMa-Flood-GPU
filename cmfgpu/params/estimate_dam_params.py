@@ -53,7 +53,6 @@ import csv
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Union
 
 import numba
 import numpy as np
@@ -244,7 +243,7 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
     ids, lats, lons, upareas, names = [], [], [], [], []
     cap_mcm_list, years_list = [], []
 
-    with open(dam_list_path, "r", newline="", encoding="utf-8-sig") as f:
+    with open(dam_list_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         header = next(reader)
         header_lower = [h.strip().lower() for h in header]
@@ -360,7 +359,7 @@ def _read_alloc_file(path: Path) -> np.ndarray:
 
 def _resolve_dam_catchment_ids(
     dam_info: dict,
-    dam_alloc: Union[str, Path, np.ndarray],
+    dam_alloc: str | Path | np.ndarray,
 ) -> np.ndarray:
     """Resolve catchment_id for each dam from allocation results.
 
@@ -809,11 +808,11 @@ def _find_nc_with_var(
 
 
 def compute_dam_discharge_from_timeseries(
-    dam_list: Union[str, Path],
-    parameter_nc: Union[str, Path],
-    outflow_stats_nc: Union[str, Path],
+    dam_list: str | Path,
+    parameter_nc: str | Path,
+    outflow_stats_nc: str | Path,
     *,
-    dam_alloc: Union[str, Path, np.ndarray, None] = None,
+    dam_alloc: str | Path | np.ndarray | None = None,
     annual_max_var: str = "total_outflow_max_mean",
     annual_mean_var: str = "total_outflow_mean_mean",
     verbose: bool = True,
@@ -1041,20 +1040,20 @@ def estimate_flood_discharge(
 
 
 def estimate_dam_params(
-    dam_list: Union[str, Path],
-    parameter_nc: Union[str, Path],
-    outflow_stats_nc: Union[str, Path],
+    dam_list: str | Path,
+    parameter_nc: str | Path,
+    outflow_stats_nc: str | Path,
     *,
-    dam_alloc: Union[str, Path, np.ndarray, None] = None,
-    output_csv: Optional[Union[str, Path]] = None,
-    output_nc: Optional[Union[str, Path]] = None,
+    dam_alloc: str | Path | np.ndarray | None = None,
+    output_csv: str | Path | None = None,
+    output_nc: str | Path | None = None,
     annual_max_var: str = "total_outflow_max_mean",
     annual_mean_var: str = "total_outflow_mean_mean",
     qf_ratio: float = 0.3,
     flood_storage_ratio: float = 0.37,
     min_uparea: float = 0.0,
-    grsad_dir: Optional[Union[str, Path]] = None,
-    regeom_dir: Optional[Union[str, Path]] = None,
+    grsad_dir: str | Path | None = None,
+    regeom_dir: str | Path | None = None,
     grsad_percentile: float = 75.0,
     verbose: bool = True,
 ) -> Path:

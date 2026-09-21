@@ -11,11 +11,11 @@ import re
 import tempfile
 import warnings
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import netCDF4 as nc
 import numpy as np
@@ -35,12 +35,12 @@ class GaugeSeries:
     """
 
     gauge_id: str
-    dates: List[datetime]
+    dates: list[datetime]
     values: np.ndarray
     units: str = "m3/s"
-    meta: Optional[dict] = None
+    meta: dict | None = None
 
-    def clip(self, start: Optional[datetime], end: Optional[datetime]) -> "GaugeSeries":
+    def clip(self, start: datetime | None, end: datetime | None) -> GaugeSeries:
         if start is None and end is None:
             return self
         dates_arr = np.array(self.dates, dtype="datetime64[ns]")
@@ -51,9 +51,7 @@ class GaugeSeries:
             mask &= dates_arr <= np.datetime64(end)
         return GaugeSeries(
             gauge_id=self.gauge_id,
-            dates=[
-                d for d, m in zip(self.dates, mask.tolist(), strict=True) if m
-            ],
+            dates=[d for d, m in zip(self.dates, mask.tolist(), strict=True) if m],
             values=self.values[mask],
             units=self.units,
             meta=self.meta,
@@ -85,7 +83,7 @@ def _atomic_path_writer(function):
     return wrapped
 
 
-def default_grdc_resolver(gauge_id: str) -> str: 
+def default_grdc_resolver(gauge_id: str) -> str:
     return f"{gauge_id}_Q_Day.Cmd.txt"
 
 
@@ -103,8 +101,8 @@ def parse_grdc_text(gauge_id: str, text: str) -> GaugeSeries:
     -------
     GaugeSeries
     """
-    dates: List[datetime] = []
-    vals: List[float] = []
+    dates: list[datetime] = []
+    vals: list[float] = []
     units = "m3/s"
     meta: dict = {"source": "GRDC"}
 
@@ -175,14 +173,14 @@ def parse_grdc_text(gauge_id: str, text: str) -> GaugeSeries:
     )
 
 
-def load_grdc(gauge_id: str, file_path: Union[str, Path]) -> GaugeSeries:
+def load_grdc(gauge_id: str, file_path: str | Path) -> GaugeSeries:
     """Load a GRDC daily discharge file → GaugeSeries."""
     file_path = Path(file_path)
     text = file_path.read_text(encoding="utf-8", errors="ignore")
     return parse_grdc_text(gauge_id, text)
 
 
-def read_mapdim(map_dir: Union[str, Path]) -> Tuple[int, int]:
+def read_mapdim(map_dir: str | Path) -> tuple[int, int]:
     """Read (nx, ny) from CaMa-Flood mapdim.txt.
 
     Parameters
@@ -200,7 +198,7 @@ def read_mapdim(map_dir: Union[str, Path]) -> Tuple[int, int]:
     return nx, ny
 
 
-def parse_alloc_txt(alloc_path: Union[str, Path]) -> Dict[int, dict]:
+def parse_alloc_txt(alloc_path: str | Path) -> dict[int, dict]:
     """Parse CaMa-Flood GRDC_alloc.txt → per-station allocation info.
 
     Parameters
@@ -214,7 +212,7 @@ def parse_alloc_txt(alloc_path: Union[str, Path]) -> Dict[int, dict]:
         ``{station_id: {ix1, iy1, ix2, iy2, area_cama, error}}``
         Grid indices are 1-based, as stored in the file.
     """
-    result: Dict[int, dict] = {}
+    result: dict[int, dict] = {}
     with open(alloc_path) as f:
         lines = f.readlines()
     for line in lines[1:]:
@@ -231,6 +229,7 @@ def parse_alloc_txt(alloc_path: Union[str, Path]) -> Dict[int, dict]:
             "error": float(tok[3]),
         }
     return result
+
 
 class GaugeReader:
     """
@@ -249,44 +248,50 @@ class GaugeReader:
 
     def __init__(
         self,
-        base_dir: Union[str, Path],
-        file_resolver: Callable[[str], Union[str, Path]] = default_grdc_resolver,
-        loader: Callable[[str, Union[str, Path]], GaugeSeries] = load_grdc,
+        base_dir: str | Path,
+        file_resolver: Callable[[str], str | Path] = default_grdc_resolver,
+        loader: Callable[[str, str | Path], GaugeSeries] = load_grdc,
     ) -> None:
         self.base_dir = Path(base_dir)
         self._file_resolver = file_resolver
         self._loader = loader
 
         # Gauge meta state (populated via load_meta)
-        self._gauge_ids: List[str] = []
+        self._gauge_ids: list[str] = []
         # gauge_id -> ((ix1, iy1), (ix2, iy2) or None)
-        self._gauge_xy: Dict[str, Tuple[Tuple[int, int], Optional[Tuple[int, int]]]] = {}
+        self._gauge_xy: dict[str, tuple[tuple[int, int], tuple[int, int] | None]] = {}
         # gauge_id -> (area1, area2 or None)
-        self._gauge_areas: Dict[str, Tuple[float, Optional[float]]] = {}
+        self._gauge_areas: dict[str, tuple[float, float | None]] = {}
         # gauge_id -> [catchment_id(s)]
-        self._gauge_catchments: Dict[str, List[int]] = {}
+        self._gauge_catchments: dict[str, list[int]] = {}
         # map shape for catchment id flattening (nx, ny)
-        self._map_shape: Optional[Tuple[int, int]] = None
+        self._map_shape: tuple[int, int] | None = None
 
     # -----------------------------
     # Public API
     # -----------------------------
-    def set_loader(self, loader: Callable[[str, Union[str, Path]], GaugeSeries]) -> None:
+    def set_loader(self, loader: Callable[[str, str | Path], GaugeSeries]) -> None:
         """Override the loader used to parse a single gauge file."""
         self._loader = loader
 
-    def set_file_resolver(self, resolver: Callable[[str], Union[str, Path]]) -> None:
+    def set_file_resolver(self, resolver: Callable[[str], str | Path]) -> None:
         """Override how gauge_id is mapped to a file path."""
         self._file_resolver = resolver
 
     def resolve_path(self, gauge_id: str) -> Path:
         name_or_path = Path(self._file_resolver(gauge_id))
-        p = name_or_path if name_or_path.is_absolute() else (self.base_dir / name_or_path)
+        p = (
+            name_or_path
+            if name_or_path.is_absolute()
+            else (self.base_dir / name_or_path)
+        )
         if not p.exists():
             raise FileNotFoundError(f"Gauge file not found for id={gauge_id}: {p}")
         return p
 
-    def read(self, gauge_id: str, start: Optional[datetime] = None, end: Optional[datetime] = None) -> GaugeSeries:
+    def read(
+        self, gauge_id: str, start: datetime | None = None, end: datetime | None = None
+    ) -> GaugeSeries:
         """Read a gauge by id and clip to [start, end] if provided."""
         file_path = self.resolve_path(gauge_id)
         series = self._loader(gauge_id, file_path)
@@ -315,10 +320,12 @@ class GaugeReader:
         if self._gauge_xy:
             self._rebuild_catchments()
 
-    def load_map_shape_from_nc(self, nc_path: Union[str, Path]) -> None:
+    def load_map_shape_from_nc(self, nc_path: str | Path) -> None:
         """Load (nx, ny) from a NetCDF file if available in attributes/variables/dimensions."""
         if nc is None:
-            raise RuntimeError("netCDF4 not available to read map shape; install netCDF4 or use set_map_shape().")
+            raise RuntimeError(
+                "netCDF4 not available to read map shape; install netCDF4 or use set_map_shape()."
+            )
         p = Path(nc_path)
         if not p.exists():
             raise FileNotFoundError(f"NetCDF not found: {p}")
@@ -328,35 +335,46 @@ class GaugeReader:
             nx_val = getattr(ds, "nx", None)
             ny_val = getattr(ds, "ny", None)
             # try variables
-            if (nx_val is None or ny_val is None) and "nx" in ds.variables and "ny" in ds.variables:
+            if (
+                (nx_val is None or ny_val is None)
+                and "nx" in ds.variables
+                and "ny" in ds.variables
+            ):
                 try:
                     nx_val = int(ds["nx"][()])
                     ny_val = int(ds["ny"][()])
                 except Exception:
                     pass
             # try dims
-            if (nx_val is None or ny_val is None) and "nx" in ds.dimensions and "ny" in ds.dimensions:
+            if (
+                (nx_val is None or ny_val is None)
+                and "nx" in ds.dimensions
+                and "ny" in ds.dimensions
+            ):
                 nx_val = int(len(ds.dimensions["nx"]))
                 ny_val = int(len(ds.dimensions["ny"]))
             # common alternative x/y
-            if (nx_val is None or ny_val is None) and "x" in ds.dimensions and "y" in ds.dimensions:
+            if (
+                (nx_val is None or ny_val is None)
+                and "x" in ds.dimensions
+                and "y" in ds.dimensions
+            ):
                 nx_val = int(len(ds.dimensions["x"]))
                 ny_val = int(len(ds.dimensions["y"]))
         if nx_val is None or ny_val is None:
-            raise ValueError("Failed to get (nx, ny) from NetCDF. Provide explicitly via set_map_shape().")
+            raise ValueError(
+                "Failed to get (nx, ny) from NetCDF. Provide explicitly via set_map_shape()."
+            )
         self.set_map_shape(nx_val, ny_val)
 
     def load_meta(
         self,
-        meta_txt: Union[str, Path],
-        shape_source: Optional[
-            Union[
-                Tuple[int, int],
-                str,
-                Path,
-                Callable[[], Tuple[int, int]],
-            ]
-        ] = None,
+        meta_txt: str | Path,
+        shape_source: tuple[int, int]
+        | str
+        | Path
+        | Callable[[], tuple[int, int]]
+        | None = None,
         err_threshold: float = 0.1,
         skip_multi_catchment: bool = False,
     ) -> None:
@@ -405,8 +423,8 @@ class GaugeReader:
 
         # Parse header to locate column indices
         with meta_path.open("r", encoding="utf-8", errors="ignore") as f:
-            header_idx_map: Dict[str, int] = {}
-            rows: List[List[str]] = []
+            header_idx_map: dict[str, int] = {}
+            rows: list[list[str]] = []
             for line in f:
                 line = line.rstrip("\n")
                 if not line.strip():
@@ -416,7 +434,7 @@ class GaugeReader:
                 # split by comma and/or whitespace
                 toks = [t for t in re.split(r"[\s,]+", line.strip()) if t]
                 # Detect header row by presence of required labels
-                if ("ID" in toks and "ix1" in toks and "iy1" in toks):
+                if "ID" in toks and "ix1" in toks and "iy1" in toks:
                     header_idx_map = {name: toks.index(name) for name in toks}
                     # Allocation files produced by the current tooling use
                     # ``error`` while older GRDC allocation tables use
@@ -431,12 +449,24 @@ class GaugeReader:
         if not header_idx_map:
             # Fallback: assume fixed column order
             expected = [
-                "ID","lat","lon","err","area_GRDC","area_CaMa","diff","ups_num",
-                "ix1","iy1","ix2","iy2","area1","area2"
+                "ID",
+                "lat",
+                "lon",
+                "err",
+                "area_GRDC",
+                "area_CaMa",
+                "diff",
+                "ups_num",
+                "ix1",
+                "iy1",
+                "ix2",
+                "iy2",
+                "area1",
+                "area2",
             ]
             header_idx_map = {name: i for i, name in enumerate(expected)}
 
-        def get_val(toks: List[str], key: str, cast):
+        def get_val(toks: list[str], key: str, cast):
             idx = header_idx_map.get(key)
             if idx is None or idx >= len(toks):
                 return None
@@ -486,7 +516,7 @@ class GaugeReader:
 
             ix2_raw = get_val(toks, "ix2", int)
             iy2_raw = get_val(toks, "iy2", int)
-            xy2: Optional[Tuple[int, int]] = None
+            xy2: tuple[int, int] | None = None
             if ix2_raw is None and iy2_raw is None:
                 pass
             elif (
@@ -529,7 +559,9 @@ class GaugeReader:
                 gid, err, xy1, xy2, a1, a2 = gauges[0]
             else:
                 # Sort by abs(err), select the smallest
-                gauges.sort(key=lambda x: abs(x[1]) if x[1] is not None else float('inf'))
+                gauges.sort(
+                    key=lambda x: abs(x[1]) if x[1] is not None else float("inf")
+                )
                 gid, err, xy1, xy2, a1, a2 = gauges[0]
 
             self._gauge_ids.append(gid)
@@ -544,20 +576,20 @@ class GaugeReader:
 
     # Accessors
     @property
-    def gauge_ids(self) -> List[str]:
+    def gauge_ids(self) -> list[str]:
         """List of gauge IDs loaded from meta."""
         return list(self._gauge_ids)
 
-    def get_xy(self, gauge_id: str) -> Tuple[Tuple[int, int], Optional[Tuple[int, int]]]:
+    def get_xy(self, gauge_id: str) -> tuple[tuple[int, int], tuple[int, int] | None]:
         return self._gauge_xy[gauge_id]
 
-    def get_catchments(self, gauge_id: str) -> List[int]:
+    def get_catchments(self, gauge_id: str) -> list[int]:
         return self._gauge_catchments[gauge_id]
 
-    def get_areas(self, gauge_id: str) -> Tuple[float, Optional[float]]:
+    def get_areas(self, gauge_id: str) -> tuple[float, float | None]:
         return self._gauge_areas[gauge_id]
 
-    def get_available_cids(self) -> List[int]:
+    def get_available_cids(self) -> list[int]:
         """Get list of catchment IDs for gauges where the file exists."""
         available = []
         for gid in self._gauge_ids:
@@ -593,7 +625,8 @@ class GaugeReader:
 #  Batch extraction and NetCDF writing
 # ──────────────────────────────────────────────────────────────────────────────
 
-def scan_grdc_zips(grdc_dir: Union[str, Path]) -> Dict[str, List[Tuple[int, str]]]:
+
+def scan_grdc_zips(grdc_dir: str | Path) -> dict[str, list[tuple[int, str]]]:
     """Discover all daily-discharge station files inside GRDC zip archives.
 
     Scans all ``*.zip`` files in *grdc_dir* for filenames matching
@@ -611,9 +644,9 @@ def scan_grdc_zips(grdc_dir: Union[str, Path]) -> Dict[str, List[Tuple[int, str]
         Ready to pass to :func:`extract_grdc_from_zips`.
     """
     grdc_dir = Path(grdc_dir)
-    result: Dict[str, List[Tuple[int, str]]] = {}
+    result: dict[str, list[tuple[int, str]]] = {}
     for zf_path in sorted(grdc_dir.glob("*.zip")):
-        entries: List[Tuple[int, str]] = []
+        entries: list[tuple[int, str]] = []
         try:
             with zipfile.ZipFile(zf_path) as zf:
                 for name in zf.namelist():
@@ -641,11 +674,11 @@ def scan_grdc_zips(grdc_dir: Union[str, Path]) -> Dict[str, List[Tuple[int, str]
 
 
 def extract_grdc_from_zips(
-    grdc_dir: Union[str, Path],
-    zip_file_map: Dict[str, List[Tuple[int, str]]],
+    grdc_dir: str | Path,
+    zip_file_map: dict[str, list[tuple[int, str]]],
     time_start: str,
     time_end: str,
-) -> Dict[int, Tuple[np.ndarray, np.ndarray, dict]]:
+) -> dict[int, tuple[np.ndarray, np.ndarray, dict]]:
     """Extract daily discharge from GRDC zip archives.
 
     Parameters
@@ -668,7 +701,7 @@ def extract_grdc_from_zips(
     t0 = np.datetime64(time_start)
     t1 = np.datetime64(time_end)
 
-    result: Dict[int, Tuple[np.ndarray, np.ndarray, dict]] = {}
+    result: dict[int, tuple[np.ndarray, np.ndarray, dict]] = {}
     n_zips = len(zip_file_map)
 
     for zi, (zf_name, entries) in enumerate(sorted(zip_file_map.items())):
@@ -709,7 +742,7 @@ def extract_grdc_from_zips(
                 stacklevel=2,
             )
         if (zi + 1) % 20 == 0 or zi + 1 == n_zips:
-            print(f"  {zi+1}/{n_zips} zips done, {len(result)} series")
+            print(f"  {zi + 1}/{n_zips} zips done, {len(result)} series")
 
     print(f"Extracted {len(result)} time series")
     return result
@@ -717,7 +750,7 @@ def extract_grdc_from_zips(
 
 @_atomic_path_writer
 def write_gauge_nc(
-    output_path: Union[str, Path],
+    output_path: str | Path,
     station_ids: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
@@ -725,10 +758,8 @@ def write_gauge_nc(
     downstream_station_id: np.ndarray,
     observations: np.ndarray,
     time_start: str,
-    resolution_allocs: Optional[
-        Dict[str, Dict[str, np.ndarray]]
-    ] = None,
-    resolution_dims: Optional[Dict[str, Tuple[int, int]]] = None,
+    resolution_allocs: dict[str, dict[str, np.ndarray]] | None = None,
+    resolution_dims: dict[str, tuple[int, int]] | None = None,
     title: str = "GRDC daily discharge observations",
     source: str = "GRDC",
     error_threshold: float = 0.10,
@@ -766,8 +797,7 @@ def write_gauge_nc(
     observations = np.asarray(observations, dtype=np.float32)
     if observations.ndim != 2:
         raise ValueError(
-            f"observations must have shape (time, station), got "
-            f"{observations.shape}"
+            f"observations must have shape (time, station), got {observations.shape}"
         )
     n_time, n_station = observations.shape
     if n_time < 1 or n_station < 1:
@@ -855,7 +885,10 @@ def write_gauge_nc(
 
         # Reported area
         v = ds.createVariable(
-            "reported_area_km2", "f4", ("station",), zlib=True,
+            "reported_area_km2",
+            "f4",
+            ("station",),
+            zlib=True,
         )
         v.units = "km2"
         v.long_name = "Reported upstream drainage area"
@@ -863,15 +896,22 @@ def write_gauge_nc(
 
         # Downstream station
         v = ds.createVariable(
-            "downstream_station_id", "i8", ("station",), zlib=True,
+            "downstream_station_id",
+            "i8",
+            ("station",),
+            zlib=True,
         )
         v.long_name = "Nearest downstream station (-1 = none)"
         v[:] = downstream_station_id
 
         # Discharge observations (chunked per station time series)
         v = ds.createVariable(
-            "discharge", "f4", ("time", "station"),
-            zlib=True, complevel=4, shuffle=True,
+            "discharge",
+            "f4",
+            ("time", "station"),
+            zlib=True,
+            complevel=4,
+            shuffle=True,
             fill_value=np.float32(np.nan),
             chunksizes=(n_time, 1),
         )
@@ -887,17 +927,20 @@ def write_gauge_nc(
                 suffix = f"_{res}"
 
                 v = ds.createVariable(
-                    f"catchment_id{suffix}", "i8", ("station",), zlib=True,
+                    f"catchment_id{suffix}",
+                    "i8",
+                    ("station",),
+                    zlib=True,
                 )
-                v.long_name = (
-                    f"Catchment index on {res} grid (ix*ny+iy, 0-based)"
-                )
+                v.long_name = f"Catchment index on {res} grid (ix*ny+iy, 0-based)"
                 v.setncattr("nx", int(nx))
                 v.setncattr("ny", int(ny))
                 v[:] = arrs["catchment_id"]
 
                 v = ds.createVariable(
-                    f"allocated_area{suffix}_km2", "f4", ("station",),
+                    f"allocated_area{suffix}_km2",
+                    "f4",
+                    ("station",),
                     zlib=True,
                 )
                 v.units = "km2"
@@ -905,7 +948,10 @@ def write_gauge_nc(
                 v[:] = arrs["allocated_area_km2"]
 
                 v = ds.createVariable(
-                    f"alloc_error{suffix}", "f4", ("station",), zlib=True,
+                    f"alloc_error{suffix}",
+                    "f4",
+                    ("station",),
+                    zlib=True,
                 )
                 v.long_name = f"Relative area allocation error on {res} grid"
                 v[:] = arrs["alloc_error"]

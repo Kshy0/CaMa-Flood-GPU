@@ -2,14 +2,14 @@
     long num_reservoirs = *args.num_reservoirs;
     long num_catchments = *args.num_catchments;
     long reservoir_idx = (long)i % num_reservoirs;
-    long trial_idx = (long)i / num_reservoirs;
-    long trial_offset = trial_idx * num_catchments;
+    long member_index = (long)i / num_reservoirs;
+    long member_offset = member_index * num_catchments;
 
     int local_catchment = args.reservoir_catchment_idx_ptr[reservoir_idx];
     int local_downstream = args.downstream_idx_ptr[local_catchment];
     bool is_river_mouth = local_downstream == local_catchment;
-    long catchment = trial_offset + local_catchment;
-    long downstream = trial_offset + local_downstream;
+    long catchment = member_offset + local_catchment;
+    long downstream = member_offset + local_downstream;
     float time_step = *args.time_step_ptr;
 
     float old_river_outflow = args.river_outflow_ptr[catchment];
@@ -60,7 +60,7 @@
         float fraction = (total_storage - adjustment_volume)
             / (emergency_volume - adjustment_volume);
         float controlled = adjustment_outflow
-            + exp(0.1f * log(fraction))
+            + exp(CMF_RESERVOIR_RELEASE_EXPONENT * log(fraction))
             * (flood_control_outflow - adjustment_outflow);
         if (reservoir_inflow >= flood_control_outflow) {
             float flood = normal_outflow

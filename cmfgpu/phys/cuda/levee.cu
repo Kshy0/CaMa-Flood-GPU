@@ -1,33 +1,19 @@
-// LICENSE HEADER MANAGED BY add-license-header
-// Copyright (c) 2025 Shengyu Kang (Wuhan University)
-// Licensed under the Apache License, Version 2.0
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// CUDA backend for levee-aware flood-stage and levee bifurcation outflow.
-//
-// The stage kernel uses one thread per levee, writes back to the indexed
-// catchment, and uses lane-local early exits for in-bank levee lanes and
-// completed flood-level scans.  The levee bifurcation kernel uses the same
-// lane-level skip style as outflow.cu.
-
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
+
 #include "block_reduce.cuh"
 
-// Global water-balance counters the levee LOG path accumulates.
 #define CMF_LEVEE_LOG_SUMS 5
 
-template <typename REAL>
-__device__ __forceinline__ REAL pow73(REAL x) { return x * x * cbrt(x); }
 template <typename REAL>
 __device__ __forceinline__ REAL clamp01(REAL x) {
     return fmin(fmax(x, (REAL)0), (REAL)1);
 }
 
 template <typename REAL, typename STO, bool LOG>
-__global__ void k_levee_stage(
+__device__ __forceinline__ void k_levee_stage_cell(
     const int* __restrict__ levee_catchment_idx,
     STO* __restrict__ river_storage, STO* __restrict__ flood_storage,
     STO* __restrict__ protected_storage,
@@ -260,99 +246,85 @@ __global__ void k_levee_stage(
     }
 }
 
-template <typename REAL, typename STO>
-__global__ void k_levee_bif_outflow(
-    const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
-    const REAL* __restrict__ manning, REAL* __restrict__ outflow,
-    const REAL* __restrict__ width, const REAL* __restrict__ length,
-    const REAL* __restrict__ elevation, REAL* __restrict__ cs_depth,
-    const REAL* __restrict__ river_depth,
-    const REAL* __restrict__ protected_depth,
-    const REAL* __restrict__ river_height,
-    const REAL* __restrict__ catchment_elevation,
-    const bool* __restrict__ is_levee,
-    const STO* __restrict__ river_storage,
-    const STO* __restrict__ flood_storage,
-    const STO* __restrict__ protected_storage,
-    STO* __restrict__ outgoing_storage,
-    REAL gravity, const REAL* __restrict__ time_step_ptr,
-    long num_paths, int num_levels)
+template <typename REAL, typename STO, bool LOG>
+__global__ void k_levee_stage(
+    const int* __restrict__ levee_catchment_idx,
+    STO* __restrict__ river_storage, STO* __restrict__ flood_storage,
+    STO* __restrict__ protected_storage,
+    REAL* __restrict__ river_depth, REAL* __restrict__ flood_depth,
+    REAL* __restrict__ protected_depth,
+    const REAL* __restrict__ river_height, const REAL* __restrict__ flood_depth_table,
+    const REAL* __restrict__ catchment_area, const REAL* __restrict__ river_width,
+    const REAL* __restrict__ river_length,
+    const REAL* __restrict__ levee_base_height,
+    const REAL* __restrict__ levee_crown_height,
+    const REAL* __restrict__ levee_fraction,
+    REAL* __restrict__ flood_fraction,
+    REAL* __restrict__ total_storage_stage_sum,
+    REAL* __restrict__ river_storage_sum,
+    REAL* __restrict__ flood_storage_sum,
+    REAL* __restrict__ flood_area_sum,
+    REAL* __restrict__ total_stage_error_sum,
+    const int* __restrict__ current_step_ptr,
+    int num_levees, int num_flood_levels)
 {
-    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
-    if (t >= num_paths) return;
+    k_levee_stage_cell<REAL, STO, LOG>(
+        levee_catchment_idx, river_storage, flood_storage, protected_storage, river_depth,
+        flood_depth, protected_depth, river_height, flood_depth_table, catchment_area,
+        river_width, river_length, levee_base_height, levee_crown_height, levee_fraction,
+        flood_fraction, total_storage_stage_sum, river_storage_sum, flood_storage_sum,
+        flood_area_sum, total_stage_error_sum, current_step_ptr, num_levees, num_flood_levels);
+}
 
-    REAL time_step = __ldg(time_step_ptr);
-
-    int ci = __ldg(cat_idx + t);
-    int di = __ldg(dn_idx + t);
-    REAL blen = __ldg(length + t);
-
-    REAL elevation_c = __ldg(catchment_elevation + ci);
-    REAL elevation_d = __ldg(catchment_elevation + di);
-    REAL wse_c = __ldg(river_depth + ci)
-        + elevation_c - __ldg(river_height + ci);
-    REAL wse_d = __ldg(river_depth + di)
-        + elevation_d - __ldg(river_height + di);
-    REAL max_wse = fmax(wse_c, wse_d);
-    REAL pwse_c = is_levee[ci]
-        ? fmin(elevation_c + __ldg(protected_depth + ci), wse_c) : wse_c;
-    REAL pwse_d = is_levee[di]
-        ? fmin(elevation_d + __ldg(protected_depth + di), wse_d) : wse_d;
-    REAL max_pwse = fmax(pwse_c, pwse_d);
-
-    REAL slope = (wse_c - wse_d) / blen;
-    slope = fmin(fmax(slope, (REAL)-0.005), (REAL)0.005);
-
-    REAL ts_c = (REAL)(
-        river_storage[ci] + flood_storage[ci] + protected_storage[ci]);
-    REAL ts_d = (REAL)(
-        river_storage[di] + flood_storage[di] + protected_storage[di]);
-
-    REAL sum_out = (REAL)0.0;
-    for (int lv = 0; lv < num_levels; ++lv) {
-        long level_idx = t * (long)num_levels + lv;
-        REAL current_max_wse = (lv == 0) ? max_wse : max_pwse;
-        REAL elv = __ldg(elevation + level_idx);
-        REAL upd_csd = fmax(current_max_wse - elv, (REAL)0.0);
-        REAL semi_depth;
-        if (lv == 0) {
-            REAL old_csd = __ldg(cs_depth + level_idx);
-            semi_depth = sqrt(upd_csd * old_csd);
-            if (semi_depth <= (REAL)0.0) semi_depth = upd_csd;
-        } else {
-            semi_depth = upd_csd;
-        }
-
-        bool flow_condition = semi_depth > (REAL)1e-5;
-        REAL upd_out = (REAL)0.0;
-        if (flow_condition) {
-            REAL man = __ldg(manning + level_idx);
-            REAL w = __ldg(width + level_idx);
-            REAL o = outflow[level_idx];
-            REAL unit_o = o / w;
-            REAL num = w * (unit_o + gravity * time_step * semi_depth * slope);
-            REAL den = (REAL)1.0 + gravity * time_step * (man * man) * fabs(unit_o)
-                * ((REAL)1.0 / pow73(semi_depth));
-            upd_out = num / den;
-        }
-
-        sum_out += upd_out;
-        cs_depth[level_idx] = upd_csd;
-        outflow[level_idx] = upd_out;
-    }
-
-    REAL limit_rate = fmin(
-        (REAL)0.05 * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step), (REAL)1.0);
-    sum_out *= limit_rate;
-    for (int lv = 0; lv < num_levels; ++lv) {
-        long level_idx = t * (long)num_levels + lv;
-        outflow[level_idx] = outflow[level_idx] * limit_rate;
-    }
-
-    REAL pos = fmax(sum_out, (REAL)0.0);
-    REAL neg = fmin(sum_out, (REAL)0.0);
-    atomicAdd(outgoing_storage + ci, (STO)(pos * time_step));
-    atomicAdd(outgoing_storage + di, (STO)(-neg * time_step));
+template <typename REAL, typename STO, bool LOG>
+__global__ void k_levee_stage_batched(
+    const int* __restrict__ levee_catchment_idx,
+    STO* __restrict__ river_storage, STO* __restrict__ flood_storage,
+    STO* __restrict__ protected_storage,
+    REAL* __restrict__ river_depth, REAL* __restrict__ flood_depth,
+    REAL* __restrict__ protected_depth,
+    const REAL* __restrict__ river_height, const REAL* __restrict__ flood_depth_table,
+    const REAL* __restrict__ catchment_area, const REAL* __restrict__ river_width,
+    const REAL* __restrict__ river_length,
+    const REAL* __restrict__ levee_base_height,
+    const REAL* __restrict__ levee_crown_height,
+    const REAL* __restrict__ levee_fraction,
+    REAL* __restrict__ flood_fraction,
+    REAL* __restrict__ total_storage_stage_sum,
+    REAL* __restrict__ river_storage_sum,
+    REAL* __restrict__ flood_storage_sum,
+    REAL* __restrict__ flood_area_sum,
+    REAL* __restrict__ total_stage_error_sum,
+    const int* __restrict__ current_step_ptr,
+    int num_levees, int num_flood_levels, long num_catchments,
+    bool batched_river_height, bool batched_flood_depth_table,
+    bool batched_catchment_area, bool batched_river_width,
+    bool batched_river_length, bool batched_levee_base_height,
+    bool batched_levee_crown_height, bool batched_levee_fraction)
+{
+    const long member_offset = (long)blockIdx.y * num_catchments;
+    const long levee_offset = (long)blockIdx.y * num_levees;
+    river_storage += member_offset;
+    flood_storage += member_offset;
+    protected_storage += member_offset;
+    river_depth += member_offset;
+    flood_depth += member_offset;
+    protected_depth += member_offset;
+    flood_fraction += member_offset;
+    if (batched_river_height) river_height += member_offset;
+    if (batched_flood_depth_table) flood_depth_table += member_offset * num_flood_levels;
+    if (batched_catchment_area) catchment_area += member_offset;
+    if (batched_river_width) river_width += member_offset;
+    if (batched_river_length) river_length += member_offset;
+    if (batched_levee_base_height) levee_base_height += levee_offset;
+    if (batched_levee_crown_height) levee_crown_height += levee_offset;
+    if (batched_levee_fraction) levee_fraction += levee_offset;
+    k_levee_stage_cell<REAL, STO, LOG>(
+        levee_catchment_idx, river_storage, flood_storage, protected_storage, river_depth,
+        flood_depth, protected_depth, river_height, flood_depth_table, catchment_area,
+        river_width, river_length, levee_base_height, levee_crown_height, levee_fraction,
+        flood_fraction, total_storage_stage_sum, river_storage_sum, flood_storage_sum,
+        flood_area_sum, total_stage_error_sum, current_step_ptr, num_levees, num_flood_levels);
 }
 
 void launch_levee_stage(
@@ -365,25 +337,48 @@ void launch_levee_stage(
     at::Tensor river_length_ptr, at::Tensor levee_base_height_ptr,
     at::Tensor levee_crown_height_ptr, at::Tensor levee_fraction_ptr,
     at::Tensor flood_fraction_ptr, long num_catchments, int num_levees,
-    int num_flood_levels, long BLOCK_SIZE)
+    int num_flood_levels, long ensemble_size,
+    bool batched_river_height, bool batched_flood_depth_table,
+    bool batched_catchment_area, bool batched_river_width,
+    bool batched_river_length, bool batched_levee_base_height,
+    bool batched_levee_crown_height, bool batched_levee_fraction,
+    long BLOCK_SIZE)
 {
-    (void)num_catchments;
-    int grid = (int)((num_levees + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const dim3 grid((num_levees + BLOCK_SIZE - 1) / BLOCK_SIZE, ensemble_size);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 #define LAUNCH_LEVEE(REAL_T, STO_T) \
-        k_levee_stage<REAL_T, STO_T, false><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
-            levee_catchment_idx_ptr.data_ptr<int>(), \
-            river_storage_ptr.data_ptr<STO_T>(), flood_storage_ptr.data_ptr<STO_T>(), \
-            protected_storage_ptr.data_ptr<STO_T>(), \
-            river_depth_ptr.data_ptr<REAL_T>(), flood_depth_ptr.data_ptr<REAL_T>(), \
-            protected_depth_ptr.data_ptr<REAL_T>(), \
-            river_height_ptr.data_ptr<REAL_T>(), flood_depth_table_ptr.data_ptr<REAL_T>(), \
-            catchment_area_ptr.data_ptr<REAL_T>(), river_width_ptr.data_ptr<REAL_T>(), \
-            river_length_ptr.data_ptr<REAL_T>(), \
-            levee_base_height_ptr.data_ptr<REAL_T>(), levee_crown_height_ptr.data_ptr<REAL_T>(), \
-            levee_fraction_ptr.data_ptr<REAL_T>(), flood_fraction_ptr.data_ptr<REAL_T>(), \
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, \
-            num_levees, num_flood_levels)
+        do { \
+            if (ensemble_size > 1) { \
+                k_levee_stage_batched<REAL_T, STO_T, false><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
+                    levee_catchment_idx_ptr.data_ptr<int>(), river_storage_ptr.data_ptr<STO_T>(), \
+                    flood_storage_ptr.data_ptr<STO_T>(), protected_storage_ptr.data_ptr<STO_T>(), \
+                    river_depth_ptr.data_ptr<REAL_T>(), flood_depth_ptr.data_ptr<REAL_T>(), \
+                    protected_depth_ptr.data_ptr<REAL_T>(), river_height_ptr.data_ptr<REAL_T>(), \
+                    flood_depth_table_ptr.data_ptr<REAL_T>(), catchment_area_ptr.data_ptr<REAL_T>(), \
+                    river_width_ptr.data_ptr<REAL_T>(), river_length_ptr.data_ptr<REAL_T>(), \
+                    levee_base_height_ptr.data_ptr<REAL_T>(), \
+                    levee_crown_height_ptr.data_ptr<REAL_T>(), \
+                    levee_fraction_ptr.data_ptr<REAL_T>(), flood_fraction_ptr.data_ptr<REAL_T>(), \
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, num_levees, \
+                    num_flood_levels, num_catchments, batched_river_height, \
+                    batched_flood_depth_table, batched_catchment_area, batched_river_width, \
+                    batched_river_length, batched_levee_base_height, batched_levee_crown_height, \
+                    batched_levee_fraction); \
+            } else { \
+                k_levee_stage<REAL_T, STO_T, false><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
+                    levee_catchment_idx_ptr.data_ptr<int>(), river_storage_ptr.data_ptr<STO_T>(), \
+                    flood_storage_ptr.data_ptr<STO_T>(), protected_storage_ptr.data_ptr<STO_T>(), \
+                    river_depth_ptr.data_ptr<REAL_T>(), flood_depth_ptr.data_ptr<REAL_T>(), \
+                    protected_depth_ptr.data_ptr<REAL_T>(), river_height_ptr.data_ptr<REAL_T>(), \
+                    flood_depth_table_ptr.data_ptr<REAL_T>(), catchment_area_ptr.data_ptr<REAL_T>(), \
+                    river_width_ptr.data_ptr<REAL_T>(), river_length_ptr.data_ptr<REAL_T>(), \
+                    levee_base_height_ptr.data_ptr<REAL_T>(), \
+                    levee_crown_height_ptr.data_ptr<REAL_T>(), \
+                    levee_fraction_ptr.data_ptr<REAL_T>(), flood_fraction_ptr.data_ptr<REAL_T>(), \
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, num_levees, \
+                    num_flood_levels); \
+            } \
+        } while (false)
     if (river_depth_ptr.scalar_type() == at::kDouble) {
         LAUNCH_LEVEE(double, double);
     } else if (river_storage_ptr.scalar_type() == at::kDouble) {
@@ -435,6 +430,178 @@ void launch_levee_stage_log(
     }
 #undef LAUNCH_LEVEE_LOG
 }
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+template <typename REAL>
+__device__ __forceinline__ REAL pow73(REAL x) { return x * x * cbrt(x); }
+
+template <typename REAL, typename STO>
+__device__ __forceinline__ void k_levee_bif_outflow_cell(
+    const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
+    const REAL* __restrict__ manning, REAL* __restrict__ outflow,
+    const REAL* __restrict__ width, const REAL* __restrict__ length,
+    const REAL* __restrict__ elevation, REAL* __restrict__ cs_depth,
+    const REAL* __restrict__ river_depth,
+    const REAL* __restrict__ protected_depth,
+    const REAL* __restrict__ river_height,
+    const REAL* __restrict__ catchment_elevation,
+    const bool* __restrict__ is_levee,
+    const STO* __restrict__ river_storage,
+    const STO* __restrict__ flood_storage,
+    const STO* __restrict__ protected_storage,
+    STO* __restrict__ outgoing_storage,
+    REAL gravity, const REAL* __restrict__ time_step_ptr,
+    long num_paths, int num_levels)
+{
+    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (t >= num_paths) return;
+
+    REAL time_step = __ldg(time_step_ptr);
+
+    int ci = __ldg(cat_idx + t);
+    int di = __ldg(dn_idx + t);
+    REAL blen = __ldg(length + t);
+
+    REAL elevation_c = __ldg(catchment_elevation + ci);
+    REAL elevation_d = __ldg(catchment_elevation + di);
+    REAL wse_c = __ldg(river_depth + ci)
+        + elevation_c - __ldg(river_height + ci);
+    REAL wse_d = __ldg(river_depth + di)
+        + elevation_d - __ldg(river_height + di);
+    REAL max_wse = fmax(wse_c, wse_d);
+    REAL pwse_c = is_levee[ci]
+        ? fmin(elevation_c + __ldg(protected_depth + ci), wse_c) : wse_c;
+    REAL pwse_d = is_levee[di]
+        ? fmin(elevation_d + __ldg(protected_depth + di), wse_d) : wse_d;
+    REAL max_pwse = fmax(pwse_c, pwse_d);
+
+    REAL slope = (wse_c - wse_d) / blen;
+    slope = fmin(fmax(slope, (REAL)-CMF_ROUTING_SLOPE_LIMIT), (REAL)CMF_ROUTING_SLOPE_LIMIT);
+
+    REAL ts_c = (REAL)(
+        river_storage[ci] + flood_storage[ci] + protected_storage[ci]);
+    REAL ts_d = (REAL)(
+        river_storage[di] + flood_storage[di] + protected_storage[di]);
+
+    REAL sum_out = (REAL)0.0;
+    for (int lv = 0; lv < num_levels; ++lv) {
+        long level_idx = t * (long)num_levels + lv;
+        REAL current_max_wse = (lv == 0) ? max_wse : max_pwse;
+        REAL elv = __ldg(elevation + level_idx);
+        REAL upd_csd = fmax(current_max_wse - elv, (REAL)0.0);
+        REAL semi_depth;
+        if (lv == 0) {
+            REAL old_csd = __ldg(cs_depth + level_idx);
+            semi_depth = sqrt(upd_csd * old_csd);
+            if (semi_depth <= (REAL)0.0) semi_depth = upd_csd;
+        } else {
+            semi_depth = upd_csd;
+        }
+
+        bool flow_condition = semi_depth > (REAL)1e-5;
+        REAL upd_out = (REAL)0.0;
+        if (flow_condition) {
+            REAL man = __ldg(manning + level_idx);
+            REAL w = __ldg(width + level_idx);
+            REAL o = outflow[level_idx];
+            REAL unit_o = o / w;
+            REAL num = w * (unit_o + gravity * time_step * semi_depth * slope);
+            REAL den = (REAL)1.0 + gravity * time_step * (man * man) * fabs(unit_o)
+                * ((REAL)1.0 / pow73(semi_depth));
+            upd_out = num / den;
+        }
+
+        sum_out += upd_out;
+        cs_depth[level_idx] = upd_csd;
+        outflow[level_idx] = upd_out;
+    }
+
+    REAL limit_rate = fmin(
+        (REAL)CMF_BACKFLOW_STORAGE_FRACTION * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step), (REAL)1.0);
+    sum_out *= limit_rate;
+    for (int lv = 0; lv < num_levels; ++lv) {
+        long level_idx = t * (long)num_levels + lv;
+        outflow[level_idx] = outflow[level_idx] * limit_rate;
+    }
+
+    REAL pos = fmax(sum_out, (REAL)0.0);
+    REAL neg = fmin(sum_out, (REAL)0.0);
+    atomicAdd(outgoing_storage + ci, (STO)(pos * time_step));
+    atomicAdd(outgoing_storage + di, (STO)(-neg * time_step));
+}
+
+template <typename REAL, typename STO>
+__global__ void k_levee_bif_outflow(
+    const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
+    const REAL* __restrict__ manning, REAL* __restrict__ outflow,
+    const REAL* __restrict__ width, const REAL* __restrict__ length,
+    const REAL* __restrict__ elevation, REAL* __restrict__ cs_depth,
+    const REAL* __restrict__ river_depth,
+    const REAL* __restrict__ protected_depth,
+    const REAL* __restrict__ river_height,
+    const REAL* __restrict__ catchment_elevation,
+    const bool* __restrict__ is_levee,
+    const STO* __restrict__ river_storage,
+    const STO* __restrict__ flood_storage,
+    const STO* __restrict__ protected_storage,
+    STO* __restrict__ outgoing_storage,
+    REAL gravity, const REAL* __restrict__ time_step_ptr,
+    long num_paths, int num_levels)
+{
+    k_levee_bif_outflow_cell<REAL, STO>(
+        cat_idx, dn_idx, manning, outflow, width, length, elevation, cs_depth, river_depth,
+        protected_depth, river_height, catchment_elevation, is_levee, river_storage,
+        flood_storage, protected_storage, outgoing_storage, gravity, time_step_ptr, num_paths,
+        num_levels);
+}
+
+template <typename REAL, typename STO>
+__global__ void k_levee_bif_outflow_batched(
+    const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
+    const REAL* __restrict__ manning, REAL* __restrict__ outflow,
+    const REAL* __restrict__ width, const REAL* __restrict__ length,
+    const REAL* __restrict__ elevation, REAL* __restrict__ cs_depth,
+    const REAL* __restrict__ river_depth,
+    const REAL* __restrict__ protected_depth,
+    const REAL* __restrict__ river_height,
+    const REAL* __restrict__ catchment_elevation,
+    const bool* __restrict__ is_levee,
+    const STO* __restrict__ river_storage,
+    const STO* __restrict__ flood_storage,
+    const STO* __restrict__ protected_storage,
+    STO* __restrict__ outgoing_storage,
+    REAL gravity, const REAL* __restrict__ time_step_ptr,
+    long num_paths, int num_levels, long num_catchments,
+    bool batched_bifurcation_manning, bool batched_bifurcation_width,
+    bool batched_bifurcation_length, bool batched_bifurcation_elevation,
+    bool batched_river_height, bool batched_catchment_elevation)
+{
+    const long member_offset = (long)blockIdx.y * num_catchments;
+    const long path_offset = (long)blockIdx.y * num_paths;
+    const long level_offset = path_offset * num_levels;
+    outflow += level_offset;
+    cs_depth += level_offset;
+    river_depth += member_offset;
+    protected_depth += member_offset;
+    river_storage += member_offset;
+    flood_storage += member_offset;
+    protected_storage += member_offset;
+    outgoing_storage += member_offset;
+    if (batched_bifurcation_manning) manning += level_offset;
+    if (batched_bifurcation_width) width += level_offset;
+    if (batched_bifurcation_length) length += path_offset;
+    if (batched_bifurcation_elevation) elevation += level_offset;
+    if (batched_river_height) river_height += member_offset;
+    if (batched_catchment_elevation) catchment_elevation += member_offset;
+    k_levee_bif_outflow_cell<REAL, STO>(
+        cat_idx, dn_idx, manning, outflow, width, length, elevation, cs_depth, river_depth,
+        protected_depth, river_height, catchment_elevation, is_levee, river_storage,
+        flood_storage, protected_storage, outgoing_storage, gravity, time_step_ptr, num_paths,
+        num_levels);
+}
 
 void launch_levee_bif_outflow(
     at::Tensor bifurcation_catchment_idx_ptr,
@@ -450,35 +617,54 @@ void launch_levee_bif_outflow(
     at::Tensor protected_storage_ptr, at::Tensor outgoing_storage_ptr,
     double gravity, at::Tensor time_step_ptr,
     long num_catchments, long num_bifurcation_paths,
-    int num_bifurcation_levels,
+    int num_bifurcation_levels, long ensemble_size,
+    bool batched_bifurcation_manning, bool batched_bifurcation_width,
+    bool batched_bifurcation_length, bool batched_bifurcation_elevation,
+    bool batched_river_height, bool batched_catchment_elevation,
     long BLOCK_SIZE)
 {
-    (void)num_catchments;
-    const long grid = (
-        num_bifurcation_paths + BLOCK_SIZE - 1
-    ) / BLOCK_SIZE;
+    const dim3 grid((num_bifurcation_paths + BLOCK_SIZE - 1) / BLOCK_SIZE, ensemble_size);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 #define LAUNCH_LEVEE_BIF(REAL_T, STO_T) \
-        k_levee_bif_outflow<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
-            bifurcation_catchment_idx_ptr.data_ptr<int>(), \
-            bifurcation_downstream_idx_ptr.data_ptr<int>(), \
-            bifurcation_manning_ptr.data_ptr<REAL_T>(), \
-            bifurcation_outflow_ptr.data_ptr<REAL_T>(), \
-            bifurcation_width_ptr.data_ptr<REAL_T>(), \
-            bifurcation_length_ptr.data_ptr<REAL_T>(), \
-            bifurcation_elevation_ptr.data_ptr<REAL_T>(), \
-            bifurcation_cross_section_depth_ptr.data_ptr<REAL_T>(), \
-            river_depth_ptr.data_ptr<REAL_T>(), \
-            protected_depth_ptr.data_ptr<REAL_T>(), \
-            river_height_ptr.data_ptr<REAL_T>(), \
-            catchment_elevation_ptr.data_ptr<REAL_T>(), \
-            is_levee_ptr.data_ptr<bool>(), \
-            river_storage_ptr.data_ptr<STO_T>(), \
-            flood_storage_ptr.data_ptr<STO_T>(), \
-            protected_storage_ptr.data_ptr<STO_T>(), \
-            outgoing_storage_ptr.data_ptr<STO_T>(), (REAL_T)gravity, \
-            time_step_ptr.data_ptr<REAL_T>(), num_bifurcation_paths, \
-            num_bifurcation_levels)
+        do { \
+            if (ensemble_size > 1) { \
+                k_levee_bif_outflow_batched<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
+                    bifurcation_catchment_idx_ptr.data_ptr<int>(), \
+                    bifurcation_downstream_idx_ptr.data_ptr<int>(), \
+                    bifurcation_manning_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_outflow_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_width_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_length_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_elevation_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_cross_section_depth_ptr.data_ptr<REAL_T>(), \
+                    river_depth_ptr.data_ptr<REAL_T>(), protected_depth_ptr.data_ptr<REAL_T>(), \
+                    river_height_ptr.data_ptr<REAL_T>(), catchment_elevation_ptr.data_ptr<REAL_T>(), \
+                    is_levee_ptr.data_ptr<bool>(), river_storage_ptr.data_ptr<STO_T>(), \
+                    flood_storage_ptr.data_ptr<STO_T>(), protected_storage_ptr.data_ptr<STO_T>(), \
+                    outgoing_storage_ptr.data_ptr<STO_T>(), (REAL_T)gravity, \
+                    time_step_ptr.data_ptr<REAL_T>(), num_bifurcation_paths, num_bifurcation_levels, \
+                    num_catchments, batched_bifurcation_manning, batched_bifurcation_width, \
+                    batched_bifurcation_length, batched_bifurcation_elevation, batched_river_height, \
+                    batched_catchment_elevation); \
+            } else { \
+                k_levee_bif_outflow<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
+                    bifurcation_catchment_idx_ptr.data_ptr<int>(), \
+                    bifurcation_downstream_idx_ptr.data_ptr<int>(), \
+                    bifurcation_manning_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_outflow_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_width_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_length_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_elevation_ptr.data_ptr<REAL_T>(), \
+                    bifurcation_cross_section_depth_ptr.data_ptr<REAL_T>(), \
+                    river_depth_ptr.data_ptr<REAL_T>(), protected_depth_ptr.data_ptr<REAL_T>(), \
+                    river_height_ptr.data_ptr<REAL_T>(), catchment_elevation_ptr.data_ptr<REAL_T>(), \
+                    is_levee_ptr.data_ptr<bool>(), river_storage_ptr.data_ptr<STO_T>(), \
+                    flood_storage_ptr.data_ptr<STO_T>(), protected_storage_ptr.data_ptr<STO_T>(), \
+                    outgoing_storage_ptr.data_ptr<STO_T>(), (REAL_T)gravity, \
+                    time_step_ptr.data_ptr<REAL_T>(), num_bifurcation_paths, \
+                    num_bifurcation_levels); \
+            } \
+        } while (false)
     if (river_depth_ptr.scalar_type() == at::kDouble) {
         LAUNCH_LEVEE_BIF(double, double);
     } else if (river_storage_ptr.scalar_type() == at::kDouble) {

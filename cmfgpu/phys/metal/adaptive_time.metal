@@ -2,15 +2,15 @@
     threadgroup int shared_steps[HF_BLOCK_SIZE];
 
     long num_catchments = *args.num_catchments;
-    long num_trials = *args.num_trials;
-    long total = num_catchments * num_trials;
+    long ensemble_size = *args.ensemble_size;
+    long total = num_catchments * ensemble_size;
     float outer_dt = args.outer_time_step_ptr[0];
 
     if ((long)i >= total) {
         shared_steps[lid] = 1;
     } else {
         long catchment = (long)i % num_catchments;
-        long trial_offset = ((long)i / num_catchments) * num_catchments;
+        long member_offset = ((long)i / num_catchments) * num_catchments;
 
         bool skip = false;
         if (HAS_RESERVOIR) {
@@ -18,13 +18,13 @@
         }
 
         long distance_offset = batched_downstream_distance
-            ? trial_offset + catchment : catchment;
+            ? member_offset + catchment : catchment;
         if (skip) {
             shared_steps[lid] = 1;
         } else {
             float downstream_distance =
                 args.downstream_distance_ptr[distance_offset];
-            float river_depth = args.river_depth_ptr[trial_offset + catchment];
+            float river_depth = args.river_depth_ptr[member_offset + catchment];
             float depth = max(river_depth, 0.01f);
             float candidate = *args.adaptive_time_factor
                 * downstream_distance / sqrt(*args.gravity * depth);

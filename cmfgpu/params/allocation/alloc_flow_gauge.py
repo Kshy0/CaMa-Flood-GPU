@@ -7,16 +7,19 @@
 """
 Flow-gauge allocation kernel and mixin for :class:`HiResMap`.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numba import njit
 
-from cmfgpu.params.allocation.hires_kernels import (search_best_pixel,
-                                                    trace_gauge_downstream)
+from cmfgpu.params.allocation.hires_kernels import (
+    search_best_pixel,
+    trace_gauge_downstream,
+)
 
 if TYPE_CHECKING:
     from cmfgpu.params.allocation.hires_map import HiResMap
@@ -26,21 +29,22 @@ if TYPE_CHECKING:
 # Numba kernel
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True)
 def allocate_all_gauges(
-    gauge_ids: np.ndarray,       # (N,) int64
-    gauge_lats: np.ndarray,      # (N,) float64
-    gauge_lons: np.ndarray,      # (N,) float64
-    gauge_areas: np.ndarray,     # (N,) float64, upstream area in m² (same unit as upa1m)
-    upa1m: np.ndarray,           # (nx, ny) float32
-    ctx1m: np.ndarray,           # (nx, ny) int16, 0-based
+    gauge_ids: np.ndarray,  # (N,) int64
+    gauge_lats: np.ndarray,  # (N,) float64
+    gauge_lons: np.ndarray,  # (N,) float64
+    gauge_areas: np.ndarray,  # (N,) float64, upstream area in m² (same unit as upa1m)
+    upa1m: np.ndarray,  # (nx, ny) float32
+    ctx1m: np.ndarray,  # (nx, ny) int16, 0-based
     cty1m: np.ndarray,
     dwx1m: np.ndarray,
     dwy1m: np.ndarray,
-    uparea: np.ndarray,          # (nXX, nYY) float32, in km²
-    upstXX: np.ndarray,          # (nXX, nYY, n_ups)
+    uparea: np.ndarray,  # (nXX, nYY) float32, in km²
+    upstXX: np.ndarray,  # (nXX, nYY, n_ups)
     upstYY: np.ndarray,
-    outx: np.ndarray,            # (nXX, nYY)
+    outx: np.ndarray,  # (nXX, nYY)
     outy: np.ndarray,
     west: float,
     north: float,
@@ -52,11 +56,13 @@ def allocate_all_gauges(
     ny: int,
     nXX: int,
     nYY: int,
-    nn: int,                     # search radius in hi-res pixels
+    nn: int,  # search radius in hi-res pixels
     n_ups: int,
     is_global: bool,
     mode_single: bool,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
     """Allocate all gauges to CaMa-Flood grid cells.
 
     Returns 7 arrays of length N (one per gauge):
@@ -245,21 +251,23 @@ class FlowGaugeMixin:
         catchment_id1, catchment_id2 : flat IDs via ravel_multi_index, -1 if unallocated
         """
         N = len(self.gauge_ids)
-        dtype = np.dtype([
-            ("id", np.int64),
-            ("lat", np.float64),
-            ("lon", np.float64),
-            ("area_input", np.float64),
-            ("ix1", np.int32),
-            ("iy1", np.int32),
-            ("ix2", np.int32),
-            ("iy2", np.int32),
-            ("area1", np.float64),
-            ("area2", np.float64),
-            ("snum", np.int32),
-            ("catchment_id1", np.int64),
-            ("catchment_id2", np.int64),
-        ])
+        dtype = np.dtype(
+            [
+                ("id", np.int64),
+                ("lat", np.float64),
+                ("lon", np.float64),
+                ("area_input", np.float64),
+                ("ix1", np.int32),
+                ("iy1", np.int32),
+                ("ix2", np.int32),
+                ("iy2", np.int32),
+                ("area1", np.float64),
+                ("area2", np.float64),
+                ("snum", np.int32),
+                ("catchment_id1", np.int64),
+                ("catchment_id2", np.int64),
+            ]
+        )
         arr = np.empty(N, dtype=dtype)
         arr["id"] = self.gauge_ids
         arr["lat"] = self.gauge_lats

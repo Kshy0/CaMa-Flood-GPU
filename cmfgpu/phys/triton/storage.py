@@ -114,74 +114,86 @@ def compute_flood_stage_kernel(
     width_increment = catchment_width / num_flood_levels
 
     # Determine flood level by scanning the storage table
-    level = tl.where(total_storage > river_max_storage, 0, -1)
+    if num_catchments < 1024 or tl.sum(
+        (mask & ~(total_storage <= river_max_storage)).to(tl.int32), 0
+    ) > 0:
+        level = tl.where(total_storage > river_max_storage, 0, -1)
     
-    S_accum = river_max_storage
-    prev_H = 0.0
-    prev_W = river_width
+        S_accum = river_max_storage
+        prev_H = 0.0
+        prev_W = river_width
     
-    prev_total_storage = river_max_storage
-    prev_flood_depth = 0.0
-    next_flood_depth = 0.0
+        prev_total_storage = river_max_storage
+        prev_flood_depth = 0.0
+        next_flood_depth = 0.0
     
-    for i in tl.static_range(num_flood_levels):
-        H_curr = tl.load(flood_depth_table_ptr + offs * num_flood_levels + i, mask=mask)
-        W_curr = river_width + (i + 1) * width_increment
-        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
-        S_curr = S_accum + dS
+        for i in tl.static_range(num_flood_levels):
+            H_curr = tl.load(flood_depth_table_ptr + offs * num_flood_levels + i, mask=mask)
+            W_curr = river_width + (i + 1) * width_increment
+            dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+            S_curr = S_accum + dS
         
-        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+            next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
         
-        is_above = total_storage > S_curr
-        level += tl.where(is_above, 1, 0)
-        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
-        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+            is_above = total_storage > S_curr
+            level += tl.where(is_above, 1, 0)
+            prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+            prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
 
-        S_accum = S_curr
-        prev_H = H_curr
-        prev_W = W_curr
+            S_accum = S_curr
+            prev_H = H_curr
+            prev_W = W_curr
 
-    no_flood_cond = level < 0
-    level = tl.maximum(level, 0)
+        no_flood_cond = level < 0
+        level = tl.maximum(level, 0)
     
-    prev_total_width = river_width + level * width_increment
+        prev_total_width = river_width + level * width_increment
 
-    flood_grad = tl.where(
-        level == num_flood_levels,
-        0.0,
-        (next_flood_depth - prev_flood_depth) / width_increment
-    )
+        flood_grad = tl.where(
+            level == num_flood_levels,
+            0.0,
+            (next_flood_depth - prev_flood_depth) / width_increment
+        )
 
-    diff_width = tl.sqrt(
-        prev_total_width * prev_total_width +
-        2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
-    ) - prev_total_width
-    flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
-    flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
+        diff_width = tl.sqrt(
+            prev_total_width * prev_total_width +
+            2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
+        ) - prev_total_width
+        flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
+        flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
 
-    flood_depth = tl.where(
-        no_flood_cond, 0.0,
-        tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
-    )
+        flood_depth = tl.where(
+            no_flood_cond, 0.0,
+            tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
+        )
 
-    river_capacity = river_max_storage + river_length * river_width * flood_depth
-    river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
-    river_storage_final_hp = tl.where(
-        no_flood_cond,
-        total_storage_hp,
-        tl.minimum(river_capacity_hp, total_storage_hp),
-    )
-    river_storage_final = hpfloat_to_compute_inline(
-        river_storage_final_hp, river_outflow,
-    )
-    river_depth = river_storage_final / (river_length * river_width)
+        river_capacity = river_max_storage + river_length * river_width * flood_depth
+        river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+        river_storage_final_hp = tl.where(
+            no_flood_cond,
+            total_storage_hp,
+            tl.minimum(river_capacity_hp, total_storage_hp),
+        )
+        river_storage_final = hpfloat_to_compute_inline(
+            river_storage_final_hp, river_outflow,
+        )
+        river_depth = river_storage_final / (river_length * river_width)
 
 
-    flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
-    flood_fraction = tl.where(
-        no_flood_cond, 0.0,
-        tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
-    )
+        flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
+        flood_fraction = tl.where(
+            no_flood_cond, 0.0,
+            tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
+        )
+
+    else:
+        river_storage_final_hp = total_storage_hp
+        river_storage_final = hpfloat_to_compute_inline(
+            total_storage_hp, river_outflow,
+        )
+        river_depth = river_storage_final / (river_length * river_width)
+        flood_depth = tl.zeros_like(river_width)
+        flood_fraction = tl.zeros_like(river_width)
 
     flood_storage_final_hp = tl.maximum(
         total_storage_hp - river_storage_final_hp, 0.0,
@@ -337,77 +349,89 @@ def compute_flood_stage_log_kernel(
     width_increment = catchment_width / num_flood_levels
 
     # Determine flood level by scanning the storage table
-    level = tl.where(total_storage > river_max_storage, 0, -1)
+    if num_catchments < 1024 or tl.sum(
+        (mask & ~(total_storage <= river_max_storage)).to(tl.int32), 0
+    ) > 0:
+        level = tl.where(total_storage > river_max_storage, 0, -1)
     
-    S_accum = river_max_storage
-    prev_H = 0.0
-    prev_W = river_width
+        S_accum = river_max_storage
+        prev_H = 0.0
+        prev_W = river_width
     
-    prev_total_storage = river_max_storage
-    prev_flood_depth = 0.0
-    next_flood_depth = 0.0
+        prev_total_storage = river_max_storage
+        prev_flood_depth = 0.0
+        next_flood_depth = 0.0
     
-    for i in tl.static_range(num_flood_levels):
-        H_curr = tl.load(
-            flood_depth_table_ptr + offs * num_flood_levels + i,
-            mask=mask,
-            other=0.0,
+        for i in tl.static_range(num_flood_levels):
+            H_curr = tl.load(
+                flood_depth_table_ptr + offs * num_flood_levels + i,
+                mask=mask,
+                other=0.0,
+            )
+            W_curr = river_width + (i + 1) * width_increment
+            dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+            S_curr = S_accum + dS
+        
+            next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+        
+            is_above = total_storage > S_curr
+            level += tl.where(is_above, 1, 0)
+            prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+            prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+
+            S_accum = S_curr
+            prev_H = H_curr
+            prev_W = W_curr
+
+        no_flood_cond = level < 0
+        level = tl.maximum(level, 0)
+    
+        prev_total_width = river_width + level * width_increment
+
+        flood_grad = tl.where(
+            level == num_flood_levels,
+            0.0,
+            (next_flood_depth - prev_flood_depth) / width_increment
         )
-        W_curr = river_width + (i + 1) * width_increment
-        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
-        S_curr = S_accum + dS
-        
-        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
-        
-        is_above = total_storage > S_curr
-        level += tl.where(is_above, 1, 0)
-        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
-        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
-
-        S_accum = S_curr
-        prev_H = H_curr
-        prev_W = W_curr
-
-    no_flood_cond = level < 0
-    level = tl.maximum(level, 0)
     
-    prev_total_width = river_width + level * width_increment
+        diff_width = tl.sqrt(
+            prev_total_width * prev_total_width +
+            2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
+        ) - prev_total_width
+        flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
+        flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
 
-    flood_grad = tl.where(
-        level == num_flood_levels,
-        0.0,
-        (next_flood_depth - prev_flood_depth) / width_increment
-    )
-    
-    diff_width = tl.sqrt(
-        prev_total_width * prev_total_width +
-        2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
-    ) - prev_total_width
-    flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
-    flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
+        flood_depth = tl.where(
+            no_flood_cond, 0.0,
+            tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
+        )
 
-    flood_depth = tl.where(
-        no_flood_cond, 0.0,
-        tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
-    )
+        river_capacity = river_max_storage + river_length * river_width * flood_depth
+        river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+        river_storage_final_hp = tl.where(
+            no_flood_cond,
+            total_storage_hp,
+            tl.minimum(river_capacity_hp, total_storage_hp),
+        )
+        river_storage_final = hpfloat_to_compute_inline(
+            river_storage_final_hp, river_outflow,
+        )
+        river_depth = river_storage_final / (river_length * river_width)
 
-    river_capacity = river_max_storage + river_length * river_width * flood_depth
-    river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
-    river_storage_final_hp = tl.where(
-        no_flood_cond,
-        total_storage_hp,
-        tl.minimum(river_capacity_hp, total_storage_hp),
-    )
-    river_storage_final = hpfloat_to_compute_inline(
-        river_storage_final_hp, river_outflow,
-    )
-    river_depth = river_storage_final / (river_length * river_width)
+        flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
+        flood_fraction = tl.where(
+            no_flood_cond, 0.0,
+            tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
+        )
 
-    flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
-    flood_fraction = tl.where(
-        no_flood_cond, 0.0,
-        tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
-    )
+    else:
+        river_storage_final_hp = total_storage_hp
+        river_storage_final = hpfloat_to_compute_inline(
+            total_storage_hp, river_outflow,
+        )
+        river_depth = river_storage_final / (river_length * river_width)
+        flood_depth = tl.zeros_like(river_width)
+        flood_fraction = tl.zeros_like(river_width)
 
     flood_area    = flood_fraction * catchment_area
     flood_storage_final_hp = tl.maximum(
@@ -477,7 +501,7 @@ def compute_flood_stage_batched_kernel(
     # Constants
     num_catchments: tl.constexpr,
     num_flood_levels: tl.constexpr,
-    num_trials: tl.constexpr,
+    ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     # Batch flags
     batched_runoff: tl.constexpr,
@@ -494,15 +518,15 @@ def compute_flood_stage_batched_kernel(
     num_inflow_gauges: tl.constexpr = 0,
 ):
     # --- Loop-based batched kernel ---
-    # Grid = cdiv(num_catchments, BLOCK_SIZE), each block loops over trials.
-    # Shared (non-trial) parameters are loaded once and reused across trials,
+    # Grid = cdiv(num_catchments, BLOCK_SIZE), each block loops over members.
+    # Shared (non-member) parameters are loaded once and reused across members,
     # reducing memory traffic and register pressure.
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_catchments
     time_step = tl.load(time_step_ptr)
 
-    # ---- Load shared (non-trial) parameters once ----
+    # ---- Load shared (non-member) parameters once ----
     if not batched_river_height:
         river_height_shared = tl.load(river_height_ptr + offs, mask=mask)
     if not batched_catchment_area:
@@ -513,17 +537,17 @@ def compute_flood_stage_batched_kernel(
         river_length_shared = tl.load(river_length_ptr + offs, mask=mask)
     if not batched_runoff:
         runoff_shared = tl.load(runoff_ptr + offs, mask=mask, other=0.0)
-    # Pre-compute derived constants that don't change across trials
+    # Pre-compute derived constants that don't change across members
     if not batched_river_height and not batched_river_width and not batched_river_length:
         river_max_storage_shared = river_length_shared * river_width_shared * river_height_shared
     if not batched_catchment_area and not batched_river_length:
         catchment_width_shared = catchment_area_shared / river_length_shared
         width_increment_shared = catchment_width_shared / num_flood_levels
 
-    # ---- Loop over trials ----
-    for t in tl.static_range(num_trials):
-        trial_offset = t * num_catchments
-        idx = trial_offset + offs
+    # ---- Loop over members ----
+    for t in tl.static_range(ensemble_size):
+        member_offset = t * num_catchments
+        idx = member_offset + offs
 
         # ---- 1. Storage update ----
         river_storage = tl.load(river_storage_ptr + idx, mask=mask, other=0.0)
@@ -579,7 +603,7 @@ def compute_flood_stage_batched_kernel(
         )
 
         # ---- 2. Flood stage computation ----
-        # Use pre-loaded shared values or load per-trial batched values
+        # Use pre-loaded shared values or load per-member batched values
         river_height = tl.load(river_height_ptr + idx, mask=mask) if batched_river_height else river_height_shared
         catchment_area = tl.load(catchment_area_ptr + idx, mask=mask) if batched_catchment_area else catchment_area_shared
         river_width = tl.load(river_width_ptr + idx, mask=mask) if batched_river_width else river_width_shared
@@ -596,82 +620,94 @@ def compute_flood_stage_batched_kernel(
         else:
             width_increment = width_increment_shared
 
-        level = tl.where(total_storage > river_max_storage, 0, -1)
+        if num_catchments < 1024 or tl.sum(
+            (mask & ~(total_storage <= river_max_storage)).to(tl.int32), 0
+        ) > 0:
+            level = tl.where(total_storage > river_max_storage, 0, -1)
 
-        S_accum = river_max_storage
-        prev_H = 0.0
-        prev_W = river_width
+            S_accum = river_max_storage
+            prev_H = 0.0
+            prev_W = river_width
 
-        prev_total_storage = river_max_storage
-        prev_flood_depth = 0.0
-        next_flood_depth = 0.0
+            prev_total_storage = river_max_storage
+            prev_flood_depth = 0.0
+            next_flood_depth = 0.0
 
-        # Table offset: when not batched, table_base_offset is 0 and addresses
-        # don't depend on trial → Triton compiler can hoist these loads.
-        if batched_flood_depth_table:
-            table_base_offset = trial_offset * num_flood_levels
+            # Table offset: when not batched, table_base_offset is 0 and addresses
+            # don't depend on member → Triton compiler can hoist these loads.
+            if batched_flood_depth_table:
+                table_base_offset = member_offset * num_flood_levels
+            else:
+                table_base_offset = 0
+
+            for i in tl.static_range(num_flood_levels):
+                H_curr = tl.load(flood_depth_table_ptr + table_base_offset + offs * num_flood_levels + i, mask=mask)
+                W_curr = river_width + (i + 1) * width_increment
+                dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+                S_curr = S_accum + dS
+
+                next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+
+                is_above = total_storage > S_curr
+                level += tl.where(is_above, 1, 0)
+                prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+                prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+
+                S_accum = S_curr
+                prev_H = H_curr
+                prev_W = W_curr
+
+            no_flood_cond = level < 0
+            level = tl.maximum(level, 0)
+
+            prev_total_width = river_width + level * width_increment
+
+            flood_grad = tl.where(
+                level == num_flood_levels,
+                0.0,
+                (next_flood_depth - prev_flood_depth) / width_increment
+            )
+
+            diff_width = tl.sqrt(
+                prev_total_width * prev_total_width +
+                2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
+            ) - prev_total_width
+            flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
+            flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
+
+            flood_depth = tl.where(
+                no_flood_cond, 0.0,
+                tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
+            )
+
+            river_capacity = (
+                river_max_storage + river_length * river_width * flood_depth
+            )
+            river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+            river_storage_final_hp = tl.where(
+                no_flood_cond,
+                total_storage_hp,
+                tl.minimum(river_capacity_hp, total_storage_hp),
+            )
+            river_storage_final = hpfloat_to_compute_inline(
+                river_storage_final_hp, river_outflow,
+            )
+            river_depth = river_storage_final / (river_length * river_width)
+
+            flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
+            flood_fraction = tl.where(
+                no_flood_cond, 0.0,
+                tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
+            )
+
         else:
-            table_base_offset = 0
-
-        for i in tl.static_range(num_flood_levels):
-            H_curr = tl.load(flood_depth_table_ptr + table_base_offset + offs * num_flood_levels + i, mask=mask)
-            W_curr = river_width + (i + 1) * width_increment
-            dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
-            S_curr = S_accum + dS
-
-            next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
-
-            is_above = total_storage > S_curr
-            level += tl.where(is_above, 1, 0)
-            prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
-            prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
-
-            S_accum = S_curr
-            prev_H = H_curr
-            prev_W = W_curr
-
-        no_flood_cond = level < 0
-        level = tl.maximum(level, 0)
-
-        prev_total_width = river_width + level * width_increment
-
-        flood_grad = tl.where(
-            level == num_flood_levels,
-            0.0,
-            (next_flood_depth - prev_flood_depth) / width_increment
-        )
-
-        diff_width = tl.sqrt(
-            prev_total_width * prev_total_width +
-            2.0 * (total_storage - prev_total_storage) / (flood_grad * river_length)
-        ) - prev_total_width
-        flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
-        flood_depth_if_top = prev_flood_depth + (total_storage - prev_total_storage) / (prev_total_width * river_length)
-
-        flood_depth = tl.where(
-            no_flood_cond, 0.0,
-            tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid)
-        )
-
-        river_capacity = (
-            river_max_storage + river_length * river_width * flood_depth
-        )
-        river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
-        river_storage_final_hp = tl.where(
-            no_flood_cond,
-            total_storage_hp,
-            tl.minimum(river_capacity_hp, total_storage_hp),
-        )
-        river_storage_final = hpfloat_to_compute_inline(
-            river_storage_final_hp, river_outflow,
-        )
-        river_depth = river_storage_final / (river_length * river_width)
-
-        flood_fraction_mid = tl.clamp((prev_total_width + diff_width - river_width) * river_length / catchment_area, 0.0, 1.0)
-        flood_fraction = tl.where(
-            no_flood_cond, 0.0,
-            tl.where(level == num_flood_levels, 1.0, flood_fraction_mid)
-        )
+            river_storage_final_hp = total_storage_hp
+            river_storage_final = hpfloat_to_compute_inline(
+                total_storage_hp, river_outflow,
+            )
+            river_depth = river_storage_final / (river_length * river_width)
+            flood_depth = tl.zeros_like(river_width)
+            flood_fraction = tl.zeros_like(river_width)
 
         flood_storage_final_hp = tl.maximum(
             total_storage_hp - river_storage_final_hp, 0.0,

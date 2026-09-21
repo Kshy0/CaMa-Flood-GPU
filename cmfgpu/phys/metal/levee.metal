@@ -268,14 +268,14 @@ static inline void cmf_block_atomic_add(
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_stage
 long num_levees = *args.num_levees;
-    long num_trials = *args.num_trials;
-    long total = num_levees * num_trials;
+    long ensemble_size = *args.ensemble_size;
+    long total = num_levees * ensemble_size;
     if ((long)i >= total) return;
 
     long levee = (long)i % num_levees;
-    long trial = (long)i / num_levees;
-    long levee_offset = trial * num_levees;
-    long catchment_offset = trial * *args.num_catchments;
+    long member = (long)i / num_levees;
+    long levee_offset = member * num_levees;
+    long catchment_offset = member * *args.num_catchments;
     int local_catchment = args.levee_catchment_idx_ptr[levee];
     long catchment = catchment_offset + local_catchment;
 
@@ -293,9 +293,9 @@ long num_levees = *args.num_levees;
         ? levee_offset + levee : levee;
     long levee_base_idx = batched_levee_base_height
         ? levee_offset + levee : levee;
-    long table_trial_offset = batched_flood_depth_table
+    long table_member_offset = batched_flood_depth_table
         ? catchment_offset * (long)num_flood_levels : 0;
-    long table_offset = table_trial_offset
+    long table_offset = table_member_offset
         + (long)local_catchment * (long)num_flood_levels;
 
     LeveeStageResult result = levee_stage_inline(
@@ -394,14 +394,14 @@ long num_levees = *args.num_levees;
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_bifurcation_outflow
 long num_paths = *args.num_bifurcation_paths;
-    long num_trials = *args.num_trials;
-    long total = num_paths * num_trials;
+    long ensemble_size = *args.ensemble_size;
+    long total = num_paths * ensemble_size;
     if ((long)i >= total) return;
 
     long path = (long)i % num_paths;
-    long trial = (long)i / num_paths;
-    long path_offset = trial * num_paths;
-    long catchment_offset = trial * *args.num_catchments;
+    long member = (long)i / num_paths;
+    long path_offset = member * num_paths;
+    long catchment_offset = member * *args.num_catchments;
     long level_offset = path_offset * (long)num_bifurcation_levels;
     long path_level = path * (long)num_bifurcation_levels;
 
@@ -443,7 +443,7 @@ long num_paths = *args.num_bifurcation_paths;
     float maximum_protected_surface = max(
         protected_surface, downstream_protected_surface);
     float slope = clamp(
-        (water_surface - downstream_surface) / length, -0.005f, 0.005f);
+        (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
     float gravity = *args.gravity;
     float time_step = args.time_step_ptr[0];
 
@@ -476,7 +476,7 @@ long num_paths = *args.num_bifurcation_paths;
             + args.flood_storage_ptr[downstream_cell]
             + args.protected_storage_ptr[downstream_cell]);
     float limit = min(
-        0.05f * available_storage / (fabs(total_outflow) * time_step),
+        CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
         1.0f);
     total_outflow *= limit;
     for (int level = 0; level < num_bifurcation_levels; ++level) {

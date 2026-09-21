@@ -20,7 +20,7 @@
 #define CMF_LOG_SUMS 11
 
 template <typename REAL, typename STO, bool LOG>
-__global__ void k_flood_stage(
+__device__ __forceinline__ void k_flood_stage_cell(
     const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
     const REAL* __restrict__ river_outflow, const REAL* __restrict__ flood_outflow,
     const STO* __restrict__ global_bif_outflow, const REAL* __restrict__ runoff,
@@ -232,6 +232,123 @@ __global__ void k_flood_stage(
 }
 
 template <typename REAL, typename STO, bool LOG>
+__global__ void k_flood_stage(
+    const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
+    const REAL* __restrict__ river_outflow, const REAL* __restrict__ flood_outflow,
+    const STO* __restrict__ global_bif_outflow, const REAL* __restrict__ runoff,
+    const REAL* __restrict__ inflow, const int* __restrict__ catchment_inflow_idx,
+    const REAL* __restrict__ time_step_ptr,
+    STO* __restrict__ outgoing_storage,
+    STO* __restrict__ river_storage, STO* __restrict__ flood_storage,
+    STO* __restrict__ protected_storage,
+    STO* __restrict__ total_storage_output,
+    REAL* __restrict__ river_depth, REAL* __restrict__ flood_depth,
+    REAL* __restrict__ protected_depth, REAL* __restrict__ flood_fraction,
+    const REAL* __restrict__ river_height, const REAL* __restrict__ flood_depth_table,
+    const REAL* __restrict__ catchment_area, const REAL* __restrict__ river_width,
+    const REAL* __restrict__ river_length,
+    const bool* __restrict__ is_levee,
+    REAL* __restrict__ total_storage_pre_sum,
+    REAL* __restrict__ total_storage_next_sum,
+    REAL* __restrict__ total_storage_new_sum,
+    REAL* __restrict__ total_inflow_sum,
+    REAL* __restrict__ total_outflow_sum,
+    REAL* __restrict__ total_storage_stage_sum,
+    REAL* __restrict__ river_storage_sum,
+    REAL* __restrict__ flood_storage_sum,
+    REAL* __restrict__ flood_area_sum,
+    REAL* __restrict__ total_inflow_error_sum,
+    REAL* __restrict__ total_stage_error_sum,
+    const int* __restrict__ current_step_ptr,
+    long num_catchments, int num_flood_levels,
+    int has_bifurcation, int has_inflow, int has_levee,
+    int has_total_storage_output)
+{
+    k_flood_stage_cell<REAL, STO, LOG>(
+        river_inflow, flood_inflow, river_outflow, flood_outflow, global_bif_outflow, runoff,
+        inflow, catchment_inflow_idx, time_step_ptr, outgoing_storage, river_storage,
+        flood_storage, protected_storage, total_storage_output, river_depth, flood_depth,
+        protected_depth, flood_fraction, river_height, flood_depth_table, catchment_area,
+        river_width, river_length, is_levee, total_storage_pre_sum, total_storage_next_sum,
+        total_storage_new_sum, total_inflow_sum, total_outflow_sum, total_storage_stage_sum,
+        river_storage_sum, flood_storage_sum, flood_area_sum, total_inflow_error_sum,
+        total_stage_error_sum, current_step_ptr, num_catchments, num_flood_levels,
+        has_bifurcation, has_inflow, has_levee, has_total_storage_output);
+}
+
+template <typename REAL, typename STO, bool LOG>
+__global__ void k_flood_stage_batched(
+    const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
+    const REAL* __restrict__ river_outflow, const REAL* __restrict__ flood_outflow,
+    const STO* __restrict__ global_bif_outflow, const REAL* __restrict__ runoff,
+    const REAL* __restrict__ inflow, const int* __restrict__ catchment_inflow_idx,
+    const REAL* __restrict__ time_step_ptr,
+    STO* __restrict__ outgoing_storage,
+    STO* __restrict__ river_storage, STO* __restrict__ flood_storage,
+    STO* __restrict__ protected_storage,
+    STO* __restrict__ total_storage_output,
+    REAL* __restrict__ river_depth, REAL* __restrict__ flood_depth,
+    REAL* __restrict__ protected_depth, REAL* __restrict__ flood_fraction,
+    const REAL* __restrict__ river_height, const REAL* __restrict__ flood_depth_table,
+    const REAL* __restrict__ catchment_area, const REAL* __restrict__ river_width,
+    const REAL* __restrict__ river_length,
+    const bool* __restrict__ is_levee,
+    REAL* __restrict__ total_storage_pre_sum,
+    REAL* __restrict__ total_storage_next_sum,
+    REAL* __restrict__ total_storage_new_sum,
+    REAL* __restrict__ total_inflow_sum,
+    REAL* __restrict__ total_outflow_sum,
+    REAL* __restrict__ total_storage_stage_sum,
+    REAL* __restrict__ river_storage_sum,
+    REAL* __restrict__ flood_storage_sum,
+    REAL* __restrict__ flood_area_sum,
+    REAL* __restrict__ total_inflow_error_sum,
+    REAL* __restrict__ total_stage_error_sum,
+    const int* __restrict__ current_step_ptr,
+    long num_catchments, int num_flood_levels,
+    int has_bifurcation, int has_inflow, int has_levee,
+    int has_total_storage_output, int num_inflow_gauges,
+    bool batched_runoff, bool batched_inflow,
+    bool batched_river_height, bool batched_flood_depth_table,
+    bool batched_catchment_area, bool batched_river_width, bool batched_river_length)
+{
+    const long member_offset = (long)blockIdx.y * num_catchments;
+    river_inflow += member_offset;
+    flood_inflow += member_offset;
+    river_outflow += member_offset;
+    flood_outflow += member_offset;
+    outgoing_storage += member_offset;
+    river_storage += member_offset;
+    flood_storage += member_offset;
+    river_depth += member_offset;
+    flood_depth += member_offset;
+    flood_fraction += member_offset;
+    if (has_bifurcation) global_bif_outflow += member_offset;
+    if (has_levee) {
+        protected_storage += member_offset;
+        protected_depth += member_offset;
+    }
+    if (has_total_storage_output) total_storage_output += member_offset;
+    if (batched_runoff) runoff += member_offset;
+    if (has_inflow && batched_inflow) inflow += (long)blockIdx.y * num_inflow_gauges;
+    if (batched_river_height) river_height += member_offset;
+    if (batched_flood_depth_table) flood_depth_table += member_offset * num_flood_levels;
+    if (batched_catchment_area) catchment_area += member_offset;
+    if (batched_river_width) river_width += member_offset;
+    if (batched_river_length) river_length += member_offset;
+    k_flood_stage_cell<REAL, STO, LOG>(
+        river_inflow, flood_inflow, river_outflow, flood_outflow, global_bif_outflow, runoff,
+        inflow, catchment_inflow_idx, time_step_ptr, outgoing_storage, river_storage,
+        flood_storage, protected_storage, total_storage_output, river_depth, flood_depth,
+        protected_depth, flood_fraction, river_height, flood_depth_table, catchment_area,
+        river_width, river_length, is_levee, total_storage_pre_sum, total_storage_next_sum,
+        total_storage_new_sum, total_inflow_sum, total_outflow_sum, total_storage_stage_sum,
+        river_storage_sum, flood_storage_sum, flood_area_sum, total_inflow_error_sum,
+        total_stage_error_sum, current_step_ptr, num_catchments, num_flood_levels,
+        has_bifurcation, has_inflow, has_levee, has_total_storage_output);
+}
+
+template <typename REAL, typename STO, bool LOG>
 static void launch_t(const at::Tensor& ri, const at::Tensor& fi,
     const at::Tensor& ro, const at::Tensor& fo,
     const c10::optional<at::Tensor>& gb, const at::Tensor& run,
@@ -255,9 +372,14 @@ static void launch_t(const at::Tensor& ri, const at::Tensor& fi,
     REAL* total_stage_error_sum,
     const c10::optional<at::Tensor>& current_step,
     long n, int nl, int has_bif, int has_inflow,
-    int has_levee, int has_total_storage_output, int block)
+    int has_levee, int has_total_storage_output, int block,
+    long ensemble_size = 1, int num_inflow_gauges = 0,
+    bool batched_runoff = false, bool batched_inflow = false,
+    bool batched_river_height = false, bool batched_flood_depth_table = false,
+    bool batched_catchment_area = false, bool batched_river_width = false,
+    bool batched_river_length = false)
 {
-    int grid = (int)((n + block - 1) / block);
+    const dim3 grid((n + block - 1) / block, ensemble_size);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     const STO* gbp = gb ? gb->data_ptr<STO>() : nullptr;
     const REAL* inflow_p = inflow ? inflow->data_ptr<REAL>() : nullptr;
@@ -269,21 +391,33 @@ static void launch_t(const at::Tensor& ri, const at::Tensor& fi,
     REAL* protected_depth_p = pd ? pd->data_ptr<REAL>() : nullptr;
     const bool* levee_p = is_levee ? is_levee->data_ptr<bool>() : nullptr;
     const int* step_p = current_step ? current_step->data_ptr<int>() : nullptr;
-    k_flood_stage<REAL, STO, LOG><<<grid, block, 0, stream>>>(
-        ri.data_ptr<STO>(), fi.data_ptr<STO>(),
-        ro.data_ptr<REAL>(), fo.data_ptr<REAL>(), gbp, run.data_ptr<REAL>(),
-        inflow_p, inflow_idx_p, tsp.data_ptr<REAL>(),
-        outs.data_ptr<STO>(), rs.data_ptr<STO>(), fs.data_ptr<STO>(),
-        protected_storage_p, total_storage_output_p,
-        rd.data_ptr<REAL>(), fd.data_ptr<REAL>(), protected_depth_p,
-        ff.data_ptr<REAL>(),
-        rh.data_ptr<REAL>(), tbl.data_ptr<REAL>(), ca.data_ptr<REAL>(), rw.data_ptr<REAL>(), rl.data_ptr<REAL>(),
-        levee_p, total_storage_pre_sum, total_storage_next_sum,
-        total_storage_new_sum, total_inflow_sum, total_outflow_sum,
-        total_storage_stage_sum, river_storage_sum, flood_storage_sum,
-        flood_area_sum, total_inflow_error_sum, total_stage_error_sum, step_p,
-        n, nl, has_bif, has_inflow, has_levee,
-        has_total_storage_output);
+    if (ensemble_size > 1) {
+        k_flood_stage_batched<REAL, STO, LOG><<<grid, block, 0, stream>>>(
+            ri.data_ptr<STO>(), fi.data_ptr<STO>(), ro.data_ptr<REAL>(), fo.data_ptr<REAL>(),
+            gbp, run.data_ptr<REAL>(), inflow_p, inflow_idx_p, tsp.data_ptr<REAL>(),
+            outs.data_ptr<STO>(), rs.data_ptr<STO>(), fs.data_ptr<STO>(), protected_storage_p,
+            total_storage_output_p, rd.data_ptr<REAL>(), fd.data_ptr<REAL>(), protected_depth_p,
+            ff.data_ptr<REAL>(), rh.data_ptr<REAL>(), tbl.data_ptr<REAL>(), ca.data_ptr<REAL>(),
+            rw.data_ptr<REAL>(), rl.data_ptr<REAL>(), levee_p, total_storage_pre_sum,
+            total_storage_next_sum, total_storage_new_sum, total_inflow_sum, total_outflow_sum,
+            total_storage_stage_sum, river_storage_sum, flood_storage_sum, flood_area_sum,
+            total_inflow_error_sum, total_stage_error_sum, step_p, n, nl, has_bif, has_inflow,
+            has_levee, has_total_storage_output, num_inflow_gauges, batched_runoff,
+            batched_inflow, batched_river_height, batched_flood_depth_table,
+            batched_catchment_area, batched_river_width, batched_river_length);
+    } else {
+        k_flood_stage<REAL, STO, LOG><<<grid, block, 0, stream>>>(
+            ri.data_ptr<STO>(), fi.data_ptr<STO>(), ro.data_ptr<REAL>(), fo.data_ptr<REAL>(),
+            gbp, run.data_ptr<REAL>(), inflow_p, inflow_idx_p, tsp.data_ptr<REAL>(),
+            outs.data_ptr<STO>(), rs.data_ptr<STO>(), fs.data_ptr<STO>(), protected_storage_p,
+            total_storage_output_p, rd.data_ptr<REAL>(), fd.data_ptr<REAL>(), protected_depth_p,
+            ff.data_ptr<REAL>(), rh.data_ptr<REAL>(), tbl.data_ptr<REAL>(), ca.data_ptr<REAL>(),
+            rw.data_ptr<REAL>(), rl.data_ptr<REAL>(), levee_p, total_storage_pre_sum,
+            total_storage_next_sum, total_storage_new_sum, total_inflow_sum, total_outflow_sum,
+            total_storage_stage_sum, river_storage_sum, flood_storage_sum, flood_area_sum,
+            total_inflow_error_sum, total_stage_error_sum, step_p, n, nl, has_bif, has_inflow,
+            has_levee, has_total_storage_output);
+    }
 }
 
 static void launch(
@@ -301,7 +435,10 @@ static void launch(
     at::Tensor river_height, at::Tensor flood_depth_table, at::Tensor catchment_area,
     at::Tensor river_width, at::Tensor river_length,
     long n, int nl, int has_bif, int has_inflow, int has_levee,
-    int has_total_storage_output, int block)
+    int has_total_storage_output, int block, long ensemble_size, int num_inflow_gauges,
+    bool batched_runoff, bool batched_inflow,
+    bool batched_river_height, bool batched_flood_depth_table,
+    bool batched_catchment_area, bool batched_river_width, bool batched_river_length)
 {
     if (river_depth.scalar_type() == at::kDouble) {
         launch_t<double, double, false>(river_inflow, flood_inflow, river_outflow, flood_outflow,
@@ -314,7 +451,10 @@ static void launch(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, c10::nullopt,
             n, nl, has_bif, has_inflow, has_levee,
-            has_total_storage_output, block);
+            has_total_storage_output, block, ensemble_size, num_inflow_gauges,
+            batched_runoff, batched_inflow, batched_river_height,
+            batched_flood_depth_table, batched_catchment_area,
+            batched_river_width, batched_river_length);
     } else if (river_storage.scalar_type() == at::kDouble) {
         launch_t<float, double, false>(river_inflow, flood_inflow, river_outflow, flood_outflow,
             global_bif_outflow, runoff, inflow, catchment_inflow_idx, time_step,
@@ -326,7 +466,10 @@ static void launch(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, c10::nullopt,
             n, nl, has_bif, has_inflow, has_levee,
-            has_total_storage_output, block);
+            has_total_storage_output, block, ensemble_size, num_inflow_gauges,
+            batched_runoff, batched_inflow, batched_river_height,
+            batched_flood_depth_table, batched_catchment_area,
+            batched_river_width, batched_river_length);
     } else {
         launch_t<float, float, false>(river_inflow, flood_inflow, river_outflow, flood_outflow,
             global_bif_outflow, runoff, inflow, catchment_inflow_idx, time_step,
@@ -338,7 +481,10 @@ static void launch(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, c10::nullopt,
             n, nl, has_bif, has_inflow, has_levee,
-            has_total_storage_output, block);
+            has_total_storage_output, block, ensemble_size, num_inflow_gauges,
+            batched_runoff, batched_inflow, batched_river_height,
+            batched_flood_depth_table, batched_catchment_area,
+            batched_river_width, batched_river_length);
     }
 }
 
@@ -360,9 +506,11 @@ void launch_flood_stage(
     long num_catchments, int num_inflow_gauges,
     int num_flood_levels, bool HAS_BIFURCATION,
     bool HAS_INFLOW, bool HAS_LEVEE, bool HAS_TOTAL_STORAGE_OUTPUT,
+    long ensemble_size, bool batched_runoff, bool batched_inflow,
+    bool batched_river_height, bool batched_flood_depth_table,
+    bool batched_catchment_area, bool batched_river_width, bool batched_river_length,
     long BLOCK_SIZE)
 {
-    (void)num_inflow_gauges;
     launch(
         river_inflow_ptr, flood_inflow_ptr, river_outflow_ptr,
         flood_outflow_ptr, global_bifurcation_outflow_ptr, runoff_ptr,
@@ -374,7 +522,10 @@ void launch_flood_stage(
         flood_depth_table_ptr, catchment_area_ptr, river_width_ptr,
         river_length_ptr, num_catchments, num_flood_levels,
         (int)HAS_BIFURCATION, (int)HAS_INFLOW, (int)HAS_LEVEE,
-        (int)HAS_TOTAL_STORAGE_OUTPUT, (int)BLOCK_SIZE);
+        (int)HAS_TOTAL_STORAGE_OUTPUT, (int)BLOCK_SIZE, ensemble_size, num_inflow_gauges,
+        batched_runoff, batched_inflow, batched_river_height,
+        batched_flood_depth_table, batched_catchment_area,
+        batched_river_width, batched_river_length);
 }
 
 void launch_flood_stage_log(
