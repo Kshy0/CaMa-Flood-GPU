@@ -214,7 +214,7 @@ class LogModule(AbstractModule):
     # Computed tensor fields (independent log buffers)
     # ------------------------------------------------------------------ #
     @computed_log_field(
-        description="Running sum of storage before routing step",
+        description="Running sum of storage before routing step (km3)",
     )
     @cached_property
     def total_storage_pre_sum(self) -> torch.Tensor:
@@ -225,7 +225,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of storage after routing step",
+        description="Running sum of storage after routing step (km3)",
     )
     @cached_property
     def total_storage_next_sum(self) -> torch.Tensor:
@@ -236,7 +236,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of new storage",
+        description="Running sum of new storage (km3)",
     )
     @cached_property
     def total_storage_new_sum(self) -> torch.Tensor:
@@ -247,7 +247,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of inflow errors",
+        description="Running sum of inflow errors (km3)",
     )
     @cached_property
     def total_inflow_error_sum(self) -> torch.Tensor:
@@ -258,7 +258,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of inflow",
+        description="Running sum of inflow (km3)",
     )
     @cached_property
     def total_inflow_sum(self) -> torch.Tensor:
@@ -269,7 +269,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of outflow",
+        description="Running sum of outflow (km3)",
     )
     @cached_property
     def total_outflow_sum(self) -> torch.Tensor:
@@ -280,7 +280,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of storage stage",
+        description="Running sum of storage stage (km3)",
     )
     @cached_property
     def total_storage_stage_sum(self) -> torch.Tensor:
@@ -291,7 +291,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of stage error",
+        description="Running sum of stage error (km3)",
     )
     @cached_property
     def total_stage_error_sum(self) -> torch.Tensor:
@@ -302,7 +302,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of river storage",
+        description="Running sum of river storage (km3)",
     )
     @cached_property
     def river_storage_sum(self) -> torch.Tensor:
@@ -313,7 +313,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of flood storage",
+        description="Running sum of flood storage (km3)",
     )
     @cached_property
     def flood_storage_sum(self) -> torch.Tensor:
@@ -324,7 +324,7 @@ class LogModule(AbstractModule):
         )
 
     @computed_log_field(
-        description="Running sum of flood area",
+        description="Running sum of flood area — area scaled by 1e-9 for logging (1e9 m2)",
     )
     @cached_property
     def flood_area_sum(self) -> torch.Tensor:

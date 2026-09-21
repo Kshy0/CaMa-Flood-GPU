@@ -96,8 +96,7 @@ class BifurcationModule(AbstractModule):
     # Bifurcation topology
     # ------------------------------------------------------------------ #
     output_bifurcation_path_id: torch.Tensor | None = SelectionField(
-        description="Bifurcation path IDs to save in output. "
-        "None means save all paths.",
+        description="Bifurcation path IDs to save in output. None means save all paths",
         dtype="int",
         shape=("num_output_bifurcation_paths",),
         selects="bifurcation_path_id",
@@ -124,7 +123,7 @@ class BifurcationModule(AbstractModule):
     # Channel properties
     # ------------------------------------------------------------------ #
     bifurcation_manning: torch.Tensor = BifurcationField(
-        description="Manning roughness coefficients for bifurcation channels (-)",
+        description="Bifurcation channel Manning roughness coefficient (s m-1/3)",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         default=0.03,
         category="param",
@@ -142,7 +141,7 @@ class BifurcationModule(AbstractModule):
     )
 
     bifurcation_elevation: torch.Tensor = BifurcationField(
-        description="Channel-bed elevations by path and level (m a.s.l.)",
+        description="Channel-bed elevations by path and level (above mean sea level) (m)",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         category="param",
     )
@@ -151,7 +150,7 @@ class BifurcationModule(AbstractModule):
     # State variables
     # ------------------------------------------------------------------ #
     bifurcation_outflow: torch.Tensor = BifurcationField(
-        description="Outflow through each bifurcation path & level (m³ s⁻¹)",
+        description="Outflow through each bifurcation path & level (m3 s-1)",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         default=0,
         category="init_state",
@@ -175,7 +174,7 @@ class BifurcationModule(AbstractModule):
     )
 
     @computed_bifurcation_field(
-        description="Total outflow via all bifurcation paths (m³ s⁻¹)",
+        description="Total outflow via all bifurcation paths (m3 s-1)",
         shape=("base.num_catchments",),
         dtype="hpfloat",
         dim_coords="base.catchment_id",
@@ -190,7 +189,7 @@ class BifurcationModule(AbstractModule):
         )
 
     @computed_bifurcation_field(
-        description="Maximum flow-rate limit per catchment (m³ s⁻¹)",
+        description="Dimensionless storage-availability multiplier limiting bifurcation discharge",
         shape=("base.num_catchments",),
         dim_coords="base.catchment_id",
         category="state",
@@ -203,19 +202,19 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
-    @computed_field(description="Number of paths saved in output.")
+    @computed_field(description="Number of paths saved in output")
     @cached_property
     def num_output_bifurcation_paths(self) -> int:
         if self.output_bifurcation_path_id is None:
             return self.num_bifurcation_paths
         return self.output_bifurcation_path_id.shape[0]
 
-    @computed_field(description="Total number of bifurcation paths.")
+    @computed_field(description="Total number of bifurcation paths")
     @cached_property
     def num_bifurcation_paths(self) -> int:
         return self.bifurcation_path_id.shape[0]
 
-    @computed_field(description="Number of levels in each bifurcation path.")
+    @computed_field(description="Number of levels in each bifurcation path")
     @cached_property
     def num_bifurcation_levels(self) -> int:
         return self.bifurcation_width.shape[-1]

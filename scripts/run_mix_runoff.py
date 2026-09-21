@@ -57,15 +57,6 @@ def main() -> None:
     device = distributed.device
 
     input_proxy = InputProxy.from_nc(input_file)
-    if "output_catchment_id" not in input_proxy:
-        output_catchment_id = input_proxy["catchment_id"]
-        if "catchment_save_mask" in input_proxy:
-            output_catchment_id = output_catchment_id[
-                input_proxy["catchment_save_mask"].astype(bool)
-            ]
-        input_proxy = input_proxy.updated(
-            values={"output_catchment_id": output_catchment_id},
-        )
 
     dataset_time = dict(
         start_date=start_date,
