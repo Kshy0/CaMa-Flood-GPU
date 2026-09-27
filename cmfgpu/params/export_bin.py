@@ -1048,7 +1048,7 @@ def export_inpmat(
 
     # --- Load NPZ ---
     mapping_data = np.load(str(npz_path))
-    npz_catchment_ids = mapping_data["catchment_ids"].astype(np.int64)
+    npz_catchment_ids = mapping_data["target_ids"].astype(np.int64)
     sparse_data = mapping_data["sparse_data"]
     sparse_indices = mapping_data["sparse_indices"]
     sparse_indptr = mapping_data["sparse_indptr"]

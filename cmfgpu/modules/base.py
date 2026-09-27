@@ -324,7 +324,9 @@ class BaseModule(AbstractModule):
     # ---------------- Hidden / intermediate states ------------------- #
     @computed_base_field(
         description=(
-            "Total outgoing storage from each catchment Can not be saved, as it is a temporary state (m3)"
+            "Sub-step sum of the flows leaving each catchment, including flow "
+            "reversed from its upstream cells; times the time step it is CaMa-Flood's "
+            "outgoing volume P2STOOUT. Can not be saved, as it is a temporary state (m3 s-1)"
         ),
         output="disabled",
         category="state",
@@ -426,7 +428,7 @@ class BaseModule(AbstractModule):
     # Post-init validation
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
-    def validate_physical_parameters(self) -> Self:
+    def validate_parameters(self) -> Self:
         strictly_positive = {
             "river_width": self.river_width,
             "river_length": self.river_length,
@@ -479,6 +481,22 @@ class BaseModule(AbstractModule):
                 f"invalid element count: {negative_depths}"
             )
 
+        if self.num_flood_levels > 1:
+            diffs = torch.diff(self.flood_depth_table, dim=-1)
+            invalid = diffs < 0
+            num_invalid = int(invalid.sum().item())
+            if num_invalid:
+                min_diff = diffs.min().item()
+                raise ValueError(
+                    "flood_depth_table must be monotonically non-decreasing; "
+                    f"found {num_invalid} decreasing intervals "
+                    f"(minimum diff={min_diff:.6f}). Regenerate the parameter "
+                    "file with MERITMap."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_initial_state(self) -> Self:
         nonnegative_state = {
             "river_storage": self.river_storage,
             "flood_storage": self.flood_storage,
@@ -534,20 +552,4 @@ class BaseModule(AbstractModule):
                 "Initial river and flood outflow must contain only finite "
                 f"values; invalid element counts: {details}"
             )
-        return self
-
-    @model_validator(mode="after")
-    def validate_flood_depth_table_monotonicity(self) -> Self:
-        if self.num_flood_levels > 1:
-            diffs = torch.diff(self.flood_depth_table, dim=-1)
-            invalid = diffs < 0
-            num_invalid = int(invalid.sum().item())
-            if num_invalid:
-                min_diff = diffs.min().item()
-                raise ValueError(
-                    "flood_depth_table must be monotonically non-decreasing; "
-                    f"found {num_invalid} decreasing intervals "
-                    f"(minimum diff={min_diff:.6f}). Regenerate the parameter "
-                    "file with MERITMap."
-                )
         return self

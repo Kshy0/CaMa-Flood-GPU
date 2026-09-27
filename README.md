@@ -1,10 +1,10 @@
 # CaMa-Flood-GPU
 
-**CaMa-Flood-GPU** is a high-performance, GPU-accelerated re-implementation of the [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) hydrodynamic model. This project leverages the [Triton](https://github.com/openai/triton) language and the [PyTorch](https://github.com/pytorch/pytorch) tensor ecosystem to achieve rapid, scalable global river simulations. By using Triton's custom GPU kernels and PyTorch's tensor abstraction, CaMa-Flood-GPU delivers significant speed-ups over the original Fortran implementation.
+**CaMa-Flood-GPU** is a GPU-accelerated re-implementation of the [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) hydrodynamic model. Built on [PyTorch](https://github.com/pytorch/pytorch), it runs on NVIDIA, AMD, and Apple GPUs through CUDA/HIP, [Triton](https://github.com/openai/triton), and Metal backends. It supports global river simulations on Linux, Windows, and macOS, with multi-GPU execution where the platform and backend support it.
 
 **Note:** This repository is under active development, and both the code structure and content are subject to significant changes at any time.
 
-**Development Environment:** This project is currently developed under WSL2 (Windows Subsystem for Linux 2), and requires that `torch` and `triton` can be installed successfully.
+**Runtime setup:** Install a GPU-enabled `torch` build for your platform and a compatible `triton` package when using the Triton backend. The model's GPU kernels compile when first used; no manual kernel build is needed. On macOS, the Metal backend uses PyTorch MPS and does not require Triton.
 
 **Target Audience:** This project is intended for advanced users who are already familiar with the original CaMa-Flood model. Users are strongly advised to run the original [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) first to understand the data structure, input specifications, and general workflow before attempting to use this GPU-accelerated version.
 
@@ -38,16 +38,14 @@ Kang, S., Yin, J., & Yamazaki, D. (2026). CaMa-Flood-GPU: A GPU-based hydrodynam
 
 ## Prerequisites
 
-- Python == 3.14.*  
-- PyTorch (with CUDA support) == 2.13.0+cu132 — `triton` ships automatically with PyTorch on supported systems
+- Python >= 3.11
+- A GPU-enabled PyTorch build for your platform; install Triton when using the Triton backend
 - Additional Python libraries (will be auto-installed, but listed here for clarity):
   - pydantic (for better data validation)
   - netCDF4
   - and other utility packages as needed
 
-The installable version of torch depends on your system. This project will always rely on the official latest releases of torch (and the triton version it bundles) for the newest features and optimal performance. Tests have confirmed that the project can also run with torch 2.6.0 and CUDA 12.4.
-
-In theory, the codebase should also run on AMD GPUs, but I haven’t had the chance to test that setup yet.
+Choose a PyTorch build compatible with your GPU and operating system. The available GPU paths are NVIDIA CUDA on Linux and Windows, AMD ROCm on Linux, and Apple Metal on macOS. Windows users can also run the Linux CUDA path through WSL2.
 
 ---
 
@@ -60,7 +58,7 @@ git clone https://github.com/Kshy0/CaMa-Flood-GPU.git
 cd CaMa-Flood-GPU
 ```
 
-### 2. Install PyTorch
+### 2. Install PyTorch and Triton
 
 It is recommended to use a virtual environment (`venv` or `conda`):
 
@@ -69,16 +67,16 @@ conda create -n CMF python=3.14.*
 conda activate CMF
 ```
 
-#### 2a. Latest PyTorch (recommended)
+#### 2a. NVIDIA CUDA example
 
-Please follow the official [PyTorch installation guide](https://pytorch.org/get-started/locally/) for your environment. 
+Choose the build for your GPU from the official [PyTorch installation guide](https://pytorch.org/get-started/locally/). The command below is an NVIDIA CUDA example; AMD ROCm and macOS MPS use different builds.
 For CUDA 13.2, you may use:
 
 ```shell
 pip install torch --index-url https://download.pytorch.org/whl/cu132
 ```
 
-> **Note:** `triton` ships automatically with PyTorch on supported CUDA systems — no separate installation needed. You also don't need to install `torchvision` or `torchaudio` as stated in the official manual.
+> **Note:** On supported CUDA and ROCm installations, PyTorch may install Triton automatically. Verify that `import triton` works when using the Triton backend. For native Windows, use [triton-windows](https://github.com/triton-lang/triton-windows); on macOS, use the Metal backend without Triton. `torchvision` and `torchaudio` are **NOT** required.
 
 #### 2b. Older GPUs / legacy systems
 
@@ -220,29 +218,6 @@ The [Hydroforge](https://github.com/Kshy0/hydroforge) dependency includes datase
   cd /path/to/CaMa-Flood-GPU
   torchrun --nproc_per_node=4 ./scripts_user/run_daily_bin.py
   ```
-  
-  - For distributed runs, please refer to upcoming documentation and code samples.
-  
-  ### [Optional] Choosing Block Size for Optimal Performance
-  
-  The `block_size` parameter varies depending on your hardware, impacting memory usage and computational efficiency. To find the optimal size for your system, run a benchmark across typical values `[64, 128, 256, 512, 1024]`. Smaller block sizes may improve memory utilization, while larger ones can speed up computation by reducing kernel launch overhead. Use the provided `benchmark_block_sizes()` function to test and select the best block size for your setup.
-  
-  ```bash
-  cd /path/to/CaMa-Flood-GPU
-  python ./scripts_user/run_benchmark.py
-  ```
-  
-  Once the benchmark is complete, select the block size that provides the best balance between performance and resource usage for your system.
-
-
----
-
-## Features
-
-- **Ultra-fast computation:** Even with the standard CPython interpreter, CaMa-Flood-GPU achieves superior performance. 
-  **Benchmark:** `test1-glb_15min`, simulation from 2000-01-01 to 2000-12-31 with `adaptive_time_step` enabled runs in ~20 seconds (single 4070Ti GPU + i7-13700 CPU).
-- **Modular design:** The codebase is structured for easy expansion and maintenance, allowing users to add or replace modules as needed.
-- **Scalable architecture:** This codebase is designed to be suitable for multi-node, multi-GPU. It has the ability to simulate floods on extremely high-resolution geographic maps.
 
 ---
 

@@ -45,6 +45,7 @@ from cmfgpu.params import estimate_dam_params
 def main():
     ### Configuration Start ###
     resolution = "glb_15min"
+    # Windows path example: base_dir = Path(r"C:\Users\YourName\CaMa-Flood-GPU")
     base_dir = Path("/home/eat/CaMa-Flood-GPU")
     inp_dir = base_dir / "inp" / resolution
 

@@ -64,12 +64,13 @@ long num_paths = *args.num_bifurcation_paths;
         ? catchment_cell : (long)catchment;
     long downstream_elevation_idx = batched_catchment_elevation
         ? downstream_cell : (long)downstream;
+    // D2SFCELV = D2RIVDPH + D2RIVELV, with D2RIVELV = D2ELEVTN - D2RIVHGT.
     float water_surface = args.river_depth_ptr[catchment_cell]
-        + args.catchment_elevation_ptr[catchment_elevation_idx]
-        - args.river_height_ptr[catchment_height_idx];
+        + (args.catchment_elevation_ptr[catchment_elevation_idx]
+           - args.river_height_ptr[catchment_height_idx]);
     float downstream_surface = args.river_depth_ptr[downstream_cell]
-        + args.catchment_elevation_ptr[downstream_elevation_idx]
-        - args.river_height_ptr[downstream_height_idx];
+        + (args.catchment_elevation_ptr[downstream_elevation_idx]
+           - args.river_height_ptr[downstream_height_idx]);
     float maximum_surface = max(water_surface, downstream_surface);
     float slope = clamp(
         (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
@@ -102,21 +103,24 @@ long num_paths = *args.num_bifurcation_paths;
             + args.flood_storage_ptr[catchment_cell],
         args.river_storage_ptr[downstream_cell]
             + args.flood_storage_ptr[downstream_cell]);
-    float limit = min(
-        CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
-        1.0f);
+    // v4.23 storage-change limiter; a path whose levels sum to zero is left as is.
+    float limit = total_outflow != 0.0f
+        ? min(CMF_BACKFLOW_STORAGE_FRACTION * available_storage
+              / (fabs(total_outflow) * time_step), 1.0f)
+        : 1.0f;
     total_outflow *= limit;
     for (int level = 0; level < num_bifurcation_levels; ++level) {
         long state_level = level_offset + path_level + level;
         args.bifurcation_outflow_ptr[state_level] *= limit;
     }
 
+    // P2STOOUT flows, multiplied by the step in compute_inflow.
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + catchment_cell,
-        max(total_outflow, 0.0f) * time_step, memory_order_relaxed);
+        max(total_outflow, 0.0f), memory_order_relaxed);
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + downstream_cell,
-        -min(total_outflow, 0.0f) * time_step, memory_order_relaxed);
+        -min(total_outflow, 0.0f), memory_order_relaxed);
 
 // HYDROFORGE METAL KERNEL BODY: compute_bifurcation_inflow
 long num_paths = *args.num_bifurcation_paths;

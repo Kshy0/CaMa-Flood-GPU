@@ -19,52 +19,60 @@
     float old_negative = min(old_river_outflow, 0.0f)
         + min(old_flood_outflow, 0.0f);
 
+    // Undo exactly the outflow kernel's outgoing flows of this cell.
     atomic_fetch_add_explicit(
         &args.outgoing_storage_ptr[catchment],
-        -(old_positive * time_step), memory_order_relaxed);
+        -old_positive, memory_order_relaxed);
     if (!is_river_mouth) {
         atomic_fetch_add_explicit(
             &args.outgoing_storage_ptr[downstream],
-            old_negative * time_step, memory_order_relaxed);
+            old_negative, memory_order_relaxed);
     }
 
-    float river_storage = args.river_storage_ptr[catchment];
-    float flood_storage = args.flood_storage_ptr[catchment];
-    float total_storage = river_storage + flood_storage;
-    float total_inflow = args.reservoir_total_inflow_ptr[catchment];
-    args.reservoir_total_inflow_ptr[catchment] = 0.0f;
+    float river_flood_storage = args.river_storage_ptr[catchment]
+        + args.flood_storage_ptr[catchment];
+    float dam_volume = river_flood_storage;
+    if (HAS_LEVEE) {
+        dam_volume += args.protected_storage_ptr[catchment];
+    }
     long runoff_idx = batched_runoff ? catchment : local_catchment;
-    float reservoir_inflow = total_inflow + args.runoff_ptr[runoff_idx];
+    float reservoir_inflow = args.reservoir_total_inflow_ptr[catchment]
+        + args.runoff_ptr[runoff_idx];
+    args.reservoir_total_inflow_ptr[catchment] = 0.0f;
 
-    float conservation_volume =
-        args.conservation_volume_ptr[reservoir_idx];
-    float emergency_volume = args.emergency_volume_ptr[reservoir_idx];
-    float adjustment_volume = args.adjustment_volume_ptr[reservoir_idx];
-    float normal_outflow =
-        args.effective_normal_outflow_ptr[reservoir_idx];
-    float adjustment_outflow = args.adjustment_outflow_ptr[reservoir_idx];
-    float flood_control_outflow =
-        args.flood_control_outflow_ptr[reservoir_idx];
+    long member_reservoir = member_index * num_reservoirs + reservoir_idx;
+    float conservation_volume = args.conservation_volume_ptr[
+        batched_conservation_volume ? member_reservoir : reservoir_idx];
+    float emergency_volume = args.emergency_volume_ptr[
+        batched_emergency_volume ? member_reservoir : reservoir_idx];
+    float adjustment_volume = args.adjustment_volume_ptr[
+        batched_adjustment_volume ? member_reservoir : reservoir_idx];
+    float normal_outflow = args.effective_normal_outflow_ptr[
+        batched_effective_normal_outflow ? member_reservoir : reservoir_idx];
+    float adjustment_outflow = args.adjustment_outflow_ptr[
+        batched_adjustment_outflow ? member_reservoir : reservoir_idx];
+    float flood_control_outflow = args.flood_control_outflow_ptr[
+        batched_flood_control_outflow ? member_reservoir : reservoir_idx];
 
     float reservoir_outflow;
-    if (total_storage <= conservation_volume) {
+    if (dam_volume <= conservation_volume) {
         reservoir_outflow = normal_outflow
-            * sqrt(total_storage / conservation_volume);
-    } else if (total_storage <= adjustment_volume) {
-        float fraction = (total_storage - conservation_volume)
+            * sqrt(dam_volume / conservation_volume);
+    } else if (dam_volume <= adjustment_volume) {
+        float fraction = (dam_volume - conservation_volume)
             / (adjustment_volume - conservation_volume);
         reservoir_outflow = normal_outflow
             + exp(3.0f * log(fraction))
             * (adjustment_outflow - normal_outflow);
-    } else if (total_storage <= emergency_volume) {
-        float fraction = (total_storage - adjustment_volume)
+    } else if (dam_volume <= emergency_volume) {
+        float fraction = (dam_volume - adjustment_volume)
             / (emergency_volume - adjustment_volume);
         float controlled = adjustment_outflow
             + exp(CMF_RESERVOIR_RELEASE_EXPONENT * log(fraction))
             * (flood_control_outflow - adjustment_outflow);
         if (reservoir_inflow >= flood_control_outflow) {
             float flood = normal_outflow
-                + (total_storage - conservation_volume)
+                + (dam_volume - conservation_volume)
                 / (emergency_volume - conservation_volume)
                 * (reservoir_inflow - normal_outflow);
             reservoir_outflow = max(flood, controlled);
@@ -76,11 +84,14 @@
             ? reservoir_inflow : flood_control_outflow;
     }
 
-    reservoir_outflow = clamp(
-        reservoir_outflow, 0.0f, total_storage / time_step);
+    // Flow limiter: the minimum first, so a negative storage releases nothing.
+    reservoir_outflow = min(
+        min(reservoir_outflow, dam_volume / time_step),
+        river_flood_storage / time_step);
+    reservoir_outflow = max(reservoir_outflow, 0.0f);
     args.river_outflow_ptr[catchment] = reservoir_outflow;
     args.flood_outflow_ptr[catchment] = 0.0f;
 
     atomic_fetch_add_explicit(
         &args.outgoing_storage_ptr[catchment],
-        reservoir_outflow * time_step, memory_order_relaxed);
+        reservoir_outflow, memory_order_relaxed);

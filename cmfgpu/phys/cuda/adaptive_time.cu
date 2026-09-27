@@ -10,11 +10,8 @@
 // decreases as dt increases, so a per-thread atomicMax over n_i gives the
 // global maximum sub-step count without a separate reduction.
 
-#include <cuda_runtime.h>
-#include <torch/extension.h>
-#include <c10/cuda/CUDAStream.h>
-
 #include "block_reduce.cuh"
+#include "canonical.cuh"
 
 template <typename REAL>
 __device__ __forceinline__ void k_adaptive_time_cell(
@@ -24,9 +21,8 @@ __device__ __forceinline__ void k_adaptive_time_cell(
     int* __restrict__ max_sub_steps,
     const REAL* __restrict__ outer_time_step,
     REAL adaptive_time_factor, REAL gravity,
-    long num_catchments, int has_reservoir)
+    long num_catchments, int has_reservoir, long t)
 {
-    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     int n_steps = 1;
 
     bool skip = (t >= num_catchments)
@@ -47,78 +43,24 @@ __device__ __forceinline__ void k_adaptive_time_cell(
     cmf_block_atomic_max(n_steps, max_sub_steps);
 }
 
-template <typename REAL>
-__global__ void k_adaptive_time(
-    const REAL* __restrict__ river_depth,
-    const REAL* __restrict__ downstream_distance,
-    const bool*  __restrict__ is_dam_related,
-    int* __restrict__ max_sub_steps,
-    const REAL* __restrict__ outer_time_step,
-    REAL adaptive_time_factor, REAL gravity,
-    long num_catchments, int has_reservoir)
+// Generated-entry body over the canonical values ``a`` of
+// compute_adaptive_time_step; every thread reaches the block reduction.
+template <typename REAL, bool HAS_RESERVOIR, class A>
+__device__ __forceinline__ void adaptive_time(const A& a, long t)
 {
     k_adaptive_time_cell<REAL>(
-        river_depth, downstream_distance, is_dam_related, max_sub_steps, outer_time_step,
-        adaptive_time_factor, gravity, num_catchments, has_reservoir);
+        a.river_depth_ptr, a.downstream_distance_ptr,
+        cmf_optional<HAS_RESERVOIR>(a.is_dam_related_ptr),
+        a.max_sub_steps_ptr, a.outer_time_step_ptr, a.adaptive_time_factor, a.gravity,
+        a.num_catchments, HAS_RESERVOIR, t);
 }
 
-template <typename REAL>
-__global__ void k_adaptive_time_batched(
-    const REAL* __restrict__ river_depth,
-    const REAL* __restrict__ downstream_distance,
-    const bool*  __restrict__ is_dam_related,
-    int* __restrict__ max_sub_steps,
-    const REAL* __restrict__ outer_time_step,
-    REAL adaptive_time_factor, REAL gravity,
-    long num_catchments, int has_reservoir, bool batched_downstream_distance)
+// Ensemble members offset their slices, then run the body above.
+template <typename REAL, bool HAS_RESERVOIR, class A>
+__device__ __forceinline__ void adaptive_time_members(A a, long t, long member)
 {
-    const long member_offset = (long)blockIdx.y * num_catchments;
-    river_depth += member_offset;
-    if (batched_downstream_distance) downstream_distance += member_offset;
-    k_adaptive_time_cell<REAL>(
-        river_depth, downstream_distance, is_dam_related, max_sub_steps, outer_time_step,
-        adaptive_time_factor, gravity, num_catchments, has_reservoir);
-}
-
-void launch_adaptive_time(
-    at::Tensor river_depth_ptr, at::Tensor downstream_distance_ptr,
-    c10::optional<at::Tensor> is_dam_related_ptr,
-    at::Tensor max_sub_steps_ptr,
-    at::Tensor outer_time_step_ptr,
-    double adaptive_time_factor, double gravity,
-    long num_catchments, bool HAS_RESERVOIR, long ensemble_size,
-    bool batched_downstream_distance, long BLOCK_SIZE)
-{
-    const dim3 grid((num_catchments + BLOCK_SIZE - 1) / BLOCK_SIZE, ensemble_size);
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    const bool* dam = (
-        is_dam_related_ptr ? is_dam_related_ptr->data_ptr<bool>() : nullptr);
-    if (river_depth_ptr.scalar_type() == at::kDouble) {
-        if (ensemble_size > 1) {
-            k_adaptive_time_batched<double><<<grid, (int)BLOCK_SIZE, 0, stream>>>(
-                river_depth_ptr.data_ptr<double>(), downstream_distance_ptr.data_ptr<double>(),
-                dam, max_sub_steps_ptr.data_ptr<int>(), outer_time_step_ptr.data_ptr<double>(),
-                (double)adaptive_time_factor, (double)gravity, num_catchments,
-                (int)HAS_RESERVOIR, batched_downstream_distance);
-        } else {
-            k_adaptive_time<double><<<grid, (int)BLOCK_SIZE, 0, stream>>>(
-                river_depth_ptr.data_ptr<double>(), downstream_distance_ptr.data_ptr<double>(),
-                dam, max_sub_steps_ptr.data_ptr<int>(), outer_time_step_ptr.data_ptr<double>(),
-                (double)adaptive_time_factor, (double)gravity, num_catchments,
-                (int)HAS_RESERVOIR);
-        }
-    } else {
-        if (ensemble_size > 1) {
-            k_adaptive_time_batched<float><<<grid, (int)BLOCK_SIZE, 0, stream>>>(
-                river_depth_ptr.data_ptr<float>(), downstream_distance_ptr.data_ptr<float>(),
-                dam, max_sub_steps_ptr.data_ptr<int>(), outer_time_step_ptr.data_ptr<float>(),
-                adaptive_time_factor, gravity, num_catchments, (int)HAS_RESERVOIR,
-                batched_downstream_distance);
-        } else {
-            k_adaptive_time<float><<<grid, (int)BLOCK_SIZE, 0, stream>>>(
-                river_depth_ptr.data_ptr<float>(), downstream_distance_ptr.data_ptr<float>(),
-                dam, max_sub_steps_ptr.data_ptr<int>(), outer_time_step_ptr.data_ptr<float>(),
-                adaptive_time_factor, gravity, num_catchments, (int)HAS_RESERVOIR);
-        }
-    }
+    const long member_offset = member * a.num_catchments;
+    a.river_depth_ptr += member_offset;
+    if (a.batched_downstream_distance) a.downstream_distance_ptr += member_offset;
+    adaptive_time<REAL, HAS_RESERVOIR>(a, t);
 }

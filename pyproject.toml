@@ -17,6 +17,7 @@ dependencies = [
     "numba",
     "pydantic",
     "tqdm",
+    "ninja; sys_platform == 'darwin'",
 ]
 
 [tool.setuptools.packages.find]
@@ -28,7 +29,7 @@ include = ["cmfgpu*"]
 "cmfgpu.phys.metal" = ["*.metal"]
 
 [project.optional-dependencies]
-dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "meson", "ninja"]
+plot = ["matplotlib"]
 
 [tool.ruff]
 target-version = "py311"

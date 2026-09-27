@@ -89,7 +89,9 @@ class MERITMap(BaseModel):
         description="Directory containing map files (nextxy.bin, rivlen.bin, etc.)"
     )
 
-    out_dir: Path = Field(description="Output directory for generated input files")
+    out_dir: Path = Field(
+        description="Output directory for generated input files"
+    )
 
     out_file: str = Field(
         description="Name of the output NetCDF file for storing map parameters",
@@ -1100,50 +1102,13 @@ class MERITMap(BaseModel):
             levee_crown_height = _read_2d_map("levhgt.bin")
             levee_fraction = _read_2d_map("levfrc.bin")
 
-            # Derive the base height with the same interpolation used by
-            # LeveeModule.  Base height is a derived value, not an input.
-            safe_fraction = np.where(np.isfinite(levee_fraction), levee_fraction, 0)
-            position = np.clip(
-                safe_fraction * self.num_flood_levels,
-                0.0,
-                float(self.num_flood_levels),
-            )
-            lower = np.floor(position).astype(np.int64)
-            upper = np.minimum(lower + 1, self.num_flood_levels)
-            row = np.arange(len(self.catchment_id))
-            lower_value = np.zeros(len(self.catchment_id), dtype=self.numpy_precision)
-            has_lower_level = lower > 0
-            lower_value[has_lower_level] = self.flood_depth_table[
-                row[has_lower_level], lower[has_lower_level] - 1
-            ]
-            upper_value = self.flood_depth_table[row, np.maximum(upper - 1, 0)]
-            levee_base_height = lower_value + (position - lower) * (
-                upper_value - lower_value
-            )
-
             levee_mask = (
-                np.isfinite(levee_fraction)
-                & np.isfinite(levee_base_height)
-                & np.isfinite(levee_crown_height)
-                & (levee_fraction >= 0)
-                & (levee_fraction < 1.0)
-                & (levee_base_height >= 0)
-                & (levee_base_height < levee_crown_height)
-            )
-
-            candidate_mask = (
                 np.isfinite(levee_fraction)
                 & np.isfinite(levee_crown_height)
                 & (levee_fraction >= 0)
                 & (levee_fraction < 1.0)
                 & (levee_crown_height > 0)
             )
-            num_rejected = int(np.sum(candidate_mask & ~levee_mask))
-            if num_rejected:
-                print(
-                    f"Filtered {num_rejected} invalid levees whose derived "
-                    "base/crown heights do not satisfy 0 <= base < crown"
-                )
             self.num_levees = int(np.sum(levee_mask))
             self.levee_id = np.arange(self.num_levees, dtype=np.int64)
             self.levee_catchment_id = self.catchment_id[levee_mask]

@@ -18,6 +18,7 @@ def main():
 
     # --- Configuration Start ---
     map_resolution = "glb_15min"
+    # Windows path example: map_dir = fr"C:\Users\YourName\cmf_v420_pkg\map\{map_resolution}"
     map_dir = f"/home/eat/cmf_v420_pkg/map/{map_resolution}"
     out_dir = f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}"
 

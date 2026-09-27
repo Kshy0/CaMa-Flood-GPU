@@ -78,8 +78,8 @@ class InflowModule(AbstractModule):
         """Explicitly validate injection placement and retained mainstem inputs.
 
         ``downstream`` is the outlet-gauge convention: discharge observed at a
-        catchment outlet enters its downstream catchment. ``same`` reproduces
-        CaMa-Flood CPU's upstream-inflow convention. Bifurcations are ignored.
+        catchment outlet enters its downstream catchment. ``same`` enters the
+        gauge catchment. Bifurcations are ignored.
         """
         if inflow_catchment_id is None:
             inflow_catchment_id = self.inflow_catchment_id

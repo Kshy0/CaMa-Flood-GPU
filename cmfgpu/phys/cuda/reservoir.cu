@@ -8,51 +8,46 @@
 // One thread per reservoir.  Undoes the main outflow kernel's outgoing-storage
 // scatter, recomputes the regulated release (4 storage regimes), re-applies the
 // corrected scatter.  if/else-if regime chain evaluates only the matching branch
-// (avoids log() of a negative argument).  Templated on STO (hpfloat).  No
-// --use_fast_math, keeping sqrt/exp/log behavior predictable.
+// (avoids log() of a negative argument).
 
-#include <cuda_runtime.h>
-#include <torch/extension.h>
-#include <c10/cuda/CUDAStream.h>
+#include "canonical.cuh"
 
-template <typename REAL, typename STO>
+template <typename REAL, typename STO, bool HAS_LEVEE>
 __device__ __forceinline__ void k_reservoir_outflow_cell(
     const int* __restrict__ reservoir_catchment_idx,
     const int* __restrict__ downstream_idx,
     STO* __restrict__ reservoir_total_inflow,
     REAL* __restrict__ river_outflow, REAL* __restrict__ flood_outflow,
     const STO* __restrict__ river_storage, const STO* __restrict__ flood_storage,
+    const STO* __restrict__ protected_storage,
     const REAL* __restrict__ conservation_volume, const REAL* __restrict__ emergency_volume,
     const REAL* __restrict__ adjustment_volume, const REAL* __restrict__ effective_normal_outflow,
     const REAL* __restrict__ adjustment_outflow, const REAL* __restrict__ flood_control_outflow,
     const REAL* __restrict__ runoff,
-    STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr,
-    int num_reservoirs)
+    STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr, long t)
 {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= num_reservoirs) return;
     REAL time_step = __ldg(time_step_ptr);
 
     int ci = reservoir_catchment_idx[t];
     int di = downstream_idx[ci];
     bool is_river_mouth = (di == ci);
 
+    // Undo exactly the outflow kernel's outgoing flows of this cell.
     REAL old_r = river_outflow[ci];
     REAL old_f = flood_outflow[ci];
-    REAL old_pos = fmax(old_r, (REAL)0.0) + fmax(old_f, (REAL)0.0);
-    REAL old_neg = fmin(old_r, (REAL)0.0) + fmin(old_f, (REAL)0.0);
-    atomicAdd(outgoing_storage + ci, (STO)(-(old_pos * time_step)));
-    STO undo_dn = is_river_mouth ? (STO)0 : (STO)(old_neg * time_step);
-    atomicAdd(outgoing_storage + di, undo_dn);
+    atomicAdd(outgoing_storage + ci,
+              -(STO)(fmax(old_r, (REAL)0.0) + fmax(old_f, (REAL)0.0)));
+    if (!is_river_mouth)
+        atomicAdd(outgoing_storage + di,
+                  -((STO)fmax(-old_r, (REAL)0.0) + (STO)fmax(-old_f, (REAL)0.0)));
 
-    REAL rs = (REAL)river_storage[ci];
-    REAL fs = (REAL)flood_storage[ci];
-    REAL total = rs + fs;
+    STO storage = river_storage[ci] + flood_storage[ci];
+    REAL river_flood_storage = (REAL)storage;
+    if constexpr (HAS_LEVEE) storage += protected_storage[ci];
+    REAL dam_volume = (REAL)storage;
 
-    REAL total_inflow = (REAL)reservoir_total_inflow[ci];
+    REAL inflow = (REAL)(reservoir_total_inflow[ci] + (STO)__ldg(runoff + ci));
     reservoir_total_inflow[ci] = (STO)0;
-    REAL runoff_v = __ldg(runoff + ci);
-    REAL inflow = total_inflow + runoff_v;
 
     REAL cons = __ldg(conservation_volume + t);
     REAL emerg = __ldg(emergency_volume + t);
@@ -62,16 +57,17 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     REAL fc_out = __ldg(flood_control_outflow + t);
 
     REAL ro;
-    if (total <= cons) {
-        ro = n_out * sqrt(total / cons);
-    } else if (total <= adj) {
-        REAL frac2 = (total - cons) / (adj - cons);
+    if (dam_volume <= cons) {
+        ro = n_out * sqrt(dam_volume / cons);
+    } else if (dam_volume <= adj) {
+        REAL frac2 = (dam_volume - cons) / (adj - cons);
         ro = n_out + exp((REAL)3.0 * log(frac2)) * (a_out - n_out);
-    } else if (total <= emerg) {
-        REAL frac3 = (total - adj) / (emerg - adj);
-        REAL tmp = a_out + exp((REAL)CMF_RESERVOIR_RELEASE_EXPONENT * log(frac3)) * (fc_out - a_out);
+    } else if (dam_volume <= emerg) {
+        REAL frac3 = (dam_volume - adj) / (emerg - adj);
+        REAL tmp = a_out
+            + exp((REAL)(float)CMF_RESERVOIR_RELEASE_EXPONENT * log(frac3)) * (fc_out - a_out);
         if (inflow >= fc_out) {
-            REAL flood = n_out + ((total - cons) / (emerg - cons)) * (inflow - n_out);
+            REAL flood = n_out + ((dam_volume - cons) / (emerg - cons)) * (inflow - n_out);
             ro = fmax(flood, tmp);
         } else {
             ro = tmp;
@@ -79,136 +75,50 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     } else {
         ro = (inflow >= fc_out) ? inflow : fc_out;
     }
+    // Flow limiter: the minimum first, so a negative storage releases nothing.
+    ro = fmin(fmin(ro, dam_volume / time_step), river_flood_storage / time_step);
     ro = fmax(ro, (REAL)0.0);
-    ro = fmin(ro, total / time_step);
 
     river_outflow[ci] = ro;
     flood_outflow[ci] = (REAL)0.0;
 
-    REAL new_pos = fmax(ro, (REAL)0.0);
-    atomicAdd(outgoing_storage + ci, (STO)(new_pos * time_step));
-    REAL new_neg = fmin(ro, (REAL)0.0);
-    STO to_add = is_river_mouth ? (STO)0 : (STO)(-(new_neg * time_step));
-    atomicAdd(outgoing_storage + di, to_add);
+    // The release is non-negative, so it only leaves this cell.
+    atomicAdd(outgoing_storage + ci, (STO)ro);
 }
 
-template <typename REAL, typename STO>
-__global__ void k_reservoir_outflow(
-    const int* __restrict__ reservoir_catchment_idx,
-    const int* __restrict__ downstream_idx,
-    STO* __restrict__ reservoir_total_inflow,
-    REAL* __restrict__ river_outflow, REAL* __restrict__ flood_outflow,
-    const STO* __restrict__ river_storage, const STO* __restrict__ flood_storage,
-    const REAL* __restrict__ conservation_volume, const REAL* __restrict__ emergency_volume,
-    const REAL* __restrict__ adjustment_volume, const REAL* __restrict__ effective_normal_outflow,
-    const REAL* __restrict__ adjustment_outflow, const REAL* __restrict__ flood_control_outflow,
-    const REAL* __restrict__ runoff,
-    STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr,
-    int num_reservoirs)
+// Generated-entry body over the canonical values ``a`` of
+// compute_reservoir_outflow.
+template <typename REAL, typename STO, bool HAS_LEVEE, class A>
+__device__ __forceinline__ void reservoir_outflow(const A& a, long t)
 {
-    k_reservoir_outflow_cell<REAL, STO>(
-        reservoir_catchment_idx, downstream_idx, reservoir_total_inflow, river_outflow,
-        flood_outflow, river_storage, flood_storage, conservation_volume, emergency_volume,
-        adjustment_volume, effective_normal_outflow, adjustment_outflow, flood_control_outflow,
-        runoff, outgoing_storage, time_step_ptr, num_reservoirs);
+    k_reservoir_outflow_cell<REAL, STO, HAS_LEVEE>(
+        a.reservoir_catchment_idx_ptr, a.downstream_idx_ptr, a.reservoir_total_inflow_ptr,
+        a.river_outflow_ptr, a.flood_outflow_ptr, a.river_storage_ptr, a.flood_storage_ptr,
+        cmf_optional<HAS_LEVEE>(a.protected_storage_ptr), a.conservation_volume_ptr,
+        a.emergency_volume_ptr, a.adjustment_volume_ptr, a.effective_normal_outflow_ptr,
+        a.adjustment_outflow_ptr, a.flood_control_outflow_ptr, a.runoff_ptr,
+        a.outgoing_storage_ptr, a.time_step_ptr, t);
 }
 
-template <typename REAL, typename STO>
-__global__ void k_reservoir_outflow_batched(
-    const int* __restrict__ reservoir_catchment_idx,
-    const int* __restrict__ downstream_idx,
-    STO* __restrict__ reservoir_total_inflow,
-    REAL* __restrict__ river_outflow, REAL* __restrict__ flood_outflow,
-    const STO* __restrict__ river_storage, const STO* __restrict__ flood_storage,
-    const REAL* __restrict__ conservation_volume, const REAL* __restrict__ emergency_volume,
-    const REAL* __restrict__ adjustment_volume, const REAL* __restrict__ effective_normal_outflow,
-    const REAL* __restrict__ adjustment_outflow, const REAL* __restrict__ flood_control_outflow,
-    const REAL* __restrict__ runoff,
-    STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr,
-    int num_reservoirs, long num_catchments, bool batched_runoff,
-    bool batched_conservation_volume, bool batched_emergency_volume,
-    bool batched_adjustment_volume, bool batched_effective_normal_outflow,
-    bool batched_adjustment_outflow, bool batched_flood_control_outflow)
+// Ensemble members offset their slices, then run the body above.
+template <typename REAL, typename STO, bool HAS_LEVEE, class A>
+__device__ __forceinline__ void reservoir_outflow_members(A a, long t, long member)
 {
-    const long member_offset = (long)blockIdx.y * num_catchments;
-    reservoir_total_inflow += member_offset;
-    river_outflow += member_offset;
-    flood_outflow += member_offset;
-    river_storage += member_offset;
-    flood_storage += member_offset;
-    outgoing_storage += member_offset;
-    if (batched_runoff) runoff += member_offset;
-    const long reservoir_offset = (long)blockIdx.y * num_reservoirs;
-    if (batched_conservation_volume) conservation_volume += reservoir_offset;
-    if (batched_emergency_volume) emergency_volume += reservoir_offset;
-    if (batched_adjustment_volume) adjustment_volume += reservoir_offset;
-    if (batched_effective_normal_outflow) effective_normal_outflow += reservoir_offset;
-    if (batched_adjustment_outflow) adjustment_outflow += reservoir_offset;
-    if (batched_flood_control_outflow) flood_control_outflow += reservoir_offset;
-    k_reservoir_outflow_cell<REAL, STO>(
-        reservoir_catchment_idx, downstream_idx, reservoir_total_inflow, river_outflow,
-        flood_outflow, river_storage, flood_storage, conservation_volume, emergency_volume,
-        adjustment_volume, effective_normal_outflow, adjustment_outflow, flood_control_outflow,
-        runoff, outgoing_storage, time_step_ptr, num_reservoirs);
-}
-
-void launch_reservoir_outflow(
-    at::Tensor reservoir_catchment_idx_ptr, at::Tensor downstream_idx_ptr,
-    at::Tensor reservoir_total_inflow_ptr, at::Tensor river_outflow_ptr,
-    at::Tensor flood_outflow_ptr, at::Tensor river_storage_ptr,
-    at::Tensor flood_storage_ptr, at::Tensor conservation_volume_ptr,
-    at::Tensor emergency_volume_ptr, at::Tensor adjustment_volume_ptr,
-    at::Tensor effective_normal_outflow_ptr, at::Tensor adjustment_outflow_ptr,
-    at::Tensor flood_control_outflow_ptr, at::Tensor runoff_ptr,
-    at::Tensor outgoing_storage_ptr,
-    at::Tensor time_step_ptr, long num_catchments,
-    int num_reservoirs, long ensemble_size, bool batched_runoff, long BLOCK_SIZE)
-{
-    const dim3 grid((num_reservoirs + BLOCK_SIZE - 1) / BLOCK_SIZE, ensemble_size);
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    bool real64 = river_outflow_ptr.scalar_type() == at::kDouble;
-    bool sto64 = river_storage_ptr.scalar_type() == at::kDouble;
-#define LAUNCH_RESERVOIR(REAL_T, STO_T) \
-        do { \
-            if (ensemble_size > 1) { \
-                k_reservoir_outflow_batched<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
-                    reservoir_catchment_idx_ptr.data_ptr<int>(), downstream_idx_ptr.data_ptr<int>(), \
-                    reservoir_total_inflow_ptr.data_ptr<STO_T>(), \
-                    river_outflow_ptr.data_ptr<REAL_T>(), flood_outflow_ptr.data_ptr<REAL_T>(), \
-                    river_storage_ptr.data_ptr<STO_T>(), flood_storage_ptr.data_ptr<STO_T>(), \
-                    conservation_volume_ptr.data_ptr<REAL_T>(), \
-                    emergency_volume_ptr.data_ptr<REAL_T>(), \
-                    adjustment_volume_ptr.data_ptr<REAL_T>(), \
-                    effective_normal_outflow_ptr.data_ptr<REAL_T>(), \
-                    adjustment_outflow_ptr.data_ptr<REAL_T>(), \
-                    flood_control_outflow_ptr.data_ptr<REAL_T>(), runoff_ptr.data_ptr<REAL_T>(), \
-                    outgoing_storage_ptr.data_ptr<STO_T>(), time_step_ptr.data_ptr<REAL_T>(), \
-                    num_reservoirs, num_catchments, batched_runoff, \
-                    conservation_volume_ptr.dim() == 2, emergency_volume_ptr.dim() == 2, \
-                    adjustment_volume_ptr.dim() == 2, effective_normal_outflow_ptr.dim() == 2, \
-                    adjustment_outflow_ptr.dim() == 2, flood_control_outflow_ptr.dim() == 2); \
-            } else { \
-                k_reservoir_outflow<REAL_T, STO_T><<<grid, (int)BLOCK_SIZE, 0, stream>>>( \
-                    reservoir_catchment_idx_ptr.data_ptr<int>(), downstream_idx_ptr.data_ptr<int>(), \
-                    reservoir_total_inflow_ptr.data_ptr<STO_T>(), \
-                    river_outflow_ptr.data_ptr<REAL_T>(), flood_outflow_ptr.data_ptr<REAL_T>(), \
-                    river_storage_ptr.data_ptr<STO_T>(), flood_storage_ptr.data_ptr<STO_T>(), \
-                    conservation_volume_ptr.data_ptr<REAL_T>(), \
-                    emergency_volume_ptr.data_ptr<REAL_T>(), \
-                    adjustment_volume_ptr.data_ptr<REAL_T>(), \
-                    effective_normal_outflow_ptr.data_ptr<REAL_T>(), \
-                    adjustment_outflow_ptr.data_ptr<REAL_T>(), \
-                    flood_control_outflow_ptr.data_ptr<REAL_T>(), runoff_ptr.data_ptr<REAL_T>(), \
-                    outgoing_storage_ptr.data_ptr<STO_T>(), time_step_ptr.data_ptr<REAL_T>(), \
-                    num_reservoirs); \
-            } \
-        } while (false)
-    if (real64) {
-        LAUNCH_RESERVOIR(double, double);
-    } else if (sto64) {
-        LAUNCH_RESERVOIR(float, double);
-    } else {
-        LAUNCH_RESERVOIR(float, float);
-    }
-#undef LAUNCH_RESERVOIR
+    const long member_offset = member * a.num_catchments;
+    a.reservoir_total_inflow_ptr += member_offset;
+    a.river_outflow_ptr += member_offset;
+    a.flood_outflow_ptr += member_offset;
+    a.river_storage_ptr += member_offset;
+    a.flood_storage_ptr += member_offset;
+    if constexpr (HAS_LEVEE) a.protected_storage_ptr += member_offset;
+    a.outgoing_storage_ptr += member_offset;
+    if (a.batched_runoff) a.runoff_ptr += member_offset;
+    const long reservoir_offset = member * a.num_reservoirs;
+    if (a.batched_conservation_volume) a.conservation_volume_ptr += reservoir_offset;
+    if (a.batched_emergency_volume) a.emergency_volume_ptr += reservoir_offset;
+    if (a.batched_adjustment_volume) a.adjustment_volume_ptr += reservoir_offset;
+    if (a.batched_effective_normal_outflow) a.effective_normal_outflow_ptr += reservoir_offset;
+    if (a.batched_adjustment_outflow) a.adjustment_outflow_ptr += reservoir_offset;
+    if (a.batched_flood_control_outflow) a.flood_control_outflow_ptr += reservoir_offset;
+    reservoir_outflow<REAL, STO, HAS_LEVEE>(a, t);
 }

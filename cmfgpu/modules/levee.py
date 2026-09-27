@@ -101,7 +101,10 @@ class LeveeModule(AbstractModule):
     # Static levee parameters (num_levees)
     # ------------------------------------------------------------------ #
     levee_crown_height: torch.Tensor = LeveeField(
-        description="Levee crown height above river bed (m)",
+        description=(
+            "Levee crown height above river bed (m); a crown below the "
+            "levee base height is raised to it"
+        ),
         category="param",
     )
 
@@ -216,11 +219,110 @@ class LeveeModule(AbstractModule):
             self.levee_fraction * self.base.num_flood_levels,
         )
 
+    def _profile_storage(
+        self, height: torch.Tensor, *, at_levee_layer: bool = False,
+    ) -> torch.Tensor:
+        """Integrate the flood profile in the stage formula's original order.
+
+        The layer-search threshold observes the base storage inside the loop,
+        before the extrapolation used by the final base storage.
+        """
+        length, width, area, table = (
+            self.gather_tensor(
+                getattr(self.base, name), self.levee_catchment_idx,
+                batched=self.base.is_batched(name),
+            )
+            for name in ("river_length", "river_width", "catchment_area", "flood_depth_table")
+        )
+        levels = length.new_tensor(self.base.num_flood_levels)
+        increment = (area / length) / levels
+        river_max = self.levee_river_max_storage
+        current = river_max
+        previous_height = torch.zeros_like(river_max)
+        storage = river_max
+        found = torch.zeros_like(river_max, dtype=torch.bool)
+        layer_storage = torch.zeros_like(river_max)
+        levee_layer = (self.levee_fraction * self.base.num_flood_levels).to(torch.int32)
+        for level in range(self.base.num_flood_levels):
+            depth = table[..., level]
+            segment = depth - previous_height
+            middle_width = width + 0.5 * increment
+            next_storage = current + length * middle_width * segment
+            inside = ~found & (height > previous_height) & (height <= depth)
+            ratio = (height - previous_height) / segment
+            storage = torch.where(
+                inside,
+                current + length * (width + 0.5 * ratio * increment) * (ratio * segment),
+                storage,
+            )
+            found = found | inside
+            if at_levee_layer:
+                layer_storage = torch.where(level == levee_layer, storage, layer_storage)
+            current = next_storage
+            previous_height = depth
+            width = width + increment
+        if at_levee_layer:
+            return layer_storage
+        extra = current + length * width * (height - previous_height)
+        return torch.where(found, storage, torch.where(height > previous_height, extra, river_max))
+
+    def _storage_to_crown(self, base_storage: torch.Tensor) -> torch.Tensor:
+        """River-side storage at the effective crown, from a base threshold."""
+        length, width, area = (
+            self.gather_tensor(
+                getattr(self.base, name), self.levee_catchment_idx,
+                batched=self.base.is_batched(name),
+            )
+            for name in ("river_length", "river_width", "catchment_area")
+        )
+        distance = self.levee_fraction * (area / length)
+        crown = torch.maximum(self.levee_crown_height, self.levee_base_height)
+        return base_storage + (distance + width) * (crown - self.levee_base_height) * length
+
+    @computed_levee_field(description="River bankfull storage at levees (m3)", output="disabled")
+    @cached_property
+    def levee_river_max_storage(self) -> torch.Tensor:
+        length, width, height = (
+            self.gather_tensor(
+                getattr(self.base, name), self.levee_catchment_idx,
+                batched=self.base.is_batched(name),
+            )
+            for name in ("river_length", "river_width", "river_height")
+        )
+        storage = length * width * height
+        # All five arrays have a member slice, including shared geometry.
+        if self.ensemble_size is not None:
+            storage = storage.expand(self.ensemble_size, self.num_levees)
+        return storage.contiguous()
+
+    @computed_levee_field(description="Storage at the levee base (m3)", output="disabled")
+    @cached_property
+    def levee_base_storage(self) -> torch.Tensor:
+        return self._profile_storage(self.levee_base_height)
+
+    @computed_levee_field(description="River-side storage at the levee crown (m3)", output="disabled")
+    @cached_property
+    def levee_top_storage(self) -> torch.Tensor:
+        return self._storage_to_crown(self.levee_base_storage)
+
+    @computed_levee_field(description="Unprotected profile storage at the crown (m3)", output="disabled")
+    @cached_property
+    def levee_fill_storage(self) -> torch.Tensor:
+        crown = torch.maximum(self.levee_crown_height, self.levee_base_height)
+        return self._profile_storage(crown)
+
+    @computed_levee_field(description="Crown storage observed inside the levee-layer search (m3)", output="disabled")
+    @cached_property
+    def levee_layer_top_storage(self) -> torch.Tensor:
+        return self._storage_to_crown(
+            self._profile_storage(self.levee_base_height, at_levee_layer=True),
+        )
+
     # ------------------------------------------------------------------ #
     # Validators
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
-    def validate_levee_fraction(self) -> Self:
+    def validate_parameters(self) -> Self:
         invalid = (
             ~torch.isfinite(self.levee_fraction)
             | (self.levee_fraction < 0)
@@ -228,19 +330,16 @@ class LeveeModule(AbstractModule):
         )
         if torch.any(invalid):
             raise ValueError("levee_fraction must be finite and lie within [0, 1)")
-        return self
 
-    @model_validator(mode="after")
-    def validate_levee_heights(self) -> Self:
         invalid = (
             ~torch.isfinite(self.levee_crown_height)
             | ~torch.isfinite(self.levee_base_height)
-            | (self.levee_base_height >= self.levee_crown_height)
+            | (self.levee_crown_height <= 0)
         )
         num_invalid = invalid.sum().item()
         if num_invalid > 0:
             raise ValueError(
-                f"{num_invalid} levees have non-finite heights or a base "
-                "height greater than or equal to the crown height"
+                f"{num_invalid} levees have non-finite heights or a "
+                "non-positive crown height"
             )
         return self

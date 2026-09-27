@@ -22,7 +22,12 @@ static inline LeveeStageResult levee_stage_inline(
     float levee_crown_height,
     float levee_fraction,
     device const float* flood_depth_table,
-    int num_flood_levels
+    int num_flood_levels,
+    float maximum_river_storage,
+    float levee_base_storage,
+    float top_storage,
+    float levee_fill_storage,
+    float top_ilev
 ) {
     LeveeStageResult result;
     result.river_storage = river_storage;
@@ -34,10 +39,10 @@ static inline LeveeStageResult levee_stage_inline(
     result.flood_fraction = flood_fraction;
 
     float total_storage = river_storage + flood_storage;
-    float maximum_river_storage =
-        river_length * river_width * river_height;
-    if (total_storage <= maximum_river_storage) return result;
+    // Case 0, water only in the river channel: the default stage stands.
+    if (!(total_storage > maximum_river_storage)) return result;
 
+    levee_crown_height = max(levee_crown_height, levee_base_height);
     float width_increment =
         (catchment_area / river_length) / (float)num_flood_levels;
     float levee_distance =
@@ -45,10 +50,8 @@ static inline LeveeStageResult levee_stage_inline(
     float current_storage = maximum_river_storage;
     float previous_height = 0.0f;
     float previous_width = river_width;
-    float levee_base_storage = maximum_river_storage;
-    float levee_fill_storage = maximum_river_storage;
-    bool found_base = false;
-    bool found_fill = false;
+    bool case3 = total_storage >= levee_base_storage && total_storage >= top_storage && total_storage < levee_fill_storage;
+    bool case4 = total_storage >= levee_base_storage && total_storage >= top_storage && !(total_storage < levee_fill_storage);
 
     int levee_level = (int)(levee_fraction * (float)num_flood_levels);
     float case3_storage = 0.0f;
@@ -57,51 +60,27 @@ static inline LeveeStageResult levee_stage_inline(
     float case3_gradient = 0.0f;
     bool found_case3 = false;
 
-    for (int level = 0; level < num_flood_levels; ++level) {
+    float case4_storage = 0.0f;
+    float case4_width = 0.0f;
+    float case4_gradient = 0.0f;
+    bool found_case4 = false;
+
+    // Dynamic partition search is needed only for cases 3 and 4.
+    for (int level = 0; (case3 || case4) && level < num_flood_levels; ++level) {
         float depth = flood_depth_table[level];
-        float height_increment = max(depth - previous_height, 1e-6f);
+        float height_increment = depth - previous_height;
         float middle_width = previous_width + 0.5f * width_increment;
         float storage_increment =
             river_length * middle_width * height_increment;
         float next_storage = current_storage + storage_increment;
         float gradient = height_increment / width_increment;
 
-        if (
-            !found_base
-            && levee_base_height > previous_height
-            && levee_base_height <= depth
-        ) {
-            float ratio =
-                (levee_base_height - previous_height) / height_increment;
-            levee_base_storage = current_storage
-                + river_length
-                    * (previous_width + 0.5f * ratio * width_increment)
-                    * (ratio * height_increment);
-            found_base = true;
-        }
-        if (
-            !found_fill
-            && levee_crown_height > previous_height
-            && levee_crown_height <= depth
-        ) {
-            float ratio =
-                (levee_crown_height - previous_height) / height_increment;
-            levee_fill_storage = current_storage
-                + river_length
-                    * (previous_width + 0.5f * ratio * width_increment)
-                    * (ratio * height_increment);
-            found_fill = true;
-        }
-        if (level >= levee_level && !found_case3) {
-            float levee_height = levee_crown_height - levee_base_height;
-            float top_storage = levee_base_storage
-                + (levee_distance + river_width)
-                    * levee_height * river_length;
+        if (case3 && level >= levee_level && !found_case3) {
             float wedge_storage = (levee_distance + river_width)
                 * (levee_crown_height - depth) * river_length;
             float threshold = next_storage + wedge_storage;
             if (total_storage < threshold) {
-                if (level == levee_level) case3_storage = top_storage;
+                if (level == levee_level) case3_storage = top_ilev;
                 case3_gradient = gradient;
                 found_case3 = true;
             } else {
@@ -111,37 +90,24 @@ static inline LeveeStageResult levee_stage_inline(
                 case3_depth = depth - levee_base_height;
             }
         }
+        // Case 4 stops at the first layer the storage does not exceed.
+        if (case4 && !found_case4 && !(total_storage > next_storage)) {
+            case4_storage = current_storage;
+            case4_width = previous_width;
+            case4_gradient = gradient;
+            found_case4 = true;
+        }
 
         current_storage = next_storage;
         previous_height = depth;
         previous_width += width_increment;
-        if (found_base && found_fill && found_case3) break;
+        if ((!case3 || found_case3) && (!case4 || found_case4)) break;
     }
 
-    if (!found_base) {
-        levee_base_storage = levee_base_height > previous_height
-            ? current_storage + river_length * previous_width
-                * (levee_base_height - previous_height)
-            : maximum_river_storage;
-    }
-    if (!found_fill) {
-        levee_fill_storage = levee_crown_height > previous_height
-            ? current_storage + river_length * previous_width
-                * (levee_crown_height - previous_height)
-            : maximum_river_storage;
-    }
-
-    float levee_height = levee_crown_height - levee_base_height;
-    float top_storage = levee_base_storage
-        + (levee_distance + river_width) * levee_height * river_length;
-    bool above_crown = total_storage >= levee_fill_storage;
-    bool filling_protected =
-        !above_crown && total_storage >= top_storage;
-    bool below_crown =
-        !above_crown && !filling_protected
-        && total_storage >= levee_base_storage;
-
-    if (below_crown) {
+    if (total_storage < levee_base_storage) {
+        // Case 1, below the levee base: the default stage stands.
+    } else if (total_storage < top_storage) {
+        // Case 2, river side below the crown, protected side dry.
         float added_storage = total_storage - levee_base_storage;
         result.flood_depth = levee_base_height
             + added_storage
@@ -153,15 +119,14 @@ static inline LeveeStageResult levee_stage_inline(
         result.flood_storage = max(
             total_storage - result.river_storage, 0.0f);
         result.flood_fraction = levee_fraction;
-    } else if (filling_protected) {
+    } else if (total_storage < levee_fill_storage) {
+        // Case 3, river side at the crown, protected side filling.
         float added_storage = total_storage - case3_storage;
-        float width_term = case3_width * case3_width
-            + 2.0f * added_storage / river_length
-                / (case3_gradient + 1e-9f);
-        float added_width =
-            -case3_width + sqrt(max(width_term, 0.0f));
-        float added_depth = added_width * case3_gradient;
         if (found_case3) {
+            float added_width = -case3_width + sqrt(
+                case3_width * case3_width
+                + 2.0f * added_storage / river_length / case3_gradient);
+            float added_depth = added_width * case3_gradient;
             result.protected_depth =
                 levee_base_height + case3_depth + added_depth;
             result.flood_fraction = clamp(
@@ -169,10 +134,10 @@ static inline LeveeStageResult levee_stage_inline(
                     / (width_increment * (float)num_flood_levels),
                 0.0f, 1.0f);
         } else {
-            float extra_depth = added_storage
-                / (case3_width * river_length + 1e-9f);
+            float added_depth =
+                added_storage / case3_width / river_length;
             result.protected_depth =
-                levee_base_height + case3_depth + extra_depth;
+                levee_base_height + case3_depth + added_depth;
             result.flood_fraction = 1.0f;
         }
         result.flood_depth = levee_crown_height;
@@ -185,7 +150,20 @@ static inline LeveeStageResult levee_stage_inline(
         result.protected_storage = max(
             total_storage - result.river_storage - result.flood_storage,
             0.0f);
-    } else if (above_crown) {
+    } else {
+        // Case 4, above the crown: the default river stage stands, with the
+        // unclamped default-stage flood fraction.
+        float added_width = 0.0f;
+        if (found_case4) {
+            added_width = -case4_width + sqrt(
+                case4_width * case4_width
+                + 2.0f * (total_storage - case4_storage) / river_length
+                    / case4_gradient);
+        } else {
+            case4_width = previous_width;
+        }
+        result.flood_fraction = (-river_width + case4_width + added_width)
+            / (width_increment * (float)num_flood_levels);
         float added_storage = (flood_depth - levee_crown_height)
             * (levee_distance + river_width) * river_length;
         result.flood_storage = max(
@@ -312,7 +290,11 @@ long num_levees = *args.num_levees;
         args.levee_crown_height_ptr[levee_crown_idx],
         args.levee_fraction_ptr[levee_fraction_idx],
         args.flood_depth_table_ptr + table_offset,
-        num_flood_levels);
+        num_flood_levels, args.levee_river_max_storage_ptr[levee_offset + levee],
+        args.levee_base_storage_ptr[levee_offset + levee],
+        args.levee_top_storage_ptr[levee_offset + levee],
+        args.levee_fill_storage_ptr[levee_offset + levee],
+        args.levee_layer_top_storage_ptr[levee_offset + levee]);
 
     args.river_storage_ptr[catchment] = result.river_storage;
     args.flood_storage_ptr[catchment] = result.flood_storage;
@@ -358,7 +340,11 @@ long num_levees = *args.num_levees;
         args.levee_fraction_ptr[levee],
         args.flood_depth_table_ptr
             + (long)catchment * (long)num_flood_levels,
-        num_flood_levels);
+        num_flood_levels, args.levee_river_max_storage_ptr[levee],
+        args.levee_base_storage_ptr[levee],
+        args.levee_top_storage_ptr[levee],
+        args.levee_fill_storage_ptr[levee],
+        args.levee_layer_top_storage_ptr[levee]);
 
     float stage_storage = result.river_storage
         + result.flood_storage + result.protected_storage;
@@ -424,11 +410,12 @@ long num_paths = *args.num_bifurcation_paths;
         args.catchment_elevation_ptr[catchment_elevation_idx];
     float downstream_elevation =
         args.catchment_elevation_ptr[downstream_elevation_idx];
+    // D2SFCELV = D2RIVELV + D2RIVDPH with D2RIVELV = D2ELEVTN - D2RIVHGT.
     float water_surface = args.river_depth_ptr[catchment_cell]
-        + catchment_elevation - args.river_height_ptr[catchment_height_idx];
+        + (catchment_elevation - args.river_height_ptr[catchment_height_idx]);
     float downstream_surface = args.river_depth_ptr[downstream_cell]
-        + downstream_elevation
-        - args.river_height_ptr[downstream_height_idx];
+        + (downstream_elevation
+            - args.river_height_ptr[downstream_height_idx]);
     float protected_surface = args.is_levee_ptr[catchment]
         ? min(
             catchment_elevation + args.protected_depth_ptr[catchment_cell],
@@ -475,18 +462,23 @@ long num_paths = *args.num_bifurcation_paths;
         args.river_storage_ptr[downstream_cell]
             + args.flood_storage_ptr[downstream_cell]
             + args.protected_storage_ptr[downstream_cell]);
-    float limit = min(
-        CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
-        1.0f);
+    // CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
+    float limit = 1.0f;
+    if (total_outflow != 0.0f) {
+        limit = min(
+            CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
+            1.0f);
+    }
     total_outflow *= limit;
     for (int level = 0; level < num_bifurcation_levels; ++level) {
         long state_level = level_offset + path_level + level;
         args.bifurcation_outflow_ptr[state_level] *= limit;
     }
 
+    // P2STOOUT flows, multiplied by the step in compute_inflow.
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + catchment_cell,
-        max(total_outflow, 0.0f) * time_step, memory_order_relaxed);
+        max(total_outflow, 0.0f), memory_order_relaxed);
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + downstream_cell,
-        -min(total_outflow, 0.0f) * time_step, memory_order_relaxed);
+        -min(total_outflow, 0.0f), memory_order_relaxed);

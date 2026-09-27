@@ -30,6 +30,7 @@ from cmfgpu.params import estimate_river_geometry
 def main():
     ### Configuration Start ###
     resolution = "glb_15min"
+    # Windows path example: map_dir = fr"C:\Users\YourName\cmf_v420_pkg\map\{resolution}"
     map_dir = f"/home/eat/cmf_v420_pkg/map/{resolution}"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
 

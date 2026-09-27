@@ -64,7 +64,6 @@ class CaMaFlood(AbstractModel):
     reservoir = optional_module_ref(ReservoirModule)
     partition_key: ClassVar[str] = "catchment_id"
     partition_group: ClassVar[str] = "catchment_basin_id"
-    cuda_extension_modules: ClassVar[tuple[str, ...]] = ("cmfgpu.phys.cuda",)
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {
         "cuda": BackendRequirement(),
     }
@@ -75,7 +74,7 @@ class CaMaFlood(AbstractModel):
     def initialize_model_state(self) -> None:
         reservoir = self.reservoir
         if reservoir is not None:
-            reservoir.initialize_state()
+            reservoir.initialize_state(supplied=frozenset(self.input_proxy.keys()))
 
     @between_steps
     @torch.inference_mode()
@@ -139,7 +138,9 @@ class CaMaFlood(AbstractModel):
         else:
             fixed_substeps = step.fixed()
         fixed_count = fixed_substeps.count
-        time_sub_step = time_step_seconds / fixed_count
+        compute_dtype = self.base.time_step.dtype
+        inverse_count = (torch.ones((), dtype=torch.float32) / fixed_count).to(compute_dtype)
+        time_sub_step = float(torch.tensor(time_step_seconds, dtype=compute_dtype) * inverse_count)
 
         if log is not None:
             log.set_time(time_sub_step, fixed_count, step.current_time)

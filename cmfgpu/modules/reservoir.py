@@ -202,25 +202,28 @@ class ReservoirModule(AbstractModule):
     @cached_property
     def flood_volume(self) -> torch.Tensor:
         """FldVol = (EmeVol - ConVol) / 0.95, inverse of EmeVol = ConVol + FldVol * 0.95"""
-        return (self.emergency_volume - self.conservation_volume) / 0.95
+        excess = self.emergency_volume - self.conservation_volume
+        return excess / excess.new_tensor(0.95)
 
     @computed_reservoir_field(
         description="Volume threshold triggering regulation: AdjVol = ConVol + FldVol * 0.1 (m3)",
     )
     @cached_property
     def adjustment_volume(self) -> torch.Tensor:
-        return self.conservation_volume + self.flood_volume * 0.1
+        tenth = torch.tensor(0.1, dtype=torch.float32).item()
+        return self.conservation_volume + self.flood_volume * tenth
 
     @computed_reservoir_field(
         description="Effective normal outflow after Yamazaki & Funato modification. Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days) (m3 s-1)",
     )
     @cached_property
     def effective_normal_outflow(self) -> torch.Tensor:
-        seconds_per_year = 365.0 * 24 * 60 * 60
-        seconds_per_180_days = 180.0 * 24 * 60 * 60
-        Vyr = self.normal_outflow * seconds_per_year
-        Qsto = (self.conservation_volume * 0.7 + Vyr / 4.0) / seconds_per_180_days
-        return torch.minimum(self.normal_outflow, Qsto) * 1.5
+        normal_outflow = self.normal_outflow
+        annual_inflow = normal_outflow * (365.0 * 24 * 60 * 60)
+        seven_tenths = torch.tensor(0.7, dtype=torch.float32).item()
+        dry_storage = self.conservation_volume * seven_tenths + annual_inflow / 4.0
+        dry_outflow = dry_storage / dry_storage.new_tensor(180.0 * 24 * 60 * 60)
+        return torch.minimum(normal_outflow, dry_outflow) * 1.5
 
     @computed_reservoir_field(
         description="Regulated outflow rate: Qa = (modified_Qn + Qf) * 0.5 (m3 s-1)",
@@ -230,7 +233,7 @@ class ReservoirModule(AbstractModule):
         return (self.effective_normal_outflow + self.flood_control_outflow) * 0.5
 
     def initialize_dam_storage(self) -> int:
-        """Apply the CPU cold-start conservation-volume rule at dam cells."""
+        """Raise cold-start dam storage to the conservation volume."""
         idx = self.reservoir_catchment_idx
         river = self.base.river_storage[..., idx]
         flood = self.base.flood_storage[..., idx]
@@ -262,16 +265,23 @@ class ReservoirModule(AbstractModule):
         bifurcation.bifurcation_elevation[..., masked, :] = 1.0e20
         return int(masked.sum().item())
 
-    def initialize_state(self) -> None:
-        """Apply reservoir-owned cold-start adjustments after module linking."""
-        fixed = self.initialize_dam_storage()
-        if fixed:
-            self._emit(
-                "info",
-                "reservoir.storage_initialized",
-                "Initialized dam cells to conservation storage",
-                cells=fixed,
-            )
+    def initialize_state(self, *, supplied: frozenset[str]) -> None:
+        """Apply reservoir-owned cold starts without replacing restart state.
+
+        CMF_DAMOUT_INIT raises dam storage to ConVol only without restart
+        data.  Every checkpoint carries the reservoir's restart state
+        ``reservoir_total_inflow``, so its presence among the ``supplied``
+        inputs marks a restart.  Dam-related bifurcation paths close always.
+        """
+        if "reservoir_total_inflow" not in supplied:
+            fixed = self.initialize_dam_storage()
+            if fixed:
+                self._emit(
+                    "info",
+                    "reservoir.storage_initialized",
+                    "Initialized dam cells to conservation storage",
+                    cells=fixed,
+                )
         masked = self.mask_bifurcation_paths()
         if masked:
             self._emit(

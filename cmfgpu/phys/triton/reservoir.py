@@ -8,15 +8,64 @@
 Reservoir outflow Triton kernels.
 """
 
+import numpy as np
 import triton
 import triton.language as tl
+from hydroforge.kernels import triton_math as hm
 
-from cmfgpu.phys.triton.utils import hpfloat_to_compute_inline
+from cmfgpu.phys.triton.outflow import outgoing_flows_inline
 
 
 from cmfgpu import config as _constants
 
-RESERVOIR_RELEASE_EXPONENT = tl.constexpr(_constants.RESERVOIR_RELEASE_EXPONENT)
+RESERVOIR_RELEASE_EXPONENT = tl.constexpr(
+    float(np.float32(_constants.RESERVOIR_RELEASE_EXPONENT))
+)
+
+
+@triton.jit
+def reservoir_release_inline(
+    dam_volume, river_flood_storage, reservoir_inflow, time_step,
+    conservation_volume, emergency_volume, adjustment_volume,
+    normal_outflow, adjustment_outflow, flood_control_outflow,
+):
+    """Yamazaki & Funato release of CMF_DAMOUT_CALC for the dam volume
+    DamVol, then its flow limiter against DamVol and REAL(P2RIVSTO+P2FLDSTO).
+    The nested selections follow the CUDA if/else-if regime chain."""
+    # Case 1: water use, up to the conservation volume.
+    water_use = normal_outflow * hm.sqrt(hm.divide(dam_volume, conservation_volume))
+    # Case 2: water excess, up to the adjustment volume.
+    frac2 = hm.divide(dam_volume - conservation_volume, adjustment_volume - conservation_volume)
+    water_excess = normal_outflow + hm.exp(3.0 * hm.log(frac2)) * (
+        adjustment_outflow - normal_outflow
+    )
+    # Case 3: flood control, up to the emergency volume.
+    frac3 = hm.divide(dam_volume - adjustment_volume, emergency_volume - adjustment_volume)
+    controlled = adjustment_outflow + hm.exp(RESERVOIR_RELEASE_EXPONENT * hm.log(frac3)) * (
+        flood_control_outflow - adjustment_outflow
+    )
+    flood_period = reservoir_inflow >= flood_control_outflow
+    flood = normal_outflow + hm.divide(
+        dam_volume - conservation_volume, emergency_volume - conservation_volume,
+    ) * (reservoir_inflow - normal_outflow)
+    flood_control = tl.where(flood_period, tl.maximum(flood, controlled), controlled)
+    # Case 4: emergency operation.
+    emergency = tl.where(flood_period, reservoir_inflow, flood_control_outflow)
+
+    reservoir_outflow = tl.where(
+        dam_volume <= conservation_volume, water_use,
+        tl.where(
+            dam_volume <= adjustment_volume, water_excess,
+            tl.where(dam_volume <= emergency_volume, flood_control, emergency),
+        ),
+    )
+
+    # Flow limiter: the minimum first, so a negative storage releases nothing.
+    reservoir_outflow = tl.minimum(
+        tl.minimum(reservoir_outflow, hm.divide(dam_volume, time_step)),
+        hm.divide(river_flood_storage, time_step),
+    )
+    return hm.at_least(reservoir_outflow, 0.0)
 
 
 @triton.jit
@@ -32,6 +81,7 @@ def compute_reservoir_outflow_kernel(
     flood_outflow_ptr,                      # *f32  in/out: zeroed for reservoir catchments
     river_storage_ptr,                      # *f64  river storage
     flood_storage_ptr,                      # *f64  flood storage
+    protected_storage_ptr,                  # *f64  levee-protected storage (HAS_LEVEE)
 
     # Reservoir parameters (reservoir-indexed)
     conservation_volume_ptr,                # *f32  conservation storage
@@ -47,6 +97,7 @@ def compute_reservoir_outflow_kernel(
 
     time_step_ptr,                              # f32   scalar time step
     num_reservoirs,                         # i32   total number of reservoirs
+    HAS_LEVEE: tl.constexpr,                # levee-protected storage present
     BLOCK_SIZE: tl.constexpr,               # block size
 ):
     pid = tl.program_id(0)
@@ -65,45 +116,36 @@ def compute_reservoir_outflow_kernel(
     old_river_outflow = tl.load(river_outflow_ptr + catchment_idx, mask=mask, other=0.0)
     old_flood_outflow = tl.load(flood_outflow_ptr + catchment_idx, mask=mask, other=0.0)
 
-    old_pos = tl.maximum(old_river_outflow, 0.0) + tl.maximum(old_flood_outflow, 0.0)
-    old_neg = tl.minimum(old_river_outflow, 0.0) + tl.minimum(old_flood_outflow, 0.0)
-
-    # Subtract the local positive contribution
+    old_own, old_reversed = outgoing_flows_inline(
+        old_river_outflow, old_flood_outflow, outgoing_storage_ptr.dtype.element_ty,
+    )
+    tl.atomic_add(outgoing_storage_ptr + catchment_idx, -old_own, mask=mask)
     tl.atomic_add(
-        outgoing_storage_ptr + catchment_idx,
-        -(old_pos * time_step), mask=mask,
+        outgoing_storage_ptr + downstream_idx, -old_reversed,
+        mask=mask & ~is_river_mouth,
     )
-
-    # Undo the downstream scatter of negative flow
-    undo_downstream = tl.where(
-        ~is_river_mouth, old_neg * time_step, 0.0,
-    )
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx, undo_downstream, mask=mask)
 
     # ================================================================== #
     # 2. Compute reservoir outflow
     # ================================================================== #
-    river_storage = tl.load(river_storage_ptr + catchment_idx, mask=mask, other=0.0)
-    flood_storage = tl.load(flood_storage_ptr + catchment_idx, mask=mask, other=0.0)
+    storage = tl.load(river_storage_ptr + catchment_idx, mask=mask, other=0.0) + tl.load(
+        flood_storage_ptr + catchment_idx, mask=mask, other=0.0,
+    )
+    river_flood_storage = hm.to_compute(storage, old_river_outflow)
+    if HAS_LEVEE:
+        storage += tl.load(protected_storage_ptr + catchment_idx, mask=mask, other=0.0)
+    dam_volume = hm.to_compute(storage, old_river_outflow)
 
-    # Downcast hpfloat storage to the active computation dtype.
-    river_storage = hpfloat_to_compute_inline(river_storage, old_river_outflow)
-    flood_storage = hpfloat_to_compute_inline(flood_storage, old_river_outflow)
-
-    total_storage = river_storage + flood_storage
-
-    # Accumulated total inflow from upstream (from previous sub-step's inflow kernel)
-    total_inflow = hpfloat_to_compute_inline(
-        tl.load(reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0), old_river_outflow
+    total_inflow = tl.load(reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0)
+    runoff = tl.load(runoff_ptr + catchment_idx, mask=mask, other=0.0)
+    reservoir_inflow = hm.to_compute(
+        total_inflow + runoff.to(total_inflow.dtype), old_river_outflow,
     )
     # Zero the accumulator for next sub-step
     tl.store(
         reservoir_total_inflow_ptr + catchment_idx,
         tl.zeros_like(total_inflow), mask=mask,
     )
-
-    runoff = tl.load(runoff_ptr + catchment_idx, mask=mask, other=0.0)
-    reservoir_inflow = total_inflow + runoff
 
     # Reservoir parameters (reservoir-indexed)
     conservation_volume = tl.load(conservation_volume_ptr + offs, mask=mask, other=0.0)
@@ -113,58 +155,11 @@ def compute_reservoir_outflow_kernel(
     adjustment_outflow = tl.load(adjustment_outflow_ptr + offs, mask=mask, other=0.0)
     flood_control_outflow = tl.load(flood_control_outflow_ptr + offs, mask=mask, other=0.0)
 
-    reservoir_outflow = tl.zeros_like(total_storage)
-
-    # ---- Case 1: below conservation volume ----
-    cond1 = total_storage <= conservation_volume
-    reservoir_outflow = tl.where(
-        cond1,
-        normal_outflow * tl.sqrt(total_storage / conservation_volume),
-        reservoir_outflow,
+    reservoir_outflow = reservoir_release_inline(
+        dam_volume, river_flood_storage, reservoir_inflow, time_step,
+        conservation_volume, emergency_volume, adjustment_volume,
+        normal_outflow, adjustment_outflow, flood_control_outflow,
     )
-
-    # ---- Case 2: above conservation, below adjustment volume ----
-    cond2 = (total_storage > conservation_volume) & (total_storage <= adjustment_volume)
-    frac2 = (total_storage - conservation_volume) / (adjustment_volume - conservation_volume)
-    reservoir_outflow = tl.where(
-        cond2,
-        normal_outflow + tl.exp(3.0 * tl.log(frac2)) * (adjustment_outflow - normal_outflow),
-        reservoir_outflow,
-    )
-
-    # ---- Case 3: above adjustment, below emergency volume ----
-    cond3 = (total_storage > adjustment_volume) & (total_storage <= emergency_volume)
-    flood_period = reservoir_inflow >= flood_control_outflow
-
-    # Flood period
-    outflow_flood = normal_outflow + (
-        (total_storage - conservation_volume) / (emergency_volume - conservation_volume)
-    ) * (reservoir_inflow - normal_outflow)
-    frac3 = (total_storage - adjustment_volume) / (emergency_volume - adjustment_volume)
-    outflow_tmp = adjustment_outflow + tl.exp(RESERVOIR_RELEASE_EXPONENT * tl.log(frac3)) * (
-        flood_control_outflow - adjustment_outflow
-    )
-    outflow_combined = tl.maximum(outflow_flood, outflow_tmp)
-
-    # Non-flood period
-    outflow_nonflood = adjustment_outflow + tl.exp(RESERVOIR_RELEASE_EXPONENT * tl.log(frac3)) * (
-        flood_control_outflow - adjustment_outflow
-    )
-
-    reservoir_outflow = tl.where(cond3 & flood_period, outflow_combined, reservoir_outflow)
-    reservoir_outflow = tl.where(cond3 & ~flood_period, outflow_nonflood, reservoir_outflow)
-
-    # ---- Case 4: above emergency volume ----
-    cond4 = total_storage > emergency_volume
-    outflow_emergency = tl.where(
-        reservoir_inflow >= flood_control_outflow,
-        reservoir_inflow,
-        flood_control_outflow,
-    )
-    reservoir_outflow = tl.where(cond4, outflow_emergency, reservoir_outflow)
-
-    # Clamp to [0, total_storage / time_step]
-    reservoir_outflow = tl.clamp(reservoir_outflow, 0.0, total_storage / time_step)
 
     # ================================================================== #
     # 3. Store results
@@ -172,19 +167,11 @@ def compute_reservoir_outflow_kernel(
     tl.store(river_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask)
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
 
-    # Re-add corrected contribution to outgoing_storage
-    # Reservoir outflow is always >= 0 (clamped above), so only positive branch
-    new_pos = tl.maximum(reservoir_outflow, 0.0)
+    # The release is clamped non-negative, so it only leaves this cell.
     tl.atomic_add(
         outgoing_storage_ptr + catchment_idx,
-        new_pos * time_step, mask=mask,
+        reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask,
     )
-
-    new_neg = tl.minimum(reservoir_outflow, 0.0)
-    to_add = tl.where(
-        ~is_river_mouth, -(new_neg * time_step), 0.0,
-    )
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx, to_add, mask=mask)
 
 
 @triton.jit
@@ -196,6 +183,7 @@ def compute_reservoir_outflow_batched_kernel(
     flood_outflow_ptr,
     river_storage_ptr,
     flood_storage_ptr,
+    protected_storage_ptr,
     conservation_volume_ptr,
     emergency_volume_ptr,
     adjustment_volume_ptr,
@@ -207,8 +195,15 @@ def compute_reservoir_outflow_batched_kernel(
     time_step_ptr,
     num_reservoirs: tl.constexpr,
     num_catchments: tl.constexpr,
+    HAS_LEVEE: tl.constexpr,
     ensemble_size: tl.constexpr,
     batched_runoff: tl.constexpr,
+    batched_conservation_volume: tl.constexpr,
+    batched_emergency_volume: tl.constexpr,
+    batched_adjustment_volume: tl.constexpr,
+    batched_effective_normal_outflow: tl.constexpr,
+    batched_adjustment_outflow: tl.constexpr,
+    batched_flood_control_outflow: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -235,119 +230,69 @@ def compute_reservoir_outflow_batched_kernel(
     old_flood_outflow = tl.load(
         flood_outflow_ptr + catchment_idx, mask=mask, other=0.0,
     )
-    old_pos = tl.maximum(old_river_outflow, 0.0) + tl.maximum(
-        old_flood_outflow, 0.0,
+    old_own, old_reversed = outgoing_flows_inline(
+        old_river_outflow, old_flood_outflow, outgoing_storage_ptr.dtype.element_ty,
     )
-    old_neg = tl.minimum(old_river_outflow, 0.0) + tl.minimum(
-        old_flood_outflow, 0.0,
-    )
+    tl.atomic_add(outgoing_storage_ptr + catchment_idx, -old_own, mask=mask)
     tl.atomic_add(
-        outgoing_storage_ptr + catchment_idx,
-        -(old_pos * time_step), mask=mask,
-    )
-    tl.atomic_add(
-        outgoing_storage_ptr + downstream_idx,
-        tl.where(
-            ~is_river_mouth,
-            old_neg * time_step, 0.0,
-        ),
-        mask=mask,
+        outgoing_storage_ptr + downstream_idx, -old_reversed,
+        mask=mask & ~is_river_mouth,
     )
 
-    river_storage = tl.load(
+    storage = tl.load(
         river_storage_ptr + catchment_idx, mask=mask, other=0.0,
+    ) + tl.load(flood_storage_ptr + catchment_idx, mask=mask, other=0.0)
+    river_flood_storage = hm.to_compute(storage, old_river_outflow)
+    if HAS_LEVEE:
+        storage += tl.load(protected_storage_ptr + catchment_idx, mask=mask, other=0.0)
+    dam_volume = hm.to_compute(storage, old_river_outflow)
+    total_inflow = tl.load(
+        reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0,
     )
-    flood_storage = tl.load(
-        flood_storage_ptr + catchment_idx, mask=mask, other=0.0,
-    )
-    river_storage = hpfloat_to_compute_inline(river_storage, old_river_outflow)
-    flood_storage = hpfloat_to_compute_inline(flood_storage, old_river_outflow)
-    total_storage = river_storage + flood_storage
-    total_inflow = hpfloat_to_compute_inline(
-        tl.load(
-            reservoir_total_inflow_ptr + catchment_idx,
-            mask=mask, other=0.0,
-        ),
-        old_river_outflow,
+    runoff_idx = catchment_idx if batched_runoff else local_catchment
+    runoff = tl.load(runoff_ptr + runoff_idx, mask=mask, other=0.0)
+    reservoir_inflow = hm.to_compute(
+        total_inflow + runoff.to(total_inflow.dtype), old_river_outflow,
     )
     tl.store(
         reservoir_total_inflow_ptr + catchment_idx,
         tl.zeros_like(total_inflow), mask=mask,
     )
-    runoff_idx = catchment_idx if batched_runoff else local_catchment
-    reservoir_inflow = total_inflow + tl.load(
-        runoff_ptr + runoff_idx, mask=mask, other=0.0,
-    )
 
+    # ``idx`` is this member's reservoir in a parameter with a member axis.
     conservation_volume = tl.load(
-        conservation_volume_ptr + reservoir_idx, mask=mask, other=0.0,
+        conservation_volume_ptr
+        + (idx if batched_conservation_volume else reservoir_idx),
+        mask=mask, other=0.0,
     )
     emergency_volume = tl.load(
-        emergency_volume_ptr + reservoir_idx, mask=mask, other=0.0,
+        emergency_volume_ptr + (idx if batched_emergency_volume else reservoir_idx),
+        mask=mask, other=0.0,
     )
     adjustment_volume = tl.load(
-        adjustment_volume_ptr + reservoir_idx, mask=mask, other=0.0,
+        adjustment_volume_ptr + (idx if batched_adjustment_volume else reservoir_idx),
+        mask=mask, other=0.0,
     )
     normal_outflow = tl.load(
-        effective_normal_outflow_ptr + reservoir_idx, mask=mask, other=0.0,
+        effective_normal_outflow_ptr
+        + (idx if batched_effective_normal_outflow else reservoir_idx),
+        mask=mask, other=0.0,
     )
     adjustment_outflow = tl.load(
-        adjustment_outflow_ptr + reservoir_idx, mask=mask, other=0.0,
+        adjustment_outflow_ptr
+        + (idx if batched_adjustment_outflow else reservoir_idx),
+        mask=mask, other=0.0,
     )
     flood_control_outflow = tl.load(
-        flood_control_outflow_ptr + reservoir_idx, mask=mask, other=0.0,
+        flood_control_outflow_ptr
+        + (idx if batched_flood_control_outflow else reservoir_idx),
+        mask=mask, other=0.0,
     )
 
-    reservoir_outflow = tl.zeros_like(total_storage)
-    cond1 = total_storage <= conservation_volume
-    reservoir_outflow = tl.where(
-        cond1,
-        normal_outflow * tl.sqrt(total_storage / conservation_volume),
-        reservoir_outflow,
-    )
-    cond2 = (total_storage > conservation_volume) & (
-        total_storage <= adjustment_volume
-    )
-    frac2 = (total_storage - conservation_volume) / (
-        adjustment_volume - conservation_volume
-    )
-    reservoir_outflow = tl.where(
-        cond2,
-        normal_outflow + tl.exp(3.0 * tl.log(frac2))
-        * (adjustment_outflow - normal_outflow),
-        reservoir_outflow,
-    )
-    cond3 = (total_storage > adjustment_volume) & (
-        total_storage <= emergency_volume
-    )
-    flood_period = reservoir_inflow >= flood_control_outflow
-    outflow_flood = normal_outflow + (
-        (total_storage - conservation_volume)
-        / (emergency_volume - conservation_volume)
-    ) * (reservoir_inflow - normal_outflow)
-    frac3 = (total_storage - adjustment_volume) / (
-        emergency_volume - adjustment_volume
-    )
-    outflow_nonflood = adjustment_outflow + tl.exp(RESERVOIR_RELEASE_EXPONENT * tl.log(frac3)) * (
-        flood_control_outflow - adjustment_outflow
-    )
-    reservoir_outflow = tl.where(
-        cond3 & flood_period,
-        tl.maximum(outflow_flood, outflow_nonflood), reservoir_outflow,
-    )
-    reservoir_outflow = tl.where(
-        cond3 & ~flood_period, outflow_nonflood, reservoir_outflow,
-    )
-    reservoir_outflow = tl.where(
-        total_storage > emergency_volume,
-        tl.where(
-            reservoir_inflow >= flood_control_outflow,
-            reservoir_inflow, flood_control_outflow,
-        ),
-        reservoir_outflow,
-    )
-    reservoir_outflow = tl.clamp(
-        reservoir_outflow, 0.0, total_storage / time_step,
+    reservoir_outflow = reservoir_release_inline(
+        dam_volume, river_flood_storage, reservoir_inflow, time_step,
+        conservation_volume, emergency_volume, adjustment_volume,
+        normal_outflow, adjustment_outflow, flood_control_outflow,
     )
 
     tl.store(
@@ -356,15 +301,5 @@ def compute_reservoir_outflow_batched_kernel(
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
     tl.atomic_add(
         outgoing_storage_ptr + catchment_idx,
-        tl.maximum(reservoir_outflow, 0.0) * time_step,
-        mask=mask,
-    )
-    new_neg = tl.minimum(reservoir_outflow, 0.0)
-    tl.atomic_add(
-        outgoing_storage_ptr + downstream_idx,
-        tl.where(
-            ~is_river_mouth,
-            -(new_neg * time_step), 0.0,
-        ),
-        mask=mask,
+        reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask,
     )

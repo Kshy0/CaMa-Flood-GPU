@@ -588,36 +588,36 @@ def read_bifori(
     p_elv = p_elv[keep_mask]
     wth_all = wth_all[keep_mask]
 
-    # 2) dph from wth(1), clamped to [0.5, max(rivhgt(up), rivhgt(dn))]
-    w1 = wth_all[:, 0]
-    dph = np.full(w1.shape, -9999.0, dtype=np.float64)
+    # 2) dph from wth(1), clamped to [0.5, max(rivhgt(up), rivhgt(dn))].
+    p_elv = p_elv.astype(np.float32)
+    w1 = wth_all[:, 0].astype(np.float32)
+    dph = np.full(w1.shape, -9999.0, dtype=np.float32)
     pos = w1 > 0.0
     if np.any(pos):
-        dph_pos = np.log10(w1[pos]) * 2.5 - 4.0
-        dph_pos = np.maximum(dph_pos, 0.5)
+        dph_pos = np.log10(w1[pos]) * np.float32(2.5) - np.float32(4.0)
+        dph_pos = np.maximum(dph_pos, np.float32(0.5))
         if rivhgt_2d is not None:
             dph0 = np.maximum(rivhgt_2d[ix[pos], iy[pos]], rivhgt_2d[jx[pos], jy[pos]])
-            dph[pos] = np.minimum(dph_pos, dph0)
-        else:
-            dph[pos] = dph_pos
+            dph_pos = np.minimum(dph_pos, dph0.astype(np.float32))
+        dph[pos] = np.array([f"{value:.2f}" for value in dph_pos], dtype=np.float32)
 
     # 3) Truncate widths to keepN; force wth(1)=0 when w1<=0
     wth_keep = wth_all[:, :keepN].copy()
     wth_keep[~pos, 0] = 0.0
 
     # 4) Build elevation table
-    elv = np.full((wth_keep.shape[0], keepN), 1.0e20, dtype=np.float64)
+    elv = np.full((wth_keep.shape[0], keepN), 1.0e20, dtype=np.float32)
 
     # Level 0: pelv - dph when width>0
     w0_pos = wth_keep[:, 0] > 0.0
     if np.any(w0_pos):
         elv[w0_pos, 0] = p_elv[w0_pos] - dph[w0_pos]
 
-    # Levels 1..keepN-1: pelv + ilev - 1 when width>0
+    # Levels 1..keepN-1 (CaMa's ILEV = ilev + 1): (pelv + ILEV) - 2 when width>0
     for ilev in range(1, keepN):
         maskL = wth_keep[:, ilev] > 0.0
         if np.any(maskL):
-            elv[maskL, ilev] = p_elv[maskL] + (ilev - 1.0)
+            elv[maskL, ilev] = (p_elv[maskL] + np.float32(ilev + 1)) - np.float32(2.0)
 
     # Assemble upstream/downstream index pairs
     pth_upst = np.stack([ix, iy], axis=1).astype(np.int64)

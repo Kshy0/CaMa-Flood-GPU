@@ -6,6 +6,35 @@ struct FloodStageResult {
     float flood_fraction;
 };
 
+// CALC_STONXT; returns PSTOALL, the total storage the stage splits.
+// Runoff splits by the previous stage's flood fraction; prescribed inflow
+// (LUPSINF) joins the river part. Negative runoff may leave a negative total.
+static inline float update_storage_inline(
+    float river_storage, float flood_storage, float protected_storage,
+    float river_inflow, float flood_inflow, float river_outflow,
+    float flood_outflow, float bifurcation_outflow, float runoff,
+    float prescribed_inflow, float flood_fraction, float time_step
+) {
+    float river = river_storage + river_inflow * time_step
+        - river_outflow * time_step;
+    float flood = flood_storage;
+    if (river < 0.0f) {
+        flood += river;
+        river = 0.0f;
+    }
+    flood = flood + flood_inflow * time_step - flood_outflow * time_step
+        - bifurcation_outflow * time_step;
+    if (flood < 0.0f) {
+        river = max(river + flood, 0.0f);
+        flood = 0.0f;
+    }
+    float river_runoff = runoff * (1.0f - flood_fraction) * time_step
+        + prescribed_inflow * time_step;
+    river += river_runoff;
+    flood += runoff * flood_fraction * time_step;
+    return river + flood + protected_storage;
+}
+
 static inline FloodStageResult flood_stage_inline(
     float total_storage,
     float river_height,
@@ -13,15 +42,17 @@ static inline FloodStageResult flood_stage_inline(
     float river_width,
     float river_length,
     device const float* flood_depth_table,
-    int num_flood_levels
+    int num_flood_levels,
+    bool has_levee
 ) {
     FloodStageResult result;
     float maximum_river_storage =
         river_length * river_width * river_height;
-    if (total_storage <= maximum_river_storage) {
+    if (!(total_storage > maximum_river_storage)) {
         result.river_storage = total_storage;
         result.flood_storage = 0.0f;
-        result.river_depth = total_storage / (river_length * river_width);
+        result.river_depth =
+            max(total_storage / river_length / river_width, 0.0f);
         result.flood_depth = 0.0f;
         result.flood_fraction = 0.0f;
         return result;
@@ -77,14 +108,15 @@ static inline FloodStageResult flood_stage_inline(
             previous_flood_depth + width_difference * flood_gradient;
     }
 
-    result.river_storage = min(
-        maximum_river_storage
-            + river_length * river_width * result.flood_depth,
-        total_storage);
+    result.river_storage = maximum_river_storage
+        + river_length * river_width * result.flood_depth;
+    if (!has_levee) {
+        result.river_storage = min(result.river_storage, total_storage);
+    }
     result.flood_storage = max(
         total_storage - result.river_storage, 0.0f);
     result.river_depth =
-        result.river_storage / (river_length * river_width);
+        result.river_storage / river_length / river_width;
     float middle_fraction = clamp(
         (previous_total_width + width_difference - river_width)
             * river_length / catchment_area,
@@ -160,21 +192,10 @@ long num_catchments = *args.num_catchments;
         }
     }
 
-    float updated_river_storage = river_storage
-        + (river_inflow - river_outflow) * time_step;
-    float updated_flood_storage = flood_storage
-        + (updated_river_storage < 0.0f ? updated_river_storage : 0.0f)
-        + (flood_inflow - flood_outflow - bifurcation_outflow) * time_step;
-    updated_river_storage = max(updated_river_storage, 0.0f);
-    if (updated_flood_storage < 0.0f) {
-        updated_river_storage = max(
-            updated_river_storage + updated_flood_storage, 0.0f);
-    }
-    updated_flood_storage = max(updated_flood_storage, 0.0f);
-    float total_storage = max(
-        updated_river_storage + updated_flood_storage + protected_storage
-            + (runoff + prescribed_inflow) * time_step,
-        0.0f);
+    float total_storage = update_storage_inline(
+        river_storage, flood_storage, protected_storage, river_inflow,
+        flood_inflow, river_outflow, flood_outflow, bifurcation_outflow,
+        runoff, prescribed_inflow, args.flood_fraction_ptr[cell], time_step);
 
     long river_height_idx = batched_river_height ? cell : catchment;
     long catchment_area_idx = batched_catchment_area ? cell : catchment;
@@ -192,7 +213,7 @@ long num_catchments = *args.num_catchments;
         total_storage, river_height, catchment_area,
         river_width, river_length,
         args.flood_depth_table_ptr + table_cell_offset,
-        num_flood_levels);
+        num_flood_levels, HAS_LEVEE);
 
     args.outgoing_storage_ptr[cell] = 0.0f;
     args.river_storage_ptr[cell] = stage.river_storage;
@@ -206,7 +227,7 @@ long num_catchments = *args.num_catchments;
     args.river_depth_ptr[cell] = stage.river_depth;
     args.flood_depth_ptr[cell] = stage.flood_depth;
     if (HAS_LEVEE) {
-        args.protected_depth_ptr[cell] = stage.flood_depth;
+        args.protected_depth_ptr[cell] = 0.0f;
     }
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
 // HYDROFORGE METAL KERNEL BODY: compute_flood_stage_log
@@ -259,21 +280,11 @@ long num_catchments = *args.num_catchments;
         river_storage + flood_storage + protected_storage;
     log_storage_pre = storage_before * 1e-9f;
 
-    float updated_river_storage = river_storage
-        + (river_inflow - river_outflow) * time_step;
-    float updated_flood_storage = flood_storage
-        + (updated_river_storage < 0.0f ? updated_river_storage : 0.0f)
-        + (flood_inflow - flood_outflow - bifurcation_outflow) * time_step;
-    updated_river_storage = max(updated_river_storage, 0.0f);
-    if (updated_flood_storage < 0.0f) {
-        updated_river_storage = max(
-            updated_river_storage + updated_flood_storage, 0.0f);
-    }
-    updated_flood_storage = max(updated_flood_storage, 0.0f);
-    float storage_after_routing =
-        updated_river_storage + updated_flood_storage + protected_storage
-        + (runoff + prescribed_inflow) * time_step;
-    float total_storage = max(storage_after_routing, 0.0f);
+    float total_storage = update_storage_inline(
+        river_storage, flood_storage, protected_storage, river_inflow,
+        flood_inflow, river_outflow, flood_outflow, bifurcation_outflow,
+        runoff, prescribed_inflow, args.flood_fraction_ptr[cell], time_step);
+    float storage_after_routing = total_storage;
 
     log_storage_next = storage_after_routing * 1e-9f;
     log_storage_new = total_storage * 1e-9f;
@@ -294,7 +305,7 @@ long num_catchments = *args.num_catchments;
         total_storage, river_height, catchment_area,
         river_width, river_length,
         args.flood_depth_table_ptr + cell * (long)num_flood_levels,
-        num_flood_levels);
+        num_flood_levels, HAS_LEVEE);
 
     float stage_storage = stage.river_storage + stage.flood_storage;
     if (non_levee) {
@@ -317,7 +328,7 @@ long num_catchments = *args.num_catchments;
     args.river_depth_ptr[cell] = stage.river_depth;
     args.flood_depth_ptr[cell] = stage.flood_depth;
     if (HAS_LEVEE) {
-        args.protected_depth_ptr[cell] = stage.flood_depth;
+        args.protected_depth_ptr[cell] = 0.0f;
     }
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
 

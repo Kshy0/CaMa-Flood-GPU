@@ -24,6 +24,7 @@ def main() -> None:
 
     ### Configuration Start ###
     resolution = "glb_06min"
+    # Windows path example: runoff_dir = r"C:\Users\YourName\ERA5_Runoff"
     experiment_name = f"{resolution}_era5"
     input_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/parameters.nc"
     output_dir = "/home/eat/CaMa-Flood-GPU/out"

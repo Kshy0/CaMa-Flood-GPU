@@ -74,8 +74,7 @@ long num_catchments = *args.num_catchments;
         (water_surface - effective_downstream_surface) / downstream_distance;
     float flood_slope = clamp(river_slope, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
 
-    // The mouth boundary level controls slope, while CaMa-Flood uses the
-    // local river depth itself for the mouth's hydraulic cross-section.
+    // The mouth boundary controls slope; its cross-section uses local depth.
     float updated_river_xs = is_mouth
         ? river_depth : maximum_surface - river_elevation;
     float river_flow_depth =
@@ -116,13 +115,18 @@ long num_catchments = *args.num_catchments;
         updated_flood_outflow = flood_numerator / flood_denominator;
     }
 
-    if (updated_river_outflow * updated_flood_outflow < 0.0f) {
+    // Floodplain flow only moves with the river flow (rivout*fldout > 0).
+    if (!(updated_river_outflow * updated_flood_outflow > 0.0f)) {
         updated_flood_outflow = 0.0f;
     }
-    if (updated_river_outflow < 0.0f && !is_mouth) {
-        float negative_volume =
-            (-updated_river_outflow - updated_flood_outflow) * time_step;
-        float limit = min(CMF_BACKFLOW_STORAGE_FRACTION * total_storage / negative_volume, 1.0f);
+    // v4.23 storage-change limiter on every non-mouth cell: flow towards the
+    // upstream cell removes at most 5% of the storage per step.
+    if (!is_mouth) {
+        float backflow = max(
+            (-updated_river_outflow - updated_flood_outflow) * time_step,
+            CMF_OUTGOING_VOLUME_FLOOR);
+        float limit = min(
+            CMF_BACKFLOW_STORAGE_FRACTION * total_storage / backflow, 1.0f);
         updated_river_outflow *= limit;
         updated_flood_outflow *= limit;
     }
@@ -134,42 +138,46 @@ long num_catchments = *args.num_catchments;
             (catchment_elevation - downstream_elevation)
                 / downstream_distance,
             min_kinematic_slope);
-        float river_velocity = sqrt(bed_slope)
-            * pow(river_depth * river_depth, 1.0f / 3.0f) / river_manning;
-        updated_river_outflow = clamp(
-            river_width * river_depth * river_velocity,
-            0.0f, river_storage / time_step);
+        // CaMa bounds the kinematic flows by the storage only (MIN), so a
+        // negative storage (negative runoff) gives a negative flow.
+        float river_velocity = (1.0f / river_manning) * sqrt(bed_slope)
+            * pow(river_depth * river_depth, 1.0f / 3.0f);
+        updated_river_outflow = min(
+            river_width * river_depth * river_velocity, river_storage / time_step);
 
-        float flood_velocity = sqrt(min(bed_slope, CMF_ROUTING_SLOPE_LIMIT))
-            * pow(flood_depth * flood_depth, 1.0f / 3.0f) / flood_manning;
+        float flood_velocity = (1.0f / flood_manning)
+            * sqrt(min(bed_slope, CMF_ROUTING_SLOPE_LIMIT))
+            * pow(flood_depth * flood_depth, 1.0f / 3.0f);
         float flood_area = max(
             flood_storage / river_length - flood_depth * river_width, 0.0f);
-        updated_flood_outflow = clamp(
-            flood_area * flood_velocity, 0.0f, flood_storage / time_step);
+        updated_flood_outflow = min(
+            flood_area * flood_velocity, flood_storage / time_step);
     }
 
     args.river_outflow_ptr[cell] = updated_river_outflow;
     args.flood_outflow_ptr[cell] = updated_flood_outflow;
     args.river_cross_section_depth_ptr[cell] = updated_river_xs;
     args.flood_cross_section_depth_ptr[cell] = updated_flood_xs;
-    args.flood_cross_section_area_ptr[cell] = updated_flood_area;
+    // Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
+    args.flood_cross_section_area_ptr[cell] = max(flood_storage / river_length
+        - max(river_depth - river_height, 0.0f) * river_width, 0.0f);
     args.river_inflow_ptr[cell] = 0.0f;
     args.flood_inflow_ptr[cell] = 0.0f;
     if (HAS_BIFURCATION) {
         args.global_bifurcation_outflow_ptr[cell] = 0.0f;
     }
 
-    float positive_flow =
-        max(updated_river_outflow, 0.0f) + max(updated_flood_outflow, 0.0f);
-    float negative_flow =
-        min(updated_river_outflow, 0.0f) + min(updated_flood_outflow, 0.0f);
+    // P2STOOUT flows: the cell's own positive flows, and the flow reversed
+    // into its downstream cell; compute_inflow multiplies by the step.
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + cell,
-        positive_flow * time_step, memory_order_relaxed);
+        max(updated_river_outflow, 0.0f) + max(updated_flood_outflow, 0.0f),
+        memory_order_relaxed);
     if (!is_mouth) {
         atomic_fetch_add_explicit(
             args.outgoing_storage_ptr + downstream_cell,
-            -negative_flow * time_step, memory_order_relaxed);
+            max(-updated_river_outflow, 0.0f) + max(-updated_flood_outflow, 0.0f),
+            memory_order_relaxed);
     }
 
 // HYDROFORGE METAL KERNEL BODY: compute_inflow
@@ -184,29 +192,27 @@ long num_catchments = *args.num_catchments;
 
     float river_outflow = args.river_outflow_ptr[cell];
     float flood_outflow = args.flood_outflow_ptr[cell];
-    float outgoing_storage = args.outgoing_storage_ptr[cell];
+    // CaMa-Flood v4.23 supply-side limiter (CALC_INFLOW_LSPAMAT): a cell
+    // releases at most its storage.  The rate of the cell a flow leaves sets
+    // both of its flows, chosen by the river flow's direction.
+    float time_step = args.time_step_ptr[0];
     float available_storage =
         args.river_storage_ptr[cell] + args.flood_storage_ptr[cell];
-    float local_limit = outgoing_storage > 1e-8f
-        ? min(available_storage / outgoing_storage, 1.0f)
-        : 1.0f;
+    float local_limit = min(available_storage / max(
+        args.outgoing_storage_ptr[cell] * time_step, CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
 
     int downstream = args.downstream_idx_ptr[catchment];
     long downstream_cell = member_offset + (long)downstream;
-    float downstream_outgoing = args.outgoing_storage_ptr[downstream_cell];
     float downstream_available =
         args.river_storage_ptr[downstream_cell]
         + args.flood_storage_ptr[downstream_cell];
-    float downstream_limit = downstream_outgoing > 1e-8f
-        ? min(downstream_available / downstream_outgoing, 1.0f)
-        : 1.0f;
+    float downstream_limit = min(downstream_available / max(
+        args.outgoing_storage_ptr[downstream_cell] * time_step,
+        CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
 
-    float updated_river = river_outflow >= 0.0f
-        ? river_outflow * local_limit
-        : river_outflow * downstream_limit;
-    float updated_flood = flood_outflow >= 0.0f
-        ? flood_outflow * local_limit
-        : flood_outflow * downstream_limit;
+    float rate = river_outflow > 0.0f ? local_limit : downstream_limit;
+    float updated_river = river_outflow * rate;
+    float updated_flood = flood_outflow * rate;
 
     args.river_outflow_ptr[cell] = updated_river;
     args.flood_outflow_ptr[cell] = updated_flood;
