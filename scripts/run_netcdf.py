@@ -9,8 +9,10 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.data import InputProxy, setup_distributed
+from hydroforge.data import InputProxy
+from hydroforge.parallel import setup_distributed
 from hydroforge.data.datasets import NetCDFDataset
+from hydroforge.model import OutputConfig
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -80,19 +82,22 @@ def main() -> None:
 
     model = CaMaFlood(
         device=device,
-        experiment_name=experiment_name,
+        output=OutputConfig(
+            experiment=experiment_name,
+            dir=output_dir,
+            variables=variables_to_save,
+            workers=output_workers,
+            split_by_year=output_split_by_year,
+        ),
+        block_size=BLOCK_SIZE,
         input_proxy=input_proxy,
-        output_dir=output_dir,
         opened_modules=opened_modules,
-        variables_to_save=variables_to_save,
-        output_workers=output_workers,
-        BLOCK_SIZE=BLOCK_SIZE,
-        output_split_by_year=output_split_by_year,
         simulation_schedule=schedule,
     )
-    local_mapping = dataset.build_local_mapping(
-        mapping_file=runoff_mapping_file,
-        desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
+    model.materialize()
+    dataset, local_mapping = dataset.build_local_mapping(
+        runoff_mapping_file,
+        model.base.catchment_id.to("cpu").numpy(),
         device=device,
     )
 

@@ -2,9 +2,9 @@
 # Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 
-"""Runtime-compiled CUDA routes for CaMa-Flood.
+"""Runtime-compiled CUDA kernels for CaMa-Flood.
 
-Each route runs a ``__device__`` body per item of its spec's size key on the
+Each kernel runs a ``__device__`` body per item of its spec's size on the
 canonical values packed into one struct ``args``; HydroForge generates the
 ``__global__`` entry. Ensembles of more than one member run the body's
 ``*_members`` variant over ``blockIdx.y``. Each ``.cu`` file keeps its
@@ -13,26 +13,8 @@ single-member and ensemble bodies together.
 
 from pathlib import Path
 
-from hydroforge.kernels.backends.cuda import (
-    CudaExtensionGroup,
-    CudaExtensionSpec,
-    CudaKernel,
-    CudaRoute,
-)
+from hydroforge.kernels import CudaCall, CudaKernel, CudaSource
 from cmfgpu import config as constants
-from cmfgpu.phys.specs import (
-    ADAPTIVE_TIME,
-    BIFURCATION_INFLOW,
-    BIFURCATION_OUTFLOW,
-    FLOOD_STAGE,
-    FLOOD_STAGE_LOG,
-    INFLOW,
-    LEVEE_BIFURCATION_OUTFLOW,
-    LEVEE_STAGE,
-    LEVEE_STAGE_LOG,
-    OUTFLOW,
-    RESERVOIR_OUTFLOW,
-)
 
 PHYSICAL_CONSTANT_FLAGS = tuple(
     f"-DCMF_{name}={value!r}"
@@ -42,6 +24,17 @@ PHYSICAL_CONSTANT_FLAGS = tuple(
 _DIR = Path(__file__).resolve().parent
 # Routing keeps subnormal storages and fluxes, also under HydroForge fast math.
 _SUBNORMAL_OPTIONS = ("--ftz=false", *PHYSICAL_CONSTANT_FLAGS)
+_SOURCES = {
+    name: CudaSource(path=_DIR / f"{name}.cu", options=options, include_root=_DIR)
+    for name, options in (
+        ("storage", _SUBNORMAL_OPTIONS),
+        ("outflow", _SUBNORMAL_OPTIONS),
+        ("adaptive_time", PHYSICAL_CONSTANT_FLAGS),
+        ("bifurcation", _SUBNORMAL_OPTIONS),
+        ("reservoir", PHYSICAL_CONSTANT_FLAGS),
+        ("levee", _SUBNORMAL_OPTIONS),
+    )
+}
 _REAL_STO = "{river_depth_ptr}, {river_storage_ptr}"
 _FLOOD_STAGE = (
     _REAL_STO + ", {HAS_BIFURCATION}, {HAS_INFLOW}, {HAS_LEVEE}, "
@@ -49,19 +42,17 @@ _FLOOD_STAGE = (
 )
 
 
-def _route(extension, spec, body, templates, *, guard=True):
-    """Run ``body<templates>(args, index)``; with an ensemble axis, more than
-    one member runs ``body_members<templates>(args, index, member)``.
+def _kernel(source, body, templates, *, members=True, guard=True):
+    """Run ``body<templates>(args, index)``; with ``members``, more than one
+    ensemble member runs ``body_members<templates>(args, index, member)``.
 
     ``guard=False`` keeps out-of-range threads for bodies that check the index
     themselves, as block reductions must.
     """
-    members = "ensemble_size" in spec.parameters
-    return CudaRoute(
-        extension=extension,
-        spec=spec,
+    return CudaKernel(
+        _SOURCES[source],
         steps=(
-            CudaKernel(
+            CudaCall(
                 device=f"{body}<{templates}>",
                 batched=f"{body}_members<{templates}>" if members else None,
                 batch_axis="ensemble_size" if members else None,
@@ -73,69 +64,34 @@ def _route(extension, spec, body, templates, *, guard=True):
     )
 
 
-_CUDA = CudaExtensionGroup(
-    specs={
-        extension: CudaExtensionSpec(
-            source=_DIR / source, options=options, include_root=_DIR
-        )
-        for extension, source, options in (
-            ("storage", "storage.cu", _SUBNORMAL_OPTIONS),
-            ("outflow", "outflow.cu", _SUBNORMAL_OPTIONS),
-            ("adaptive", "adaptive_time.cu", PHYSICAL_CONSTANT_FLAGS),
-            ("bifurcation", "bifurcation.cu", _SUBNORMAL_OPTIONS),
-            ("reservoir", "reservoir.cu", PHYSICAL_CONSTANT_FLAGS),
-            ("levee", "levee.cu", _SUBNORMAL_OPTIONS),
-        )
-    },
-    routes=(
-        # The stage bodies check the index themselves for the LOG reduction.
-        _route("storage", FLOOD_STAGE, "flood_stage", _FLOOD_STAGE, guard=False),
-        _route(
-            "storage", FLOOD_STAGE_LOG, "flood_stage", _FLOOD_STAGE + ", true",
-            guard=False,
-        ),
-        _route(
-            "outflow", OUTFLOW, "outflow",
-            _REAL_STO + ", {HAS_BIFURCATION}, {HAS_LEVEE}, {HAS_RESERVOIR}, "
-            "{HAS_SEA_LEVEL}",
-        ),
-        _route(
-            "outflow", INFLOW, "inflow",
-            "{river_outflow_ptr}, {river_storage_ptr}, {HAS_BIFURCATION}, "
-            "{HAS_RESERVOIR}",
-        ),
-        _route(
-            "adaptive", ADAPTIVE_TIME, "adaptive_time",
-            "{river_depth_ptr}, {HAS_RESERVOIR}", guard=False,
-        ),
-        _route("bifurcation", BIFURCATION_OUTFLOW, "bif_outflow", _REAL_STO),
-        _route(
-            "bifurcation", BIFURCATION_INFLOW, "bif_inflow",
-            "{bifurcation_outflow_ptr}, {global_bifurcation_outflow_ptr}",
-        ),
-        _route(
-            "reservoir", RESERVOIR_OUTFLOW, "reservoir_outflow",
-            "{river_outflow_ptr}, {river_storage_ptr}, {HAS_LEVEE}",
-        ),
-        _route("levee", LEVEE_STAGE, "levee_stage", _REAL_STO, guard=False),
-        _route(
-            "levee", LEVEE_STAGE_LOG, "levee_stage", _REAL_STO + ", true", guard=False,
-        ),
-        _route(
-            "levee", LEVEE_BIFURCATION_OUTFLOW, "levee_bif_outflow", _REAL_STO,
-        ),
-    ),
+# The stage bodies check the index themselves for the LOG reduction.
+FLOOD_STAGE = _kernel("storage", "flood_stage", _FLOOD_STAGE, guard=False)
+FLOOD_STAGE_LOG = _kernel(
+    "storage", "flood_stage", _FLOOD_STAGE + ", true", members=False, guard=False
 )
-
-flood_stage = _CUDA.factory("storage", FLOOD_STAGE.name)
-flood_stage_log = _CUDA.factory("storage", FLOOD_STAGE_LOG.name)
-outflow = _CUDA.factory("outflow", OUTFLOW.name)
-inflow = _CUDA.factory("outflow", INFLOW.name)
-adaptive_time = _CUDA.factory("adaptive", ADAPTIVE_TIME.name)
-bifurcation_outflow = _CUDA.factory("bifurcation", BIFURCATION_OUTFLOW.name)
-bifurcation_inflow = _CUDA.factory("bifurcation", BIFURCATION_INFLOW.name)
-reservoir_outflow = _CUDA.factory("reservoir", RESERVOIR_OUTFLOW.name)
-levee_stage = _CUDA.factory("levee", LEVEE_STAGE.name)
-levee_stage_log = _CUDA.factory("levee", LEVEE_STAGE_LOG.name)
-levee_bifurcation_outflow = _CUDA.factory("levee", LEVEE_BIFURCATION_OUTFLOW.name)
+OUTFLOW = _kernel(
+    "outflow", "outflow",
+    _REAL_STO + ", {HAS_BIFURCATION}, {HAS_LEVEE}, {HAS_RESERVOIR}, {HAS_SEA_LEVEL}",
+)
+INFLOW = _kernel(
+    "outflow", "inflow",
+    "{river_outflow_ptr}, {river_storage_ptr}, {HAS_BIFURCATION}, {HAS_RESERVOIR}",
+)
+ADAPTIVE_TIME = _kernel(
+    "adaptive_time", "adaptive_time", "{river_depth_ptr}, {HAS_RESERVOIR}", guard=False
+)
+BIFURCATION_OUTFLOW = _kernel("bifurcation", "bif_outflow", _REAL_STO)
+BIFURCATION_INFLOW = _kernel(
+    "bifurcation", "bif_inflow",
+    "{bifurcation_outflow_ptr}, {global_bifurcation_outflow_ptr}",
+)
+RESERVOIR_OUTFLOW = _kernel(
+    "reservoir", "reservoir_outflow",
+    "{river_outflow_ptr}, {river_storage_ptr}, {HAS_LEVEE}",
+)
+LEVEE_STAGE = _kernel("levee", "levee_stage", _REAL_STO, guard=False)
+LEVEE_STAGE_LOG = _kernel(
+    "levee", "levee_stage", _REAL_STO + ", true", members=False, guard=False
+)
+LEVEE_BIFURCATION_OUTFLOW = _kernel("levee", "levee_bif_outflow", _REAL_STO)
 __all__ = []

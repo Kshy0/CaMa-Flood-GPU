@@ -9,8 +9,10 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.data import InputProxy, setup_distributed
+from hydroforge.data import InputProxy
+from hydroforge.parallel import setup_distributed
 from hydroforge.data.datasets import NetCDFDataset
+from hydroforge.model import OutputConfig
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -93,30 +95,29 @@ def main() -> None:
 
     model = CaMaFlood(
         device=device,
-        experiment_name=experiment_name,
+        output=OutputConfig(
+            experiment=experiment_name,
+            dir=output_dir,
+            workers=output_workers,
+            split_by_year=output_split_by_year,
+            variables={
+                "mean": ["total_outflow"],
+                "last": ["river_depth"],
+            },
+        ),
+        block_size=BLOCK_SIZE,
         input_proxy=input_proxy,
-        output_dir=output_dir,
         opened_modules=opened_modules,
-        output_workers=output_workers,
-        BLOCK_SIZE=BLOCK_SIZE,
-        output_split_by_year=output_split_by_year,
         simulation_schedule=schedule,
-        variables_to_save={
-            "mean": ["total_outflow"],
-            "last": ["river_depth"],
-        },
     )
+    model.materialize()
 
     desired_catchment_ids = model.base.catchment_id.to("cpu").numpy()
-    local_mapping0 = dataset0.build_local_mapping(
-        mapping_file=runoff_mapping_file,
-        desired_catchment_ids=desired_catchment_ids,
-        device=device,
+    dataset0, local_mapping0 = dataset0.build_local_mapping(
+        runoff_mapping_file, desired_catchment_ids, device=device
     )
-    dataset1.build_local_mapping(
-        mapping_file=runoff_mapping_file,
-        desired_catchment_ids=desired_catchment_ids,
-        device=device,
+    dataset1, _ = dataset1.build_local_mapping(
+        runoff_mapping_file, desired_catchment_ids, device=device
     )
     loader0 = DataLoader(
         dataset0,

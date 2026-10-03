@@ -66,9 +66,10 @@ class CaMaFlood(AbstractModel):
     partition_group: ClassVar[str] = "catchment_basin_id"
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {
         "cuda": BackendRequirement(),
+        "metal": BackendRequirement(default_mixed_precision=True),
     }
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {
-        "log": ModuleRequirement(ensemble=False),
+        "log": ModuleRequirement(ensemble=False, clock=True),
     }
 
     def initialize_model_state(self) -> None:
@@ -128,9 +129,10 @@ class CaMaFlood(AbstractModel):
         if adaptive_time is not None:
             adaptive_time.max_sub_steps.zero_()
             compute_adaptive_time_step()
-            if self.spatial_world_size > 1:
+            plan = self.plan
+            if plan.spatial_world_size > 1:
                 all_reduce_(adaptive_time.max_sub_steps, reduction="max")
-            if self.parallel is not None and self.parallel.ensemble_partitions > 1:
+            if plan.parallel is not None and plan.parallel.ensemble_partitions > 1:
                 all_reduce_(adaptive_time.max_sub_steps, reduction="max", scope="ensemble")
             fixed_substeps = step.fixed(
                 count=int(adaptive_time.max_sub_steps.item()),
@@ -181,9 +183,12 @@ class CaMaFlood(AbstractModel):
             self.base.current_step.fill_(fixed_count - 1)
 
         if log is not None:
-            if self.spatial_world_size > 1:
+            plan = self.plan
+            if plan.spatial_world_size > 1:
                 log.gather_results()
-            if self.spatial_rank == 0 and step.output_enabled:
-                log.write_step(self.log_path)
+            # Without an output directory the model writes no log file.
+            directory = plan.output.directory
+            if plan.spatial_rank == 0 and step.output_enabled and directory is not None:
+                log.write_step(directory / "log.txt")
             else:
                 log.clear_buffers()

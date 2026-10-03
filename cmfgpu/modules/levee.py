@@ -102,8 +102,8 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     levee_crown_height: torch.Tensor = LeveeField(
         description=(
-            "Levee crown height above river bed (m); a crown below the "
-            "levee base height is raised to it"
+            "Levee crown height above river bed; a crown below the "
+            "levee base height is raised to it (m)"
         ),
         category="param",
     )

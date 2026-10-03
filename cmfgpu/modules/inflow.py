@@ -98,7 +98,7 @@ class InflowModule(AbstractModule):
             if placement == "same":
                 expected = gauge_id
             else:
-                from hydroforge.data import find_indices_in_torch
+                from hydroforge.core import find_indices_in_torch
 
                 gauge_idx = find_indices_in_torch(gauge_id, self.base.catchment_id)
                 if torch.any(gauge_idx < 0):

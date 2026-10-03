@@ -25,7 +25,7 @@ from hydroforge.model import (
     computed_tensor_field,
     module_ref,
 )
-from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
+from pydantic import Field, PrivateAttr
 
 from cmfgpu.modules.base import BaseModule
 
@@ -67,20 +67,6 @@ class LogModule(AbstractModule):
     _current_time: datetime = PrivateAttr()
     _times: list[datetime] = PrivateAttr(default_factory=list)
     _log_initialized: bool = PrivateAttr(default=False)
-
-    @model_validator(mode="after")
-    def require_runtime_clock(self, info: ValidationInfo):
-        """Log rows require an absolute model clock."""
-
-        context = info.context or {}
-        if (
-            context.get("hydroforge_model_simulation_schedule") is None
-            and context.get("hydroforge_model_initial_time") is None
-        ):
-            raise ValueError(
-                "the log module requires simulation_schedule or initial_time"
-            )
-        return self
 
     # ------------------------------------------------------------------ #
     # Methods

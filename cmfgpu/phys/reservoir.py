@@ -4,35 +4,30 @@
 
 """Registered reservoir-outflow implementations."""
 
-from hydroforge.kernels import BackendRegistry
-from cmfgpu.phys.specs import RESERVOIR_OUTFLOW
-
-
-def _metal():
-    from cmfgpu.phys import metal
-    return metal.reservoir_outflow()
-
-
-def _cuda():
-    from cmfgpu.phys import cuda
-    return cuda.reservoir_outflow()
+from hydroforge.kernels import BackendRegistry, TritonKernel
+from cmfgpu.phys import cuda, metal
+from cmfgpu.phys.specs import (
+    METAL_RESERVOIR_OUTFLOW,
+    RESERVOIR_OUTFLOW,
+)
 
 
 def _triton():
-    from hydroforge.kernels import make_triton_dispatcher
-    from cmfgpu.phys.triton.reservoir import (
-        compute_reservoir_outflow_batched_kernel,
-        compute_reservoir_outflow_kernel,
-    )
-    return make_triton_dispatcher(
-        compute_reservoir_outflow_kernel,
-        batched_kernel=compute_reservoir_outflow_batched_kernel,
+    from cmfgpu.phys.triton import reservoir
+
+    return TritonKernel(
+        reservoir.compute_reservoir_outflow_kernel,
+        batched=reservoir.compute_reservoir_outflow_batched_kernel,
+        batch_axis="ensemble_size",
     )
 
 
-compute_reservoir_outflow_registry = BackendRegistry(
-    implementations={"metal": _metal, "cuda": _cuda, "triton": _triton},
-    name="compute_reservoir_outflow",
-    spec=RESERVOIR_OUTFLOW,
+compute_reservoir_outflow = BackendRegistry(
+    RESERVOIR_OUTFLOW,
+    {
+        "metal": metal.RESERVOIR_OUTFLOW,
+        "cuda": cuda.RESERVOIR_OUTFLOW,
+        "triton": _triton,
+    },
+    backend_specs={"metal": METAL_RESERVOIR_OUTFLOW},
 )
-compute_reservoir_outflow = compute_reservoir_outflow_registry.selected

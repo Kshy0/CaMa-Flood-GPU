@@ -4,7 +4,7 @@
 
 **Note:** This repository is under active development, and both the code structure and content are subject to significant changes at any time.
 
-**Runtime setup:** Install a GPU-enabled `torch` build for your platform and a compatible `triton` package when using the Triton backend. The model's GPU kernels compile when first used; no manual kernel build is needed. On macOS, the Metal backend uses PyTorch MPS and does not require Triton.
+**Runtime setup:** Install a GPU-enabled `torch` build for your platform and a compatible `triton` package when using the Triton backend. The model's GPU kernels compile when first used; no manual kernel build is needed. On macOS, the Metal backend uses PyTorch MPS and does not require Triton. 
 
 **Target Audience:** This project is intended for advanced users who are already familiar with the original CaMa-Flood model. Users are strongly advised to run the original [CaMa-Flood](https://github.com/global-hydrodynamics/CaMa-Flood_v4) first to understand the data structure, input specifications, and general workflow before attempting to use this GPU-accelerated version.
 
@@ -169,7 +169,7 @@ Regardless of this setting, the system always computes and reports GPU load assi
 
   `update_river_params.py` reads a **daily runoff climatology** (e.g., `ELSE_GPCC_dayclm-1981-2010.one`, a 365-day global climatology bundled with `cmf_v420_pkg`), accumulates discharge along the flow network, and applies power-law scaling with optional satellite-width fusion. This is the Python equivalent of `calc_outclm`, `calc_rivwth`, and `set_gwdlr` in the original Fortran coded.
 
-  You can also use your own runoff data to compute the climatology. The built-in dataset classes (`DailyBinDataset`, `NetCDFDataset`, `ERA5LandAccumDataset`, etc.) all provide an `export_climatology()` method that aggregates any time-series runoff into a catchment-level mean-annual climatology NetCDF, which can then be fed directly into `estimate_river_geometry()`.
+  You can also use your own runoff data to compute the climatology. `hydroforge.data.datasets.export_climatology()` aggregates the runoff of any built-in dataset class (`DailyBinDataset`, `NetCDFDataset`, `ERA5LandAccumDataset`, etc.), mapped with `build_local_mapping()`, into a catchment-level mean-annual climatology NetCDF, which can then be fed directly into `estimate_river_geometry()`.
 
   ```shell
   cd /path/to/CaMa-Flood-GPU
@@ -188,7 +188,7 @@ The [Hydroforge](https://github.com/Kshy0/hydroforge) dependency includes datase
   
   For convenience, we provide a script `scripts_user/make_runoff_map.py` to generate the mapping table using `DailyBinDataset`. You can modify it to use other dataset classes (like `NetCDFDataset` or `ERA5LandAccumDataset`) if needed.
 
-  These classes include built-in methods such as `generate_mapping_table()` to create the required mapping `.npz` file.
+  `hydroforge.data.datasets.generate_mapping_table()` creates the required mapping `.npz` file from any of these datasets.
   
   ```shell
   cd /path/to/CaMa-Flood-GPU

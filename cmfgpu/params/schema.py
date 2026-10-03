@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from hydroforge.contracts import ModuleFieldSchema, parse_module_schema
+from hydroforge.model import FieldSpec, module_schema
 
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
@@ -72,7 +72,7 @@ MAP_OPTIONAL_FIELD_DIMS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _is_parameter_field(field: ModuleFieldSchema) -> bool:
+def _is_parameter_field(field: FieldSpec) -> bool:
     # Optional selections configure output views rather than parameter data.
     # A required selection such as BaseModule.output_catchment_id is input data.
     if field.selects is not None and not field.required:
@@ -80,7 +80,7 @@ def _is_parameter_field(field: ModuleFieldSchema) -> bool:
     return field.output != "disabled" or field.required
 
 
-MODEL_SCHEMA = parse_module_schema(PARAMETER_MODULES)
+MODEL_SCHEMA = module_schema(PARAMETER_MODULES)
 MODULE_FIELD_DIMS = MODEL_SCHEMA.resolve_dimensions(
     MODEL_DIMENSIONS,
     include=_is_parameter_field,

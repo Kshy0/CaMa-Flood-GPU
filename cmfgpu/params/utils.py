@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from hydroforge.data import find_indices_in
+from hydroforge.core import find_indices_in
+from hydroforge.mapping import MappingTable
 from netCDF4 import Dataset
 from numba import njit
 
@@ -2228,24 +2229,17 @@ def visualize_runoff_mapping(
         print("matplotlib not available")
         return
 
-    from scipy.sparse import csr_matrix
-
     npz_path = Path(npz_path)
     parameter_nc = Path(parameter_nc)
 
     # --- Load mapping ---
-    d = np.load(npz_path)
-    mapping_cids = d["catchment_ids"]
-    shape = tuple(d["matrix_shape"])
-    coord_lon = d["coord_lon"]
-    coord_lat = d["coord_lat"]
+    mapping = MappingTable.load(npz_path)
+    mapping_cids = mapping.target_ids
+    coord_lon = mapping.source_x
+    coord_lat = mapping.source_y
     nlon = len(coord_lon)
     nlat = len(coord_lat)
-
-    mat = csr_matrix(
-        (d["sparse_data"], d["sparse_indices"], d["sparse_indptr"]),
-        shape=shape,
-    )
+    mat = mapping.matrix
 
     # --- Panel 1: Source grid mapped area ---
     col_sum = np.array(mat.sum(axis=0)).ravel()  # m²

@@ -4,54 +4,44 @@
 
 """Registered flood-stage implementations."""
 
-from hydroforge.kernels import BackendRegistry
-from cmfgpu.phys.specs import FLOOD_STAGE, FLOOD_STAGE_LOG
-
-
-def _metal_stage():
-    from cmfgpu.phys import metal
-    return metal.flood_stage()
-
-
-def _metal_log():
-    from cmfgpu.phys import metal
-    return metal.flood_stage_log()
-
-
-def _cuda_stage():
-    from cmfgpu.phys import cuda
-    return cuda.flood_stage()
-
-
-def _cuda_log():
-    from cmfgpu.phys import cuda
-    return cuda.flood_stage_log()
+from hydroforge.kernels import BackendRegistry, TritonKernel
+from cmfgpu.phys import cuda, metal
+from cmfgpu.phys.specs import (
+    FLOOD_STAGE,
+    FLOOD_STAGE_LOG,
+    METAL_FLOOD_STAGE,
+    METAL_FLOOD_STAGE_LOG,
+)
 
 
 def _triton_stage():
-    from hydroforge.kernels import make_triton_dispatcher
-    from cmfgpu.phys.triton.storage import (
-        compute_flood_stage_batched_kernel, compute_flood_stage_kernel,
-    )
-    return make_triton_dispatcher(
-        compute_flood_stage_kernel, batched_kernel=compute_flood_stage_batched_kernel,
-        batched_grid="loop",
+    from cmfgpu.phys.triton import storage
+
+    return TritonKernel(
+        storage.compute_flood_stage_kernel,
+        batched=storage.compute_flood_stage_batched_kernel,
+        batch_axis="ensemble_size",
+        batch_layout="loop",
     )
 
 
 def _triton_log():
-    from hydroforge.kernels import make_triton_dispatcher
     from cmfgpu.phys.triton.storage import compute_flood_stage_log_kernel
-    return make_triton_dispatcher(compute_flood_stage_log_kernel)
+
+    return TritonKernel(compute_flood_stage_log_kernel)
 
 
 compute_flood_stage = BackendRegistry(
-    implementations={"metal": _metal_stage, "cuda": _cuda_stage, "triton": _triton_stage},
-    name="compute_flood_stage",
-    spec=FLOOD_STAGE,
-).selected
+    FLOOD_STAGE,
+    {"metal": metal.FLOOD_STAGE, "cuda": cuda.FLOOD_STAGE, "triton": _triton_stage},
+    backend_specs={"metal": METAL_FLOOD_STAGE},
+)
 compute_flood_stage_log = BackendRegistry(
-    implementations={"metal": _metal_log, "cuda": _cuda_log, "triton": _triton_log},
-    name="compute_flood_stage_log",
-    spec=FLOOD_STAGE_LOG,
-).selected
+    FLOOD_STAGE_LOG,
+    {
+        "metal": metal.FLOOD_STAGE_LOG,
+        "cuda": cuda.FLOOD_STAGE_LOG,
+        "triton": _triton_log,
+    },
+    backend_specs={"metal": METAL_FLOOD_STAGE_LOG},
+)

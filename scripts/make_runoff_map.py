@@ -9,8 +9,9 @@ Script to generate runoff mapping tables for input datasets.
 """
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from hydroforge.data.datasets import DailyBinDataset
+from hydroforge.data.datasets import DailyBinDataset, generate_mapping_table
 
 
 def main():
@@ -40,11 +41,7 @@ def main():
         model_step=timedelta(days=1),
     )
 
-    dataset.generate_mapping_table(
-        map_dir=map_dir,
-        out_dir=out_dir,
-        npz_file="runoff_mapping_bin.npz",
-    )
+    generate_mapping_table(dataset, map_dir, Path(out_dir) / "runoff_mapping_bin.npz")
 
 
 if __name__ == "__main__":
@@ -61,8 +58,8 @@ if __name__ == "__main__":
 #     var_name="Runoff",
 #     chunk_len=24,
 # )
-# dataset.generate_mapping_table(
-#     map_dir=f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
-#     out_dir=f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}",
-#     npz_file="runoff_mapping_nc.npz",
+# generate_mapping_table(
+#     dataset,
+#     f"/home/eat/cmf_v420_pkg/map/{map_resolution}",
+#     f"/home/eat/CaMa-Flood-GPU/inp/{map_resolution}/runoff_mapping_nc.npz",
 # )

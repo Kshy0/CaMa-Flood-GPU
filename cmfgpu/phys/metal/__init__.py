@@ -1,15 +1,12 @@
-"""Lazy native Metal implementation catalog for CaMa-Flood.
+"""Metal kernels of CaMa-Flood.
 
-Only shader/source strategy lives here.  Public ABI metadata is inherited from
-the active BackendRegistry when a factory returned by :func:`route` is called.
+Each kernel's body is selected from its ``.metal`` source by the spec name;
+HydroForge generates the argument buffer and entry from the spec.
 """
 
 from pathlib import Path
 
-from hydroforge.kernels import (
-    make_spec_metal_dispatcher,
-    registry_factory,
-)
+from hydroforge.kernels import MetalKernel
 
 from cmfgpu import config as constants
 
@@ -21,58 +18,24 @@ PHYSICAL_CONSTANT_SOURCE = "".join(
 _DIR = Path(__file__).parent
 
 
-def _template(filename: str, *, parallel_axes: tuple[str, ...] = ()):
-    """Generate the complete Metal ABI from the active KernelSpec."""
+def _kernel(filename: str, *, members: bool = True) -> MetalKernel:
+    """``members`` runs one thread per catchment and ensemble member."""
 
-    @registry_factory
-    def factory():
-        return make_spec_metal_dispatcher(
-            source=PHYSICAL_CONSTANT_SOURCE + (_DIR / filename).read_text(),
-            parallel_axes=parallel_axes,
-        )
-
-    return factory
+    return MetalKernel(
+        _DIR / filename,
+        prelude=PHYSICAL_CONSTANT_SOURCE + "\n#ifdef HF_HP_ENABLED\nusing cmf_storage = hf_hp;\n#else\nusing cmf_storage = float;\n#endif\n",
+        batch_axis="ensemble_size" if members else None,
+    )
 
 
-outflow = _template(
-    "outflow.metal",
-    parallel_axes=("ensemble_size",),
-)
-inflow = _template(
-    "outflow.metal",
-    parallel_axes=("ensemble_size",),
-)
-flood_stage = _template(
-    "storage.metal",
-    parallel_axes=("ensemble_size",),
-)
-flood_stage_log = _template(
-    "storage.metal",
-)
-adaptive_time = _template(
-    "adaptive_time.metal",
-    parallel_axes=("ensemble_size",),
-)
-bifurcation_outflow = _template(
-    "bifurcation.metal",
-    parallel_axes=("ensemble_size",),
-)
-bifurcation_inflow = _template(
-    "bifurcation.metal",
-    parallel_axes=("ensemble_size",),
-)
-reservoir_outflow = _template(
-    "reservoir.metal",
-    parallel_axes=("ensemble_size",),
-)
-levee_stage = _template(
-    "levee.metal",
-    parallel_axes=("ensemble_size",),
-)
-levee_stage_log = _template(
-    "levee.metal",
-)
-levee_bifurcation_outflow = _template(
-    "levee.metal",
-    parallel_axes=("ensemble_size",),
-)
+OUTFLOW = _kernel("outflow.metal")
+INFLOW = _kernel("outflow.metal")
+FLOOD_STAGE = _kernel("storage.metal")
+FLOOD_STAGE_LOG = _kernel("storage.metal", members=False)
+ADAPTIVE_TIME = _kernel("adaptive_time.metal")
+BIFURCATION_OUTFLOW = _kernel("bifurcation.metal")
+BIFURCATION_INFLOW = _kernel("bifurcation.metal")
+RESERVOIR_OUTFLOW = _kernel("reservoir.metal")
+LEVEE_STAGE = _kernel("levee.metal")
+LEVEE_STAGE_LOG = _kernel("levee.metal", members=False)
+LEVEE_BIFURCATION_OUTFLOW = _kernel("levee.metal")

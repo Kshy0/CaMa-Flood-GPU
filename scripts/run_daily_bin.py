@@ -9,8 +9,10 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-from hydroforge.data import InputProxy, setup_distributed
+from hydroforge.data import InputProxy
+from hydroforge.parallel import setup_distributed
 from hydroforge.data.datasets import DailyBinDataset
+from hydroforge.model import OutputConfig
 from torch.utils.data import DataLoader
 
 from cmfgpu.models import CaMaFlood
@@ -84,54 +86,59 @@ def main() -> None:
     )
     schedule = dataset.simulation_schedule
 
+    # Construction validates and compiles the declaration without I/O.
     model = CaMaFlood(
         device=device,
-        experiment_name=experiment_name,
+        output=OutputConfig(
+            experiment=experiment_name,
+            dir=output_dir,
+            variables=variables_to_save,
+            workers=output_workers,
+            split_by_year=output_split_by_year,
+        ),
+        block_size=BLOCK_SIZE,
         input_proxy=input_proxy,
-        output_dir=output_dir,
         opened_modules=opened_modules,
-        variables_to_save=variables_to_save,
-        output_workers=output_workers,
-        BLOCK_SIZE=BLOCK_SIZE,
-        output_split_by_year=output_split_by_year,
         simulation_schedule=schedule,
     )
-    local_mapping = dataset.build_local_mapping(
-        mapping_file=runoff_mapping_file,
-        desired_catchment_ids=model.base.catchment_id.to("cpu").numpy(),
-        device=device,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=None,
-        shuffle=False,
-        num_workers=loader_workers,
-        pin_memory=device.type == "cuda",
-        prefetch_factor=prefetch_factor if loader_workers > 0 else None,
-    )
+    # Entering materializes (collective): read and shard inputs, build modules,
+    # start output writers. Leaving closes the model, also when a step fails.
+    with model:
+        dataset, local_mapping = dataset.build_local_mapping(
+            runoff_mapping_file,
+            model.base.catchment_id.to("cpu").numpy(),
+            device=device,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=loader_workers,
+            pin_memory=device.type == "cuda",
+            prefetch_factor=prefetch_factor if loader_workers > 0 else None,
+        )
 
-    stream_ctx = (
-        torch.cuda.stream(torch.cuda.Stream(device=device))
-        if device.type == "cuda"
-        else nullcontext()
-    )
-    for runoff_chunk in loader:
-        with stream_ctx:
-            runoff_chunk = dataset.shard_forcing(
-                runoff_chunk.to(
-                    device,
-                    non_blocking=device.type == "cuda",
-                ),
-                local_mapping,
-            )
-            for runoff in runoff_chunk:
-                model.set_inputs(runoff=runoff)
-                model.step_advance(
-                    num_sub_steps=num_sub_steps,
+        stream_ctx = (
+            torch.cuda.stream(torch.cuda.Stream(device=device))
+            if device.type == "cuda"
+            else nullcontext()
+        )
+        for runoff_chunk in loader:
+            with stream_ctx:
+                runoff_chunk = dataset.shard_forcing(
+                    runoff_chunk.to(
+                        device,
+                        non_blocking=device.type == "cuda",
+                    ),
+                    local_mapping,
                 )
-    if save_state:
-        model.save_state()
-    model.close()
+                for runoff in runoff_chunk:
+                    model.set_inputs(runoff=runoff)
+                    model.step_advance(
+                        num_sub_steps=num_sub_steps,
+                    )
+        if save_state:
+            model.save_state()
     if world_size > 1:
         dist.destroy_process_group()
 

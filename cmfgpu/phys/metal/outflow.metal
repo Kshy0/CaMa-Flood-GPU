@@ -1,3 +1,42 @@
+#ifdef HF_HP_ENABLED
+inline cmf_storage outgoing_demand_inline(long cell, long member, long n, int paths, bool has_bifurcation,
+    device const int* routing_edge_start_ptr,
+    device const int* routing_edge_source_ptr,
+    device const int* bifurcation_catchment_start_ptr,
+    device const int* bifurcation_catchment_path_ptr,
+    device const int* bifurcation_downstream_start_ptr,
+    device const int* bifurcation_downstream_path_ptr,
+    device const float* bifurcation_path_flow_ptr,
+    device const float* unlimited_outflow_ptr) {
+    long offset = member * n;
+    cmf_storage outgoing = cmf_storage(max(unlimited_outflow_ptr[2 * (offset + cell)], 0.0f)
+        + max(unlimited_outflow_ptr[2 * (offset + cell) + 1], 0.0f));
+    int end = cell + 1 < n ? routing_edge_start_ptr[cell + 1] : int(n);
+    for (int edge = routing_edge_start_ptr[cell]; edge < end; ++edge) {
+        int source = routing_edge_source_ptr[edge];
+        if (source == int(cell)) continue;
+        outgoing = outgoing + cmf_storage(max(-unlimited_outflow_ptr[2 * (offset + source)], 0.0f))
+            + cmf_storage(max(-unlimited_outflow_ptr[2 * (offset + source) + 1], 0.0f));
+    }
+    if (has_bifurcation) {
+
+        long path_offset = member * paths;
+        int last = cell + 1 < n ? bifurcation_catchment_start_ptr[cell + 1] : paths;
+        for (int edge = bifurcation_catchment_start_ptr[cell]; edge < last; ++edge) {
+            int path = bifurcation_catchment_path_ptr[edge];
+            outgoing = outgoing + cmf_storage(max(bifurcation_path_flow_ptr[path_offset + path], 0.0f));
+        }
+        last = cell + 1 < n ? bifurcation_downstream_start_ptr[cell + 1] : paths;
+        for (int edge = bifurcation_downstream_start_ptr[cell]; edge < last; ++edge) {
+            int path = bifurcation_downstream_path_ptr[edge];
+            outgoing = outgoing + cmf_storage(-min(bifurcation_path_flow_ptr[path_offset + path], 0.0f));
+        }
+    }
+    return outgoing;
+
+}
+#endif
+
 // HYDROFORGE METAL KERNEL BODY: compute_outflow
 long num_catchments = *args.num_catchments;
     long ensemble_size = *args.ensemble_size;
@@ -47,7 +86,8 @@ long num_catchments = *args.num_catchments;
 
     float river_elevation = catchment_elevation - river_height;
     float water_surface = river_depth + river_elevation;
-    float total_storage = river_storage + flood_storage + protected_storage;
+    float total_storage = float(args.river_storage_ptr[cell] + args.flood_storage_ptr[cell]
+        + (HAS_LEVEE ? args.protected_storage_ptr[cell] : cmf_storage(0.0f)));
 
     long downstream_height_idx = batched_river_height
         ? downstream_cell : (long)downstream;
@@ -156,6 +196,10 @@ long num_catchments = *args.num_catchments;
 
     args.river_outflow_ptr[cell] = updated_river_outflow;
     args.flood_outflow_ptr[cell] = updated_flood_outflow;
+#ifdef HF_HP_ENABLED
+    args.unlimited_outflow_ptr[2 * cell] = updated_river_outflow;
+    args.unlimited_outflow_ptr[2 * cell + 1] = updated_flood_outflow;
+#endif
     args.river_cross_section_depth_ptr[cell] = updated_river_xs;
     args.flood_cross_section_depth_ptr[cell] = updated_flood_xs;
     // Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
@@ -169,6 +213,7 @@ long num_catchments = *args.num_catchments;
 
     // P2STOOUT flows: the cell's own positive flows, and the flow reversed
     // into its downstream cell; compute_inflow multiplies by the step.
+#ifndef HF_HP_ENABLED
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + cell,
         max(updated_river_outflow, 0.0f) + max(updated_flood_outflow, 0.0f),
@@ -179,6 +224,8 @@ long num_catchments = *args.num_catchments;
             max(-updated_river_outflow, 0.0f) + max(-updated_flood_outflow, 0.0f),
             memory_order_relaxed);
     }
+
+#endif
 
 // HYDROFORGE METAL KERNEL BODY: compute_inflow
 long num_catchments = *args.num_catchments;
@@ -196,18 +243,51 @@ long num_catchments = *args.num_catchments;
     // releases at most its storage.  The rate of the cell a flow leaves sets
     // both of its flows, chosen by the river flow's direction.
     float time_step = args.time_step_ptr[0];
-    float available_storage =
-        args.river_storage_ptr[cell] + args.flood_storage_ptr[cell];
-    float local_limit = min(available_storage / max(
-        args.outgoing_storage_ptr[cell] * time_step, CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
-
     int downstream = args.downstream_idx_ptr[catchment];
     long downstream_cell = member_offset + (long)downstream;
-    float downstream_available =
+#ifdef HF_HP_ENABLED
+    // Both demands use the preceding dispatch's immutable flow snapshot.
+    cmf_storage local_outgoing = outgoing_demand_inline(
+        catchment, (long)i / num_catchments, num_catchments,
+        int(*args.num_bifurcation_paths), HAS_BIFURCATION,
+        args.routing_edge_start_ptr,
+        args.routing_edge_source_ptr,
+        args.bifurcation_catchment_start_ptr,
+        args.bifurcation_catchment_path_ptr,
+        args.bifurcation_downstream_start_ptr,
+        args.bifurcation_downstream_path_ptr,
+        args.bifurcation_path_flow_ptr,
+        args.unlimited_outflow_ptr);
+    // Forward flow uses only the local rate. Mouths reuse their own demand.
+    cmf_storage downstream_outgoing = local_outgoing;
+    if (river_outflow <= 0.0f && downstream != (int)catchment) {
+        downstream_outgoing = outgoing_demand_inline(
+            downstream, (long)i / num_catchments, num_catchments,
+            int(*args.num_bifurcation_paths), HAS_BIFURCATION,
+            args.routing_edge_start_ptr,
+            args.routing_edge_source_ptr,
+            args.bifurcation_catchment_start_ptr,
+            args.bifurcation_catchment_path_ptr,
+            args.bifurcation_downstream_start_ptr,
+            args.bifurcation_downstream_path_ptr,
+            args.bifurcation_path_flow_ptr,
+            args.unlimited_outflow_ptr);
+    }
+    args.outgoing_storage_ptr[cell] = local_outgoing;
+#else
+    cmf_storage local_outgoing = args.outgoing_storage_ptr[cell];
+    cmf_storage downstream_outgoing = args.outgoing_storage_ptr[downstream_cell];
+#endif
+    cmf_storage available_storage =
+        args.river_storage_ptr[cell] + args.flood_storage_ptr[cell];
+    float local_limit = min(float(available_storage) / max(
+        float(local_outgoing * cmf_storage(time_step)), CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
+
+    cmf_storage downstream_available =
         args.river_storage_ptr[downstream_cell]
         + args.flood_storage_ptr[downstream_cell];
-    float downstream_limit = min(downstream_available / max(
-        args.outgoing_storage_ptr[downstream_cell] * time_step,
+    float downstream_limit = min(float(downstream_available) / max(
+        float(downstream_outgoing * cmf_storage(time_step)),
         CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
 
     float rate = river_outflow > 0.0f ? local_limit : downstream_limit;
@@ -220,6 +300,7 @@ long num_catchments = *args.num_catchments;
         args.limit_rate_ptr[cell] = local_limit;
     }
 
+#ifndef HF_HP_ENABLED
     if (downstream != (int)catchment) {
         atomic_fetch_add_explicit(
             args.river_inflow_ptr + downstream_cell,
@@ -233,3 +314,5 @@ long num_catchments = *args.num_catchments;
                 updated_river + updated_flood, memory_order_relaxed);
         }
     }
+
+#endif

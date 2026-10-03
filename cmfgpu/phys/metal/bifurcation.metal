@@ -36,26 +36,51 @@ static inline BifurcationLevelResult bifurcation_level_inline(
     return result;
 }
 
-// HYDROFORGE METAL KERNEL BODY: compute_bifurcation_outflow
-long num_paths = *args.num_bifurcation_paths;
-    long ensemble_size = *args.ensemble_size;
+
+static inline float bifurcation_outflow_inline(uint i,
+    device const int* bifurcation_catchment_idx_ptr,
+    device const int* bifurcation_downstream_idx_ptr,
+    device const float* bifurcation_manning_ptr,
+    device float* bifurcation_outflow_ptr,
+    device const float* bifurcation_width_ptr,
+    device const float* bifurcation_length_ptr,
+    device const float* bifurcation_elevation_ptr,
+    device float* bifurcation_cross_section_depth_ptr,
+    device const float* river_depth_ptr,
+    device const float* river_height_ptr,
+    device const float* catchment_elevation_ptr,
+    device const cmf_storage* river_storage_ptr,
+    device const cmf_storage* flood_storage_ptr,
+    float gravity,
+    device const float* time_step_ptr,
+    long num_bifurcation_paths,
+    int num_bifurcation_levels,
+    long ensemble_size,
+    long num_catchments,
+    bool batched_bifurcation_manning,
+    bool batched_bifurcation_width,
+    bool batched_bifurcation_length,
+    bool batched_bifurcation_elevation,
+    bool batched_river_height,
+    bool batched_catchment_elevation) {
+long num_paths = num_bifurcation_paths;
     long total = num_paths * ensemble_size;
-    if ((long)i >= total) return;
+
 
     long path = (long)i % num_paths;
     long member = (long)i / num_paths;
     long path_offset = member * num_paths;
-    long catchment_offset = member * *args.num_catchments;
+    long catchment_offset = member * num_catchments;
     long level_offset = path_offset * (long)num_bifurcation_levels;
     long path_level = path * (long)num_bifurcation_levels;
 
-    int catchment = args.bifurcation_catchment_idx_ptr[path];
-    int downstream = args.bifurcation_downstream_idx_ptr[path];
+    int catchment = bifurcation_catchment_idx_ptr[path];
+    int downstream = bifurcation_downstream_idx_ptr[path];
     long catchment_cell = catchment_offset + catchment;
     long downstream_cell = catchment_offset + downstream;
     long length_idx = batched_bifurcation_length
         ? path_offset + path : path;
-    float length = args.bifurcation_length_ptr[length_idx];
+    float length = bifurcation_length_ptr[length_idx];
     long catchment_height_idx = batched_river_height
         ? catchment_cell : (long)catchment;
     long downstream_height_idx = batched_river_height
@@ -65,17 +90,16 @@ long num_paths = *args.num_bifurcation_paths;
     long downstream_elevation_idx = batched_catchment_elevation
         ? downstream_cell : (long)downstream;
     // D2SFCELV = D2RIVDPH + D2RIVELV, with D2RIVELV = D2ELEVTN - D2RIVHGT.
-    float water_surface = args.river_depth_ptr[catchment_cell]
-        + (args.catchment_elevation_ptr[catchment_elevation_idx]
-           - args.river_height_ptr[catchment_height_idx]);
-    float downstream_surface = args.river_depth_ptr[downstream_cell]
-        + (args.catchment_elevation_ptr[downstream_elevation_idx]
-           - args.river_height_ptr[downstream_height_idx]);
+    float water_surface = river_depth_ptr[catchment_cell]
+        + (catchment_elevation_ptr[catchment_elevation_idx]
+           - river_height_ptr[catchment_height_idx]);
+    float downstream_surface = river_depth_ptr[downstream_cell]
+        + (catchment_elevation_ptr[downstream_elevation_idx]
+           - river_height_ptr[downstream_height_idx]);
     float maximum_surface = max(water_surface, downstream_surface);
     float slope = clamp(
         (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
-    float gravity = *args.gravity;
-    float time_step = args.time_step_ptr[0];
+    float time_step = time_step_ptr[0];
 
     long manning_offset = batched_bifurcation_manning ? level_offset : 0;
     long width_offset = batched_bifurcation_width ? level_offset : 0;
@@ -85,24 +109,24 @@ long num_paths = *args.num_bifurcation_paths;
         long local_level = path_level + level;
         long state_level = level_offset + local_level;
         BifurcationLevelResult result = bifurcation_level_inline(
-            args.bifurcation_outflow_ptr[state_level],
-            args.bifurcation_cross_section_depth_ptr[state_level],
+            bifurcation_outflow_ptr[state_level],
+            bifurcation_cross_section_depth_ptr[state_level],
             maximum_surface,
-            args.bifurcation_elevation_ptr[elevation_offset + local_level],
-            args.bifurcation_width_ptr[width_offset + local_level],
-            args.bifurcation_manning_ptr[manning_offset + local_level],
+            bifurcation_elevation_ptr[elevation_offset + local_level],
+            bifurcation_width_ptr[width_offset + local_level],
+            bifurcation_manning_ptr[manning_offset + local_level],
             slope, gravity, time_step, true);
-        args.bifurcation_cross_section_depth_ptr[state_level] =
+        bifurcation_cross_section_depth_ptr[state_level] =
             result.cross_section_depth;
-        args.bifurcation_outflow_ptr[state_level] = result.outflow;
+        bifurcation_outflow_ptr[state_level] = result.outflow;
         total_outflow += result.outflow;
     }
 
-    float available_storage = min(
-        args.river_storage_ptr[catchment_cell]
-            + args.flood_storage_ptr[catchment_cell],
-        args.river_storage_ptr[downstream_cell]
-            + args.flood_storage_ptr[downstream_cell]);
+    float available_storage = float(min(
+        river_storage_ptr[catchment_cell]
+            + flood_storage_ptr[catchment_cell],
+        river_storage_ptr[downstream_cell]
+            + flood_storage_ptr[downstream_cell]));
     // v4.23 storage-change limiter; a path whose levels sum to zero is left as is.
     float limit = total_outflow != 0.0f
         ? min(CMF_BACKFLOW_STORAGE_FRACTION * available_storage
@@ -111,52 +135,107 @@ long num_paths = *args.num_bifurcation_paths;
     total_outflow *= limit;
     for (int level = 0; level < num_bifurcation_levels; ++level) {
         long state_level = level_offset + path_level + level;
-        args.bifurcation_outflow_ptr[state_level] *= limit;
+        bifurcation_outflow_ptr[state_level] *= limit;
     }
 
-    // P2STOOUT flows, multiplied by the step in compute_inflow.
-    atomic_fetch_add_explicit(
-        args.outgoing_storage_ptr + catchment_cell,
-        max(total_outflow, 0.0f), memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.outgoing_storage_ptr + downstream_cell,
-        -min(total_outflow, 0.0f), memory_order_relaxed);
 
-// HYDROFORGE METAL KERNEL BODY: compute_bifurcation_inflow
-long num_paths = *args.num_bifurcation_paths;
-    long ensemble_size = *args.ensemble_size;
+    return total_outflow;
+}
+
+static inline float bifurcation_inflow_inline(uint i,
+    device const int* bifurcation_catchment_idx_ptr,
+    device const int* bifurcation_downstream_idx_ptr,
+    device const float* limit_rate_ptr,
+    device float* bifurcation_outflow_ptr,
+    long num_bifurcation_paths,
+    int num_bifurcation_levels,
+    long ensemble_size,
+    long num_catchments) {
+long num_paths = num_bifurcation_paths;
     long total = num_paths * ensemble_size;
-    if ((long)i >= total) return;
+
 
     long path = (long)i % num_paths;
     long member = (long)i / num_paths;
-    long catchment_offset = member * *args.num_catchments;
+    long catchment_offset = member * num_catchments;
     long level_offset =
         member * num_paths * (long)num_bifurcation_levels;
 
-    int catchment = args.bifurcation_catchment_idx_ptr[path];
-    int downstream = args.bifurcation_downstream_idx_ptr[path];
+    int catchment = bifurcation_catchment_idx_ptr[path];
+    int downstream = bifurcation_downstream_idx_ptr[path];
     float local_limit =
-        args.limit_rate_ptr[catchment_offset + (long)catchment];
+        limit_rate_ptr[catchment_offset + (long)catchment];
     float downstream_limit =
-        args.limit_rate_ptr[catchment_offset + (long)downstream];
+        limit_rate_ptr[catchment_offset + (long)downstream];
     float raw_sum = 0.0f;
 
     for (int level = 0; level < num_bifurcation_levels; ++level) {
         long item = path * (long)num_bifurcation_levels + level;
-        float outflow = args.bifurcation_outflow_ptr[level_offset + item];
+        float outflow = bifurcation_outflow_ptr[level_offset + item];
         raw_sum += outflow;
         outflow *= outflow >= 0.0f ? local_limit : downstream_limit;
-        args.bifurcation_outflow_ptr[level_offset + item] = outflow;
+        bifurcation_outflow_ptr[level_offset + item] = outflow;
     }
 
     float net = raw_sum >= 0.0f
         ? raw_sum * local_limit : raw_sum * downstream_limit;
-    atomic_fetch_add_explicit(
-        args.global_bifurcation_outflow_ptr
-            + catchment_offset + (long)catchment,
-        net, memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.global_bifurcation_outflow_ptr
-            + catchment_offset + (long)downstream,
-        -net, memory_order_relaxed);
+
+    return net;
+}
+
+// HYDROFORGE METAL KERNEL BODY: compute_bifurcation_outflow
+if ((long)i >= *args.num_bifurcation_paths * *args.ensemble_size) return;
+float flow = bifurcation_outflow_inline(i,
+    args.bifurcation_catchment_idx_ptr,
+    args.bifurcation_downstream_idx_ptr,
+    args.bifurcation_manning_ptr,
+    args.bifurcation_outflow_ptr,
+    args.bifurcation_width_ptr,
+    args.bifurcation_length_ptr,
+    args.bifurcation_elevation_ptr,
+    args.bifurcation_cross_section_depth_ptr,
+    args.river_depth_ptr,
+    args.river_height_ptr,
+    args.catchment_elevation_ptr,
+    args.river_storage_ptr,
+    args.flood_storage_ptr,
+    *args.gravity,
+    args.time_step_ptr,
+    *args.num_bifurcation_paths,
+    num_bifurcation_levels,
+    *args.ensemble_size,
+    *args.num_catchments,
+    batched_bifurcation_manning,
+    batched_bifurcation_width,
+    batched_bifurcation_length,
+    batched_bifurcation_elevation,
+    batched_river_height,
+    batched_catchment_elevation);
+#ifdef HF_HP_ENABLED
+args.bifurcation_path_flow_ptr[i] = flow;
+#else
+long path = (long)i % *args.num_bifurcation_paths;
+long offset = ((long)i / *args.num_bifurcation_paths) * *args.num_catchments;
+atomic_fetch_add_explicit(args.outgoing_storage_ptr + offset + args.bifurcation_catchment_idx_ptr[path], max(flow, 0.0f), memory_order_relaxed);
+atomic_fetch_add_explicit(args.outgoing_storage_ptr + offset + args.bifurcation_downstream_idx_ptr[path], -min(flow, 0.0f), memory_order_relaxed);
+#endif
+
+// HYDROFORGE METAL KERNEL BODY: compute_bifurcation_inflow
+if ((long)i >= *args.num_bifurcation_paths * *args.ensemble_size) return;
+float flow = bifurcation_inflow_inline(i,
+    args.bifurcation_catchment_idx_ptr,
+    args.bifurcation_downstream_idx_ptr,
+    args.limit_rate_ptr,
+    args.bifurcation_outflow_ptr,
+    *args.num_bifurcation_paths,
+    num_bifurcation_levels,
+    *args.ensemble_size,
+    *args.num_catchments);
+#ifdef HF_HP_ENABLED
+args.bifurcation_path_flow_ptr[i] = flow;
+#else
+long path = (long)i % *args.num_bifurcation_paths;
+long offset = ((long)i / *args.num_bifurcation_paths) * *args.num_catchments;
+atomic_fetch_add_explicit(args.global_bifurcation_outflow_ptr + offset + args.bifurcation_catchment_idx_ptr[path], flow, memory_order_relaxed);
+atomic_fetch_add_explicit(args.global_bifurcation_outflow_ptr + offset + args.bifurcation_downstream_idx_ptr[path], -flow, memory_order_relaxed);
+#endif

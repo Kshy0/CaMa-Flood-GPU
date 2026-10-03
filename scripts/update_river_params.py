@@ -21,7 +21,11 @@ import os
 from datetime import datetime, timedelta
 
 import numpy as np
-from hydroforge.data.datasets import DailyBinDataset
+from hydroforge.data.datasets import (
+    DailyBinDataset,
+    export_climatology,
+    generate_mapping_table,
+)
 from netCDF4 import Dataset
 
 from cmfgpu.params import estimate_river_geometry
@@ -72,30 +76,19 @@ def main():
     )
 
     if not os.path.exists(runoff_mapping_file):
-        mapping_out_dir = os.path.dirname(runoff_mapping_file)
-        mapping_npz_file = os.path.basename(runoff_mapping_file)
-        os.makedirs(mapping_out_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(runoff_mapping_file), exist_ok=True)
         print(f"runoff mapping not found, generating: {runoff_mapping_file}")
-        dataset.generate_mapping_table(
-            map_dir=map_dir,
-            out_dir=mapping_out_dir,
-            npz_file=mapping_npz_file,
-        )
+        generate_mapping_table(dataset, map_dir, runoff_mapping_file)
 
-    local_mapping = dataset.build_local_mapping(
-        mapping_file=runoff_mapping_file,
-        desired_catchment_ids=catchment_ids,
-        device="cpu",
+    dataset, local_mapping = dataset.build_local_mapping(
+        runoff_mapping_file, catchment_ids, device="cpu"
     )
 
     # ------------------------------------------------------------------
     # 3. Export runoff climatology
     # ------------------------------------------------------------------
-    dataset.export_climatology(
-        local_mapping=local_mapping,
-        out_path=climatology_nc,
-        var_name="runoff_clm",
-        device="cpu",
+    export_climatology(
+        dataset, local_mapping, climatology_nc, var_name="runoff_clm", device="cpu"
     )
 
     # ------------------------------------------------------------------

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
-from hydroforge.data import binread, read_map
+from hydroforge.io import binread, read_map
 from pydantic import (
     BaseModel,
     ConfigDict,

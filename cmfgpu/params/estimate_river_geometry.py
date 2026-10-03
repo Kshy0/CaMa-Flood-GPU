@@ -20,7 +20,7 @@ to downstream along the river network.
 **Workflow**:
 
 1. Read catchment-level mean runoff from a climatology NetCDF produced by
-   :meth:`AbstractDataset.export_runoff_climatology`.
+   :func:`hydroforge.data.datasets.export_climatology`.
 2. Read the river network (``catchment_id``, ``downstream_id``) from
    :class:`MERITMap`'s ``parameters.nc``.
 3. Accumulate local runoff from upstream to downstream to obtain mean
@@ -32,7 +32,7 @@ to downstream along the river network.
 
 **Unit convention**:
 
-The ``export_runoff_climatology`` output stores the area-weighted sum of
+The ``export_climatology`` output stores the area-weighted sum of
 runoff per catchment.  The stored units depend on the dataset's
 ``unit_factor``:
 
@@ -64,7 +64,7 @@ from pathlib import Path
 
 import numba
 import numpy as np
-from hydroforge.data import find_indices_in
+from hydroforge.core import find_indices_in
 from netCDF4 import Dataset
 
 from cmfgpu.params.utils import compute_init_river_depth
@@ -311,7 +311,7 @@ def accumulate_discharge(
     Parameters
     ----------
     climatology_nc : path
-        NetCDF produced by ``AbstractDataset.export_runoff_climatology``.
+        NetCDF produced by ``hydroforge.data.datasets.export_climatology``.
         Must contain ``catchment_id`` and the variable *clm_var*.
     parameter_nc : path
         ``parameters.nc`` produced by :class:`MERITMap`.  Must contain
@@ -492,7 +492,7 @@ def estimate_river_geometry(
     Parameters
     ----------
     climatology_nc : path
-        NetCDF produced by ``AbstractDataset.export_runoff_climatology``.
+        NetCDF produced by ``hydroforge.data.datasets.export_climatology``.
         Must contain ``catchment_id`` and the variable *clm_var*.
     parameter_nc : path
         ``parameters.nc`` produced by :class:`MERITMap`.  Must contain

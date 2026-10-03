@@ -1,7 +1,7 @@
 struct LeveeStageResult {
-    float river_storage;
-    float flood_storage;
-    float protected_storage;
+    cmf_storage river_storage;
+    cmf_storage flood_storage;
+    cmf_storage protected_storage;
     float river_depth;
     float flood_depth;
     float protected_depth;
@@ -9,8 +9,8 @@ struct LeveeStageResult {
 };
 
 static inline LeveeStageResult levee_stage_inline(
-    float river_storage,
-    float flood_storage,
+    cmf_storage river_storage,
+    cmf_storage flood_storage,
     float river_depth,
     float flood_depth,
     float flood_fraction,
@@ -38,7 +38,8 @@ static inline LeveeStageResult levee_stage_inline(
     result.protected_depth = 0.0f;
     result.flood_fraction = flood_fraction;
 
-    float total_storage = river_storage + flood_storage;
+    cmf_storage total_storage_hp = river_storage + flood_storage;
+    float total_storage = float(total_storage_hp);
     // Case 0, water only in the river channel: the default stage stands.
     if (!(total_storage > maximum_river_storage)) return result;
 
@@ -114,10 +115,10 @@ static inline LeveeStageResult levee_stage_inline(
                 / (levee_distance + river_width) / river_length;
         result.river_storage = maximum_river_storage
             + river_length * river_width * result.flood_depth;
-        result.river_depth = result.river_storage
+        result.river_depth = float(result.river_storage)
             / river_length / river_width;
         result.flood_storage = max(
-            total_storage - result.river_storage, 0.0f);
+            total_storage_hp - result.river_storage, cmf_storage(0.0f));
         result.flood_fraction = levee_fraction;
     } else if (total_storage < levee_fill_storage) {
         // Case 3, river side at the crown, protected side filling.
@@ -143,13 +144,13 @@ static inline LeveeStageResult levee_stage_inline(
         result.flood_depth = levee_crown_height;
         result.river_storage = maximum_river_storage
             + river_length * river_width * result.flood_depth;
-        result.river_depth = result.river_storage
+        result.river_depth = float(result.river_storage)
             / river_length / river_width;
         result.flood_storage = max(
-            top_storage - result.river_storage, 0.0f);
+            cmf_storage(top_storage) - result.river_storage, cmf_storage(0.0f));
         result.protected_storage = max(
-            total_storage - result.river_storage - result.flood_storage,
-            0.0f);
+            total_storage_hp - result.river_storage - result.flood_storage,
+            cmf_storage(0.0f));
     } else {
         // Case 4, above the crown: the default river stage stands, with the
         // unclamped default-stage flood fraction.
@@ -167,9 +168,9 @@ static inline LeveeStageResult levee_stage_inline(
         float added_storage = (flood_depth - levee_crown_height)
             * (levee_distance + river_width) * river_length;
         result.flood_storage = max(
-            top_storage + added_storage - river_storage, 0.0f);
+            cmf_storage(top_storage + added_storage) - river_storage, cmf_storage(0.0f));
         result.protected_storage = max(
-            total_storage - river_storage - result.flood_storage, 0.0f);
+            total_storage_hp - river_storage - result.flood_storage, cmf_storage(0.0f));
         result.protected_depth = flood_depth;
     }
     return result;
@@ -242,6 +243,134 @@ static inline void cmf_block_atomic_add(
     }
     // Ensure the reduction is consumed before the caller reuses ``scratch``.
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline float levee_bifurcation_outflow_inline(
+    uint i,
+    device const int* bifurcation_catchment_idx_ptr,
+    device const int* bifurcation_downstream_idx_ptr,
+    device const float* bifurcation_manning_ptr,
+    device float* bifurcation_outflow_ptr,
+    device const float* bifurcation_width_ptr,
+    device const float* bifurcation_length_ptr,
+    device const float* bifurcation_elevation_ptr,
+    device float* bifurcation_cross_section_depth_ptr,
+    device const float* river_depth_ptr,
+    device const float* protected_depth_ptr,
+    device const float* river_height_ptr,
+    device const float* catchment_elevation_ptr,
+    device const uchar* is_levee_ptr,
+    device const cmf_storage* river_storage_ptr,
+    device const cmf_storage* flood_storage_ptr,
+    device const cmf_storage* protected_storage_ptr,
+    float gravity,
+    device const float* time_step_ptr,
+    long num_bifurcation_paths,
+    int num_bifurcation_levels,
+    long ensemble_size,
+    long num_catchments,
+    bool batched_bifurcation_manning,
+    bool batched_bifurcation_width,
+    bool batched_bifurcation_length,
+    bool batched_bifurcation_elevation,
+    bool batched_river_height,
+    bool batched_catchment_elevation
+) {
+    long num_paths = num_bifurcation_paths;
+    long total = num_paths * ensemble_size;
+    if ((long)i >= total) return 0.0f;
+
+    long path = (long)i % num_paths;
+    long member = (long)i / num_paths;
+    long path_offset = member * num_paths;
+    long catchment_offset = member * num_catchments;
+    long level_offset = path_offset * (long)num_bifurcation_levels;
+    long path_level = path * (long)num_bifurcation_levels;
+
+    int catchment = bifurcation_catchment_idx_ptr[path];
+    int downstream = bifurcation_downstream_idx_ptr[path];
+    long catchment_cell = catchment_offset + catchment;
+    long downstream_cell = catchment_offset + downstream;
+    long length_idx = batched_bifurcation_length
+        ? path_offset + path : path;
+    float length = bifurcation_length_ptr[length_idx];
+    long catchment_height_idx = batched_river_height
+        ? catchment_cell : (long)catchment;
+    long downstream_height_idx = batched_river_height
+        ? downstream_cell : (long)downstream;
+    long catchment_elevation_idx = batched_catchment_elevation
+        ? catchment_cell : (long)catchment;
+    long downstream_elevation_idx = batched_catchment_elevation
+        ? downstream_cell : (long)downstream;
+    float catchment_elevation =
+        catchment_elevation_ptr[catchment_elevation_idx];
+    float downstream_elevation =
+        catchment_elevation_ptr[downstream_elevation_idx];
+    // D2SFCELV = D2RIVELV + D2RIVDPH with D2RIVELV = D2ELEVTN - D2RIVHGT.
+    float water_surface = river_depth_ptr[catchment_cell]
+        + (catchment_elevation - river_height_ptr[catchment_height_idx]);
+    float downstream_surface = river_depth_ptr[downstream_cell]
+        + (downstream_elevation
+            - river_height_ptr[downstream_height_idx]);
+    float protected_surface = is_levee_ptr[catchment]
+        ? min(
+            catchment_elevation + protected_depth_ptr[catchment_cell],
+            water_surface)
+        : water_surface;
+    float downstream_protected_surface = is_levee_ptr[downstream]
+        ? min(
+            downstream_elevation + protected_depth_ptr[downstream_cell],
+            downstream_surface)
+        : downstream_surface;
+    float maximum_river_surface = max(water_surface, downstream_surface);
+    float maximum_protected_surface = max(
+        protected_surface, downstream_protected_surface);
+    float slope = clamp(
+        (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
+    float time_step = time_step_ptr[0];
+
+    long manning_offset = batched_bifurcation_manning ? level_offset : 0;
+    long width_offset = batched_bifurcation_width ? level_offset : 0;
+    long elevation_offset = batched_bifurcation_elevation ? level_offset : 0;
+    float total_outflow = 0.0f;
+    for (int level = 0; level < num_bifurcation_levels; ++level) {
+        long local_level = path_level + level;
+        long state_level = level_offset + local_level;
+        BifurcationLevelResult result = bifurcation_level_inline(
+            bifurcation_outflow_ptr[state_level],
+            bifurcation_cross_section_depth_ptr[state_level],
+            level == 0 ? maximum_river_surface : maximum_protected_surface,
+            bifurcation_elevation_ptr[elevation_offset + local_level],
+            bifurcation_width_ptr[width_offset + local_level],
+            bifurcation_manning_ptr[manning_offset + local_level],
+            slope, gravity, time_step, level == 0);
+        bifurcation_cross_section_depth_ptr[state_level] =
+            result.cross_section_depth;
+        bifurcation_outflow_ptr[state_level] = result.outflow;
+        total_outflow += result.outflow;
+    }
+
+    float available_storage = min(
+        river_storage_ptr[catchment_cell]
+            + flood_storage_ptr[catchment_cell]
+            + protected_storage_ptr[catchment_cell],
+        river_storage_ptr[downstream_cell]
+            + flood_storage_ptr[downstream_cell]
+            + protected_storage_ptr[downstream_cell]);
+    // CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
+    float limit = 1.0f;
+    if (total_outflow != 0.0f) {
+        limit = min(
+            CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
+            1.0f);
+    }
+    total_outflow *= limit;
+    for (int level = 0; level < num_bifurcation_levels; ++level) {
+        long state_level = level_offset + path_level + level;
+        bifurcation_outflow_ptr[state_level] *= limit;
+    }
+
+    return total_outflow;
 }
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_stage
@@ -322,7 +451,7 @@ long num_levees = *args.num_levees;
 
     long levee = (long)i;
     int catchment = args.levee_catchment_idx_ptr[levee];
-    float total_storage = args.river_storage_ptr[catchment]
+    cmf_storage total_storage = args.river_storage_ptr[catchment]
         + args.flood_storage_ptr[catchment];
     float catchment_area = args.catchment_area_ptr[catchment];
     LeveeStageResult result = levee_stage_inline(
@@ -346,13 +475,13 @@ long num_levees = *args.num_levees;
         args.levee_fill_storage_ptr[levee],
         args.levee_layer_top_storage_ptr[levee]);
 
-    float stage_storage = result.river_storage
+    cmf_storage stage_storage = result.river_storage
         + result.flood_storage + result.protected_storage;
-    log_storage_stage = stage_storage * 1e-9f;
-    log_river_storage = result.river_storage * 1e-9f;
-    log_flood_storage = result.flood_storage * 1e-9f;
+    log_storage_stage = float(stage_storage) * 1e-9f;
+    log_river_storage = float(result.river_storage) * 1e-9f;
+    log_flood_storage = float(result.flood_storage) * 1e-9f;
     log_flood_area = result.flood_fraction * catchment_area * 1e-9f;
-    log_stage_error = (stage_storage - total_storage) * 1e-9f;
+    log_stage_error = float(stage_storage - total_storage) * 1e-9f;
 
     args.river_storage_ptr[catchment] = result.river_storage;
     args.flood_storage_ptr[catchment] = result.flood_storage;
@@ -379,102 +508,44 @@ long num_levees = *args.num_levees;
         args.total_stage_error_sum_ptr + current_step);
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_bifurcation_outflow
-long num_paths = *args.num_bifurcation_paths;
-    long ensemble_size = *args.ensemble_size;
-    long total = num_paths * ensemble_size;
-    if ((long)i >= total) return;
-
-    long path = (long)i % num_paths;
-    long member = (long)i / num_paths;
-    long path_offset = member * num_paths;
-    long catchment_offset = member * *args.num_catchments;
-    long level_offset = path_offset * (long)num_bifurcation_levels;
-    long path_level = path * (long)num_bifurcation_levels;
-
-    int catchment = args.bifurcation_catchment_idx_ptr[path];
-    int downstream = args.bifurcation_downstream_idx_ptr[path];
-    long catchment_cell = catchment_offset + catchment;
-    long downstream_cell = catchment_offset + downstream;
-    long length_idx = batched_bifurcation_length
-        ? path_offset + path : path;
-    float length = args.bifurcation_length_ptr[length_idx];
-    long catchment_height_idx = batched_river_height
-        ? catchment_cell : (long)catchment;
-    long downstream_height_idx = batched_river_height
-        ? downstream_cell : (long)downstream;
-    long catchment_elevation_idx = batched_catchment_elevation
-        ? catchment_cell : (long)catchment;
-    long downstream_elevation_idx = batched_catchment_elevation
-        ? downstream_cell : (long)downstream;
-    float catchment_elevation =
-        args.catchment_elevation_ptr[catchment_elevation_idx];
-    float downstream_elevation =
-        args.catchment_elevation_ptr[downstream_elevation_idx];
-    // D2SFCELV = D2RIVELV + D2RIVDPH with D2RIVELV = D2ELEVTN - D2RIVHGT.
-    float water_surface = args.river_depth_ptr[catchment_cell]
-        + (catchment_elevation - args.river_height_ptr[catchment_height_idx]);
-    float downstream_surface = args.river_depth_ptr[downstream_cell]
-        + (downstream_elevation
-            - args.river_height_ptr[downstream_height_idx]);
-    float protected_surface = args.is_levee_ptr[catchment]
-        ? min(
-            catchment_elevation + args.protected_depth_ptr[catchment_cell],
-            water_surface)
-        : water_surface;
-    float downstream_protected_surface = args.is_levee_ptr[downstream]
-        ? min(
-            downstream_elevation + args.protected_depth_ptr[downstream_cell],
-            downstream_surface)
-        : downstream_surface;
-    float maximum_river_surface = max(water_surface, downstream_surface);
-    float maximum_protected_surface = max(
-        protected_surface, downstream_protected_surface);
-    float slope = clamp(
-        (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
-    float gravity = *args.gravity;
-    float time_step = args.time_step_ptr[0];
-
-    long manning_offset = batched_bifurcation_manning ? level_offset : 0;
-    long width_offset = batched_bifurcation_width ? level_offset : 0;
-    long elevation_offset = batched_bifurcation_elevation ? level_offset : 0;
-    float total_outflow = 0.0f;
-    for (int level = 0; level < num_bifurcation_levels; ++level) {
-        long local_level = path_level + level;
-        long state_level = level_offset + local_level;
-        BifurcationLevelResult result = bifurcation_level_inline(
-            args.bifurcation_outflow_ptr[state_level],
-            args.bifurcation_cross_section_depth_ptr[state_level],
-            level == 0 ? maximum_river_surface : maximum_protected_surface,
-            args.bifurcation_elevation_ptr[elevation_offset + local_level],
-            args.bifurcation_width_ptr[width_offset + local_level],
-            args.bifurcation_manning_ptr[manning_offset + local_level],
-            slope, gravity, time_step, level == 0);
-        args.bifurcation_cross_section_depth_ptr[state_level] =
-            result.cross_section_depth;
-        args.bifurcation_outflow_ptr[state_level] = result.outflow;
-        total_outflow += result.outflow;
-    }
-
-    float available_storage = min(
-        args.river_storage_ptr[catchment_cell]
-            + args.flood_storage_ptr[catchment_cell]
-            + args.protected_storage_ptr[catchment_cell],
-        args.river_storage_ptr[downstream_cell]
-            + args.flood_storage_ptr[downstream_cell]
-            + args.protected_storage_ptr[downstream_cell]);
-    // CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
-    float limit = 1.0f;
-    if (total_outflow != 0.0f) {
-        limit = min(
-            CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
-            1.0f);
-    }
-    total_outflow *= limit;
-    for (int level = 0; level < num_bifurcation_levels; ++level) {
-        long state_level = level_offset + path_level + level;
-        args.bifurcation_outflow_ptr[state_level] *= limit;
-    }
-
+    if ((long)i >= *args.num_bifurcation_paths * *args.ensemble_size) return;
+    float total_outflow = levee_bifurcation_outflow_inline(
+        i,
+        args.bifurcation_catchment_idx_ptr,
+        args.bifurcation_downstream_idx_ptr,
+        args.bifurcation_manning_ptr,
+        args.bifurcation_outflow_ptr,
+        args.bifurcation_width_ptr,
+        args.bifurcation_length_ptr,
+        args.bifurcation_elevation_ptr,
+        args.bifurcation_cross_section_depth_ptr,
+        args.river_depth_ptr,
+        args.protected_depth_ptr,
+        args.river_height_ptr,
+        args.catchment_elevation_ptr,
+        args.is_levee_ptr,
+        args.river_storage_ptr,
+        args.flood_storage_ptr,
+        args.protected_storage_ptr,
+        *args.gravity,
+        args.time_step_ptr,
+        *args.num_bifurcation_paths,
+        num_bifurcation_levels,
+        *args.ensemble_size,
+        *args.num_catchments,
+        batched_bifurcation_manning,
+        batched_bifurcation_width,
+        batched_bifurcation_length,
+        batched_bifurcation_elevation,
+        batched_river_height,
+        batched_catchment_elevation);
+#ifdef HF_HP_ENABLED
+    args.bifurcation_path_flow_ptr[i] = total_outflow;
+#else
+    long path = (long)i % *args.num_bifurcation_paths;
+    long catchment_offset = ((long)i / *args.num_bifurcation_paths) * *args.num_catchments;
+    long catchment_cell = catchment_offset + args.bifurcation_catchment_idx_ptr[path];
+    long downstream_cell = catchment_offset + args.bifurcation_downstream_idx_ptr[path];
     // P2STOOUT flows, multiplied by the step in compute_inflow.
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + catchment_cell,
@@ -482,3 +553,4 @@ long num_paths = *args.num_bifurcation_paths;
     atomic_fetch_add_explicit(
         args.outgoing_storage_ptr + downstream_cell,
         -min(total_outflow, 0.0f), memory_order_relaxed);
+#endif

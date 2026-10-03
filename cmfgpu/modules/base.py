@@ -396,6 +396,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Current sub-step time step. Updated via.fill_() before each sub-step loop (s)",
         shape=(1,),
+        dim_coords=None,
         output="disabled",
         category="shared_state",
     )
@@ -406,6 +407,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Current outer time-step duration (s)",
         shape=(1,),
+        dim_coords=None,
         output="disabled",
         category="shared_state",
     )
@@ -416,6 +418,7 @@ class BaseModule(AbstractModule):
     @computed_base_field(
         description="Current sub-step index within the time step. Updated via.fill_() before each sub-step for log kernels",
         shape=(1,),
+        dim_coords=None,
         output="disabled",
         category="shared_state",
         dtype="idx",
