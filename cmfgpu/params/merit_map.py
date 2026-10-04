@@ -239,7 +239,11 @@ class MERITMap(BaseModel):
 
         del nextxy_data  # release memory map
 
-        # Trace to river mouths
+        # Negative nextxy mouth sentinels were normalized to -1 above.
+        # Validate the raw graph before outlet tracing: positive-index
+        # self-loops and multi-node cycles are invalid raw-map inputs.
+        topological_sort(catchment_id, downstream_id)
+        # Keep the tracer's bounded traversal as a runtime safety net too.
         river_mouth_id = trace_outlets(catchment_id, downstream_id)
 
         # Store results

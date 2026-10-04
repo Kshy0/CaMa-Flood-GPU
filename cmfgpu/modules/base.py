@@ -432,6 +432,8 @@ class BaseModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
     def validate_parameters(self) -> Self:
+        if self.num_flood_levels < 1:
+            raise ValueError("flood_depth_table must contain at least one flood level")
         strictly_positive = {
             "river_width": self.river_width,
             "river_length": self.river_length,

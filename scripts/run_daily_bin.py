@@ -85,6 +85,8 @@ def main() -> None:
         lon_0_to_360=lon_0_to_360,
     )
     schedule = dataset.simulation_schedule
+    # DataLoader returns source rows; it does not repeat them for short model steps.
+    reuse_count = dataset.time_interval // dataset.model_step
 
     # Construction validates and compiles the declaration without I/O.
     model = CaMaFlood(
@@ -134,9 +136,10 @@ def main() -> None:
                 )
                 for runoff in runoff_chunk:
                     model.set_inputs(runoff=runoff)
-                    model.step_advance(
-                        num_sub_steps=num_sub_steps,
-                    )
+                    for _ in range(reuse_count):
+                        model.step_advance(
+                            num_sub_steps=num_sub_steps,
+                        )
         if save_state:
             model.save_state()
     if world_size > 1:

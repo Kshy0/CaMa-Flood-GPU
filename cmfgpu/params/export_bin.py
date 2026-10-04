@@ -59,6 +59,8 @@ import numpy as np
 from netCDF4 import Dataset
 from scipy.sparse import csr_matrix
 
+from cmfgpu.params.utils import _require_unmasked_array
+
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
@@ -712,9 +714,30 @@ def export_map_params(
         # --- Core 1-D catchment arrays ---
         catchment_id = ds.variables["catchment_id"][:].astype(np.int64)
         downstream_id = ds.variables["downstream_id"][:].astype(np.int64)
-        catchment_x = ds.variables["catchment_x"][:].astype(np.int64)
-        catchment_y = ds.variables["catchment_y"][:].astype(np.int64)
+        catchment_x = _require_unmasked_array(
+            ds.variables["catchment_x"][:], name="catchment_x"
+        )
+        catchment_y = _require_unmasked_array(
+            ds.variables["catchment_y"][:], name="catchment_y"
+        )
         n_catch = len(catchment_id)
+        if n_catch == 0:
+            raise ValueError("Binary export requires at least one catchment")
+        if (catchment_x.shape != (n_catch,) or catchment_y.shape != (n_catch,)
+                or catchment_x.dtype.kind not in "iu"
+                or catchment_y.dtype.kind not in "iu"):
+            raise ValueError("catchment_x/y must be aligned integer vectors")
+        if (np.any(catchment_x < 0) or np.any(catchment_x >= full_nx)
+                or np.any(catchment_y < 0) or np.any(catchment_y >= full_ny)):
+            raise ValueError("Catchment coordinates are outside the raster")
+        coordinates = np.column_stack((catchment_x, catchment_y))
+        if np.unique(coordinates, axis=0).shape[0] != n_catch:
+            raise ValueError(
+                "Binary raster cannot preserve duplicate catchment coordinates "
+                "(for example independent ghost nodes); use the graph NetCDF"
+            )
+        catchment_x = catchment_x.astype(np.int64)
+        catchment_y = catchment_y.astype(np.int64)
 
         # Flood levels
         flood_depth_table = ds.variables["flood_depth_table"][:]

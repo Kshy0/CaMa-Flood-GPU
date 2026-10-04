@@ -17,6 +17,13 @@ Example: estimate dam / reservoir parameters from aggregated outflow statistics.
 2. Run a naturalized (no-dam) CaMa-Flood simulation with the aggregator
    configured to save yearly max and mean of ``total_outflow``::
 
+       from hydroforge.contracts import CalendarWindow, StatisticsPlan
+       statistics_plan = StatisticsPlan(
+           inner=CalendarWindow(period="day"),
+           outer=CalendarWindow(period="year"),
+           partial_period="drop",
+       )
+       # Pass statistics_plan to OutputConfig, not only variables_to_save.
        variables_to_save = {
            "max_mean": ["total_outflow"],
            "mean_mean": ["total_outflow"],
@@ -59,6 +66,10 @@ def main():
     # Aggregator output NC from naturalized simulation
     # (must contain total_outflow_max_mean and total_outflow_mean_mean)
     outflow_stats_nc = base_dir / "out" / "glb_15min_dam_natural_nc"
+
+    # Keep actual window/sampling records alongside this output; annual labels
+    # alone cannot prove full-year coverage. See the ecosystem cookbook's
+    # cmf-annual-input-contract section.
 
     # Output paths
     output_csv = base_dir / "output" / "dam_params.csv"

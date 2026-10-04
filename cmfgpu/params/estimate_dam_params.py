@@ -57,6 +57,8 @@ from pathlib import Path
 import numba
 import numpy as np
 from hydroforge.core import find_indices_in
+from hydroforge.io import MultiRankStatsReader
+from hydroforge.io.netcdf.encoding import read_netcdf_values
 from netCDF4 import Dataset
 
 # ---------------------------------------------------------------------------
@@ -271,24 +273,27 @@ def _load_dam_list_csv(dam_list_path: Path) -> dict:
             if not row or not row[0].strip():
                 continue
             try:
-                ids.append(int(row[ids_col]))
-                lats.append(float(row[lats_col]))
-                lons.append(float(row[lons_col]))
-                upareas.append(
-                    float(row[col["upareas"]]) if col["upareas"] is not None else -999.0
-                )
-                names.append(
+                record = (
+                    int(row[ids_col]),
+                    float(row[lats_col]),
+                    float(row[lons_col]),
+                    float(row[col["upareas"]]) if col["upareas"] is not None else -999.0,
                     row[col["names"]].strip()
-                    if col["names"] is not None
-                    else f"dam_{row[ids_col]}"
-                )
-                cap_mcm_list.append(float(row[cap_col]))
-                years_list.append(
-                    int(row[col["years"]]) if col["years"] is not None else -99
+                    if col["names"] is not None else f"dam_{row[ids_col]}",
+                    float(row[cap_col]),
+                    int(row[col["years"]]) if col["years"] is not None else -99,
                 )
             except (ValueError, IndexError):
-                continue  # skip malformed rows
+                continue  # malformed row, including present-but-empty year: discard all
+            for column, value in zip(
+                (ids, lats, lons, upareas, names, cap_mcm_list, years_list),
+                record, strict=True,
+            ):
+                column.append(value)
 
+    if len({len(column) for column in
+            (ids, lats, lons, upareas, names, cap_mcm_list, years_list)}) != 1:
+        raise RuntimeError("Dam CSV columns lost row alignment")
     return {
         "ids": np.array(ids, dtype=np.int64),
         "lats": np.array(lats, dtype=np.float64),
@@ -513,64 +518,71 @@ def _estimate_flood_storage_grsad(
     float
         Flood-control storage in MCM.  Returns ``NaN`` if data is missing.
     """
-    import pandas as pd
-
-    # ---- Read GRSAD surface-area time series ----
     grsad_path = grsad_dir / f"{dam_id}_intp"
-    if not grsad_path.exists():
+    regeom_path = regeom_dir / f"{dam_id}.csv"
+    if not grsad_path.is_file() or not regeom_path.is_file():
         return np.nan
-
-    df = pd.read_table(str(grsad_path), index_col=0, parse_dates=True)
-    data = df.dropna()
-
-    # Remove suspicious repeated values (>12 identical records)
-    if "3water_enh" not in data.columns:
-        return np.nan
-
-    counts = data["3water_enh"].value_counts()
-    suspicious = counts[counts > 12].index
-    for val in suspicious:
-        data.loc[:, "3water_enh"] = data["3water_enh"].replace(val, np.nan)
-    data = data.dropna()
-    data = data["3water_enh"]
-
-    if len(data) < 2:
+    # ---- Read GRSAD surface-area time series ----
+    areas = []
+    with grsad_path.open(newline="", encoding="utf-8") as source:
+        rows = csv.reader(source, delimiter="\t")
+        header = next(rows)
+        if "3water_enh" not in header:
+            return np.nan
+        area_column = header.index("3water_enh") - 1
+        for row in rows:
+            if not row:
+                continue
+            row += [""] * (len(header) - len(row))
+            # The first column is a date label; all remaining columns are
+            # measurements. Preserve the former whole-row missing-data filter.
+            values = np.array(
+                [
+                    np.nan
+                    if value.strip() in {"", "NA", "N/A", "null"}
+                    else float(value)
+                    for value in row[1:]
+                ]
+            )
+            if not np.isnan(values).any():
+                areas.append(values[area_column])
+    data = np.asarray(areas, dtype=np.float64)
+    # Remove suspicious repeated values (>12 identical records).
+    unique, counts = np.unique(data, return_counts=True)
+    data = data[~np.isin(data, unique[counts > 12])]
+    if data.size < 2:
         return np.nan
 
     # Normal-water-level surface area
-    fld_area = float(np.percentile(data.values, percentile))
-    area_max = float(np.max(data.values))
+    fld_area = float(np.percentile(data, percentile))
+    area_max = float(np.max(data))
 
     # ---- Read ReGeom bathymetry ----
-    regeom_path = regeom_dir / f"{dam_id}.csv"
-    if not regeom_path.exists():
-        return np.nan
-
-    regeom = pd.read_csv(str(regeom_path), header=7)
-    regeom.columns = ["Depth", "Area", "Storage"]
+    regeom = np.genfromtxt(regeom_path, delimiter=",", skip_header=8, ndmin=2)
     if len(regeom) <= 1:
         return np.nan
+    area, storage = regeom[:, 1], regeom[:, 2]
 
     # Adjust GRSAD area to ReGeom scale
-    fld_area = fld_area * regeom["Area"].values[-1] / area_max
+    fld_area = fld_area * area[-1] / area_max
 
     # Linear interpolation of storage at normal-water-level area
     use_sto = np.nan
     for i in range(len(regeom)):
-        rg_area = regeom["Area"].values[i]
+        rg_area = area[i]
         if rg_area < fld_area:
             continue
         elif rg_area == fld_area:
-            use_sto = float(np.mean(regeom.query("Area == @fld_area")["Storage"]))
+            use_sto = float(np.mean(storage[area == fld_area]))
             break
         else:
             if i == 0:
-                use_sto = regeom["Storage"].values[0]
+                use_sto = storage[0]
                 break
-            sto_max = regeom["Storage"].values[i]
-            area_hi = regeom["Area"].values[i]
-            sto_min = regeom["Storage"].values[i - 1]
-            area_lo = regeom["Area"].values[i - 1]
+            sto_max = storage[i]
+            area_hi = area[i]
+            sto_min = storage[i - 1]
+            area_lo = area[i - 1]
             if area_hi == area_lo:
                 use_sto = sto_min
             else:
@@ -583,7 +595,7 @@ def _estimate_flood_storage_grsad(
         return np.nan
 
     # Adjust to GRanD total capacity
-    regeom_total = regeom["Storage"].values[-1]
+    regeom_total = storage[-1]
     if regeom_total > 0:
         use_sto = use_sto * total_cap_mcm / regeom_total
 
@@ -774,37 +786,43 @@ def _read_nc_catchment_ids(ds: Dataset) -> np.ndarray:
     )
 
 
-def _find_nc_with_var(
-    base_path: Path,
-    var_name: str,
-) -> Path:
-    """Find the NC file containing *var_name*.
+def read_annual_stats(
+    base_path: str | Path,
+    catchment_ids: np.ndarray,
+    max_name: str,
+    mean_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read standard CaMa annual output in parameter catchment order.
 
-    The :class:`StatisticsRuntime` may write each statistic into a
-    separate file (e.g. ``total_outflow_max_mean_rank0.nc``).  If
-    *base_path* is a file that already contains the variable, return it.
-    Otherwise search the directory of *base_path* (or *base_path* itself
-    if it is a directory) for any ``.nc`` file containing the variable.
+    The caller supplies complete annual max/mean products from the same run.
+    Rank-file schema and live file checks belong to MultiRankStatsReader.
+    A merged file contains both variables; rank outputs are passed as a directory.
     """
-    if base_path.is_file():
-        with Dataset(str(base_path), "r") as ds:
-            if var_name in ds.variables:
-                return base_path
-        search_dir = base_path.parent
-    elif base_path.is_dir():
-        search_dir = base_path
-    else:
-        raise FileNotFoundError(f"Path not found: {base_path}")
-
-    # Search sibling / child NC files
-    for nc_file in sorted(search_dir.glob("*.nc")):
-        with Dataset(str(nc_file), "r") as ds:
-            if var_name in ds.variables:
-                return nc_file
-
-    raise FileNotFoundError(
-        f"Cannot find variable '{var_name}' in any NC file under {search_dir}"
-    )
+    path = Path(base_path)
+    if path.is_file():
+        with Dataset(path, "r") as dataset:
+            indices = find_indices_in(catchment_ids, _read_nc_catchment_ids(dataset))
+            if np.any(indices < 0):
+                raise ValueError("parameter catchments are missing from annual output")
+            return tuple(
+                np.ma.asarray(
+                    read_netcdf_values(dataset.variables[name]), dtype=np.float64
+                ).filled(np.nan)[:, indices]
+                for name in (max_name, mean_name)
+            )
+    series = []
+    for name in (max_name, mean_name):
+        reader = MultiRankStatsReader(
+            base_dir=path,
+            var_name=name,
+            coord_name="catchment_id",
+            split_by_year=any(path.glob(f"{name}_rank0_*.nc")),
+        )
+        try:
+            series.append(reader.get_series(catchment_ids, dtype=np.float64))
+        finally:
+            reader.close()
+    return series[0], series[1]
 
 
 def compute_dam_discharge_from_timeseries(
@@ -827,11 +845,10 @@ def compute_dam_discharge_from_timeseries(
             "mean_mean": ["total_outflow"],
         }
 
-    The aggregator may write **both** variables into a single NC, or
-    **separate** files (e.g. ``total_outflow_max_mean_rank0.nc`` and
-    ``total_outflow_mean_mean_rank0.nc``).  Pass either a specific NC
-    file or the output **directory**; the function auto-discovers the
-    file(s) containing each variable.
+    Pass one complete merged file containing both variables, or a directory
+    of formal rank-output files. All declared years and spatial ranks are read.
+    Both series must be complete annual products from the same run, with matching
+    rows. Annual aggregation is configured by the producer.
 
     Parameters
     ----------
@@ -897,83 +914,22 @@ def compute_dam_discharge_from_timeseries(
         n_ok = int((dam_cids >= 0).sum())
         print(f"[dam_params] Loaded {n_dam} dams, grid ({nx}×{ny}), {n_ok} allocated")
 
-    # ---- Read pre-aggregated statistics ----
-    # Max and mean may live in the same NC or separate files
-    max_nc = _find_nc_with_var(outflow_stats_nc, annual_max_var)
-    mean_nc = _find_nc_with_var(outflow_stats_nc, annual_mean_var)
-    if verbose:
-        if max_nc == mean_nc:
-            print(f"[dam_params] Reading stats from {max_nc.name}")
-        else:
-            print(
-                f"[dam_params] Reading max from {max_nc.name}, mean from {mean_nc.name}"
-            )
-
-    with Dataset(str(max_nc), "r") as ds:
-        q_cids = _read_nc_catchment_ids(ds)
-        # annual_max: (time, saved_points)
-        max_data = np.ma.asarray(
-            ds.variables[annual_max_var][:],
-            dtype=np.float64,
-        ).filled(np.nan)
-
-    with Dataset(str(mean_nc), "r") as ds:
-        q_cids_mean = _read_nc_catchment_ids(ds)
-        # annual_mean: (time, saved_points)
-        mean_data = np.ma.asarray(
-            ds.variables[annual_mean_var][:],
-            dtype=np.float64,
-        ).filled(np.nan)
-
-    if max_data.ndim != 2 or mean_data.ndim != 2:
-        raise ValueError(
-            "Dam outflow statistics must be 2-D (time, catchment): "
-            f"{annual_max_var} has shape {max_data.shape}, "
-            f"{annual_mean_var} has shape {mean_data.shape}"
-        )
-    if max_data.shape[0] != mean_data.shape[0]:
-        raise ValueError(
-            "Time-length mismatch between dam outflow statistics: "
-            f"{max_nc.name}:{annual_max_var} has {max_data.shape[0]} rows, "
-            f"{mean_nc.name}:{annual_mean_var} has {mean_data.shape[0]} rows"
-        )
-
-    # ---- Validate catchment_id consistency ----
-    same_layout = np.array_equal(q_cids, q_cids_mean)
-    if not np.array_equal(q_cids, param_cids):
-        n_stats = len(q_cids)
-        n_param = len(param_cids)
-        if n_stats != n_param:
-            detail = f"length mismatch: stats has {n_stats}, parameters has {n_param}"
-        else:
-            n_diff = int(np.sum(q_cids != param_cids))
-            detail = f"same length ({n_stats}) but {n_diff} IDs differ"
-        raise ValueError(
-            f"catchment_id mismatch between outflow stats NC and parameters NC. "
-            f"{detail}. "
-            f"Ensure the simulation was run with the same parameters.nc."
-        )
-    if not same_layout and not np.array_equal(q_cids_mean, param_cids):
-        raise ValueError(
-            "catchment_id mismatch between mean-stats NC and parameters NC. "
-            "Ensure the simulation was run with the same parameters.nc."
-        )
-
+    # Read standard annual products in parameter catchment order.
+    max_data, mean_data = read_annual_stats(
+        outflow_stats_nc, param_cids, annual_max_var, annual_mean_var,
+    )
     n_years = max_data.shape[0]
 
     # ---- Map dams to aggregator catchment indices ----
-    dam_idx_in_max = find_indices_in(dam_cids, q_cids)
-    dam_idx_in_mean = (
-        dam_idx_in_max if same_layout else find_indices_in(dam_cids, q_cids_mean)
-    )
-    valid = (dam_idx_in_max >= 0) & (dam_idx_in_mean >= 0)
+    dam_indices = find_indices_in(dam_cids, param_cids).astype(np.int64, copy=False)
+    valid = dam_indices >= 0
 
     # ---- Extract at dam cells (Numba-parallel) ----
     annual_max_all, qn = _extract_dam_stats(
         max_data,
         mean_data,
-        dam_idx_in_max.astype(np.int64),
-        dam_idx_in_mean.astype(np.int64),
+        dam_indices,
+        dam_indices,
         valid,
     )
 

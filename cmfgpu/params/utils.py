@@ -5,7 +5,10 @@
 #
 
 import fnmatch
+import os
+import tempfile
 from collections import defaultdict
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -58,8 +61,12 @@ def trace_outlets(catchment_id, downstream_id):
 
         # Trace downstream to mouth or resolved cell
         current = cid
+        hops = 0
         while down[current] >= 0:
+            if hops >= n:
+                raise ValueError("Cycle in downstream topology before outlet tracing")
             current = down[current]
+            hops += 1
 
         # current is a mouth (down==-1) or already resolved (down<=-3)
         v = down[current]
@@ -1139,8 +1146,12 @@ def visualize_nc_basins(
             and "gauge_catchment_id" in ds.variables
             and "catchment_id" in ds.variables
         ):
-            g_cids = ds["gauge_catchment_id"][:]
-            c_ids = ds["catchment_id"][:]
+            g_cids = _require_unmasked_array(
+                ds["gauge_catchment_id"][:], name="gauge_catchment_id"
+            )
+            c_ids = _require_unmasked_array(
+                ds["catchment_id"][:], name="catchment_id"
+            )
             idx = find_indices_in(g_cids, c_ids)
             idx = idx[idx >= 0]
             if idx.size > 0:
@@ -1297,6 +1308,33 @@ def _create_variable_like(dst, name, source, dimensions=None):
     return out
 
 
+def _atomic_crop(function):
+    """Publish a complete crop only after the input and output files are closed."""
+    @wraps(function)
+    def wrapped(input_nc, output_nc, *args, **kwargs):
+        destination = Path(output_nc)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            dir=destination.parent, prefix=f".{destination.name}.", suffix=".nc"
+        )
+        os.close(fd)
+        staged = Path(temporary)
+        try:
+            result = function(input_nc, staged, *args, **kwargs)
+            # A future early return must not publish the empty mkstemp file.
+            with Dataset(staged, "r") as verified:
+                required = {"catchment_id", "catchment_x", "catchment_y",
+                            "catchment_basin_id", "output_catchment_id"}
+                if not required.issubset(verified.variables):
+                    raise ValueError("Crop did not produce a complete parameter file")
+            os.replace(staged, destination)
+            return result
+        finally:
+            staged.unlink(missing_ok=True)
+    return wrapped
+
+
+@_atomic_crop
 def crop_parameters_nc(
     input_nc: str | Path,
     output_nc: str | Path,
@@ -1344,7 +1382,25 @@ def crop_parameters_nc(
         raise ValueError(
             "Only one of crop_upstream, crop_downstream, crop_interval can be True."
         )
+    if (crop_upstream or crop_downstream or crop_interval) and not points_of_interest:
+        raise ValueError("Topology cut modes require non-empty points_of_interest")
     with Dataset(input_nc, "r") as src:
+        # Rebuilding augmented provenance is not supported yet. A plain
+        # recrop remains valid and keeps its existing metadata.
+        if extend_downstream_steps > 0 and any(
+            name in src.variables
+            for name in ("catchment_source_id", "catchment_ghost_level")
+        ):
+            raise ValueError(
+                "Cannot extend an already augmented map; start from the original map"
+            )
+        if (crop_downstream or crop_interval) and (
+            "inflow_catchment_id" in src.variables or "inflow_gauge" in src.dimensions
+        ):
+            raise ValueError(
+                "Cannot rebuild inflow augmentation on an augmented map; "
+                "start from the original map"
+            )
         # Load connectivity
         catchment_id = _require_unmasked_array(
             src["catchment_id"][:], name="catchment_id"
@@ -1418,10 +1474,7 @@ def crop_parameters_nc(
         outlet_cids = np.array([], dtype=np.int64)  # CIDs that will become river mouths
         if crop_upstream and len(target_cids) > 0:
             if downstream_id is None:
-                print(
-                    "Error: crop_upstream requires 'downstream_id' in the input NC. Aborting."
-                )
-                return
+                raise ValueError("crop_upstream requires 'downstream_id' in the input NC")
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
             grid_to_idx = upstream_adj[2]
@@ -1473,10 +1526,7 @@ def crop_parameters_nc(
         removed_mask_dn = np.zeros(len(catchment_id), dtype=bool)
         if crop_downstream and len(target_cids) > 0:
             if downstream_id is None:
-                print(
-                    "Error: crop_downstream requires 'downstream_id' in the input NC. Aborting."
-                )
-                return
+                raise ValueError("crop_downstream requires 'downstream_id' in the input NC")
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
 
@@ -1505,10 +1555,7 @@ def crop_parameters_nc(
         # ── crop_interval mode: split river network into interval sub-basins at POIs ──
         if crop_interval and len(target_cids) > 0:
             if downstream_id is None:
-                print(
-                    "Error: crop_interval requires 'downstream_id' in the input NC. Aborting."
-                )
-                return
+                raise ValueError("crop_interval requires 'downstream_id' in the input NC")
 
             upstream_adj = _build_upstream_adj(catchment_id, downstream_id)
             indptr, indices, grid_to_idx, cid_arr = upstream_adj

@@ -79,6 +79,8 @@ def main() -> None:
         suffix=suffix,
     )
     schedule = dataset.simulation_schedule
+    # DataLoader returns source rows; it does not repeat them for short model steps.
+    reuse_count = dataset.time_interval // dataset.model_step
     variables_to_save = {
         "mean": ["total_outflow"],
         "last": ["river_depth"],
@@ -131,9 +133,10 @@ def main() -> None:
             )
             for runoff in runoff_chunk:
                 model.set_inputs(runoff=runoff)
-                model.step_advance(
-                    num_sub_steps=num_sub_steps,
-                )
+                for _ in range(reuse_count):
+                    model.step_advance(
+                        num_sub_steps=num_sub_steps,
+                    )
     if save_state:
         model.save_state()
     model.close()

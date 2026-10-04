@@ -260,10 +260,10 @@ def trace_gauge_downstream(
             return False
         if ctx1m[jx, jy] != iXX0 or cty1m[jx, jy] != iYY0:
             return False
-        if dwx1m[jx, jy] <= -900:
-            return False  # reached mouth without hitting gauge
         if jx == ix0 and jy == iy0:
             return True
+        if dwx1m[jx, jy] <= -900:
+            return False  # reached a different mouth
         jx, jy = nextxy_hires(jx, jy, dwx1m, dwy1m, nx)
     return False
 

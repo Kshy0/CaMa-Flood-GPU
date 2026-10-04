@@ -41,7 +41,10 @@ def kge(pred: np.ndarray, obs: np.ndarray) -> float:
         return float("nan")
     r = float(np.corrcoef(p, o)[0, 1])
     a = float(p.std() / o.std())
-    b = float(p.mean() / o.mean()) if o.mean() > 0 else 0.0
+    observed_mean = float(o.mean())
+    if observed_mean == 0.0:
+        return float("nan")
+    b = float(p.mean() / observed_mean)
     return 1.0 - float(np.sqrt((r - 1) ** 2 + (a - 1) ** 2 + (b - 1) ** 2))
 
 

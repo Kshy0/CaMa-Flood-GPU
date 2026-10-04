@@ -296,8 +296,29 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
     def validate_reservoir_volumes(self) -> Self:
+        for name in (
+            "reservoir_capacity", "conservation_volume", "emergency_volume",
+            "normal_outflow", "flood_control_outflow", "reservoir_area",
+            "reservoir_total_inflow",
+        ):
+            if not torch.isfinite(getattr(self, name)).all().item():
+                raise ValueError(f"{name} must contain only finite values")
+        for name in ("reservoir_capacity", "conservation_volume", "reservoir_area"):
+            if torch.any(getattr(self, name) <= 0).item():
+                raise ValueError(f"{name} must be greater than zero")
+        for name in ("normal_outflow", "flood_control_outflow"):
+            if torch.any(getattr(self, name) < 0).item():
+                raise ValueError(f"{name} must be non-negative")
+        # Both interpolation regimes divide by the gap above conservation.
+        if torch.any(self.emergency_volume <= self.conservation_volume).item():
+            raise ValueError("Emergency volume must exceed conservation volume")
         if torch.any(self.emergency_volume > self.reservoir_capacity):
             raise ValueError("Emergency volume exceeds reservoir capacity")
-        if torch.any(self.conservation_volume > self.emergency_volume):
-            raise ValueError("Conservation volume exceeds emergency volume")
+        adjustment = self.adjustment_volume
+        if torch.any(
+            ~torch.isfinite(adjustment)
+            | (adjustment <= self.conservation_volume)
+            | (adjustment >= self.emergency_volume)
+        ).item():
+            raise ValueError("Adjustment volume must remain strictly between conservation and emergency")
         return self

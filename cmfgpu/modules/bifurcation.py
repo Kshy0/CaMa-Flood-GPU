@@ -12,7 +12,7 @@ for concise tensor metadata.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, Self
 
 import torch
 from hydroforge.model import (
@@ -25,7 +25,7 @@ from hydroforge.model import (
     computed_tensor_field,
     module_ref,
 )
-from pydantic import computed_field
+from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
 
@@ -222,3 +222,27 @@ class BifurcationModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Validators
     # ------------------------------------------------------------------ #
+    @model_validator(mode="after")
+    def validate_parameters(self) -> Self:
+        # MERIT and reservoir masking use finite elevations >= 1e20 for
+        # disabled levels. Zero-width disabled levels remain valid.
+        if self.num_bifurcation_paths and self.num_bifurcation_levels < 1:
+            raise ValueError("nonempty bifurcation paths need at least one level")
+        for name in (
+            "bifurcation_width", "bifurcation_length", "bifurcation_elevation",
+            "bifurcation_manning", "bifurcation_outflow",
+            "bifurcation_cross_section_depth",
+        ):
+            if not torch.isfinite(getattr(self, name)).all().item():
+                raise ValueError(f"{name} must contain only finite values")
+        active = self.bifurcation_elevation < 1.0e20
+        if torch.any(active & (self.bifurcation_width <= 0)).item():
+            raise ValueError("active bifurcation levels require positive width")
+        if torch.any(active & (self.bifurcation_manning <= 0)).item():
+            raise ValueError("active bifurcation levels require positive Manning roughness")
+        active_path = active.any(dim=-1)
+        if torch.any(active_path & (self.bifurcation_length <= 0)).item():
+            raise ValueError("active bifurcation paths require positive length")
+        if torch.any(self.bifurcation_cross_section_depth < 0).item():
+            raise ValueError("bifurcation cross-section depth must be non-negative")
+        return self

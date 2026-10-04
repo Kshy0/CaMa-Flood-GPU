@@ -164,6 +164,8 @@ def allocate_all_level_gauges(
 
             # Follow from upstream outlet to see if we reach gauge pixel
             t_jx, t_jy = nextxy_hires(oix, oiy, dwx1m, dwy1m, nx)
+            if t_jx < 0 or t_jx >= nx or t_jy < 0 or t_jy >= ny:
+                continue
             d = rgetlen(
                 hires_lon[oix], hires_lat[oiy], hires_lon[t_jx], hires_lat[t_jy]
             )
@@ -173,12 +175,14 @@ def allocate_all_level_gauges(
                     break
                 if ctx1m[t_jx, t_jy] != iXX0 or cty1m[t_jx, t_jy] != iYY0:
                     break
-                if dwx1m[t_jx, t_jy] <= -900:
-                    break
                 if t_jx == ix0 and t_jy == iy0:
                     found_it = True
                     break
+                if dwx1m[t_jx, t_jy] <= -900:
+                    break
                 n_jx, n_jy = nextxy_hires(t_jx, t_jy, dwx1m, dwy1m, nx)
+                if n_jx < 0 or n_jx >= nx or n_jy < 0 or n_jy >= ny:
+                    break
                 d += rgetlen(
                     hires_lon[t_jx], hires_lat[t_jy], hires_lon[n_jx], hires_lat[n_jy]
                 )

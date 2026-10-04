@@ -92,6 +92,8 @@ def main() -> None:
     if dataset0.simulation_schedule != dataset1.simulation_schedule:
         raise ValueError("forcing datasets generated different schedules")
     schedule = dataset0.simulation_schedule
+    # DataLoader returns source rows; it does not repeat them for short model steps.
+    reuse_count = dataset0.time_interval // dataset0.model_step
 
     model = CaMaFlood(
         device=device,
@@ -156,9 +158,10 @@ def main() -> None:
             )
             for runoff in runoff_chunk:
                 model.set_inputs(runoff=runoff)
-                model.step_advance(
-                    num_sub_steps=num_sub_steps,
-                )
+                for _ in range(reuse_count):
+                    model.step_advance(
+                        num_sub_steps=num_sub_steps,
+                    )
     if save_state:
         model.save_state()
     model.close()
