@@ -45,7 +45,8 @@ def main():
     runoff_clm_suffix = ".one"
     runoff_mapping_file = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_mapping_clm.npz"
     runoff_shape = (180, 360)  # (ny, nx)
-    unit_factor = 86400000  # mm/day → m/s
+    source_units = "mm day-1"  # binary files record no units
+    target_units = "m s-1"
 
     # Output paths
     climatology_nc = f"/home/eat/CaMa-Flood-GPU/inp/{resolution}/runoff_clm.nc"
@@ -68,7 +69,8 @@ def main():
         end_date=datetime(2001, 12, 31),
         time_interval=timedelta(days=1),
         model_step=timedelta(days=1),
-        unit_factor=unit_factor,
+        source_units=source_units,
+        target_units=target_units,
         prefix=runoff_clm_prefix,
         suffix=runoff_clm_suffix,
         time_to_key=None,  # single file mode

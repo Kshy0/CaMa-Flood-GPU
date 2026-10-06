@@ -50,11 +50,12 @@ class SeaLevelModule(AbstractModule):
         return self.sea_level_catchment_id.shape[0]
 
     sea_surface_elevation: torch.Tensor = TensorField(
-        description="Current absolute downstream water-surface elevation (m)",
+        description="Current absolute downstream water-surface elevation",
         shape=("num_sea_level_boundaries",),
         dtype="float",
         dim_coords="sea_level_catchment_id",
         category="forcing",
+        units="m",
         output="disabled",
         default=0,
     )

@@ -132,11 +132,12 @@ class InflowModule(AbstractModule):
                 )
 
     inflow: torch.Tensor = TensorField(
-        description="Current compact prescribed inflow forcing (m3 s-1)",
+        description="Current compact prescribed inflow forcing",
         shape=("num_inflow_gauges",),
         dtype="float",
         dim_coords="inflow_catchment_id",
         category="forcing",
+        units="m3 s-1",
         output="disabled",
         default=0,
     )

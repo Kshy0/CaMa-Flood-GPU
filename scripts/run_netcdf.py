@@ -34,7 +34,11 @@ def main() -> None:
     }
     loader_workers = 2
     output_workers = 2
-    unit_factor = 86400000
+    # Runoff depth flux; the mapping weights (catchment areas, m2) turn it
+    # into the model's runoff in m3 s-1. Source units come from the files'
+    # units attribute (set source_units, e.g. "mm day-1", if they have none).
+    source_units = None
+    target_units = "m s-1"
     prefetch_factor = 2
     BLOCK_SIZE = 128
     save_state = True
@@ -72,7 +76,8 @@ def main() -> None:
         spin_up_start_date=spin_up_start_date if spin_up_cycles > 0 else None,
         spin_up_end_date=spin_up_end_date if spin_up_cycles > 0 else None,
         model_step=runoff_time_interval,
-        unit_factor=unit_factor,
+        source_units=source_units,
+        target_units=target_units,
         var_name=var_name,
         prefix=prefix,
         suffix=suffix,

@@ -98,19 +98,9 @@ class CaMaFlood(AbstractModel):
             if inflow is None:
                 raise ValueError("the inflow module requires inflow forcing")
             staged_inputs["inflow"] = (inflow, inflow_module.inflow)
-        sea_level_module = self.sea_level
-        if sea_level_module is None:
-            if sea_surface_elevation is not None:
-                raise ValueError(
-                    "sea_surface_elevation forcing requires the sea_level module"
-                )
-        else:
-            if sea_surface_elevation is None:
-                raise ValueError(
-                    "the sea_level module requires sea_surface_elevation forcing"
-                )
+        if sea_surface_elevation is not None:
             staged_inputs["sea_surface_elevation"] = (
-                sea_surface_elevation, sea_level_module.sea_surface_elevation,
+                sea_surface_elevation, self.sea_level.sea_surface_elevation,
             )
         copy_tensor_inputs(staged_inputs)
 

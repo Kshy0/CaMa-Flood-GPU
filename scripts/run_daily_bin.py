@@ -46,7 +46,10 @@ def main() -> None:
     runoff_shape = (180, 360)
     start_date = datetime(2000, 1, 1)
     end_date = datetime(2000, 12, 31)
-    unit_factor = 86400000
+    # Binary files record no units; the mapping weights (catchment areas, m2)
+    # turn the m s-1 depth flux into the model's runoff in m3 s-1.
+    source_units = "mm day-1"
+    target_units = "m s-1"
     bin_dtype = "float32"
     prefix = "Roff____"
     suffix = ".one"
@@ -77,7 +80,8 @@ def main() -> None:
         spin_up_start_date=spin_up_start_date if spin_up_cycles > 0 else None,
         spin_up_end_date=spin_up_end_date if spin_up_cycles > 0 else None,
         model_step=runoff_time_interval,
-        unit_factor=unit_factor,
+        source_units=source_units,
+        target_units=target_units,
         bin_dtype=bin_dtype,
         prefix=prefix,
         suffix=suffix,

@@ -26,6 +26,7 @@ from hydroforge.model import (
 )
 from pydantic import computed_field, model_validator
 
+from cmfgpu.config import DISABLED_BIFURCATION_ELEVATION
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
 
@@ -107,10 +108,12 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     reservoir_capacity: torch.Tensor = ReservoirField(
         description="Maximum storage capacity (m3)",
+        gt=0,
     )
 
     conservation_volume: torch.Tensor = ReservoirField(
         description="Conservation storage volume (m3)",
+        gt=0,
     )
 
     emergency_volume: torch.Tensor = ReservoirField(
@@ -119,14 +122,17 @@ class ReservoirModule(AbstractModule):
 
     normal_outflow: torch.Tensor = ReservoirField(
         description="Normal outflow rate (m3 s-1)",
+        ge=0,
     )
 
     flood_control_outflow: torch.Tensor = ReservoirField(
         description="Flood-control outflow rate (m3 s-1)",
+        ge=0,
     )
 
     reservoir_area: torch.Tensor = ReservoirField(
         description="Surface area at normal water level (m2)",
+        gt=0,
     )
 
     # ------------------------------------------------------------------ #
@@ -262,7 +268,9 @@ class ReservoirModule(AbstractModule):
             self.is_dam_related[bifurcation.bifurcation_catchment_idx]
             | self.is_dam_related[bifurcation.bifurcation_downstream_idx]
         )
-        bifurcation.bifurcation_elevation[..., masked, :] = 1.0e20
+        bifurcation.bifurcation_elevation[..., masked, :] = (
+            DISABLED_BIFURCATION_ELEVATION
+        )
         return int(masked.sum().item())
 
     def initialize_state(self, *, supplied: frozenset[str]) -> None:
@@ -296,19 +304,6 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
     def validate_reservoir_volumes(self) -> Self:
-        for name in (
-            "reservoir_capacity", "conservation_volume", "emergency_volume",
-            "normal_outflow", "flood_control_outflow", "reservoir_area",
-            "reservoir_total_inflow",
-        ):
-            if not torch.isfinite(getattr(self, name)).all().item():
-                raise ValueError(f"{name} must contain only finite values")
-        for name in ("reservoir_capacity", "conservation_volume", "reservoir_area"):
-            if torch.any(getattr(self, name) <= 0).item():
-                raise ValueError(f"{name} must be greater than zero")
-        for name in ("normal_outflow", "flood_control_outflow"):
-            if torch.any(getattr(self, name) < 0).item():
-                raise ValueError(f"{name} must be non-negative")
         # Both interpolation regimes divide by the gap above conservation.
         if torch.any(self.emergency_volume <= self.conservation_volume).item():
             raise ValueError("Emergency volume must exceed conservation volume")

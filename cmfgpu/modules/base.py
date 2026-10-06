@@ -129,18 +129,21 @@ class BaseModule(AbstractModule):
         description="River-channel width (m)",
         category="param",
         shape=("num_catchments",),
+        gt=0,
     )
 
     river_length: torch.Tensor = BaseField(
         description="River-channel length (m)",
         category="param",
         shape=("num_catchments",),
+        gt=0,
     )
 
     river_height: torch.Tensor = BaseField(
         description="Bankfull depth of river channel (m)",
         category="param",
         shape=("num_catchments",),
+        gt=0,
     )
 
     # --------------------------------------------------------------------- #
@@ -154,11 +157,13 @@ class BaseModule(AbstractModule):
     catchment_area: torch.Tensor = BaseField(
         description="Surface area of catchment (m2)",
         category="param",
+        gt=0,
     )
 
     runoff: torch.Tensor = BaseField(
-        description="Current external runoff forcing (m3 s-1)",
+        description="Current external runoff forcing",
         category="forcing",
+        units="m3 s-1",
         output="disabled",
         default=0,
     )
@@ -166,6 +171,7 @@ class BaseModule(AbstractModule):
     downstream_distance: torch.Tensor = BaseField(
         description="Downstream distance (m)",
         category="param",
+        gt=0,
     )
 
     output_catchment_id: torch.Tensor = SelectionField(
@@ -182,12 +188,14 @@ class BaseModule(AbstractModule):
         description="River Manning roughness coefficient (s m-1/3)",
         default=0.03,
         category="param",
+        gt=0,
     )
 
     flood_manning: torch.Tensor = BaseField(
         description="Floodplain Manning roughness coefficient (s m-1/3)",
         default=0.1,
         category="param",
+        gt=0,
     )
 
     # --------------------------------------------------------------------- #
@@ -197,6 +205,7 @@ class BaseModule(AbstractModule):
         description="Lookup table: flood depth vs. fraction of catchment area flooded (m)",
         shape=("num_catchments", "num_flood_levels"),
         category="param",
+        ge=0,
     )
 
     # --------------------------------------------------------------------- #
@@ -207,6 +216,7 @@ class BaseModule(AbstractModule):
         default=0,
         category="init_state",
         dtype="hpfloat",
+        ge=0,
     )
 
     flood_storage: torch.Tensor = BaseField(
@@ -214,6 +224,7 @@ class BaseModule(AbstractModule):
         default=0,
         category="init_state",
         dtype="hpfloat",
+        ge=0,
     )
 
     protected_storage: torch.Tensor | None = BaseField(
@@ -222,6 +233,7 @@ class BaseModule(AbstractModule):
         category="init_state",
         dtype="hpfloat",
         depends_on="levee",
+        ge=0,
     )
 
     protected_depth: torch.Tensor | None = BaseField(
@@ -229,18 +241,21 @@ class BaseModule(AbstractModule):
         default=0,
         category="init_state",
         depends_on="levee",
+        ge=0,
     )
 
     river_depth: torch.Tensor = BaseField(
         description="Current water depth in rivers (m)",
         default=0,
         category="init_state",
+        ge=0,
     )
 
     flood_depth: torch.Tensor = BaseField(
         description="Current water depth on floodplains above river bankfull (m)",
         default=0,
         category="init_state",
+        ge=0,
     )
 
     river_outflow: torch.Tensor = BaseField(
@@ -259,18 +274,21 @@ class BaseModule(AbstractModule):
         description="Effective water depth used in river-flow calculations (m)",
         default=0,
         category="init_state",
+        ge=0,
     )
 
     flood_cross_section_depth: torch.Tensor = BaseField(
         description="Effective water depth used in flood-flow calculations (m)",
         default=0,
         category="init_state",
+        ge=0,
     )
 
     flood_cross_section_area: torch.Tensor = BaseField(
         description="Cross-sectional flow area on floodplains (m2)",
         default=0,
         category="init_state",
+        ge=0,
     )
 
     flood_fraction: torch.Tensor = BaseField(
@@ -278,6 +296,8 @@ class BaseModule(AbstractModule):
         default=0,
         category="init_state",
         output="auto",
+        ge=0,
+        le=1,
     )
 
     # ------------------------------------------------------------------ #
@@ -434,58 +454,6 @@ class BaseModule(AbstractModule):
     def validate_parameters(self) -> Self:
         if self.num_flood_levels < 1:
             raise ValueError("flood_depth_table must contain at least one flood level")
-        strictly_positive = {
-            "river_width": self.river_width,
-            "river_length": self.river_length,
-            "river_height": self.river_height,
-            "catchment_area": self.catchment_area,
-            "downstream_distance": self.downstream_distance,
-            "river_manning": self.river_manning,
-            "flood_manning": self.flood_manning,
-        }
-        invalid_counts = {
-            name: int((~torch.isfinite(value) | (value <= 0)).sum().item())
-            for name, value in strictly_positive.items()
-        }
-        invalid_counts = {
-            name: count for name, count in invalid_counts.items() if count
-        }
-        if invalid_counts:
-            details = ", ".join(
-                f"{name}={count}" for name, count in invalid_counts.items()
-            )
-            raise ValueError(
-                "River geometry, catchment area, downstream distance, and "
-                "Manning coefficients must contain only finite values greater "
-                f"than zero; invalid element counts: {details}"
-            )
-
-        finite_only = {
-            "catchment_elevation": self.catchment_elevation,
-            "flood_depth_table": self.flood_depth_table,
-        }
-        nonfinite_counts = {
-            name: int((~torch.isfinite(value)).sum().item())
-            for name, value in finite_only.items()
-        }
-        nonfinite_counts = {
-            name: count for name, count in nonfinite_counts.items() if count
-        }
-        if nonfinite_counts:
-            details = ", ".join(
-                f"{name}={count}" for name, count in nonfinite_counts.items()
-            )
-            raise ValueError(
-                "Elevation and flood-depth lookup values must be finite; "
-                f"invalid element counts: {details}"
-            )
-        negative_depths = int((self.flood_depth_table < 0).sum().item())
-        if negative_depths:
-            raise ValueError(
-                "flood_depth_table must be non-negative; "
-                f"invalid element count: {negative_depths}"
-            )
-
         if self.num_flood_levels > 1:
             diffs = torch.diff(self.flood_depth_table, dim=-1)
             invalid = diffs < 0
@@ -498,63 +466,4 @@ class BaseModule(AbstractModule):
                     f"(minimum diff={min_diff:.6f}). Regenerate the parameter "
                     "file with MERITMap."
                 )
-        return self
-
-    @model_validator(mode="after")
-    def validate_initial_state(self) -> Self:
-        nonnegative_state = {
-            "river_storage": self.river_storage,
-            "flood_storage": self.flood_storage,
-            "river_depth": self.river_depth,
-            "flood_depth": self.flood_depth,
-            "river_cross_section_depth": self.river_cross_section_depth,
-            "flood_cross_section_depth": self.flood_cross_section_depth,
-            "flood_cross_section_area": self.flood_cross_section_area,
-            "flood_fraction": self.flood_fraction,
-        }
-        if self.protected_storage is not None:
-            nonnegative_state["protected_storage"] = self.protected_storage
-        if self.protected_depth is not None:
-            nonnegative_state["protected_depth"] = self.protected_depth
-        invalid_state_counts = {
-            name: int((~torch.isfinite(value) | (value < 0)).sum().item())
-            for name, value in nonnegative_state.items()
-        }
-        invalid_state_counts = {
-            name: count for name, count in invalid_state_counts.items() if count
-        }
-        if invalid_state_counts:
-            details = ", ".join(
-                f"{name}={count}" for name, count in invalid_state_counts.items()
-            )
-            raise ValueError(
-                "Initial storage, depth, and cross-section state must contain "
-                "only finite non-negative values; invalid element counts: "
-                f"{details}"
-            )
-        fraction_above_one = int((self.flood_fraction > 1).sum().item())
-        if fraction_above_one:
-            raise ValueError(
-                "Initial flood_fraction must not exceed one; "
-                f"invalid element count: {fraction_above_one}"
-            )
-
-        nonfinite_flow_counts = {
-            name: int((~torch.isfinite(value)).sum().item())
-            for name, value in {
-                "river_outflow": self.river_outflow,
-                "flood_outflow": self.flood_outflow,
-            }.items()
-        }
-        nonfinite_flow_counts = {
-            name: count for name, count in nonfinite_flow_counts.items() if count
-        }
-        if nonfinite_flow_counts:
-            details = ", ".join(
-                f"{name}={count}" for name, count in nonfinite_flow_counts.items()
-            )
-            raise ValueError(
-                "Initial river and flood outflow must contain only finite "
-                f"values; invalid element counts: {details}"
-            )
         return self

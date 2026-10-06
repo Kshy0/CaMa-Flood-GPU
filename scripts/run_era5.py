@@ -37,7 +37,11 @@ def main() -> None:
 
     loader_workers = 1
     output_workers = 2
-    unit_factor = 3600 * runoff_time_interval_hour
+    # ERA5-Land "ro" accumulates runoff depth in m: the increment per interval
+    # divided by the interval length in seconds is the depth flux in m s-1.
+    source_units = "m"
+    target_units = "m s-1"
+    interval_seconds = 3600 * runoff_time_interval_hour
     prefetch_factor = 2
     BLOCK_SIZE = 128
     save_state = False
@@ -73,7 +77,9 @@ def main() -> None:
         spin_up_start_date=spin_up_start_date if spin_up_cycles > 0 else None,
         spin_up_end_date=spin_up_end_date if spin_up_cycles > 0 else None,
         model_step=runoff_time_interval,
-        unit_factor=unit_factor,  # mm/day divided by unit_factor to get m/s
+        source_units=source_units,
+        target_units=target_units,
+        unit_factor=interval_seconds,  # m per interval -> m s-1 (not a table pair)
         var_name=var_name,
         prefix=prefix,
         suffix=suffix,

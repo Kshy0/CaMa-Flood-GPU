@@ -30,7 +30,11 @@ def main() -> None:
     num_sub_steps = 360 if "adaptive_time" not in opened_modules else None
     loader_workers = 3
     output_workers = 2
-    unit_factor = 86400000
+    # Runoff depth flux; the mapping weights (catchment areas, m2) turn it
+    # into the model's runoff in m3 s-1. Source units come from the files'
+    # units attribute (set source_units, e.g. "mm day-1", if they have none).
+    source_units = None
+    target_units = "m s-1"
     prefetch_factor = 2
     BLOCK_SIZE = 128
     save_state = False
@@ -73,7 +77,8 @@ def main() -> None:
         **dataset_time,
         base_dir=runoff_dir,
         model_step=runoff_time_interval,
-        unit_factor=unit_factor,
+        source_units=source_units,
+        target_units=target_units,
         var_name=var_name0,
         prefix=prefix0,
         suffix=suffix,
@@ -83,7 +88,8 @@ def main() -> None:
         **dataset_time,
         base_dir=runoff_dir,
         model_step=runoff_time_interval,
-        unit_factor=unit_factor,
+        source_units=source_units,
+        target_units=target_units,
         var_name=var_name1,
         prefix=prefix1,
         suffix=suffix,

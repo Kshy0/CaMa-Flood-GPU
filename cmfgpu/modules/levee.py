@@ -106,11 +106,14 @@ class LeveeModule(AbstractModule):
             "levee base height is raised to it (m)"
         ),
         category="param",
+        gt=0,
     )
 
     levee_fraction: torch.Tensor = LeveeField(
         description="Relative distance between river and levee (0 close to channel, 1 far end)",
         category="param",
+        ge=0,
+        lt=1,
     )
 
     # ------------------------------------------------------------------ #
@@ -214,9 +217,12 @@ class LeveeModule(AbstractModule):
     )
     @cached_property
     def levee_base_height(self) -> torch.Tensor:
+        # Derived during construction: keep a NaN fraction (rejected by the
+        # validator) out of the table gather.
+        fraction = torch.nan_to_num(self.levee_fraction, nan=0.0)
         return self._interp_lookup(
             self.base.flood_depth_table,
-            self.levee_fraction * self.base.num_flood_levels,
+            fraction * self.base.num_flood_levels,
         )
 
     def _profile_storage(
@@ -323,23 +329,7 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     @model_validator(mode="after")
     def validate_parameters(self) -> Self:
-        invalid = (
-            ~torch.isfinite(self.levee_fraction)
-            | (self.levee_fraction < 0)
-            | (self.levee_fraction >= 1)
-        )
-        if torch.any(invalid):
-            raise ValueError("levee_fraction must be finite and lie within [0, 1)")
-
-        invalid = (
-            ~torch.isfinite(self.levee_crown_height)
-            | ~torch.isfinite(self.levee_base_height)
-            | (self.levee_crown_height <= 0)
-        )
-        num_invalid = invalid.sum().item()
+        num_invalid = int((~torch.isfinite(self.levee_base_height)).sum().item())
         if num_invalid > 0:
-            raise ValueError(
-                f"{num_invalid} levees have non-finite heights or a "
-                "non-positive crown height"
-            )
+            raise ValueError(f"{num_invalid} levees have a non-finite base height")
         return self

@@ -31,6 +31,7 @@ class AdaptiveTimeModule(AbstractModule):
         0.7,
         description="Factor to adjust adaptive time step calculation",
         gt=0.0,
+        le=1.0,
         allow_inf_nan=False,
     )
     
