@@ -119,11 +119,8 @@ def compute_reservoir_outflow_kernel(
     old_own, old_reversed = outgoing_flows_inline(
         old_river_outflow, old_flood_outflow, outgoing_storage_ptr.dtype.element_ty,
     )
-    tl.atomic_add(outgoing_storage_ptr + catchment_idx, -old_own, mask=mask)
-    tl.atomic_add(
-        outgoing_storage_ptr + downstream_idx, -old_reversed,
-        mask=mask & ~is_river_mouth,
-    )
+    tl.atomic_add(outgoing_storage_ptr + catchment_idx, -old_own, mask=mask, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + downstream_idx, -old_reversed, mask=mask & ~is_river_mouth, sem="relaxed")
 
     # ================================================================== #
     # 2. Compute reservoir outflow
@@ -168,10 +165,7 @@ def compute_reservoir_outflow_kernel(
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
 
     # The release is clamped non-negative, so it only leaves this cell.
-    tl.atomic_add(
-        outgoing_storage_ptr + catchment_idx,
-        reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask,
-    )
+    tl.atomic_add(outgoing_storage_ptr + catchment_idx, reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -233,11 +227,8 @@ def compute_reservoir_outflow_batched_kernel(
     old_own, old_reversed = outgoing_flows_inline(
         old_river_outflow, old_flood_outflow, outgoing_storage_ptr.dtype.element_ty,
     )
-    tl.atomic_add(outgoing_storage_ptr + catchment_idx, -old_own, mask=mask)
-    tl.atomic_add(
-        outgoing_storage_ptr + downstream_idx, -old_reversed,
-        mask=mask & ~is_river_mouth,
-    )
+    tl.atomic_add(outgoing_storage_ptr + catchment_idx, -old_own, mask=mask, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + downstream_idx, -old_reversed, mask=mask & ~is_river_mouth, sem="relaxed")
 
     storage = tl.load(
         river_storage_ptr + catchment_idx, mask=mask, other=0.0,
@@ -299,7 +290,4 @@ def compute_reservoir_outflow_batched_kernel(
         river_outflow_ptr + catchment_idx, reservoir_outflow, mask=mask,
     )
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
-    tl.atomic_add(
-        outgoing_storage_ptr + catchment_idx,
-        reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask,
-    )
+    tl.atomic_add(outgoing_storage_ptr + catchment_idx, reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask, sem="relaxed")

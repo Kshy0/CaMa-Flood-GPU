@@ -355,8 +355,8 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
     REAL pos = fmax(sum_out, (REAL)0.0);
     REAL neg = fmin(sum_out, (REAL)0.0);
     // P2STOOUT flows, multiplied by the step in compute_inflow.
-    atomicAdd(outgoing_storage + ci, (STO)pos);
-    atomicAdd(outgoing_storage + di, (STO)(-neg));
+    cmf_atomic_add(outgoing_storage + ci, (STO)pos);
+    cmf_atomic_add(outgoing_storage + di, (STO)(-neg));
 }
 
 // Generated-entry body over the canonical values ``a`` of

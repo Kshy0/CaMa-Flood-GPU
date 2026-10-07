@@ -40,12 +40,12 @@ __device__ __forceinline__ void k_inflow_cell(
 
     bool is_river_mouth = (dn == (int)t);
     if (!is_river_mouth) {
-        atomicAdd(river_inflow + dn, (STO)upd_r_out);
-        atomicAdd(flood_inflow + dn, (STO)upd_f_out);
+        cmf_atomic_add(river_inflow + dn, (STO)upd_r_out);
+        cmf_atomic_add(flood_inflow + dn, (STO)upd_f_out);
         if (has_reservoir) {
             bool is_downstream_res = is_reservoir && (is_reservoir[dn] != 0);
             if (is_downstream_res)
-                atomicAdd(reservoir_total_inflow + dn, (STO)upd_r_out + (STO)upd_f_out);
+                cmf_atomic_add(reservoir_total_inflow + dn, (STO)upd_r_out + (STO)upd_f_out);
         }
     }
 }
@@ -219,11 +219,11 @@ __device__ __forceinline__ void k_outflow_cell(
 
     // P2STOOUT includes positive flows from this cell and reversed flows
     // into its downstream cell.
-    atomicAdd(outgoing_storage + t,
-              (STO)(fmax(upd_r_out, (REAL)0.0) + fmax(upd_f_out, (REAL)0.0)));
+    cmf_atomic_add(outgoing_storage + t,
+                   (STO)(fmax(upd_r_out, (REAL)0.0) + fmax(upd_f_out, (REAL)0.0)));
     if (!is_river_mouth)
-        atomicAdd(outgoing_storage + dn,
-                  (STO)fmax(-upd_r_out, (REAL)0.0) + (STO)fmax(-upd_f_out, (REAL)0.0));
+        cmf_atomic_add(outgoing_storage + dn,
+                       (STO)fmax(-upd_r_out, (REAL)0.0) + (STO)fmax(-upd_f_out, (REAL)0.0));
 }
 
 // Generated-entry body over the canonical values ``a`` of compute_outflow.

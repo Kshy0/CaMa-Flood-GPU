@@ -35,11 +35,11 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     // Undo exactly the outflow kernel's outgoing flows of this cell.
     REAL old_r = river_outflow[ci];
     REAL old_f = flood_outflow[ci];
-    atomicAdd(outgoing_storage + ci,
-              -(STO)(fmax(old_r, (REAL)0.0) + fmax(old_f, (REAL)0.0)));
+    cmf_atomic_add(outgoing_storage + ci,
+                   -(STO)(fmax(old_r, (REAL)0.0) + fmax(old_f, (REAL)0.0)));
     if (!is_river_mouth)
-        atomicAdd(outgoing_storage + di,
-                  -((STO)fmax(-old_r, (REAL)0.0) + (STO)fmax(-old_f, (REAL)0.0)));
+        cmf_atomic_add(outgoing_storage + di,
+                       -((STO)fmax(-old_r, (REAL)0.0) + (STO)fmax(-old_f, (REAL)0.0)));
 
     STO storage = river_storage[ci] + flood_storage[ci];
     REAL river_flood_storage = (REAL)storage;
@@ -83,7 +83,7 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     flood_outflow[ci] = (REAL)0.0;
 
     // The release is non-negative, so it only leaves this cell.
-    atomicAdd(outgoing_storage + ci, (STO)ro);
+    cmf_atomic_add(outgoing_storage + ci, (STO)ro);
 }
 
 // Generated-entry body over the canonical values ``a`` of

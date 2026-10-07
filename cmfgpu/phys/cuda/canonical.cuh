@@ -35,4 +35,29 @@ __device__ __forceinline__ auto cmf_balance(const A& a)
     else return CmfNoBalance{};
 }
 
+// Scatter accumulation into storage-typed buffers.
+template <class T>
+__device__ __forceinline__ void cmf_atomic_add(T* address, T value)
+{
+    atomicAdd(address, value);
+}
+
+#if defined(__GFX12__)
+// gfx12's native global_atomic_add_f32 is several times slower than a 32-bit
+// compare-and-swap loop (RX 9070 XT, 15' downstream scatter: 54 us vs 8 us),
+// so FP32 storage accumulates through CAS there.  Each add stays one atomic
+// read-modify-write; only the order of concurrent adds may differ, as with
+// atomicAdd.
+__device__ __forceinline__ void cmf_atomic_add(float* address, float value)
+{
+    unsigned int* word = reinterpret_cast<unsigned int*>(address);
+    unsigned int observed = *word;
+    unsigned int expected;
+    do {
+        expected = observed;
+        observed = atomicCAS(word, expected, __float_as_uint(__uint_as_float(expected) + value));
+    } while (observed != expected);
+}
+#endif
+
 #endif  // CMFGPU_CANONICAL_CUH

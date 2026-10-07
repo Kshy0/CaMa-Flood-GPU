@@ -8,8 +8,6 @@ import numpy as np
 import triton
 import triton.language as tl
 from hydroforge.kernels import triton_math as hm
-
-
 from cmfgpu import config as _constants
 
 BACKFLOW_STORAGE_FRACTION = tl.constexpr(_constants.BACKFLOW_STORAGE_FRACTION)
@@ -314,8 +312,8 @@ def compute_outflow_kernel(
         updated_river_outflow, updated_flood_outflow,
         outgoing_storage_ptr.dtype.element_ty,
     )
-    tl.atomic_add(outgoing_storage_ptr + offs, own_flow, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx, reversed_flow, mask=mask & ~is_river_mouth)
+    tl.atomic_add(outgoing_storage_ptr + offs, own_flow, mask=mask, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + downstream_idx, reversed_flow, mask=mask & ~is_river_mouth, sem="relaxed")
     
 
 
@@ -376,15 +374,15 @@ def compute_inflow_kernel(
     # -------- Accumulate inflows --------
     is_river_mouth = downstream_idx == offs
     not_mouth = mask & (~is_river_mouth)
-    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=not_mouth)
-    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=not_mouth)
+    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=not_mouth, sem="relaxed")
+    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=not_mouth, sem="relaxed")
 
     # -------- Accumulate reservoir inflow --------
     if HAS_RESERVOIR:
         is_downstream_res = tl.load(is_reservoir_ptr + downstream_idx, mask=not_mouth, other=0) != 0
         reservoir_dtype = reservoir_total_inflow_ptr.dtype.element_ty
         total_outflow = updated_river_outflow.to(reservoir_dtype) + updated_flood_outflow.to(reservoir_dtype)
-        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx, total_outflow, mask=not_mouth & is_downstream_res)
+        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx, total_outflow, mask=not_mouth & is_downstream_res, sem="relaxed")
 
 
 @triton.jit
@@ -679,8 +677,8 @@ def compute_outflow_batched_kernel(
         updated_river_outflow, updated_flood_outflow,
         outgoing_storage_ptr.dtype.element_ty,
     )
-    tl.atomic_add(outgoing_storage_ptr + idx, own_flow, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx_global, reversed_flow, mask=mask & ~is_river_mouth)
+    tl.atomic_add(outgoing_storage_ptr + idx, own_flow, mask=mask, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + downstream_idx_global, reversed_flow, mask=mask & ~is_river_mouth, sem="relaxed")
 
 
 @triton.jit
@@ -744,12 +742,12 @@ def compute_inflow_batched_kernel(
     # -------- Accumulate inflows --------
     is_river_mouth = downstream_idx == catchment_idx
     not_mouth = mask & (~is_river_mouth)
-    tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=not_mouth)
-    tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=not_mouth)
+    tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=not_mouth, sem="relaxed")
+    tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=not_mouth, sem="relaxed")
 
     # -------- Accumulate reservoir inflow --------
     if HAS_RESERVOIR:
         is_downstream_res = tl.load(is_reservoir_ptr + downstream_idx, mask=not_mouth, other=0) != 0
         reservoir_dtype = reservoir_total_inflow_ptr.dtype.element_ty
         total_outflow = updated_river_outflow.to(reservoir_dtype) + updated_flood_outflow.to(reservoir_dtype)
-        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx_global, total_outflow, mask=not_mouth & is_downstream_res)
+        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx_global, total_outflow, mask=not_mouth & is_downstream_res, sem="relaxed")

@@ -1,3 +1,5 @@
+#include "canonical.cuh"
+
 template <typename REAL, typename STO>
 __device__ __forceinline__ void k_bif_inflow_cell(
     const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
@@ -18,8 +20,8 @@ __device__ __forceinline__ void k_bif_inflow_cell(
         outflow[li] = upd;
     }
     REAL net = (raw_sum >= (REAL)0) ? raw_sum * lr_c : raw_sum * lr_d;
-    atomicAdd(global_bif_outflow + ci, (STO)net);
-    atomicAdd(global_bif_outflow + di, (STO)(-net));
+    cmf_atomic_add(global_bif_outflow + ci, (STO)net);
+    cmf_atomic_add(global_bif_outflow + di, (STO)(-net));
 }
 
 // Generated-entry body over the canonical values ``a`` of
@@ -150,8 +152,8 @@ __device__ __forceinline__ void k_bif_outflow_cell(
     REAL pos = fmax(sum_out, (REAL)0);
     REAL neg = fmin(sum_out, (REAL)0);
     // P2STOOUT flows, multiplied by the step in compute_inflow.
-    atomicAdd(outgoing_storage + ci, (STO)pos);
-    atomicAdd(outgoing_storage + di, (STO)(-neg));
+    cmf_atomic_add(outgoing_storage + ci, (STO)pos);
+    cmf_atomic_add(outgoing_storage + di, (STO)(-neg));
 }
 
 // Generated-entry body over the canonical values ``a`` of

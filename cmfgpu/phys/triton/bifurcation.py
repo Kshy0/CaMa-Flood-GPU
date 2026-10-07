@@ -130,8 +130,8 @@ def compute_bifurcation_outflow_kernel(
     # P2STOOUT flows, multiplied by the step in compute_inflow.
     pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
     neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + bifurcation_catchment_idx, pos_flow, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + bifurcation_downstream_idx, -neg_flow, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + bifurcation_catchment_idx, pos_flow, mask=mask, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + bifurcation_downstream_idx, -neg_flow, mask=mask, sem="relaxed")
 
 @triton.jit
 def compute_bifurcation_inflow_kernel(
@@ -177,8 +177,8 @@ def compute_bifurcation_inflow_kernel(
         raw_sum_bifurcation_outflow * limit_rate,
         raw_sum_bifurcation_outflow * limit_rate_downstream,
     )
-    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask)
-    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask, sem="relaxed")
+    tl.atomic_add(global_bifurcation_outflow_ptr + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -334,8 +334,8 @@ def compute_bifurcation_outflow_batched_kernel(
     # P2STOOUT flows, multiplied by the step in compute_inflow.
     pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
     neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_catchment_idx, pos_flow, mask=mask)
-    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_downstream_idx, -neg_flow, mask=mask)
+    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_catchment_idx, pos_flow, mask=mask, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_downstream_idx, -neg_flow, mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -393,5 +393,5 @@ def compute_bifurcation_inflow_batched_kernel(
         raw_sum_bifurcation_outflow * limit_rate,
         raw_sum_bifurcation_outflow * limit_rate_downstream,
     )
-    tl.atomic_add(global_bifurcation_outflow_ptr + member_offset_catchments + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask)
-    tl.atomic_add(global_bifurcation_outflow_ptr + member_offset_catchments + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask)
+    tl.atomic_add(global_bifurcation_outflow_ptr + member_offset_catchments + bifurcation_catchment_idx, net_bifurcation_outflow, mask=mask, sem="relaxed")
+    tl.atomic_add(global_bifurcation_outflow_ptr + member_offset_catchments + bifurcation_downstream_idx, -net_bifurcation_outflow, mask=mask, sem="relaxed")
