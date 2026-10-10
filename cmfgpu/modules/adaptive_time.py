@@ -11,9 +11,9 @@ import torch
 from hydroforge.model import (
     AbstractModule,
     computed_tensor_field,
+    kernel_field,
     module_ref,
 )
-from pydantic import Field
 
 from cmfgpu.modules.base import BaseModule
 
@@ -27,14 +27,11 @@ class AdaptiveTimeModule(AbstractModule):
     module_name: ClassVar[str] = "adaptive_time"
     description: ClassVar[str] = "Adaptive time step calculation module for river networks"
     base = module_ref(BaseModule)
-    adaptive_time_factor: float = Field(
-        0.7,
-        description="Factor to adjust adaptive time step calculation",
-        gt=0.0,
-        le=1.0,
-        allow_inf_nan=False,
-    )
-    
+
+    @kernel_field
+    def adaptive_time_factor(self) -> float:
+        return self.options.value("adaptive_time_factor")
+
     @computed_tensor_field(
         description="Maximum number of sub-steps across all processes",
         shape=(1,),

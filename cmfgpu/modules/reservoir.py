@@ -107,31 +107,37 @@ class ReservoirModule(AbstractModule):
     # Physical properties
     # ------------------------------------------------------------------ #
     reservoir_capacity: torch.Tensor = ReservoirField(
-        description="Maximum storage capacity (m3)",
+        description="Maximum storage capacity",
+        units="m3",
         gt=0,
     )
 
     conservation_volume: torch.Tensor = ReservoirField(
-        description="Conservation storage volume (m3)",
+        description="Conservation storage volume",
+        units="m3",
         gt=0,
     )
 
     emergency_volume: torch.Tensor = ReservoirField(
-        description="Emergency storage volume (m3)",
+        description="Emergency storage volume",
+        units="m3",
     )
 
     normal_outflow: torch.Tensor = ReservoirField(
-        description="Normal outflow rate (m3 s-1)",
+        description="Normal outflow rate",
+        units="m3 s-1",
         ge=0,
     )
 
     flood_control_outflow: torch.Tensor = ReservoirField(
-        description="Flood-control outflow rate (m3 s-1)",
+        description="Flood-control outflow rate",
+        units="m3 s-1",
         ge=0,
     )
 
     reservoir_area: torch.Tensor = ReservoirField(
-        description="Surface area at normal water level (m2)",
+        description="Surface area at normal water level",
+        units="m2",
         gt=0,
     )
 
@@ -191,7 +197,8 @@ class ReservoirModule(AbstractModule):
         return self.is_dam_related & ~self.is_reservoir
 
     reservoir_total_inflow: torch.Tensor = TensorField(
-        description="Accumulated reservoir total inflow from upstream (m3 s-1)",
+        description="Accumulated reservoir total inflow from upstream",
+        units="m3 s-1",
         shape=("base.num_catchments",),
         dtype="hpfloat",
         dim_coords="base.catchment_id",
@@ -203,7 +210,8 @@ class ReservoirModule(AbstractModule):
     # Computed tensors (operations)
     # ------------------------------------------------------------------ #
     @computed_reservoir_field(
-        description="Flood control storage capacity, derived from emergency and conservation volumes (m3)",
+        description="Flood control storage capacity, derived from emergency and conservation volumes",
+        units="m3",
     )
     @cached_property
     def flood_volume(self) -> torch.Tensor:
@@ -212,7 +220,8 @@ class ReservoirModule(AbstractModule):
         return excess / excess.new_tensor(0.95)
 
     @computed_reservoir_field(
-        description="Volume threshold triggering regulation: AdjVol = ConVol + FldVol * 0.1 (m3)",
+        description="Volume threshold triggering regulation: AdjVol = ConVol + FldVol * 0.1",
+        units="m3",
     )
     @cached_property
     def adjustment_volume(self) -> torch.Tensor:
@@ -220,7 +229,8 @@ class ReservoirModule(AbstractModule):
         return self.conservation_volume + self.flood_volume * tenth
 
     @computed_reservoir_field(
-        description="Effective normal outflow after Yamazaki & Funato modification. Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days) (m3 s-1)",
+        description="Effective normal outflow after Yamazaki & Funato modification. Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days)",
+        units="m3 s-1",
     )
     @cached_property
     def effective_normal_outflow(self) -> torch.Tensor:
@@ -232,7 +242,8 @@ class ReservoirModule(AbstractModule):
         return torch.minimum(normal_outflow, dry_outflow) * 1.5
 
     @computed_reservoir_field(
-        description="Regulated outflow rate: Qa = (modified_Qn + Qf) * 0.5 (m3 s-1)",
+        description="Regulated outflow rate: Qa = (modified_Qn + Qf) * 0.5",
+        units="m3 s-1",
     )
     @cached_property
     def adjustment_outflow(self) -> torch.Tensor:

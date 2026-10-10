@@ -23,8 +23,9 @@ from hydroforge.model import (
     SelectionField,
     TensorField,
     computed_tensor_field,
+    kernel_field,
 )
-from pydantic import Field, computed_field, model_validator
+from pydantic import computed_field, model_validator
 
 
 def BaseField(
@@ -80,21 +81,14 @@ class BaseModule(AbstractModule):
     description: ClassVar[str] = (
         "Core hydrodynamic module with fundamental river and catchment variables"
     )
-    # --------------------------------------------------------------------- #
-    # Scalars (dimensions & constants)
-    # --------------------------------------------------------------------- #
-    gravity: float = Field(
-        default=9.8,
-        description="Gravitational acceleration constant (m s-2)",
-        gt=0.0,
-        allow_inf_nan=False,
-    )
-    min_kinematic_slope: float = Field(
-        default=1.0e-5,
-        description="Minimum bed slope for kinematic wave",
-        gt=0.0,
-        allow_inf_nan=False,
-    )
+
+    @kernel_field
+    def gravity(self) -> float:
+        return self.options.value("gravity")
+
+    @kernel_field
+    def min_kinematic_slope(self) -> float:
+        return self.options.value("min_kinematic_slope")
 
     # --------------------------------------------------------------------- #
     # Network topology
@@ -126,21 +120,24 @@ class BaseModule(AbstractModule):
     # River-channel geometry
     # --------------------------------------------------------------------- #
     river_width: torch.Tensor = BaseField(
-        description="River-channel width (m)",
+        description="River-channel width",
+        units="m",
         category="param",
         shape=("num_catchments",),
         gt=0,
     )
 
     river_length: torch.Tensor = BaseField(
-        description="River-channel length (m)",
+        description="River-channel length",
+        units="m",
         category="param",
         shape=("num_catchments",),
         gt=0,
     )
 
     river_height: torch.Tensor = BaseField(
-        description="Bankfull depth of river channel (m)",
+        description="Bankfull depth of river channel",
+        units="m",
         category="param",
         shape=("num_catchments",),
         gt=0,
@@ -150,12 +147,14 @@ class BaseModule(AbstractModule):
     # Catchment properties
     # --------------------------------------------------------------------- #
     catchment_elevation: torch.Tensor = BaseField(
-        description="Mean ground elevation (above mean sea level) (m)",
+        description="Mean ground elevation (above mean sea level)",
+        units="m",
         category="param",
     )
 
     catchment_area: torch.Tensor = BaseField(
-        description="Surface area of catchment (m2)",
+        description="Surface area of catchment",
+        units="m2",
         category="param",
         gt=0,
     )
@@ -169,7 +168,8 @@ class BaseModule(AbstractModule):
     )
 
     downstream_distance: torch.Tensor = BaseField(
-        description="Downstream distance (m)",
+        description="Downstream distance",
+        units="m",
         category="param",
         gt=0,
     )
@@ -185,14 +185,16 @@ class BaseModule(AbstractModule):
     # hydrodynamic parameters
     # --------------------------------------------------------------------- #
     river_manning: torch.Tensor = BaseField(
-        description="River Manning roughness coefficient (s m-1/3)",
+        description="River Manning roughness coefficient",
+        units="s m-1/3",
         default=0.03,
         category="param",
         gt=0,
     )
 
     flood_manning: torch.Tensor = BaseField(
-        description="Floodplain Manning roughness coefficient (s m-1/3)",
+        description="Floodplain Manning roughness coefficient",
+        units="s m-1/3",
         default=0.1,
         category="param",
         gt=0,
@@ -202,7 +204,8 @@ class BaseModule(AbstractModule):
     # Lookup tables (dependent on num_flood_levels)
     # --------------------------------------------------------------------- #
     flood_depth_table: torch.Tensor = BaseField(
-        description="Lookup table: flood depth vs. fraction of catchment area flooded (m)",
+        description="Lookup table: flood depth vs. fraction of catchment area flooded",
+        units="m",
         shape=("num_catchments", "num_flood_levels"),
         category="param",
         ge=0,
@@ -212,7 +215,8 @@ class BaseModule(AbstractModule):
     # State variables (initialised to 0 where not supplied)
     # --------------------------------------------------------------------- #
     river_storage: torch.Tensor = BaseField(
-        description="Current water volume in river channels, including any above bankfull depth (m3)",
+        description="Current water volume in river channels, including any above bankfull depth",
+        units="m3",
         default=0,
         category="init_state",
         dtype="hpfloat",
@@ -220,7 +224,8 @@ class BaseModule(AbstractModule):
     )
 
     flood_storage: torch.Tensor = BaseField(
-        description="Current water volume stored on floodplains (m3)",
+        description="Current water volume stored on floodplains",
+        units="m3",
         default=0,
         category="init_state",
         dtype="hpfloat",
@@ -228,7 +233,8 @@ class BaseModule(AbstractModule):
     )
 
     protected_storage: torch.Tensor | None = BaseField(
-        description="Current water volume stored in protected areas (m3)",
+        description="Current water volume stored in protected areas",
+        units="m3",
         default=0,
         category="init_state",
         dtype="hpfloat",
@@ -237,7 +243,8 @@ class BaseModule(AbstractModule):
     )
 
     protected_depth: torch.Tensor | None = BaseField(
-        description="Current water depth on the protected side relative to river bed (m)",
+        description="Current water depth on the protected side relative to river bed",
+        units="m",
         default=0,
         category="init_state",
         depends_on="levee",
@@ -245,47 +252,54 @@ class BaseModule(AbstractModule):
     )
 
     river_depth: torch.Tensor = BaseField(
-        description="Current water depth in rivers (m)",
+        description="Current water depth in rivers",
+        units="m",
         default=0,
         category="init_state",
         ge=0,
     )
 
     flood_depth: torch.Tensor = BaseField(
-        description="Current water depth on floodplains above river bankfull (m)",
+        description="Current water depth on floodplains above river bankfull",
+        units="m",
         default=0,
         category="init_state",
         ge=0,
     )
 
     river_outflow: torch.Tensor = BaseField(
-        description="Volumetric flow rate out of rivers (m3 s-1)",
+        description="Volumetric flow rate out of rivers",
+        units="m3 s-1",
         default=0,
         category="init_state",
     )
 
     flood_outflow: torch.Tensor = BaseField(
-        description="Volumetric flow rate out of floodplains (m3 s-1)",
+        description="Volumetric flow rate out of floodplains",
+        units="m3 s-1",
         default=0,
         category="init_state",
     )
 
     river_cross_section_depth: torch.Tensor = BaseField(
-        description="Effective water depth used in river-flow calculations (m)",
+        description="Effective water depth used in river-flow calculations",
+        units="m",
         default=0,
         category="init_state",
         ge=0,
     )
 
     flood_cross_section_depth: torch.Tensor = BaseField(
-        description="Effective water depth used in flood-flow calculations (m)",
+        description="Effective water depth used in flood-flow calculations",
+        units="m",
         default=0,
         category="init_state",
         ge=0,
     )
 
     flood_cross_section_area: torch.Tensor = BaseField(
-        description="Cross-sectional flow area on floodplains (m2)",
+        description="Cross-sectional flow area on floodplains",
+        units="m2",
         default=0,
         category="init_state",
         ge=0,
@@ -293,6 +307,7 @@ class BaseModule(AbstractModule):
 
     flood_fraction: torch.Tensor = BaseField(
         description="Fraction of catchment area that is flooded",
+        units="1",
         default=0,
         category="init_state",
         output="auto",
@@ -328,7 +343,8 @@ class BaseModule(AbstractModule):
     downstream_idx = ReferenceIndexField("downstream_id")
 
     @computed_base_field(
-        description="Total water storage per catchment (m3)",
+        description="Total water storage per catchment",
+        units="m3",
         category="state",
         dtype="hpfloat",
         output="auto",
@@ -346,8 +362,9 @@ class BaseModule(AbstractModule):
         description=(
             "Sub-step sum of the flows leaving each catchment, including flow "
             "reversed from its upstream cells; times the time step it is CaMa-Flood's "
-            "outgoing volume P2STOOUT. Can not be saved, as it is a temporary state (m3 s-1)"
+            "outgoing volume P2STOOUT. Can not be saved, as it is a temporary state"
         ),
+        units="m3 s-1",
         output="disabled",
         category="state",
         dtype="hpfloat",
@@ -360,7 +377,8 @@ class BaseModule(AbstractModule):
         )
 
     @computed_base_field(
-        description="Water-surface elevation (above mean sea level) (m)",
+        description="Water-surface elevation (above mean sea level)",
+        units="m",
         category="virtual",
         expr="river_depth + catchment_elevation - river_height",
     )
@@ -369,7 +387,8 @@ class BaseModule(AbstractModule):
         return None
 
     @computed_base_field(
-        description="Total inflow into river channels (m3 s-1)",
+        description="Total inflow into river channels",
+        units="m3 s-1",
         category="state",
         dtype="hpfloat",
     )
@@ -381,7 +400,8 @@ class BaseModule(AbstractModule):
         )
 
     @computed_base_field(
-        description="Total flooded area (m2)",
+        description="Total flooded area",
+        units="m2",
         category="virtual",
         expr="flood_fraction * catchment_area",
     )
@@ -390,7 +410,8 @@ class BaseModule(AbstractModule):
         return None
 
     @computed_base_field(
-        description="Total inflow to floodplains (m3 s-1)",
+        description="Total inflow to floodplains",
+        units="m3 s-1",
         category="state",
         dtype="hpfloat",
     )
@@ -402,7 +423,8 @@ class BaseModule(AbstractModule):
         )
 
     @computed_base_field(
-        description="Total outflow from catchment (river + flood) (m3 s-1)",
+        description="Total outflow from catchment (river + flood)",
+        units="m3 s-1",
         category="virtual",
         expr="river_outflow + flood_outflow",
     )
@@ -414,7 +436,8 @@ class BaseModule(AbstractModule):
     # Mutable scalar buffers (1-element device tensors for CUDA Graph)
     # ------------------------------------------------------------------ #
     @computed_base_field(
-        description="Current sub-step time step. Updated via.fill_() before each sub-step loop (s)",
+        description="Current sub-step time step. Updated via.fill_() before each sub-step loop",
+        units="s",
         shape=(1,),
         dim_coords=None,
         output="disabled",
@@ -425,7 +448,8 @@ class BaseModule(AbstractModule):
         return torch.zeros(1, dtype=self.precision, device=self.device)
 
     @computed_base_field(
-        description="Current outer time-step duration (s)",
+        description="Current outer time-step duration",
+        units="s",
         shape=(1,),
         dim_coords=None,
         output="disabled",

@@ -37,7 +37,8 @@ class InflowModule(AbstractModule):
     )
 
     basin_shift_days: torch.Tensor | None = TensorField(
-        description=("Per-gauge day offset applied when reading prescribed inflow (d)"),
+        description=("Per-gauge day offset applied when reading prescribed inflow"),
+        units="day",
         dtype="int",
         shape=("num_inflow_gauges",),
         dim_coords="inflow_catchment_id",
@@ -47,7 +48,8 @@ class InflowModule(AbstractModule):
     )
 
     basin_valid_length_days: torch.Tensor | None = TensorField(
-        description="Per-gauge contiguous valid observation duration in days (d)",
+        description="Per-gauge contiguous valid observation duration in days",
+        units="day",
         dtype="int",
         shape=("num_inflow_gauges",),
         dim_coords="inflow_catchment_id",

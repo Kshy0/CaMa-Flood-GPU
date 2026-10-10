@@ -29,6 +29,7 @@ from pydantic import (
     model_validator,
 )
 
+from cmfgpu.config import GRAVITY
 from cmfgpu.params.schema import (
     PARAMETER_FIELD_DIMS,
     PARAMETER_MODULE_FIELDS,
@@ -152,7 +153,7 @@ class MERITMap(BaseModel):
     )
 
     # === Physical Parameters ===
-    gravity: float = Field(default=9.8, description="Gravitational acceleration [m/s²]")
+    gravity: float = Field(default=GRAVITY, description="Gravitational acceleration [m/s²]")
 
     river_mouth_distance: float = Field(
         default=10000.0, description="Distance to river mouth [m]"

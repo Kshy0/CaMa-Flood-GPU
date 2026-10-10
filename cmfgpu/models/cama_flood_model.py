@@ -25,7 +25,9 @@ from hydroforge.model import (
     module_ref,
     optional_module_ref,
 )
+from pydantic import Field
 
+from cmfgpu.config import CaMaOptions
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
@@ -53,6 +55,8 @@ class CaMaFlood(AbstractModel):
     """
     CaMa-Flood GPU model master controller class
     """
+
+    options: CaMaOptions = Field(default_factory=CaMaOptions)
 
     base = module_ref(BaseModule)
     inflow = optional_module_ref(InflowModule)

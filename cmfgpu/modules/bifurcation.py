@@ -124,25 +124,29 @@ class BifurcationModule(AbstractModule):
     # Channel properties
     # ------------------------------------------------------------------ #
     bifurcation_manning: torch.Tensor = BifurcationField(
-        description="Bifurcation channel Manning roughness coefficient (s m-1/3)",
+        description="Bifurcation channel Manning roughness coefficient",
+        units="s m-1/3",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         default=0.03,
         category="param",
     )
 
     bifurcation_width: torch.Tensor = BifurcationField(
-        description="Channel widths by path and level (m)",
+        description="Channel widths by path and level",
+        units="m",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         category="param",
     )
 
     bifurcation_length: torch.Tensor = BifurcationField(
-        description="Channel lengths for each bifurcation path (m)",
+        description="Channel lengths for each bifurcation path",
+        units="m",
         category="param",
     )
 
     bifurcation_elevation: torch.Tensor = BifurcationField(
-        description="Channel-bed elevations by path and level (above mean sea level) (m)",
+        description="Channel-bed elevations by path and level (above mean sea level)",
+        units="m",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         category="param",
     )
@@ -151,14 +155,16 @@ class BifurcationModule(AbstractModule):
     # State variables
     # ------------------------------------------------------------------ #
     bifurcation_outflow: torch.Tensor = BifurcationField(
-        description="Outflow through each bifurcation path & level (m3 s-1)",
+        description="Outflow through each bifurcation path & level",
+        units="m3 s-1",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         default=0,
         category="init_state",
     )
 
     bifurcation_cross_section_depth: torch.Tensor = BifurcationField(
-        description="Cross-sectional water depth (m)",
+        description="Cross-sectional water depth",
+        units="m",
         shape=("num_bifurcation_paths", "num_bifurcation_levels"),
         default=0,
         category="init_state",
@@ -176,7 +182,8 @@ class BifurcationModule(AbstractModule):
     )
 
     @computed_bifurcation_field(
-        description="Total outflow via all bifurcation paths (m3 s-1)",
+        description="Total outflow via all bifurcation paths",
+        units="m3 s-1",
         shape=("base.num_catchments",),
         dtype="hpfloat",
         dim_coords="base.catchment_id",
@@ -192,6 +199,7 @@ class BifurcationModule(AbstractModule):
 
     @computed_bifurcation_field(
         description="Dimensionless storage-availability multiplier limiting bifurcation discharge",
+        units="1",
         shape=("base.num_catchments",),
         dim_coords="base.catchment_id",
         category="state",
