@@ -22,13 +22,10 @@ from hydroforge.model import (
     TensorField,
     computed_tensor_field,
     module_ref,
-    optional_module_ref,
 )
 from pydantic import computed_field, model_validator
 
-from cmfgpu.config import DISABLED_BIFURCATION_ELEVATION
 from cmfgpu.modules.base import BaseModule
-from cmfgpu.modules.bifurcation import BifurcationModule
 
 
 def ReservoirField(
@@ -82,7 +79,6 @@ class ReservoirModule(AbstractModule):
         "Reservoir operation module with storage and outflow regulation"
     )
     base = module_ref(BaseModule)
-    bifurcation = optional_module_ref(BifurcationModule)
 
     # ------------------------------------------------------------------ #
     # Reservoir topology
@@ -249,65 +245,24 @@ class ReservoirModule(AbstractModule):
     def adjustment_outflow(self) -> torch.Tensor:
         return (self.effective_normal_outflow + self.flood_control_outflow) * 0.5
 
-    def initialize_dam_storage(self) -> int:
-        """Raise cold-start dam storage to the conservation volume."""
+    def fill_dams(self) -> None:
+        """Fill cold-start reservoirs to conservation volume when below it,
+        leaving their floodplains empty."""
+        base = self.base
         idx = self.reservoir_catchment_idx
-        river = self.base.river_storage[..., idx]
-        flood = self.base.flood_storage[..., idx]
+        river = base.river_storage[..., idx]
+        flood = base.flood_storage[..., idx]
         conservation = self.conservation_volume.to(river.dtype)
-        update = (river + flood) < conservation
-        if not update.any():
-            return 0
-        self.base.river_storage[..., idx] = torch.where(
-            update,
-            conservation,
-            river,
-        )
-        self.base.flood_storage[..., idx] = torch.where(
-            update,
-            torch.zeros_like(flood),
-            flood,
-        )
-        return int(update.sum().item())
-
-    def mask_bifurcation_paths(self) -> int:
-        """Disable paths whose upstream or downstream cell is dam-related."""
-        bifurcation = self.bifurcation
-        if bifurcation is None:
-            return 0
-        masked = (
-            self.is_dam_related[bifurcation.bifurcation_catchment_idx]
-            | self.is_dam_related[bifurcation.bifurcation_downstream_idx]
-        )
-        bifurcation.bifurcation_elevation[..., masked, :] = (
-            DISABLED_BIFURCATION_ELEVATION
-        )
-        return int(masked.sum().item())
-
-    def initialize_state(self, *, supplied: frozenset[str]) -> None:
-        """Apply reservoir-owned cold starts without replacing restart state.
-
-        CMF_DAMOUT_INIT raises dam storage to ConVol only without restart
-        data.  Every checkpoint carries the reservoir's restart state
-        ``reservoir_total_inflow``, so its presence among the ``supplied``
-        inputs marks a restart.  Dam-related bifurcation paths close always.
-        """
-        if "reservoir_total_inflow" not in supplied:
-            fixed = self.initialize_dam_storage()
-            if fixed:
-                self._emit(
-                    "info",
-                    "reservoir.storage_initialized",
-                    "Initialized dam cells to conservation storage",
-                    cells=fixed,
-                )
-        masked = self.mask_bifurcation_paths()
-        if masked:
+        fill = (river + flood) < conservation
+        base.river_storage[..., idx] = torch.where(fill, conservation, river)
+        base.flood_storage[..., idx] = torch.where(fill, torch.zeros_like(flood), flood)
+        count = int(fill.sum().item())
+        if count:
             self._emit(
                 "info",
-                "reservoir.bifurcation_masked",
-                "Masked dam-related bifurcation paths",
-                paths=masked,
+                "reservoir.storage_initialized",
+                "Initialized dam cells to conservation storage",
+                cells=count,
             )
 
     # ------------------------------------------------------------------ #

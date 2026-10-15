@@ -77,9 +77,13 @@ class CaMaFlood(AbstractModel):
     }
 
     def initialize_model_state(self) -> None:
-        reservoir = self.reservoir
-        if reservoir is not None:
-            reservoir.initialize_state(supplied=frozenset(self.input_proxy.keys()))
+        """Fill cold-start reservoirs and diagnose the initial water levels."""
+        base, reservoir, levee = self.base, self.reservoir, self.levee
+        if reservoir is not None and "base.river_storage" in self.missing_inputs:
+            reservoir.fill_dams()
+        base.diagnose_flood_stage()
+        if levee is not None:
+            levee.diagnose_levee_stage()
 
     @between_steps
     @torch.inference_mode()
@@ -102,9 +106,15 @@ class CaMaFlood(AbstractModel):
             if inflow is None:
                 raise ValueError("the inflow module requires inflow forcing")
             staged_inputs["inflow"] = (inflow, inflow_module.inflow)
-        if sea_surface_elevation is not None:
+        sea_level = self.sea_level
+        if sea_level is None:
+            if sea_surface_elevation is not None:
+                raise ValueError("sea_surface_elevation forcing requires the sea_level module")
+        else:
+            if sea_surface_elevation is None:
+                raise ValueError("the sea_level module requires sea_surface_elevation forcing")
             staged_inputs["sea_surface_elevation"] = (
-                sea_surface_elevation, self.sea_level.sea_surface_elevation,
+                sea_surface_elevation, sea_level.sea_surface_elevation,
             )
         copy_tensor_inputs(staged_inputs)
 
@@ -113,13 +123,11 @@ class CaMaFlood(AbstractModel):
     def step_advance(self, step: ManagedStep) -> None:
         """Advance one step; fixed mode accepts managed ``num_sub_steps``."""
 
-        time_step_seconds = step.duration.total_seconds()
         adaptive_time = self.adaptive_time
         log = self.log
         reservoir = self.reservoir
         bifurcation = self.bifurcation
         levee = self.levee
-        self.base.outer_time_step.fill_(time_step_seconds)
         if adaptive_time is not None:
             adaptive_time.max_sub_steps.zero_()
             compute_adaptive_time_step()
@@ -134,18 +142,13 @@ class CaMaFlood(AbstractModel):
         else:
             fixed_substeps = step.fixed()
         fixed_count = fixed_substeps.count
-        compute_dtype = self.base.time_step.dtype
-        inverse_count = (torch.ones((), dtype=torch.float32) / fixed_count).to(compute_dtype)
-        time_sub_step = float(torch.tensor(time_step_seconds, dtype=compute_dtype) * inverse_count)
 
         if log is not None:
-            log.set_time(time_sub_step, fixed_count, step.current_time)
+            # The kernels read the same width as substep_field("dt").
+            sub_step_seconds = step.duration.total_seconds() / fixed_count
+            log.set_time(sub_step_seconds, fixed_count, step.current_time)
 
-        self.base.time_step.fill_(time_sub_step)
-
-        for sub_step in fixed_substeps:
-            if log is not None:
-                self.base.current_step.copy_(sub_step.index)
+        for _ in fixed_substeps:
             compute_outflow()
 
             if reservoir is not None:
@@ -172,9 +175,6 @@ class CaMaFlood(AbstractModel):
                     compute_levee_stage_log()
                 else:
                     compute_levee_stage()
-
-        if log is None:
-            self.base.current_step.fill_(fixed_count - 1)
 
         if log is not None:
             plan = self.plan

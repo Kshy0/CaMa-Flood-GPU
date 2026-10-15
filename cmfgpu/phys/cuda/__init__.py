@@ -80,7 +80,7 @@ INFLOW = _kernel(
 ADAPTIVE_TIME = _kernel(
     "adaptive_time", "adaptive_time", "{river_depth_ptr}, {HAS_RESERVOIR}", guard=False
 )
-BIFURCATION_OUTFLOW = _kernel("bifurcation", "bif_outflow", _REAL_STO)
+BIFURCATION_OUTFLOW = _kernel("bifurcation", "bif_outflow", _REAL_STO + ", {HAS_RESERVOIR}")
 BIFURCATION_INFLOW = _kernel(
     "bifurcation", "bif_inflow",
     "{bifurcation_outflow_ptr}, {global_bifurcation_outflow_ptr}",
@@ -93,5 +93,7 @@ LEVEE_STAGE = _kernel("levee", "levee_stage", _REAL_STO, guard=False)
 LEVEE_STAGE_LOG = _kernel(
     "levee", "levee_stage", _REAL_STO + ", true", members=False, guard=False
 )
-LEVEE_BIFURCATION_OUTFLOW = _kernel("levee", "levee_bif_outflow", _REAL_STO)
+LEVEE_BIFURCATION_OUTFLOW = _kernel(
+    "levee", "levee_bif_outflow", _REAL_STO + ", {HAS_RESERVOIR}"
+)
 __all__ = []

@@ -13,6 +13,9 @@ from cmfgpu import config as _constants
 
 BACKFLOW_STORAGE_FRACTION = tl.constexpr(_constants.BACKFLOW_STORAGE_FRACTION)
 ROUTING_SLOPE_LIMIT = tl.constexpr(_constants.ROUTING_SLOPE_LIMIT)
+DISABLED_BIFURCATION_ELEVATION = tl.constexpr(
+    _constants.DISABLED_BIFURCATION_ELEVATION
+)
 
 
 @triton.jit
@@ -38,6 +41,8 @@ def compute_bifurcation_outflow_kernel(
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     BLOCK_SIZE: tl.constexpr,                   # Block size
     num_catchments: tl.constexpr,
+    is_dam_related_ptr=None,                    # *bool: dam-related catchment mask
+    HAS_RESERVOIR: tl.constexpr = False,        # whether the reservoir module is active
 ):
     _ = num_catchments
     pid = tl.program_id(0)
@@ -48,6 +53,12 @@ def compute_bifurcation_outflow_kernel(
     # Load indices
     bifurcation_catchment_idx = tl.load(bifurcation_catchment_idx_ptr + offs, mask=mask, other=0)
     bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
+
+    # Reservoir operation closes paths whose upstream or downstream cell is dam-related.
+    if HAS_RESERVOIR:
+        bifurcation_closed = (
+            tl.load(is_dam_related_ptr + bifurcation_catchment_idx, mask=mask, other=0) != 0
+        ) | (tl.load(is_dam_related_ptr + bifurcation_downstream_idx, mask=mask, other=0) != 0)
     
     # Load bifurcation properties
     
@@ -89,6 +100,10 @@ def compute_bifurcation_outflow_kernel(
         bifurcation_manning = tl.load(bifurcation_manning_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + level_idx, mask=mask, other=0.0)
         bifurcation_elevation = tl.load(bifurcation_elevation_ptr + level_idx, mask=mask, other=0.0)
+        if HAS_RESERVOIR:
+            bifurcation_elevation = tl.where(
+                bifurcation_closed, DISABLED_BIFURCATION_ELEVATION, bifurcation_elevation
+            )
         # Calculate bifurcation cross-section depth
         updated_bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
         # Calculate semi-implicit flow depth for bifurcation
@@ -212,6 +227,8 @@ def compute_bifurcation_outflow_batched_kernel(
     batched_bifurcation_elevation: tl.constexpr,
     batched_river_height: tl.constexpr,
     batched_catchment_elevation: tl.constexpr,
+    is_dam_related_ptr=None,                    # *bool: dam-related catchment mask
+    HAS_RESERVOIR: tl.constexpr = False,        # whether the reservoir module is active
 ):
     pid_x = tl.program_id(0)
     idx = pid_x * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -231,6 +248,12 @@ def compute_bifurcation_outflow_batched_kernel(
     # Topology is never batched
     bifurcation_catchment_idx = tl.load(bifurcation_catchment_idx_ptr + offs, mask=mask, other=0)
     bifurcation_downstream_idx = tl.load(bifurcation_downstream_idx_ptr + offs, mask=mask, other=0)
+
+    # Reservoir operation closes paths whose upstream or downstream cell is dam-related.
+    if HAS_RESERVOIR:
+        bifurcation_closed = (
+            tl.load(is_dam_related_ptr + bifurcation_catchment_idx, mask=mask, other=0) != 0
+        ) | (tl.load(is_dam_related_ptr + bifurcation_downstream_idx, mask=mask, other=0) != 0)
     
     # Load bifurcation properties
     bifurcation_length = tl.load(bifurcation_length_ptr + (member_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)
@@ -293,6 +316,10 @@ def compute_bifurcation_outflow_batched_kernel(
         bifurcation_manning = tl.load(bifurcation_manning_ptr + manning_base + level_idx, mask=mask, other=0.0)
         bifurcation_cross_section_depth = tl.load(bifurcation_cross_section_depth_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
         bifurcation_elevation = tl.load(bifurcation_elevation_ptr + elevation_base + level_idx, mask=mask, other=0.0)
+        if HAS_RESERVOIR:
+            bifurcation_elevation = tl.where(
+                bifurcation_closed, DISABLED_BIFURCATION_ELEVATION, bifurcation_elevation
+            )
         # Calculate bifurcation cross-section depth
         updated_bifurcation_cross_section_depth = tl.maximum(max_bifurcation_water_surface_elevation - bifurcation_elevation, 0.0)
         # Calculate semi-implicit flow depth for bifurcation

@@ -26,6 +26,7 @@ from hydroforge.model import (
 from pydantic import computed_field, model_validator
 
 from cmfgpu.modules.base import BaseModule
+from cmfgpu.phys.flood_stage import levee_stage
 
 
 def LeveeField(
@@ -301,7 +302,7 @@ class LeveeModule(AbstractModule):
         # All five arrays have a member slice, including shared geometry.
         if self.ensemble_size is not None:
             storage = storage.expand(self.ensemble_size, self.num_levees)
-        return storage.contiguous()
+        return storage
 
     @computed_levee_field(description="Storage at the levee base", units="m3", output="disabled")
     @cached_property
@@ -325,6 +326,10 @@ class LeveeModule(AbstractModule):
         return self._storage_to_crown(
             self._profile_storage(self.levee_base_height, at_levee_layer=True),
         )
+
+    def diagnose_levee_stage(self) -> None:
+        """Repartition water and update levels in levee cells in place."""
+        levee_stage(self)
 
     # ------------------------------------------------------------------ #
     # Validators

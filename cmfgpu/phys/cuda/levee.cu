@@ -277,7 +277,7 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
     const STO* __restrict__ flood_storage,
     const STO* __restrict__ protected_storage,
     STO* __restrict__ outgoing_storage,
-    REAL gravity, const REAL* __restrict__ time_step_ptr, int num_levels, long t)
+    REAL gravity, const REAL* __restrict__ time_step_ptr, int num_levels, bool closed, long t)
 {
     REAL time_step = __ldg(time_step_ptr);
 
@@ -311,7 +311,8 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
     for (int lv = 0; lv < num_levels; ++lv) {
         long level_idx = t * (long)num_levels + lv;
         REAL current_max_wse = (lv == 0) ? max_wse : max_pwse;
-        REAL elv = __ldg(elevation + level_idx);
+        REAL elv = closed ? (REAL)CMF_DISABLED_BIFURCATION_ELEVATION
+                          : __ldg(elevation + level_idx);
         REAL upd_csd = fmax(current_max_wse - elv, (REAL)0.0);
         REAL semi_depth;
         if (lv == 0) {
@@ -361,7 +362,7 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
 
 // Generated-entry body over the canonical values ``a`` of
 // compute_levee_bifurcation_outflow.
-template <typename REAL, typename STO, class A>
+template <typename REAL, typename STO, bool HAS_RESERVOIR, class A>
 __device__ __forceinline__ void levee_bif_outflow(const A& a, long t)
 {
     k_levee_bif_outflow_cell<REAL, STO>(
@@ -371,7 +372,8 @@ __device__ __forceinline__ void levee_bif_outflow(const A& a, long t)
         a.bifurcation_cross_section_depth_ptr, a.river_depth_ptr, a.protected_depth_ptr,
         a.river_height_ptr, a.catchment_elevation_ptr, a.is_levee_ptr, a.river_storage_ptr,
         a.flood_storage_ptr, a.protected_storage_ptr, a.outgoing_storage_ptr, a.gravity,
-        a.time_step_ptr, a.num_bifurcation_levels, t);
+        a.time_step_ptr, a.num_bifurcation_levels,
+        cmf_bifurcation_closed<HAS_RESERVOIR>(a, t), t);
 }
 
 // Ensemble variants of levee_stage and levee_bif_outflow: offset member
@@ -407,7 +409,7 @@ __device__ __forceinline__ void levee_stage_members(A a, long t, long member)
     levee_stage<REAL, STO>(a, t);
 }
 
-template <typename REAL, typename STO, class A>
+template <typename REAL, typename STO, bool HAS_RESERVOIR, class A>
 __device__ __forceinline__ void levee_bif_outflow_members(A a, long t, long member)
 {
     const long member_offset = member * a.num_catchments;
@@ -427,5 +429,5 @@ __device__ __forceinline__ void levee_bif_outflow_members(A a, long t, long memb
     if (a.batched_bifurcation_elevation) a.bifurcation_elevation_ptr += level_offset;
     if (a.batched_river_height) a.river_height_ptr += member_offset;
     if (a.batched_catchment_elevation) a.catchment_elevation_ptr += member_offset;
-    levee_bif_outflow<REAL, STO>(a, t);
+    levee_bif_outflow<REAL, STO, HAS_RESERVOIR>(a, t);
 }

@@ -27,6 +27,8 @@ from hydroforge.model import (
 )
 from pydantic import computed_field, model_validator
 
+from cmfgpu.phys.flood_stage import flood_stage
+
 
 def BaseField(
     description: str,
@@ -242,31 +244,6 @@ class BaseModule(AbstractModule):
         ge=0,
     )
 
-    protected_depth: torch.Tensor | None = BaseField(
-        description="Current water depth on the protected side relative to river bed",
-        units="m",
-        default=0,
-        category="init_state",
-        depends_on="levee",
-        ge=0,
-    )
-
-    river_depth: torch.Tensor = BaseField(
-        description="Current water depth in rivers",
-        units="m",
-        default=0,
-        category="init_state",
-        ge=0,
-    )
-
-    flood_depth: torch.Tensor = BaseField(
-        description="Current water depth on floodplains above river bankfull",
-        units="m",
-        default=0,
-        category="init_state",
-        ge=0,
-    )
-
     river_outflow: torch.Tensor = BaseField(
         description="Volumetric flow rate out of rivers",
         units="m3 s-1",
@@ -305,16 +282,6 @@ class BaseModule(AbstractModule):
         ge=0,
     )
 
-    flood_fraction: torch.Tensor = BaseField(
-        description="Fraction of catchment area that is flooded",
-        units="1",
-        default=0,
-        category="init_state",
-        output="auto",
-        ge=0,
-        le=1,
-    )
-
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
@@ -349,6 +316,7 @@ class BaseModule(AbstractModule):
         dtype="hpfloat",
         output="auto",
         output_only=True,
+        after_init=True,
     )
     @cached_property
     def total_storage(self) -> torch.Tensor | None:
@@ -356,6 +324,58 @@ class BaseModule(AbstractModule):
         if self.protected_storage is not None:
             total = total + self.protected_storage
         return total
+
+    # ---------------- Flood stage diagnosed from storage ------------- #
+    # CaMa-Flood restarts carry storage only. The model's initialization sets
+    # these to the flood stage of the initial storage
+    # and the flood stage kernels update them after every sub-step, so they
+    # are never checkpointed.
+    def diagnose_flood_stage(self) -> None:
+        """Set the flood stage of the current storage in place, before
+        levee physics (the stage of compute_flood_stage)."""
+        flood_stage(self)
+
+    def _stage_buffer(self) -> torch.Tensor:
+        return torch.zeros_like(
+            self.river_storage, dtype=self.get_expected_dtype("river_depth")
+        )
+
+    @computed_base_field(
+        description="Current water depth in rivers",
+        units="m",
+        category="state",
+    )
+    @cached_property
+    def river_depth(self) -> torch.Tensor:
+        return self._stage_buffer()
+
+    @computed_base_field(
+        description="Current water depth on floodplains above river bankfull",
+        units="m",
+        category="state",
+    )
+    @cached_property
+    def flood_depth(self) -> torch.Tensor:
+        return self._stage_buffer()
+
+    @computed_base_field(
+        description="Fraction of catchment area that is flooded",
+        units="1",
+        category="state",
+    )
+    @cached_property
+    def flood_fraction(self) -> torch.Tensor:
+        return self._stage_buffer()
+
+    @computed_base_field(
+        description="Current water depth on the protected side relative to river bed",
+        units="m",
+        category="state",
+        depends_on="levee",
+    )
+    @cached_property
+    def protected_depth(self) -> torch.Tensor | None:
+        return self._stage_buffer()
 
     # ---------------- Hidden / intermediate states ------------------- #
     @computed_base_field(
@@ -431,45 +451,6 @@ class BaseModule(AbstractModule):
     @cached_property
     def total_outflow(self) -> torch.Tensor | None:
         return None
-
-    # ------------------------------------------------------------------ #
-    # Mutable scalar buffers (1-element device tensors for CUDA Graph)
-    # ------------------------------------------------------------------ #
-    @computed_base_field(
-        description="Current sub-step time step. Updated via.fill_() before each sub-step loop",
-        units="s",
-        shape=(1,),
-        dim_coords=None,
-        output="disabled",
-        category="shared_state",
-    )
-    @cached_property
-    def time_step(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=self.precision, device=self.device)
-
-    @computed_base_field(
-        description="Current outer time-step duration",
-        units="s",
-        shape=(1,),
-        dim_coords=None,
-        output="disabled",
-        category="shared_state",
-    )
-    @cached_property
-    def outer_time_step(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=self.precision, device=self.device)
-
-    @computed_base_field(
-        description="Current sub-step index within the time step. Updated via.fill_() before each sub-step for log kernels",
-        shape=(1,),
-        dim_coords=None,
-        output="disabled",
-        category="shared_state",
-        dtype="idx",
-    )
-    @cached_property
-    def current_step(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=torch.int32, device=self.device)
 
     # ------------------------------------------------------------------ #
     # Post-init validation

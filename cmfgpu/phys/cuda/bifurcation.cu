@@ -50,7 +50,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
     const STO* __restrict__ river_storage,
     const STO* __restrict__ flood_storage,
     STO* __restrict__ outgoing_storage,
-    REAL gravity, const REAL* __restrict__ time_step_ptr, int num_levels, long t)
+    REAL gravity, const REAL* __restrict__ time_step_ptr, int num_levels, bool closed, long t)
 {
     REAL time_step = __ldg(time_step_ptr);
 
@@ -88,7 +88,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
                 long li = t * (long)num_levels + lv;
                 REAL man = __ldg(manning + li);
                 REAL csd = __ldg(cs_depth + li);
-                REAL elv = __ldg(elevation + li);
+                REAL elv = closed ? (REAL)CMF_DISABLED_BIFURCATION_ELEVATION : __ldg(elevation + li);
                 REAL upd_csd = fmax(max_wse - elv, (REAL)0);
                 REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
                 if (sifd > (REAL)1e-5) {
@@ -110,7 +110,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
             long li = t * (long)num_levels + lv;
             REAL man = __ldg(manning + li);
             REAL csd = __ldg(cs_depth + li);
-            REAL elv = __ldg(elevation + li);
+            REAL elv = closed ? (REAL)CMF_DISABLED_BIFURCATION_ELEVATION : __ldg(elevation + li);
             REAL upd_csd = fmax(max_wse - elv, (REAL)0);
             REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
             bool flow_condition = sifd > (REAL)1e-5;
@@ -158,7 +158,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
 
 // Generated-entry body over the canonical values ``a`` of
 // compute_bifurcation_outflow.
-template <typename REAL, typename STO, class A>
+template <typename REAL, typename STO, bool HAS_RESERVOIR, class A>
 __device__ __forceinline__ void bif_outflow(const A& a, long t)
 {
     k_bif_outflow_cell<REAL, STO>(
@@ -167,7 +167,8 @@ __device__ __forceinline__ void bif_outflow(const A& a, long t)
         a.bifurcation_length_ptr, a.bifurcation_elevation_ptr,
         a.bifurcation_cross_section_depth_ptr, a.river_depth_ptr, a.river_height_ptr,
         a.catchment_elevation_ptr, a.river_storage_ptr, a.flood_storage_ptr,
-        a.outgoing_storage_ptr, a.gravity, a.time_step_ptr, a.num_bifurcation_levels, t);
+        a.outgoing_storage_ptr, a.gravity, a.time_step_ptr, a.num_bifurcation_levels,
+        cmf_bifurcation_closed<HAS_RESERVOIR>(a, t), t);
 }
 
 // Ensemble members offset their slices, then run the bodies above.
@@ -181,7 +182,7 @@ __device__ __forceinline__ void bif_inflow_members(A a, long t, long member)
     bif_inflow<REAL, STO>(a, t);
 }
 
-template <typename REAL, typename STO, class A>
+template <typename REAL, typename STO, bool HAS_RESERVOIR, class A>
 __device__ __forceinline__ void bif_outflow_members(A a, long t, long member)
 {
     const long member_offset = member * a.num_catchments;
@@ -199,5 +200,5 @@ __device__ __forceinline__ void bif_outflow_members(A a, long t, long member)
     if (a.batched_bifurcation_elevation) a.bifurcation_elevation_ptr += level_offset;
     if (a.batched_river_height) a.river_height_ptr += member_offset;
     if (a.batched_catchment_elevation) a.catchment_elevation_ptr += member_offset;
-    bif_outflow<REAL, STO>(a, t);
+    bif_outflow<REAL, STO, HAS_RESERVOIR>(a, t);
 }

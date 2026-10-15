@@ -18,6 +18,19 @@ __device__ __forceinline__ auto cmf_optional(P pointer)
     else return nullptr;
 }
 
+// Reservoir operation closes a bifurcation path whose upstream or downstream cell is
+// dam-related: a reservoir cell or a cell draining directly into one.
+template <bool HAS_RESERVOIR, class A>
+__device__ __forceinline__ bool cmf_bifurcation_closed(const A& a, long t)
+{
+    if constexpr (HAS_RESERVOIR) {
+        return a.is_dam_related_ptr[a.bifurcation_catchment_idx_ptr[t]]
+            || a.is_dam_related_ptr[a.bifurcation_downstream_idx_ptr[t]];
+    } else {
+        return false;
+    }
+}
+
 // Water-balance inputs of the *_log stage specs.  The plain stage specs have
 // none, so their stage bodies take these null ones instead.
 struct CmfNoBalance {

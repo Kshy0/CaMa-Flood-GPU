@@ -62,7 +62,8 @@ static inline float bifurcation_outflow_inline(uint i,
     bool batched_bifurcation_length,
     bool batched_bifurcation_elevation,
     bool batched_river_height,
-    bool batched_catchment_elevation) {
+    bool batched_catchment_elevation,
+    device const uchar* is_dam_related_ptr) {
 long num_paths = num_bifurcation_paths;
     long total = num_paths * ensemble_size;
 
@@ -104,6 +105,9 @@ long num_paths = num_bifurcation_paths;
     long manning_offset = batched_bifurcation_manning ? level_offset : 0;
     long width_offset = batched_bifurcation_width ? level_offset : 0;
     long elevation_offset = batched_bifurcation_elevation ? level_offset : 0;
+    // Reservoir operation closes paths whose upstream or downstream cell is dam-related.
+    bool closed = HAS_RESERVOIR
+        && (is_dam_related_ptr[catchment] != 0 || is_dam_related_ptr[downstream] != 0);
     float total_outflow = 0.0f;
     for (int level = 0; level < num_bifurcation_levels; ++level) {
         long local_level = path_level + level;
@@ -112,7 +116,8 @@ long num_paths = num_bifurcation_paths;
             bifurcation_outflow_ptr[state_level],
             bifurcation_cross_section_depth_ptr[state_level],
             maximum_surface,
-            bifurcation_elevation_ptr[elevation_offset + local_level],
+            closed ? CMF_DISABLED_BIFURCATION_ELEVATION
+                   : bifurcation_elevation_ptr[elevation_offset + local_level],
             bifurcation_width_ptr[width_offset + local_level],
             bifurcation_manning_ptr[manning_offset + local_level],
             slope, gravity, time_step, true);
@@ -210,7 +215,8 @@ float flow = bifurcation_outflow_inline(i,
     batched_bifurcation_length,
     batched_bifurcation_elevation,
     batched_river_height,
-    batched_catchment_elevation);
+    batched_catchment_elevation,
+    args.is_dam_related_ptr);
 #ifdef HF_HP_ENABLED
 args.bifurcation_path_flow_ptr[i] = flow;
 #else

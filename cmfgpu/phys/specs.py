@@ -1,5 +1,6 @@
 """Canonical backend-neutral ABIs for CaMa-Flood physics kernels."""
 
+from hydroforge.contracts import step_field, substep_field
 from hydroforge.kernels import (
     KernelSpec,
     KernelWorkspace,
@@ -42,7 +43,7 @@ OUTFLOW = KernelSpec(
         "global_bifurcation_outflow_ptr": "write",
         "outgoing_storage_ptr": "atomic_add",
         "gravity": "precision",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "num_catchments": "index",
         "HAS_BIFURCATION": HAS_BIFURCATION,
         "HAS_LEVEE": HAS_LEVEE,
@@ -88,7 +89,7 @@ INFLOW = KernelSpec(
         "river_storage_ptr": "read",
         "flood_storage_ptr": "read",
         "outgoing_storage_ptr": "read",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "river_inflow_ptr": "atomic_add",
         "flood_inflow_ptr": "atomic_add",
         "limit_rate_ptr": "write",
@@ -114,7 +115,7 @@ ADAPTIVE_TIME = KernelSpec(
         "downstream_distance_ptr": "read",
         "is_dam_related_ptr": "read",
         "max_sub_steps_ptr": "atomic_max",
-        "outer_time_step_ptr": "read",
+        "outer_time_step_ptr": step_field("step_seconds"),
         "adaptive_time_factor": "precision",
         "gravity": "precision",
         "num_catchments": "index",
@@ -145,11 +146,13 @@ BIFURCATION_OUTFLOW = KernelSpec(
         "flood_storage_ptr": "read",
         "outgoing_storage_ptr": "atomic_add",
         "gravity": "precision",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "num_bifurcation_paths": "index",
         "num_bifurcation_levels": constant("int32"),
         "ensemble_size": "index",
         "num_catchments": "index",
+        "is_dam_related_ptr": "read",
+        "HAS_RESERVOIR": HAS_RESERVOIR,
         **dict.fromkeys(
             (
                 "batched_bifurcation_manning",
@@ -162,6 +165,7 @@ BIFURCATION_OUTFLOW = KernelSpec(
             constant("bool"),
         ),
     },
+    optional={"is_dam_related_ptr": "HAS_RESERVOIR"},
 )
 
 BIFURCATION_INFLOW = KernelSpec(
@@ -200,7 +204,7 @@ RESERVOIR_OUTFLOW = KernelSpec(
         "flood_control_outflow_ptr": "read",
         "runoff_ptr": "read",
         "outgoing_storage_ptr": "atomic_add",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "num_reservoirs": "int32",
         "num_catchments": "index",
         "HAS_LEVEE": HAS_LEVEE,
@@ -233,7 +237,7 @@ FLOOD_STAGE = KernelSpec(
         "runoff_ptr": "read",
         "inflow_ptr": "read",
         "catchment_inflow_idx_ptr": "read",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "outgoing_storage_ptr": "write",
         "river_storage_ptr": "read_write",
         "flood_storage_ptr": "read_write",
@@ -292,7 +296,7 @@ FLOOD_STAGE_LOG = KernelSpec(
         "runoff_ptr": "read",
         "inflow_ptr": "read",
         "catchment_inflow_idx_ptr": "read",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "outgoing_storage_ptr": "write",
         "river_storage_ptr": "read_write",
         "flood_storage_ptr": "read_write",
@@ -319,7 +323,7 @@ FLOOD_STAGE_LOG = KernelSpec(
         "flood_area_sum_ptr": "atomic_add",
         "total_inflow_error_sum_ptr": "atomic_add",
         "total_stage_error_sum_ptr": "atomic_add",
-        "current_step_ptr": "read",
+        "current_step_ptr": substep_field("index"),
         "num_catchments": "index",
         "num_flood_levels": constant("int32"),
         "HAS_BIFURCATION": HAS_BIFURCATION,
@@ -414,7 +418,7 @@ LEVEE_STAGE_LOG = KernelSpec(
         "flood_storage_sum_ptr": "atomic_add",
         "flood_area_sum_ptr": "atomic_add",
         "total_stage_error_sum_ptr": "atomic_add",
-        "current_step_ptr": "read",
+        "current_step_ptr": substep_field("index"),
         "num_levees": "int32",
         "num_flood_levels": constant("int32"),
     },
@@ -443,11 +447,13 @@ LEVEE_BIFURCATION_OUTFLOW = KernelSpec(
         "protected_storage_ptr": "read",
         "outgoing_storage_ptr": "atomic_add",
         "gravity": "precision",
-        "time_step_ptr": "read",
+        "time_step_ptr": substep_field("dt"),
         "num_bifurcation_paths": "index",
         "num_bifurcation_levels": constant("int32"),
         "ensemble_size": "index",
         "num_catchments": "index",
+        "is_dam_related_ptr": "read",
+        "HAS_RESERVOIR": HAS_RESERVOIR,
         **dict.fromkeys(
             (
                 "batched_bifurcation_manning",
@@ -460,6 +466,7 @@ LEVEE_BIFURCATION_OUTFLOW = KernelSpec(
             constant("bool"),
         ),
     },
+    optional={"is_dam_related_ptr": "HAS_RESERVOIR"},
 )
 
 # Metal's double-FP32 accumulators cannot use scatter atomics. The flow cache

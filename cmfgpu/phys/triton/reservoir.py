@@ -29,7 +29,7 @@ def reservoir_release_inline(
     conservation_volume, emergency_volume, adjustment_volume,
     normal_outflow, adjustment_outflow, flood_control_outflow,
 ):
-    """Yamazaki & Funato release of CMF_DAMOUT_CALC for the dam volume
+    """Yamazaki & Funato reservoir release for the dam volume
     DamVol, then its flow limiter against DamVol and REAL(P2RIVSTO+P2FLDSTO).
     The nested selections follow the CUDA if/else-if regime chain."""
     # Case 1: water use, up to the conservation volume.
