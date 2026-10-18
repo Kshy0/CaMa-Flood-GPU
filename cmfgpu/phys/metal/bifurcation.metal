@@ -63,7 +63,8 @@ static inline float bifurcation_outflow_inline(uint i,
     bool batched_bifurcation_elevation,
     bool batched_river_height,
     bool batched_catchment_elevation,
-    device const uchar* is_dam_related_ptr) {
+    device const uchar* is_dam_related_ptr,
+    bool has_reservoir) {
 long num_paths = num_bifurcation_paths;
     long total = num_paths * ensemble_size;
 
@@ -106,7 +107,7 @@ long num_paths = num_bifurcation_paths;
     long width_offset = batched_bifurcation_width ? level_offset : 0;
     long elevation_offset = batched_bifurcation_elevation ? level_offset : 0;
     // Reservoir operation closes paths whose upstream or downstream cell is dam-related.
-    bool closed = HAS_RESERVOIR
+    bool closed = has_reservoir
         && (is_dam_related_ptr[catchment] != 0 || is_dam_related_ptr[downstream] != 0);
     float total_outflow = 0.0f;
     for (int level = 0; level < num_bifurcation_levels; ++level) {
@@ -216,7 +217,8 @@ float flow = bifurcation_outflow_inline(i,
     batched_bifurcation_elevation,
     batched_river_height,
     batched_catchment_elevation,
-    args.is_dam_related_ptr);
+    args.is_dam_related_ptr,
+    HAS_RESERVOIR);
 #ifdef HF_HP_ENABLED
 args.bifurcation_path_flow_ptr[i] = flow;
 #else

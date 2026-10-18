@@ -9,8 +9,9 @@
 The ``compute_flood_stage`` and ``compute_levee_stage`` kernels without
 their storage update: like them, each function repartitions the storages
 and sets the depths and flooded fraction of the base module in place, here
-to diagnose the stage of the initial storage. Storages keep their storage
-precision (``hpfloat``) and every other quantity is computed in the
+to diagnose the stage of the initial storage. Except for the temporary MPS
+float32 initialization workaround, storages keep their storage precision
+(``hpfloat``) and every other quantity is computed in the
 precision of ``river_height``, as in the kernels. Tensors may carry a
 leading member axis.
 """
@@ -26,6 +27,29 @@ if TYPE_CHECKING:
     from cmfgpu.modules.levee import LeveeModule
 
 
+def _stage_storage(value: torch.Tensor) -> torch.Tensor:
+    # Temporary workaround: encoded MPS hpfloat does not support all of the
+    # mixed comparisons, minimum and clamp operations used during initialization.
+    return value.float() if value.device.type == "mps" else value
+
+
+def _write_stage_storage(
+    target: torch.Tensor, value: torch.Tensor, idx: torch.Tensor | None = None
+) -> None:
+    if target.device.type == "mps" and target.dtype == torch.float64:
+        # Encoded storage accepts CPU copies, but cannot copy native MPS floats.
+        if idx is None:
+            target.copy_(value.cpu())
+        else:
+            encoded = torch.empty_like(target[..., idx])
+            encoded.copy_(value.cpu())
+            target[..., idx] = encoded
+    elif idx is None:
+        target.copy_(value)
+    else:
+        target[..., idx] = value.to(target.dtype)
+
+
 def flood_stage(base: BaseModule) -> None:
     """Split each catchment's total storage between river and floodplain.
 
@@ -34,9 +58,9 @@ def flood_stage(base: BaseModule) -> None:
     depth are zero.
     """
     has_levee = base.protected_storage is not None
-    total_storage = base.river_storage + base.flood_storage
+    total_storage = _stage_storage(base.river_storage) + _stage_storage(base.flood_storage)
     if has_levee:
-        total_storage = total_storage + base.protected_storage
+        total_storage = total_storage + _stage_storage(base.protected_storage)
     river_height, river_width = base.river_height, base.river_width
     river_length, catchment_area = base.river_length, base.catchment_area
     flood_depth_table = base.flood_depth_table
@@ -112,8 +136,10 @@ def flood_stage(base: BaseModule) -> None:
             ).clamp(0.0, 1.0),
         ),
     )
-    base.river_storage.copy_(river_storage)
-    base.flood_storage.copy_((total_storage - river_storage).clamp_min(0.0))
+    _write_stage_storage(base.river_storage, river_storage)
+    _write_stage_storage(
+        base.flood_storage, (total_storage - river_storage).clamp_min(0.0)
+    )
     base.river_depth.copy_(river_depth)
     base.flood_depth.copy_(flood_depth)
     base.flood_fraction.copy_(flood_fraction)
@@ -147,8 +173,8 @@ def levee_stage(levee: LeveeModule) -> None:
     top_storage = levee.levee_top_storage
     fill_storage = levee.levee_fill_storage
 
-    river_storage_hp = at_levees(base.river_storage)
-    flood_storage_hp = at_levees(base.flood_storage)
+    river_storage_hp = _stage_storage(at_levees(base.river_storage))
+    flood_storage_hp = _stage_storage(at_levees(base.flood_storage))
     total_hp = river_storage_hp + flood_storage_hp
     total = total_hp.to(length.dtype)
 
@@ -294,4 +320,4 @@ def levee_stage(levee: LeveeModule) -> None:
         (base.protected_depth, protected_depth),
         (base.flood_fraction, flood_fraction),
     ):
-        target[..., idx] = value.to(target.dtype)
+        _write_stage_storage(target, value, idx)
