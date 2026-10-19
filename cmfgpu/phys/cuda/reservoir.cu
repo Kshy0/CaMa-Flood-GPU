@@ -122,3 +122,27 @@ __device__ __forceinline__ void reservoir_outflow_members(A a, long t, long memb
     if (a.batched_flood_control_outflow) a.flood_control_outflow_ptr += reservoir_offset;
     reservoir_outflow<REAL, STO, HAS_LEVEE>(a, t);
 }
+
+// Generated-entry body over the canonical values ``a`` of fill_dam_storage
+// (CMF_DAMOUT_INIT): a dam below its conservation volume starts full to it,
+// with an empty floodplain.
+template <typename REAL, typename STO, class A>
+__device__ __forceinline__ void dam_fill(const A& a, long t)
+{
+    const int ci = a.reservoir_catchment_idx_ptr[t];
+    const STO conservation = (STO)__ldg(a.conservation_volume_ptr + t);
+    if (a.river_storage_ptr[ci] + a.flood_storage_ptr[ci] < conservation) {
+        a.river_storage_ptr[ci] = conservation;
+        a.flood_storage_ptr[ci] = (STO)0;
+    }
+}
+
+template <typename REAL, typename STO, class A>
+__device__ __forceinline__ void dam_fill_members(A a, long t, long member)
+{
+    a.river_storage_ptr += member * a.num_catchments;
+    a.flood_storage_ptr += member * a.num_catchments;
+    if (a.batched_conservation_volume)
+        a.conservation_volume_ptr += member * a.num_reservoirs;
+    dam_fill<REAL, STO>(a, t);
+}

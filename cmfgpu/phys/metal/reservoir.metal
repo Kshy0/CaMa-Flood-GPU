@@ -104,3 +104,21 @@
         &args.outgoing_storage_ptr[catchment],
         reservoir_outflow, memory_order_relaxed);
 #endif
+// HYDROFORGE METAL KERNEL BODY: fill_dam_storage
+long num_reservoirs = *args.num_reservoirs;
+    long num_catchments = *args.num_catchments;
+    if ((long)i >= num_reservoirs * (*args.ensemble_size)) return;
+
+    // CMF_DAMOUT_INIT: a dam below its conservation volume starts full to
+    // it, with an empty floodplain.
+    long reservoir_idx = (long)i % num_reservoirs;
+    long member_index = (long)i / num_reservoirs;
+    long catchment = member_index * num_catchments
+        + args.reservoir_catchment_idx_ptr[reservoir_idx];
+    cmf_storage conservation = cmf_storage(args.conservation_volume_ptr[
+        batched_conservation_volume ? (long)i : reservoir_idx]);
+    if (args.river_storage_ptr[catchment] + args.flood_storage_ptr[catchment]
+            < conservation) {
+        args.river_storage_ptr[catchment] = conservation;
+        args.flood_storage_ptr[catchment] = cmf_storage(0.0f);
+    }

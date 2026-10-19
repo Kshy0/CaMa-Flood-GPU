@@ -559,7 +559,7 @@ def compute_flood_stage_batched_kernel(
         width_increment_shared = hm.divide(catchment_width_shared, num_flood_levels)
 
     # ---- Loop over members ----
-    for t in tl.static_range(ensemble_size):
+    for t in tl.range(ensemble_size):
         member_offset = t * num_catchments
         idx = member_offset + offs
 
@@ -733,3 +733,192 @@ def compute_flood_stage_batched_kernel(
         if HAS_LEVEE:
             tl.store(protected_depth_ptr + idx, tl.zeros_like(flood_depth), mask=mask)
         tl.store(flood_fraction_ptr   + idx, flood_fraction, mask=mask)
+
+
+# -----------------------------------------------------------------------------
+# Kernel: flood stage of the current storage (no storage update)
+# -----------------------------------------------------------------------------
+@triton.jit
+def flood_stage_inline(
+    total_storage_hp, river_height, catchment_area, river_width, river_length,
+    table_row_ptr, mask,
+    num_flood_levels: tl.constexpr,
+    HAS_LEVEE: tl.constexpr,
+):
+    """Split ``total_storage_hp`` between river and floodplain, as the stage of
+    ``compute_flood_stage``; returns the river and flood storages and the
+    river depth, flood depth and flooded fraction."""
+    total_storage = hm.to_compute(total_storage_hp, river_length)
+    stage_total = total_storage if HAS_LEVEE else total_storage_hp
+    river_max_storage = river_length * river_width * river_height
+    width_increment = hm.divide(hm.divide(catchment_area, river_length), num_flood_levels)
+
+    level = tl.where(stage_total > river_max_storage, 0, -1)
+    S_accum = river_max_storage
+    prev_H = tl.zeros_like(river_max_storage)
+    prev_W = river_width
+    prev_total_storage = river_max_storage
+    prev_flood_depth = tl.zeros_like(river_max_storage)
+    next_flood_depth = tl.zeros_like(river_max_storage)
+    for i in tl.static_range(num_flood_levels):
+        H_curr = tl.load(table_row_ptr + i, mask=mask, other=0.0)
+        W_curr = river_width + (i + 1) * width_increment
+        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+        S_curr = S_accum + dS
+        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+        is_above = stage_total > S_curr
+        level += tl.where(is_above, 1, 0)
+        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+        S_accum = S_curr
+        prev_H = H_curr
+        prev_W = W_curr
+
+    no_flood_cond = level < 0
+    level = tl.maximum(level, 0)
+    prev_total_width = river_width + level * width_increment
+    flood_grad = tl.where(
+        level == num_flood_levels,
+        0.0,
+        hm.divide(next_flood_depth - prev_flood_depth, width_increment),
+    )
+    diff_width = hm.sqrt(
+        prev_total_width * prev_total_width
+        + hm.divide(2.0 * (total_storage - prev_total_storage), flood_grad * river_length)
+    ) - prev_total_width
+    flood_depth_if_mid = prev_flood_depth + diff_width * flood_grad
+    flood_depth_if_top = prev_flood_depth + hm.divide(
+        total_storage - prev_total_storage, prev_total_width * river_length
+    )
+    flood_depth = tl.where(
+        no_flood_cond, 0.0,
+        tl.where(level == num_flood_levels, flood_depth_if_top, flood_depth_if_mid),
+    )
+
+    river_capacity_hp = tl.zeros_like(total_storage_hp) + (
+        river_max_storage + river_length * river_width * flood_depth
+    )
+    if not HAS_LEVEE:
+        river_capacity_hp = tl.minimum(river_capacity_hp, total_storage_hp)
+    river_storage_hp = tl.where(no_flood_cond, total_storage_hp, river_capacity_hp)
+    river_storage = hm.to_compute(river_storage_hp, river_length)
+    river_depth = tl.maximum(
+        hm.divide(hm.divide(river_storage, river_length), river_width), 0.0
+    )
+    flood_fraction_mid = tl.clamp(
+        hm.divide((prev_total_width + diff_width - river_width) * river_length, catchment_area),
+        0.0, 1.0,
+    )
+    flood_fraction = tl.where(
+        no_flood_cond, 0.0,
+        tl.where(level == num_flood_levels, 1.0, flood_fraction_mid),
+    )
+    flood_storage_hp = tl.maximum(total_storage_hp - river_storage_hp, 0.0)
+    return river_storage_hp, flood_storage_hp, river_depth, flood_depth, flood_fraction
+
+
+@triton.jit
+def initial_flood_stage_cells_inline(
+    cell, catchment, mask,
+    river_storage_ptr, flood_storage_ptr, protected_storage_ptr,
+    river_depth_ptr, flood_depth_ptr, protected_depth_ptr, flood_fraction_ptr,
+    river_height_ptr, flood_depth_table_ptr, catchment_area_ptr,
+    river_width_ptr, river_length_ptr,
+    num_catchments: tl.constexpr,
+    num_flood_levels: tl.constexpr,
+    HAS_LEVEE: tl.constexpr,
+    batched_river_height: tl.constexpr,
+    batched_flood_depth_table: tl.constexpr,
+    batched_catchment_area: tl.constexpr,
+    batched_river_width: tl.constexpr,
+    batched_river_length: tl.constexpr,
+):
+    """Stage ``cell``, a member's slice of ``catchment``, in place."""
+    total_storage_hp = (
+        tl.load(river_storage_ptr + cell, mask=mask, other=0.0)
+        + tl.load(flood_storage_ptr + cell, mask=mask, other=0.0)
+    )
+    if HAS_LEVEE:
+        total_storage_hp += tl.load(protected_storage_ptr + cell, mask=mask, other=0.0)
+    river_height = tl.load(
+        river_height_ptr + (cell if batched_river_height else catchment), mask=mask, other=0.0
+    )
+    catchment_area = tl.load(
+        catchment_area_ptr + (cell if batched_catchment_area else catchment), mask=mask, other=1.0
+    )
+    river_width = tl.load(
+        river_width_ptr + (cell if batched_river_width else catchment), mask=mask, other=1.0
+    )
+    river_length = tl.load(
+        river_length_ptr + (cell if batched_river_length else catchment), mask=mask, other=1.0
+    )
+    table_row = (cell if batched_flood_depth_table else catchment) * num_flood_levels
+    river_storage_hp, flood_storage_hp, river_depth, flood_depth, flood_fraction = (
+        flood_stage_inline(
+            total_storage_hp, river_height, catchment_area, river_width, river_length,
+            flood_depth_table_ptr + table_row, mask, num_flood_levels, HAS_LEVEE,
+        )
+    )
+    tl.store(river_storage_ptr + cell, river_storage_hp, mask=mask)
+    tl.store(flood_storage_ptr + cell, flood_storage_hp, mask=mask)
+    tl.store(river_depth_ptr + cell, river_depth, mask=mask)
+    tl.store(flood_depth_ptr + cell, flood_depth, mask=mask)
+    tl.store(flood_fraction_ptr + cell, flood_fraction, mask=mask)
+    if HAS_LEVEE:
+        tl.store(protected_storage_ptr + cell, tl.zeros_like(total_storage_hp), mask=mask)
+        tl.store(protected_depth_ptr + cell, tl.zeros_like(flood_depth), mask=mask)
+
+
+@triton.jit
+def compute_initial_flood_stage_kernel(
+    river_storage_ptr, flood_storage_ptr, protected_storage_ptr,
+    river_depth_ptr, flood_depth_ptr, protected_depth_ptr, flood_fraction_ptr,
+    river_height_ptr, flood_depth_table_ptr, catchment_area_ptr,
+    river_width_ptr, river_length_ptr,
+    num_catchments: tl.constexpr,
+    num_flood_levels: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_LEVEE: tl.constexpr = False,
+):
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    initial_flood_stage_cells_inline(
+        offs, offs, offs < num_catchments,
+        river_storage_ptr, flood_storage_ptr, protected_storage_ptr,
+        river_depth_ptr, flood_depth_ptr, protected_depth_ptr, flood_fraction_ptr,
+        river_height_ptr, flood_depth_table_ptr, catchment_area_ptr,
+        river_width_ptr, river_length_ptr,
+        num_catchments, num_flood_levels, HAS_LEVEE,
+        False, False, False, False, False,
+    )
+
+
+@triton.jit
+def compute_initial_flood_stage_batched_kernel(
+    river_storage_ptr, flood_storage_ptr, protected_storage_ptr,
+    river_depth_ptr, flood_depth_ptr, protected_depth_ptr, flood_fraction_ptr,
+    river_height_ptr, flood_depth_table_ptr, catchment_area_ptr,
+    river_width_ptr, river_length_ptr,
+    num_catchments: tl.constexpr,
+    num_flood_levels: tl.constexpr,
+    ensemble_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    batched_river_height: tl.constexpr,
+    batched_flood_depth_table: tl.constexpr,
+    batched_catchment_area: tl.constexpr,
+    batched_river_width: tl.constexpr,
+    batched_river_length: tl.constexpr,
+    HAS_LEVEE: tl.constexpr = False,
+):
+    # One lane per cell and member.
+    cell = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    initial_flood_stage_cells_inline(
+        cell, cell % num_catchments,
+        cell < num_catchments * ensemble_size,
+        river_storage_ptr, flood_storage_ptr, protected_storage_ptr,
+        river_depth_ptr, flood_depth_ptr, protected_depth_ptr, flood_fraction_ptr,
+        river_height_ptr, flood_depth_table_ptr, catchment_area_ptr,
+        river_width_ptr, river_length_ptr,
+        num_catchments, num_flood_levels, HAS_LEVEE,
+        batched_river_height, batched_flood_depth_table, batched_catchment_area,
+        batched_river_width, batched_river_length,
+    )

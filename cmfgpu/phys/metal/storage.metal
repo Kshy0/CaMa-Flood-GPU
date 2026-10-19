@@ -304,6 +304,42 @@ long num_catchments = *args.num_catchments;
         args.protected_depth_ptr[cell] = 0.0f;
     }
     args.flood_fraction_ptr[cell] = stage.flood_fraction;
+// HYDROFORGE METAL KERNEL BODY: compute_initial_flood_stage
+long num_catchments = *args.num_catchments;
+    long ensemble_size = *args.ensemble_size;
+    if ((long)i >= num_catchments * ensemble_size) return;
+
+    // CMF_PHYSICS_FLDSTG before the first step: the stage of the current
+    // storage, without compute_flood_stage's storage update.
+    long catchment = (long)i % num_catchments;
+    long member_offset = ((long)i / num_catchments) * num_catchments;
+    long cell = member_offset + catchment;
+
+    cmf_storage total_storage = args.river_storage_ptr[cell]
+        + args.flood_storage_ptr[cell];
+    if (HAS_LEVEE) {
+        total_storage = total_storage + args.protected_storage_ptr[cell];
+    }
+    float river_height = args.river_height_ptr[batched_river_height ? cell : catchment];
+    float catchment_area = args.catchment_area_ptr[batched_catchment_area ? cell : catchment];
+    float river_width = args.river_width_ptr[batched_river_width ? cell : catchment];
+    float river_length = args.river_length_ptr[batched_river_length ? cell : catchment];
+    long table_row = (batched_flood_depth_table ? cell : catchment) * (long)num_flood_levels;
+    FloodStageResult stage = flood_stage_inline(
+        total_storage, river_height, catchment_area,
+        river_width, river_length,
+        args.flood_depth_table_ptr + table_row,
+        num_flood_levels, HAS_LEVEE);
+
+    args.river_storage_ptr[cell] = stage.river_storage;
+    args.flood_storage_ptr[cell] = stage.flood_storage;
+    args.river_depth_ptr[cell] = stage.river_depth;
+    args.flood_depth_ptr[cell] = stage.flood_depth;
+    args.flood_fraction_ptr[cell] = stage.flood_fraction;
+    if (HAS_LEVEE) {
+        args.protected_storage_ptr[cell] = 0.0f;
+        args.protected_depth_ptr[cell] = 0.0f;
+    }
 // HYDROFORGE METAL KERNEL BODY: compute_flood_stage_log
 long num_catchments = *args.num_catchments;
     threadgroup float log_scratch[HF_BLOCK_SIZE];

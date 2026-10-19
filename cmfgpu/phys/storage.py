@@ -9,6 +9,7 @@ from cmfgpu.phys import cuda, metal
 from cmfgpu.phys.specs import (
     FLOOD_STAGE,
     FLOOD_STAGE_LOG,
+    INITIAL_FLOOD_STAGE,
     METAL_FLOOD_STAGE,
     METAL_FLOOD_STAGE_LOG,
 )
@@ -22,6 +23,16 @@ def _triton_stage():
         batched=storage.compute_flood_stage_batched_kernel,
         batch_axis="ensemble_size",
         batch_layout="loop",
+    )
+
+
+def _triton_initial():
+    from cmfgpu.phys.triton import storage
+
+    return TritonKernel(
+        storage.compute_initial_flood_stage_kernel,
+        batched=storage.compute_initial_flood_stage_batched_kernel,
+        batch_axis="ensemble_size",
     )
 
 
@@ -44,4 +55,12 @@ compute_flood_stage_log = BackendRegistry(
         "triton": _triton_log,
     },
     backend_specs={"metal": METAL_FLOOD_STAGE_LOG},
+)
+compute_initial_flood_stage = BackendRegistry(
+    INITIAL_FLOOD_STAGE,
+    {
+        "metal": metal.INITIAL_FLOOD_STAGE,
+        "cuda": cuda.INITIAL_FLOOD_STAGE,
+        "triton": _triton_initial,
+    },
 )

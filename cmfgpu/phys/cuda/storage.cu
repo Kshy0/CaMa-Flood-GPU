@@ -16,7 +16,9 @@
 // Number of global water-balance counters the LOG path accumulates.
 #define CMF_LOG_SUMS 11
 
-template <typename REAL, typename STO, bool LOG>
+// Without UPDATE, the stage of the current storage: no storage update, so
+// the update inputs and the LOG and total-storage outputs are unused.
+template <typename REAL, typename STO, bool LOG, bool UPDATE = true>
 __device__ __forceinline__ void k_flood_stage_cell(
     const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
     const REAL* __restrict__ river_outflow, const REAL* __restrict__ flood_outflow,
@@ -62,10 +64,17 @@ __device__ __forceinline__ void k_flood_stage_cell(
 
     if (t < num_catchments) {
 
-        REAL ts = __ldg(time_step_ptr);
         STO rsto = river_storage[t];
         STO fsto = flood_storage[t];
         STO prot = has_levee ? protected_storage[t] : (STO)0;
+
+        bool non_levee = true;
+        if constexpr (LOG) {
+            non_levee = !has_levee || !is_levee[t];
+        }
+        STO total_next = rsto + fsto + prot;
+        if constexpr (UPDATE) {
+        REAL ts = __ldg(time_step_ptr);
         REAL rinf = (REAL)river_inflow[t];
         REAL finf = (REAL)flood_inflow[t];
         REAL gbif = has_bifurcation ? (REAL)global_bif_outflow[t] : (REAL)0;
@@ -78,10 +87,6 @@ __device__ __forceinline__ void k_flood_stage_cell(
             if (inflow_idx >= 0) prescribed_inflow = __ldg(inflow + inflow_idx);
         }
 
-        bool non_levee = true;
-        if constexpr (LOG) {
-            non_levee = !has_levee || !is_levee[t];
-        }
         STO total_stage_pre = rsto + fsto + prot;
         if constexpr (LOG) {
             log_sum[0] += (REAL)total_stage_pre * (REAL)1e-9;
@@ -107,7 +112,7 @@ __device__ __forceinline__ void k_flood_stage_cell(
         if (has_inflow) river_runoff += prescribed_inflow * ts;
         river_su += (STO)river_runoff;
         flood_su += (STO)(ro * frac * ts);
-        STO total_next = river_su + flood_su + prot;
+        total_next = river_su + flood_su + prot;
         if constexpr (LOG) {
             log_sum[1] += (REAL)total_next * (REAL)1e-9;
             log_sum[2] += (rinf + finf + prescribed_inflow) * ts * (REAL)1e-9;
@@ -116,6 +121,7 @@ __device__ __forceinline__ void k_flood_stage_cell(
                 + (rinf + finf + ro + prescribed_inflow - rout - fout - gbif) * ts;
             log_sum[4] += balance * (REAL)1e-9;
         }
+        }  // UPDATE
         STO total_s = total_next;
         if (has_total_storage_output) total_storage_output[t] = total_s;
         REAL total_storage = (REAL)total_s;
@@ -138,7 +144,7 @@ __device__ __forceinline__ void k_flood_stage_cell(
                     log_sum[7] += total_storage * (REAL)1e-9;
                 }
             }
-            outgoing_storage[t] = (STO)0;
+            if constexpr (UPDATE) outgoing_storage[t] = (STO)0;
             river_storage[t] = total_s;
             flood_storage[t] = (STO)0;
             if (has_levee) protected_storage[t] = (STO)0;
@@ -211,7 +217,7 @@ __device__ __forceinline__ void k_flood_stage_cell(
             }
         }
 
-        outgoing_storage[t] = (STO)0;
+        if constexpr (UPDATE) outgoing_storage[t] = (STO)0;
         river_storage[t] = river_storage_final;
         flood_storage[t] = flood_storage_final;
         if (has_levee) protected_storage[t] = (STO)0;
@@ -298,4 +304,43 @@ __device__ __forceinline__ void flood_stage_members(A a, long t, long member)
     if (a.batched_river_length) a.river_length_ptr += member_offset;
     flood_stage<REAL, STO, HAS_BIFURCATION, HAS_INFLOW, HAS_LEVEE,
                 HAS_TOTAL_STORAGE_OUTPUT>(a, t);
+}
+
+// Generated-entry body over the canonical values ``a`` of
+// compute_initial_flood_stage: the stage of the current storage.
+template <typename REAL, typename STO, bool HAS_LEVEE, class A>
+__device__ __forceinline__ void initial_flood_stage(const A& a, long t)
+{
+    k_flood_stage_cell<REAL, STO, false, false>(
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, a.river_storage_ptr, a.flood_storage_ptr,
+        cmf_optional<HAS_LEVEE>(a.protected_storage_ptr), nullptr, a.river_depth_ptr,
+        a.flood_depth_ptr, cmf_optional<HAS_LEVEE>(a.protected_depth_ptr),
+        a.flood_fraction_ptr, a.river_height_ptr, a.flood_depth_table_ptr,
+        a.catchment_area_ptr, a.river_width_ptr, a.river_length_ptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, a.num_catchments, a.num_flood_levels,
+        false, false, HAS_LEVEE, false, t);
+}
+
+template <typename REAL, typename STO, bool HAS_LEVEE, class A>
+__device__ __forceinline__ void initial_flood_stage_members(A a, long t, long member)
+{
+    const long member_offset = member * a.num_catchments;
+    a.river_storage_ptr += member_offset;
+    a.flood_storage_ptr += member_offset;
+    a.river_depth_ptr += member_offset;
+    a.flood_depth_ptr += member_offset;
+    a.flood_fraction_ptr += member_offset;
+    if constexpr (HAS_LEVEE) {
+        a.protected_storage_ptr += member_offset;
+        a.protected_depth_ptr += member_offset;
+    }
+    if (a.batched_river_height) a.river_height_ptr += member_offset;
+    if (a.batched_flood_depth_table)
+        a.flood_depth_table_ptr += member_offset * a.num_flood_levels;
+    if (a.batched_catchment_area) a.catchment_area_ptr += member_offset;
+    if (a.batched_river_width) a.river_width_ptr += member_offset;
+    if (a.batched_river_length) a.river_length_ptr += member_offset;
+    initial_flood_stage<REAL, STO, HAS_LEVEE>(a, t);
 }

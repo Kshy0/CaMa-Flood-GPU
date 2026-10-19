@@ -225,6 +225,21 @@ RESERVOIR_OUTFLOW = KernelSpec(
     optional={"protected_storage_ptr": "HAS_LEVEE"},
 )
 
+DAM_FILL = KernelSpec(
+    name="fill_dam_storage",
+    size="num_reservoirs",
+    parameters={
+        "reservoir_catchment_idx_ptr": "read",
+        "conservation_volume_ptr": "read",
+        "river_storage_ptr": "read_write",
+        "flood_storage_ptr": "read_write",
+        "num_reservoirs": "int32",
+        "num_catchments": "index",
+        "ensemble_size": "index",
+        "batched_conservation_volume": constant("bool"),
+    },
+)
+
 FLOOD_STAGE = KernelSpec(
     name="compute_flood_stage",
     size="num_catchments",
@@ -282,6 +297,43 @@ FLOOD_STAGE = KernelSpec(
         "total_storage_ptr": None,
     },
     optional_values={"num_inflow_gauges": ("HAS_INFLOW", 0)},
+)
+
+INITIAL_FLOOD_STAGE = KernelSpec(
+    name="compute_initial_flood_stage",
+    size="num_catchments",
+    parameters={
+        "river_storage_ptr": "read_write",
+        "flood_storage_ptr": "read_write",
+        "protected_storage_ptr": "read_write",
+        "river_depth_ptr": "write",
+        "flood_depth_ptr": "write",
+        "protected_depth_ptr": "write",
+        "flood_fraction_ptr": "write",
+        "river_height_ptr": "read",
+        "flood_depth_table_ptr": "read",
+        "catchment_area_ptr": "read",
+        "river_width_ptr": "read",
+        "river_length_ptr": "read",
+        "num_catchments": "index",
+        "num_flood_levels": constant("int32"),
+        "HAS_LEVEE": HAS_LEVEE,
+        "ensemble_size": "index",
+        **dict.fromkeys(
+            (
+                "batched_river_height",
+                "batched_flood_depth_table",
+                "batched_catchment_area",
+                "batched_river_width",
+                "batched_river_length",
+            ),
+            constant("bool"),
+        ),
+    },
+    optional={
+        "protected_storage_ptr": "HAS_LEVEE",
+        "protected_depth_ptr": "HAS_LEVEE",
+    },
 )
 
 FLOOD_STAGE_LOG = KernelSpec(

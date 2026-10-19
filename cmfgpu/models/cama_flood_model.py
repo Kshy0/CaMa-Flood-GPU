@@ -47,8 +47,12 @@ from cmfgpu.phys.levee import (
     compute_levee_stage_log,
 )
 from cmfgpu.phys.outflow import compute_inflow, compute_outflow
-from cmfgpu.phys.reservoir import compute_reservoir_outflow
-from cmfgpu.phys.storage import compute_flood_stage, compute_flood_stage_log
+from cmfgpu.phys.reservoir import compute_reservoir_outflow, fill_dam_storage
+from cmfgpu.phys.storage import (
+    compute_flood_stage,
+    compute_flood_stage_log,
+    compute_initial_flood_stage,
+)
 
 
 class CaMaFlood(AbstractModel):
@@ -77,13 +81,14 @@ class CaMaFlood(AbstractModel):
     }
 
     def initialize_model_state(self) -> None:
-        """Fill cold-start reservoirs and diagnose the initial water levels."""
-        base, reservoir, levee = self.base, self.reservoir, self.levee
-        if reservoir is not None and "base.river_storage" in self.missing_inputs:
-            reservoir.fill_dams()
-        base.diagnose_flood_stage()
-        if levee is not None:
-            levee.diagnose_levee_stage()
+        if (
+            self.reservoir is not None
+            and "reservoir.reservoir_total_inflow" in self.missing_inputs
+        ):
+            fill_dam_storage()
+        compute_initial_flood_stage()
+        if self.levee is not None:
+            compute_levee_stage()
 
     @between_steps
     @torch.inference_mode()

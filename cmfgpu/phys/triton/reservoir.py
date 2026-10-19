@@ -291,3 +291,57 @@ def compute_reservoir_outflow_batched_kernel(
     )
     tl.store(flood_outflow_ptr + catchment_idx, 0.0, mask=mask)
     tl.atomic_add(outgoing_storage_ptr + catchment_idx, reservoir_outflow.to(outgoing_storage_ptr.dtype.element_ty), mask=mask, sem="relaxed")
+
+
+
+@triton.jit
+def fill_dam_cells_inline(
+    cell, volume, mask, conservation_volume_ptr, river_storage_ptr, flood_storage_ptr,
+):
+    """CMF_DAMOUT_INIT for dam storage ``cell`` and its conservation volume:
+    below that volume, the dam starts full to it with an empty floodplain."""
+    river = tl.load(river_storage_ptr + cell, mask=mask, other=0.0)
+    flood = tl.load(flood_storage_ptr + cell, mask=mask, other=0.0)
+    conservation = tl.load(
+        conservation_volume_ptr + volume, mask=mask, other=0.0
+    ).to(river.dtype)
+    fill = mask & (river + flood < conservation)
+    tl.store(river_storage_ptr + cell, conservation, mask=fill)
+    tl.store(flood_storage_ptr + cell, tl.zeros_like(flood), mask=fill)
+
+
+@triton.jit
+def fill_dam_storage_kernel(
+    reservoir_catchment_idx_ptr, conservation_volume_ptr,
+    river_storage_ptr, flood_storage_ptr,
+    num_reservoirs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    reservoir = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = reservoir < num_reservoirs
+    cell = tl.load(reservoir_catchment_idx_ptr + reservoir, mask=mask, other=0)
+    fill_dam_cells_inline(
+        cell, reservoir, mask, conservation_volume_ptr, river_storage_ptr, flood_storage_ptr,
+    )
+
+
+@triton.jit
+def fill_dam_storage_batched_kernel(
+    reservoir_catchment_idx_ptr, conservation_volume_ptr,
+    river_storage_ptr, flood_storage_ptr,
+    num_reservoirs: tl.constexpr,
+    num_catchments: tl.constexpr,
+    ensemble_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    batched_conservation_volume: tl.constexpr,
+):
+    # One lane per dam and member.
+    idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < num_reservoirs * ensemble_size
+    reservoir = idx % num_reservoirs
+    member_offset = (idx // num_reservoirs) * num_catchments
+    cell = member_offset + tl.load(reservoir_catchment_idx_ptr + reservoir, mask=mask, other=0)
+    fill_dam_cells_inline(
+        cell, idx if batched_conservation_volume else reservoir, mask,
+        conservation_volume_ptr, river_storage_ptr, flood_storage_ptr,
+    )

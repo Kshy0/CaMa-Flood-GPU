@@ -7,6 +7,7 @@
 from hydroforge.kernels import BackendRegistry, TritonKernel
 from cmfgpu.phys import cuda, metal
 from cmfgpu.phys.specs import (
+    DAM_FILL,
     METAL_RESERVOIR_OUTFLOW,
     RESERVOIR_OUTFLOW,
 )
@@ -30,4 +31,20 @@ compute_reservoir_outflow = BackendRegistry(
         "triton": _triton,
     },
     backend_specs={"metal": METAL_RESERVOIR_OUTFLOW},
+)
+
+
+def _triton_fill():
+    from cmfgpu.phys.triton import reservoir
+
+    return TritonKernel(
+        reservoir.fill_dam_storage_kernel,
+        batched=reservoir.fill_dam_storage_batched_kernel,
+        batch_axis="ensemble_size",
+    )
+
+
+fill_dam_storage = BackendRegistry(
+    DAM_FILL,
+    {"metal": metal.DAM_FILL, "cuda": cuda.DAM_FILL, "triton": _triton_fill},
 )

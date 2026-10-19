@@ -69,6 +69,9 @@ FLOOD_STAGE = _kernel("storage", "flood_stage", _FLOOD_STAGE, guard=False)
 FLOOD_STAGE_LOG = _kernel(
     "storage", "flood_stage", _FLOOD_STAGE + ", true", members=False, guard=False
 )
+INITIAL_FLOOD_STAGE = _kernel(
+    "storage", "initial_flood_stage", _REAL_STO + ", {HAS_LEVEE}"
+)
 OUTFLOW = _kernel(
     "outflow", "outflow",
     _REAL_STO + ", {HAS_BIFURCATION}, {HAS_LEVEE}, {HAS_RESERVOIR}, {HAS_SEA_LEVEL}",
@@ -88,6 +91,9 @@ BIFURCATION_INFLOW = _kernel(
 RESERVOIR_OUTFLOW = _kernel(
     "reservoir", "reservoir_outflow",
     "{river_outflow_ptr}, {river_storage_ptr}, {HAS_LEVEE}",
+)
+DAM_FILL = _kernel(
+    "reservoir", "dam_fill", "{conservation_volume_ptr}, {river_storage_ptr}"
 )
 LEVEE_STAGE = _kernel("levee", "levee_stage", _REAL_STO, guard=False)
 LEVEE_STAGE_LOG = _kernel(

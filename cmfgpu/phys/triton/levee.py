@@ -608,7 +608,7 @@ def compute_levee_stage_batched_kernel(
         ilev_shared = hm.to_index(levee_fraction_shared * num_flood_levels)
 
     # ---- Loop over members ----
-    for t in tl.static_range(ensemble_size):
+    for t in tl.range(ensemble_size):
         member_offset_catchments = t * num_catchments
         member_offset_levees = t * num_levees
 
