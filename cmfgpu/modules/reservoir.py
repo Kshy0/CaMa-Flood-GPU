@@ -131,12 +131,6 @@ class ReservoirModule(AbstractModule):
         ge=0,
     )
 
-    reservoir_area: torch.Tensor = ReservoirField(
-        description="Surface area at normal water level",
-        units="m2",
-        gt=0,
-    )
-
     # ------------------------------------------------------------------ #
     # Computed tensor fields
     # ------------------------------------------------------------------ #

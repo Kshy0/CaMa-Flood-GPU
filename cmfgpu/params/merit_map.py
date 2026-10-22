@@ -991,9 +991,6 @@ class MERITMap(BaseModel):
         tot_vol = tot_vol_mcm * 1.0e6  # total capacity
         eme_vol = con_vol + fld_vol * 0.95  # emergency threshold
 
-        # Reservoir area: not available from CSV; set to 0 (can be overridden later)
-        res_area = np.zeros(n_kept, dtype=self.numpy_precision)
-
         # Store results (reservoir-indexed arrays)
         self.num_reservoirs = n_kept
         self.reservoir_id = dam_ids
@@ -1005,7 +1002,6 @@ class MERITMap(BaseModel):
         self.emergency_volume = eme_vol
         self.normal_outflow = qn
         self.flood_control_outflow = qf
-        self.reservoir_area = res_area
 
         print(f"  Allocated {n_kept} reservoirs out of {ndam} dams")
 
@@ -1317,10 +1313,6 @@ class MERITMap(BaseModel):
                 "flood_control_outflow": {
                     "units": "m3/s",
                     "long_name": "Reservoir flood control outflow",
-                },
-                "reservoir_area": {
-                    "units": "m2",
-                    "long_name": "Reservoir surface area",
                 },
                 "levee_crown_height": {"units": "m", "long_name": "Levee crown height"},
                 "levee_fraction": {

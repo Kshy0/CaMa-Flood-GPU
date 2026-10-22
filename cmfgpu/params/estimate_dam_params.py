@@ -693,7 +693,6 @@ def _write_dam_to_nc(
     tot_vol_m3: np.ndarray,
     qn: np.ndarray,
     qf: np.ndarray,
-    res_area: np.ndarray,
     verbose: bool = True,
 ) -> None:
     """Append / update reservoir variables in an existing parameters.nc.
@@ -701,7 +700,7 @@ def _write_dam_to_nc(
     Variables written (reservoir-indexed):
         reservoir_id, reservoir_catchment_id,
         reservoir_capacity, conservation_volume, emergency_volume,
-        normal_outflow, flood_control_outflow, reservoir_area.
+        normal_outflow, flood_control_outflow.
     """
     n_res = len(dam_ids)
 
@@ -766,7 +765,6 @@ def _write_dam_to_nc(
         _put("emergency_volume", eme_vol, "f8", "m3", "emergency storage threshold")
         _put("normal_outflow", qn, "f8", "m3/s", "mean annual outflow (Qn)")
         _put("flood_control_outflow", qf, "f8", "m3/s", "flood control outflow (Qf)")
-        _put("reservoir_area", res_area, "f8", "m2", "reservoir surface area")
 
     if verbose:
         print(f"[dam_params] Written {n_res} reservoirs to {nc_path}")
@@ -1242,7 +1240,6 @@ def estimate_dam_params(
         fld_m3 = fld_k * 1.0e6
         con_m3 = con_k * 1.0e6
         tot_m3 = tot_k * 1.0e6
-        res_area = np.zeros(n_kept, dtype=np.float64)
 
         _write_dam_to_nc(
             nc_path,
@@ -1255,7 +1252,6 @@ def estimate_dam_params(
             tot_m3,
             qn_k,
             qf_k,
-            res_area,
             verbose=verbose,
         )
         if primary_output is None:

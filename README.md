@@ -54,7 +54,7 @@ Choose a PyTorch build compatible with your GPU and operating system. The availa
 ### 1. Clone the repository
 
 ```shell
-git clone https://github.com/Kshy0/CaMa-Flood-GPU.git
+git clone --branch v1.0.0 https://github.com/Kshy0/CaMa-Flood-GPU.git
 cd CaMa-Flood-GPU
 ```
 
@@ -90,34 +90,30 @@ pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
 You can use `pip index versions torch` to check the latest torch version supported by your environment, and then select a suitable torch–CUDA combination from [the PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/). You do not need to install CUDA separately, as the torch wheel package already includes a precompiled CUDA runtime. Just make sure your GPU driver is correctly installed, and that the chosen CUDA version is compatible according to [the NVIDIA CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
-### 3. Install Hydroforge
-
-[Hydroforge](https://github.com/Kshy0/hydroforge) is the underlying abstract framework used by this project. Install it with:
-
-```shell
-pip install git+https://github.com/Kshy0/hydroforge.git
-```
-
-### 4. Install other dependencies
+### 3. Install cmfgpu and its dependencies
 
 ```shell
 pip install -e .
 ```
 
-This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, and others.
+This installs cmfgpu 1.0.0 and automatically resolves its Python dependencies,
+including [HydroForge](https://github.com/Kshy0/hydroforge) from PyPI.
+This release requires `hydroforge==0.3.*`: pip uses an installed compatible
+version or installs a compatible 0.3.x release. HydroForge 0.4.x is excluded.
+No separate clone of HydroForge is needed.
 
 ---
 
-## Updating
+## Updating HydroForge within the supported release series
 
-When pulling the latest version of this repository, **remember to also update `Hydroforge`**, as the two packages are developed in tandem and API changes in one may require a matching update in the other:
+To explicitly upgrade HydroForge while staying compatible with cmfgpu 1.0.0:
 
 ```shell
-git pull
-conda activate CMF
-pip uninstall hydroforge -y
-pip install --upgrade git+https://github.com/Kshy0/hydroforge.git
+pip install --upgrade "hydroforge==0.3.*"
 ```
+
+Running the model does not automatically upgrade dependencies. For reproducible
+runs, record the exact installed versions with `pip freeze`.
 
 ---
 
