@@ -139,7 +139,7 @@ class LeveeModule(AbstractModule):
     @cached_property
     def is_levee(self) -> torch.Tensor:
         mask = torch.zeros(
-            self.base.num_catchments,
+            self.base.catchment_id.shape[0],
             dtype=torch.bool,
             device=self.base.catchment_id.device,
         )

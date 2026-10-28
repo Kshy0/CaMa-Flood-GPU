@@ -157,7 +157,7 @@ class ReservoirModule(AbstractModule):
     @cached_property
     def is_reservoir(self) -> torch.Tensor:
         mask = torch.zeros(
-            self.base.num_catchments,
+            self.base.catchment_id.shape[0],
             dtype=torch.bool,
             device=self.base.catchment_id.device,
         )
@@ -175,7 +175,7 @@ class ReservoirModule(AbstractModule):
     def is_dam_related(self) -> torch.Tensor:
         downstream_is_dam = self.is_reservoir[self.base.downstream_idx]
         idx = torch.arange(
-            self.base.num_catchments, device=self.base.catchment_id.device
+            self.base.catchment_id.shape[0], device=self.base.catchment_id.device
         )
         not_mouth = self.base.downstream_idx != idx
         upstream = (~self.is_reservoir) & not_mouth & downstream_is_dam

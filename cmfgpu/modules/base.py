@@ -285,10 +285,11 @@ class BaseModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
-    @computed_field(description="Total number of catchments")
+    @computed_field(description="Catchments this rank owns (the kernel extent)")
     @cached_property
     def num_catchments(self) -> int:
-        return self.catchment_id.shape[0]
+        # Halo ghost rows, when the basin is split, follow the owned rows.
+        return self.owned_rows("catchment_id")
 
     @computed_field(
         description="Number of catchments that will have their output saved"

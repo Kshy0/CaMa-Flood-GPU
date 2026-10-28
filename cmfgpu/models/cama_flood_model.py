@@ -77,6 +77,9 @@ class CaMaFlood(AbstractModel):
         "metal": BackendRequirement(default_mixed_precision=True),
     }
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {
+        "base": ModuleRequirement(halo=True),
+        "bifurcation": ModuleRequirement(halo=True),
+        "adaptive_time": ModuleRequirement(halo=True),
         "log": ModuleRequirement(ensemble=False, clock=True),
     }
 
