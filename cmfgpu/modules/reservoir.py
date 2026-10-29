@@ -154,7 +154,6 @@ class ReservoirModule(AbstractModule):
         dim_coords="base.catchment_id",
         category="topology",
     )
-    @cached_property
     def is_reservoir(self) -> torch.Tensor:
         mask = torch.zeros(
             self.base.catchment_id.shape[0],
@@ -171,7 +170,6 @@ class ReservoirModule(AbstractModule):
         dim_coords="base.catchment_id",
         category="topology",
     )
-    @cached_property
     def is_dam_related(self) -> torch.Tensor:
         downstream_is_dam = self.is_reservoir[self.base.downstream_idx]
         idx = torch.arange(
@@ -188,7 +186,6 @@ class ReservoirModule(AbstractModule):
         dim_coords="base.catchment_id",
         category="topology",
     )
-    @cached_property
     def is_dam_upstream(self) -> torch.Tensor:
         return self.is_dam_related & ~self.is_reservoir
 

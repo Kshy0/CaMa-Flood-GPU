@@ -189,6 +189,7 @@ class BifurcationModule(AbstractModule):
         dim_coords="base.catchment_id",
         category="state",
         output="disabled",
+        halo=True,
     )
     @cached_property
     def global_bifurcation_outflow(self) -> torch.Tensor:
@@ -204,6 +205,7 @@ class BifurcationModule(AbstractModule):
         dim_coords="base.catchment_id",
         category="state",
         output="disabled",
+        halo=True,
     )
     @cached_property
     def limit_rate(self) -> torch.Tensor:

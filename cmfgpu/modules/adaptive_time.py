@@ -4,7 +4,6 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from functools import cached_property
 from typing import ClassVar
 
 import torch
@@ -38,7 +37,6 @@ class AdaptiveTimeModule(AbstractModule):
         category="shared_state",
         dtype="idx",
     )
-    @cached_property
     def max_sub_steps(self) -> torch.Tensor:
         return torch.zeros((1,), dtype=torch.int32, device=self.device)
     

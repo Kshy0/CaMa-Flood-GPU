@@ -223,6 +223,7 @@ class BaseModule(AbstractModule):
         category="init_state",
         dtype="hpfloat",
         ge=0,
+        halo=True,
     )
 
     flood_storage: torch.Tensor = BaseField(
@@ -232,6 +233,7 @@ class BaseModule(AbstractModule):
         category="init_state",
         dtype="hpfloat",
         ge=0,
+        halo=True,
     )
 
     protected_storage: torch.Tensor | None = BaseField(
@@ -345,6 +347,7 @@ class BaseModule(AbstractModule):
         description="Current water depth in rivers",
         units="m",
         category="state",
+        halo=True,
     )
     @cached_property
     def river_depth(self) -> torch.Tensor:
@@ -389,6 +392,7 @@ class BaseModule(AbstractModule):
         output="disabled",
         category="state",
         dtype="hpfloat",
+        halo=True,
     )
     @cached_property
     def outgoing_storage(self) -> torch.Tensor:
@@ -412,6 +416,7 @@ class BaseModule(AbstractModule):
         units="m3 s-1",
         category="state",
         dtype="hpfloat",
+        halo=True,
     )
     @cached_property
     def river_inflow(self) -> torch.Tensor:
@@ -435,6 +440,7 @@ class BaseModule(AbstractModule):
         units="m3 s-1",
         category="state",
         dtype="hpfloat",
+        halo=True,
     )
     @cached_property
     def flood_inflow(self) -> torch.Tensor:

@@ -136,7 +136,6 @@ class LeveeModule(AbstractModule):
         dim_coords="base.catchment_id",
         category="topology",
     )
-    @cached_property
     def is_levee(self) -> torch.Tensor:
         mask = torch.zeros(
             self.base.catchment_id.shape[0],
