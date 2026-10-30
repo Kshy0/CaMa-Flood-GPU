@@ -48,43 +48,75 @@
         batched_conservation_volume ? member_reservoir : reservoir_idx];
     float emergency_volume = args.emergency_volume_ptr[
         batched_emergency_volume ? member_reservoir : reservoir_idx];
-    float adjustment_volume = args.adjustment_volume_ptr[
-        batched_adjustment_volume ? member_reservoir : reservoir_idx];
     float normal_outflow = args.effective_normal_outflow_ptr[
         batched_effective_normal_outflow ? member_reservoir : reservoir_idx];
-    float adjustment_outflow = args.adjustment_outflow_ptr[
-        batched_adjustment_outflow ? member_reservoir : reservoir_idx];
     float flood_control_outflow = args.flood_control_outflow_ptr[
         batched_flood_control_outflow ? member_reservoir : reservoir_idx];
 
     float reservoir_outflow;
-    if (dam_volume <= conservation_volume) {
-        reservoir_outflow = normal_outflow
-            * sqrt(dam_volume / conservation_volume);
-    } else if (dam_volume <= adjustment_volume) {
-        float fraction = (dam_volume - conservation_volume)
-            / (adjustment_volume - conservation_volume);
-        reservoir_outflow = normal_outflow
-            + exp(3.0f * log(fraction))
-            * (adjustment_outflow - normal_outflow);
-    } else if (dam_volume <= emergency_volume) {
-        float fraction = (dam_volume - adjustment_volume)
-            / (emergency_volume - adjustment_volume);
-        float controlled = adjustment_outflow
-            + exp(CMF_RESERVOIR_RELEASE_EXPONENT * log(fraction))
-            * (flood_control_outflow - adjustment_outflow);
-        if (reservoir_inflow >= flood_control_outflow) {
-            float flood = normal_outflow
-                + (dam_volume - conservation_volume)
-                / (emergency_volume - conservation_volume)
-                * (reservoir_inflow - normal_outflow);
-            reservoir_outflow = max(flood, controlled);
+    if (HAS_H22) {
+        // Hanazaki et al. (2022), CaMa-Flood v4 LDAMH22.
+        float normal_volume = args.normal_volume_ptr[
+            batched_normal_volume ? member_reservoir : reservoir_idx];
+        float share = args.flood_inflow_share_ptr[
+            batched_flood_inflow_share ? member_reservoir : reservoir_idx];
+        float half_normal = normal_outflow * 0.5f;
+        float fraction = (dam_volume - normal_volume)
+            / (emergency_volume - normal_volume);
+        float supply = half_normal
+            + fraction * fraction * (flood_control_outflow - normal_outflow);
+        bool flood_period = flood_control_outflow <= reservoir_inflow;
+        if (dam_volume <= normal_volume) {
+            reservoir_outflow = normal_outflow * (dam_volume / conservation_volume);
+        } else if (dam_volume <= conservation_volume) {
+            reservoir_outflow = flood_period
+                ? half_normal + (dam_volume - normal_volume)
+                    / (conservation_volume - normal_volume)
+                    * (flood_control_outflow - normal_outflow)
+                : supply;
+        } else if (dam_volume < emergency_volume) {
+            reservoir_outflow = flood_period
+                ? flood_control_outflow + share
+                    * (dam_volume - conservation_volume)
+                    / (emergency_volume - conservation_volume)
+                    * (reservoir_inflow - flood_control_outflow)
+                : supply;
         } else {
-            reservoir_outflow = controlled;
+            reservoir_outflow = max(reservoir_inflow, flood_control_outflow);
         }
     } else {
-        reservoir_outflow = reservoir_inflow >= flood_control_outflow
-            ? reservoir_inflow : flood_control_outflow;
+        float adjustment_volume = args.adjustment_volume_ptr[
+            batched_adjustment_volume ? member_reservoir : reservoir_idx];
+        float adjustment_outflow = args.adjustment_outflow_ptr[
+            batched_adjustment_outflow ? member_reservoir : reservoir_idx];
+        if (dam_volume <= conservation_volume) {
+            reservoir_outflow = normal_outflow
+                * sqrt(dam_volume / conservation_volume);
+        } else if (dam_volume <= adjustment_volume) {
+            float fraction = (dam_volume - conservation_volume)
+                / (adjustment_volume - conservation_volume);
+            reservoir_outflow = normal_outflow
+                + exp(3.0f * log(fraction))
+                * (adjustment_outflow - normal_outflow);
+        } else if (dam_volume <= emergency_volume) {
+            float fraction = (dam_volume - adjustment_volume)
+                / (emergency_volume - adjustment_volume);
+            float controlled = adjustment_outflow
+                + exp(release_exponent * log(fraction))
+                * (flood_control_outflow - adjustment_outflow);
+            if (reservoir_inflow >= flood_control_outflow) {
+                float flood = normal_outflow
+                    + (dam_volume - conservation_volume)
+                    / (emergency_volume - conservation_volume)
+                    * (reservoir_inflow - normal_outflow);
+                reservoir_outflow = max(flood, controlled);
+            } else {
+                reservoir_outflow = controlled;
+            }
+        } else {
+            reservoir_outflow = reservoir_inflow >= flood_control_outflow
+                ? reservoir_inflow : flood_control_outflow;
+        }
     }
 
     // Flow limiter: the minimum first, so a negative storage releases nothing.

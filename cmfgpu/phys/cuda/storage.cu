@@ -12,22 +12,12 @@
 
 #include "block_reduce.cuh"
 #include "canonical.cuh"
-#include "halo_access.cuh"
 
 // Number of global water-balance counters the LOG path accumulates.
 #define CMF_LOG_SUMS 11
 
-// What a catchment's stage leaves in its river depth and storages (the
-// values flood_stage publishes, kept in registers).
-template <typename REAL, typename STO>
-struct CmfStage {
-    REAL river_depth;
-    STO river_storage, flood_storage;
-};
-
 // Without UPDATE, the stage of the current storage: no storage update, so
 // the update inputs and the LOG and total-storage outputs are unused.
-// ``stage`` (optional) receives the depth and storages it stores.
 template <typename REAL, typename STO, bool LOG, bool UPDATE = true>
 __device__ __forceinline__ void k_flood_stage_cell(
     const STO* __restrict__ river_inflow, const STO* __restrict__ flood_inflow,
@@ -59,8 +49,7 @@ __device__ __forceinline__ void k_flood_stage_cell(
     const int* __restrict__ current_step_ptr,
     long num_catchments, int num_flood_levels,
     int has_bifurcation, int has_inflow, int has_levee,
-    int has_total_storage_output, long t,
-    CmfStage<REAL, STO>* stage = nullptr)
+    int has_total_storage_output, long t)
 {
     REAL log_sum[CMF_LOG_SUMS];
     if constexpr (LOG) {
@@ -160,7 +149,6 @@ __device__ __forceinline__ void k_flood_stage_cell(
             flood_storage[t] = (STO)0;
             if (has_levee) protected_storage[t] = (STO)0;
             river_depth[t] = river_depth_dry;
-            if (stage) *stage = {river_depth_dry, total_s, (STO)0};
             flood_depth[t] = (REAL)0;
             if (has_levee) protected_depth[t] = (REAL)0;
             flood_fraction[t] = (REAL)0;
@@ -234,7 +222,6 @@ __device__ __forceinline__ void k_flood_stage_cell(
         flood_storage[t] = flood_storage_final;
         if (has_levee) protected_storage[t] = (STO)0;
         river_depth[t] = rdep;
-        if (stage) *stage = {rdep, river_storage_final, flood_storage_final};
         flood_depth[t] = fdep;
         if (has_levee) protected_depth[t] = (REAL)0;
         flood_fraction[t] = ffr;
@@ -258,10 +245,9 @@ __device__ __forceinline__ void k_flood_stage_cell(
 // or of compute_flood_stage_log with LOG.
 template <typename REAL, typename STO, bool HAS_BIFURCATION, bool HAS_INFLOW,
           bool HAS_LEVEE, bool HAS_TOTAL_STORAGE_OUTPUT, bool LOG = false, class A>
-__device__ __forceinline__ void flood_stage(const A& a, long t, long member = 0)
+__device__ __forceinline__ void flood_stage(const A& a, long t)
 {
     const auto balance = cmf_balance<LOG>(a);
-    CmfStage<REAL, STO> stage;
     k_flood_stage_cell<REAL, STO, LOG>(
         a.river_inflow_ptr, a.flood_inflow_ptr, a.river_outflow_ptr, a.flood_outflow_ptr,
         cmf_optional<HAS_BIFURCATION>(a.global_bifurcation_outflow_ptr), a.runoff_ptr,
@@ -281,17 +267,7 @@ __device__ __forceinline__ void flood_stage(const A& a, long t, long member = 0)
         balance.flood_area_sum_ptr, balance.total_inflow_error_sum_ptr,
         balance.total_stage_error_sum_ptr, balance.current_step_ptr, a.num_catchments,
         a.num_flood_levels, HAS_BIFURCATION, HAS_INFLOW, HAS_LEVEE,
-        HAS_TOTAL_STORAGE_OUTPUT, t, &stage);
-    // Depth and storages are published (HydroForge halo_access.cuh): a
-    // catchment a neighbour holds as a ghost goes to its receive ring, with
-    // the values this lane just stored.
-    if (t < a.num_catchments && hf_publishes_row(a.halo, 0, t)) {
-        int stored = 0;
-        hf_publish(a.halo, stored, 0, member, t, 0, stage.river_depth);
-        hf_publish(a.halo, stored, 1, member, t, 0, stage.river_storage);
-        hf_publish(a.halo, stored, 2, member, t, 0, stage.flood_storage);
-        hf_publish_done(a.halo, stored);
-    }
+        HAS_TOTAL_STORAGE_OUTPUT, t);
 }
 
 // Ensemble members offset their slices, then run the body above.
@@ -327,7 +303,7 @@ __device__ __forceinline__ void flood_stage_members(A a, long t, long member)
     if (a.batched_river_width) a.river_width_ptr += member_offset;
     if (a.batched_river_length) a.river_length_ptr += member_offset;
     flood_stage<REAL, STO, HAS_BIFURCATION, HAS_INFLOW, HAS_LEVEE,
-                HAS_TOTAL_STORAGE_OUTPUT>(a, t, member);
+                HAS_TOTAL_STORAGE_OUTPUT>(a, t);
 }
 
 // Generated-entry body over the canonical values ``a`` of

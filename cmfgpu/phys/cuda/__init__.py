@@ -14,7 +14,6 @@ single-member and ensemble bodies together.
 from pathlib import Path
 
 from hydroforge.kernels import CudaCall, CudaKernel, CudaSource
-from hydroforge.kernels.halo import ACCESS_HEADER
 from cmfgpu import config as constants
 
 PHYSICAL_CONSTANT_FLAGS = tuple(
@@ -25,15 +24,8 @@ PHYSICAL_CONSTANT_FLAGS = tuple(
 _DIR = Path(__file__).resolve().parent
 # Routing keeps subnormal storages and fluxes, also under HydroForge fast math.
 _SUBNORMAL_OPTIONS = ("--ftz=false", *PHYSICAL_CONSTANT_FLAGS)
-_HALO_SOURCES = ("storage", "outflow", "bifurcation", "levee")
 _SOURCES = {
-    name: CudaSource(
-        path=_DIR / f"{name}.cu",
-        options=options,
-        include_root=_DIR,
-        # Kernels declaring neighbourhoods take HydroForge's halo argument.
-        inline_includes=(ACCESS_HEADER,) if name in _HALO_SOURCES else (),
-    )
+    name: CudaSource(path=_DIR / f"{name}.cu", options=options, include_root=_DIR)
     for name, options in (
         ("storage", _SUBNORMAL_OPTIONS),
         ("outflow", _SUBNORMAL_OPTIONS),
@@ -98,7 +90,7 @@ BIFURCATION_INFLOW = _kernel(
 )
 RESERVOIR_OUTFLOW = _kernel(
     "reservoir", "reservoir_outflow",
-    "{river_outflow_ptr}, {river_storage_ptr}, {HAS_LEVEE}",
+    "{river_outflow_ptr}, {river_storage_ptr}, {HAS_LEVEE}, {HAS_H22}",
 )
 DAM_FILL = _kernel(
     "reservoir", "dam_fill", "{conservation_volume_ptr}, {river_storage_ptr}"

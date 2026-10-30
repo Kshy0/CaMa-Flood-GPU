@@ -1,5 +1,4 @@
 #include "canonical.cuh"
-#include "halo_access.cuh"  // the halo argument
 
 template <typename REAL, typename STO>
 __device__ __forceinline__ REAL cmf_supply_rate(STO outgoing_flow, STO storage, STO step)
@@ -8,7 +7,7 @@ __device__ __forceinline__ REAL cmf_supply_rate(STO outgoing_flow, STO storage, 
     return fmin((REAL)storage / volume, (REAL)1.0);
 }
 
-template <bool HAS_BIFURCATION, typename REAL, typename STO, class StorageAt>
+template <bool HAS_BIFURCATION, typename REAL, typename STO>
 __device__ __forceinline__ void k_inflow_cell(
     const int* __restrict__ downstream_idx,
     REAL* __restrict__ river_outflow, REAL* __restrict__ flood_outflow,
@@ -16,8 +15,11 @@ __device__ __forceinline__ void k_inflow_cell(
     const STO* __restrict__ outgoing_storage, const REAL* __restrict__ time_step_ptr,
     STO* __restrict__ river_inflow, STO* __restrict__ flood_inflow,
     REAL* __restrict__ limit_rate_out, STO* __restrict__ reservoir_total_inflow,
-    const bool* __restrict__ is_reservoir, int has_reservoir, long t, const StorageAt& storage_at)
+    const bool* __restrict__ is_reservoir, int has_reservoir, long t)
 {
+    // CaMa-Flood v4.23 supply-side limiter (CALC_INFLOW_LSPAMAT): a cell
+    // releases at most its storage.  The rate of the cell a flow leaves sets
+    // both of its flows, chosen by the river flow's direction.
     REAL r_out = river_outflow[t];
     REAL f_out = flood_outflow[t];
     STO step = (STO)__ldg(time_step_ptr);
@@ -26,7 +28,7 @@ __device__ __forceinline__ void k_inflow_cell(
 
     int dn = downstream_idx[t];
     REAL limit_rate_dn = cmf_supply_rate<REAL>(
-        outgoing_storage[dn], storage_at(dn), step);
+        outgoing_storage[dn], river_storage[dn] + flood_storage[dn], step);
 
     REAL rate = (r_out > (REAL)0.0) ? limit_rate : limit_rate_dn;
     REAL upd_r_out = r_out * rate;
@@ -50,7 +52,7 @@ __device__ __forceinline__ void k_inflow_cell(
 
 // Generated-entry body over the canonical values ``a`` of compute_inflow.
 template <typename REAL, typename STO, bool HAS_BIFURCATION, bool HAS_RESERVOIR, class A>
-__device__ __forceinline__ void inflow(const A& a, long t, long member = 0)
+__device__ __forceinline__ void inflow(const A& a, long t)
 {
     k_inflow_cell<HAS_BIFURCATION, REAL, STO>(
         a.downstream_idx_ptr, a.river_outflow_ptr, a.flood_outflow_ptr, a.river_storage_ptr,
@@ -58,11 +60,7 @@ __device__ __forceinline__ void inflow(const A& a, long t, long member = 0)
         a.flood_inflow_ptr,
         cmf_optional<HAS_BIFURCATION>(a.limit_rate_ptr),
         cmf_optional<HAS_RESERVOIR>(a.reservoir_total_inflow_ptr),
-        cmf_optional<HAS_RESERVOIR>(a.is_reservoir_ptr), HAS_RESERVOIR, t,
-        [&](long index) {
-            return hf_halo_load(a.halo, 0, a.river_storage_ptr, index, member, index, 0)
-                + hf_halo_load(a.halo, 1, a.flood_storage_ptr, index, member, index, 0);
-        });
+        cmf_optional<HAS_RESERVOIR>(a.is_reservoir_ptr), HAS_RESERVOIR, t);
 }
 
 // LICENSE HEADER MANAGED BY add-license-header
@@ -71,7 +69,7 @@ __device__ __forceinline__ void inflow(const A& a, long t, long member = 0)
 // http://www.apache.org/licenses/LICENSE-2.0
 //
 
-template <bool BASE_ONLY, typename REAL, typename STO, class DepthAt>
+template <bool BASE_ONLY, typename REAL, typename STO>
 __device__ __forceinline__ void k_outflow_cell(
     const int* __restrict__ downstream_idx,
     STO* __restrict__ river_inflow, REAL* __restrict__ river_outflow,
@@ -91,8 +89,7 @@ __device__ __forceinline__ void k_outflow_cell(
     int has_bifurcation, int has_levee,
     const bool* __restrict__ is_dam_upstream, int has_reservoir, REAL min_kinematic_slope,
     const REAL* __restrict__ sea_surface_elevation,
-    const int* __restrict__ catchment_sea_level_idx, int has_sea_level, long t,
-    const DepthAt& depth_at)
+    const int* __restrict__ catchment_sea_level_idx, int has_sea_level, long t)
 {
     REAL time_step = __ldg(time_step_ptr);
 
@@ -125,7 +122,7 @@ __device__ __forceinline__ void k_outflow_cell(
     REAL river_elevation = c_elv - r_hgt;
     REAL wse = r_dep + river_elevation;
 
-    REAL r_dep_dn = depth_at(dn);
+    REAL r_dep_dn = __ldg(river_depth + dn);
     REAL r_hgt_dn = __ldg(river_height + dn);
     REAL c_elv_dn = __ldg(catchment_elevation + dn);
     REAL river_elevation_dn = c_elv_dn - r_hgt_dn;
@@ -232,7 +229,7 @@ __device__ __forceinline__ void k_outflow_cell(
 // Generated-entry body over the canonical values ``a`` of compute_outflow.
 template <typename REAL, typename STO, bool HAS_BIFURCATION, bool HAS_LEVEE,
           bool HAS_RESERVOIR, bool HAS_SEA_LEVEL, class A>
-__device__ __forceinline__ void outflow(const A& a, long t, long member = 0)
+__device__ __forceinline__ void outflow(const A& a, long t)
 {
     constexpr bool BASE_ONLY = !HAS_RESERVOIR && !HAS_SEA_LEVEL;
     k_outflow_cell<BASE_ONLY, REAL, STO>(
@@ -247,10 +244,7 @@ __device__ __forceinline__ void outflow(const A& a, long t, long member = 0)
         a.outgoing_storage_ptr, a.gravity, a.time_step_ptr, HAS_BIFURCATION, HAS_LEVEE,
         cmf_optional<HAS_RESERVOIR>(a.is_dam_upstream_ptr), HAS_RESERVOIR,
         a.min_kinematic_slope, cmf_optional<HAS_SEA_LEVEL>(a.sea_surface_elevation_ptr),
-        cmf_optional<HAS_SEA_LEVEL>(a.catchment_sea_level_idx_ptr), HAS_SEA_LEVEL, t,
-        [&](long index) {
-            return hf_halo_load(a.halo, 0, a.river_depth_ptr, index, member, index, 0);
-        });
+        cmf_optional<HAS_SEA_LEVEL>(a.catchment_sea_level_idx_ptr), HAS_SEA_LEVEL, t);
 }
 
 // Ensemble variants of inflow and outflow: offset member ``member``'s slices of
@@ -269,7 +263,7 @@ __device__ __forceinline__ void inflow_members(A a, long t, long member)
     a.flood_inflow_ptr += member_offset;
     if constexpr (HAS_BIFURCATION) a.limit_rate_ptr += member_offset;
     if constexpr (HAS_RESERVOIR) a.reservoir_total_inflow_ptr += member_offset;
-    inflow<REAL, STO, HAS_BIFURCATION, HAS_RESERVOIR>(a, t, member);
+    inflow<REAL, STO, HAS_BIFURCATION, HAS_RESERVOIR>(a, t);
 }
 
 template <typename REAL, typename STO, bool HAS_BIFURCATION, bool HAS_LEVEE,
@@ -302,5 +296,5 @@ __device__ __forceinline__ void outflow_members(A a, long t, long member)
         if (a.batched_sea_surface_elevation)
             a.sea_surface_elevation_ptr += member * a.num_sea_level_boundaries;
     }
-    outflow<REAL, STO, HAS_BIFURCATION, HAS_LEVEE, HAS_RESERVOIR, HAS_SEA_LEVEL>(a, t, member);
+    outflow<REAL, STO, HAS_BIFURCATION, HAS_LEVEE, HAS_RESERVOIR, HAS_SEA_LEVEL>(a, t);
 }

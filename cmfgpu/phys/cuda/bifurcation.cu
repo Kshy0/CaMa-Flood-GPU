@@ -1,5 +1,4 @@
 #include "canonical.cuh"
-#include "halo_access.cuh"  // the halo argument
 
 template <typename REAL, typename STO>
 __device__ __forceinline__ void k_bif_inflow_cell(
@@ -39,7 +38,7 @@ __device__ __forceinline__ void bif_inflow(const A& a, long t)
 template <typename REAL>
 __device__ __forceinline__ REAL pow73(REAL x) { return x * x * cbrt(x); }
 
-template <typename REAL, typename STO, class DepthAt, class StorageAt>
+template <typename REAL, typename STO>
 __device__ __forceinline__ void k_bif_outflow_cell(
     const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
     const REAL* __restrict__ manning, REAL* __restrict__ outflow,
@@ -51,8 +50,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
     const STO* __restrict__ river_storage,
     const STO* __restrict__ flood_storage,
     STO* __restrict__ outgoing_storage,
-    REAL gravity, const REAL* __restrict__ time_step_ptr, int num_levels, bool closed, long t,
-    const DepthAt& depth_at, const StorageAt& storage_at)
+    REAL gravity, const REAL* __restrict__ time_step_ptr, int num_levels, bool closed, long t)
 {
     REAL time_step = __ldg(time_step_ptr);
 
@@ -61,17 +59,17 @@ __device__ __forceinline__ void k_bif_outflow_cell(
     REAL blen = __ldg(length + t);
 
     // D2SFCELV = D2RIVDPH + D2RIVELV, with D2RIVELV = D2ELEVTN - D2RIVHGT.
-    REAL wse_c = depth_at(ci)
+    REAL wse_c = __ldg(river_depth + ci)
         + (__ldg(catchment_elevation + ci) - __ldg(river_height + ci));
-    REAL wse_d = depth_at(di)
+    REAL wse_d = __ldg(river_depth + di)
         + (__ldg(catchment_elevation + di) - __ldg(river_height + di));
     REAL max_wse = fmax(wse_c, wse_d);
 
     REAL slope = (wse_c - wse_d) / blen;
     slope = fmin(fmax(slope, (REAL)-CMF_ROUTING_SLOPE_LIMIT), (REAL)CMF_ROUTING_SLOPE_LIMIT);
 
-    REAL ts_c = (REAL)(storage_at(ci));
-    REAL ts_d = (REAL)(storage_at(di));
+    REAL ts_c = (REAL)(river_storage[ci] + flood_storage[ci]);
+    REAL ts_d = (REAL)(river_storage[di] + flood_storage[di]);
 
     // Carry the per-level updated flows in registers so each level is stored
     // exactly once, instead of storing then re-loading them for the limiter.
@@ -161,7 +159,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
 // Generated-entry body over the canonical values ``a`` of
 // compute_bifurcation_outflow.
 template <typename REAL, typename STO, bool HAS_RESERVOIR, class A>
-__device__ __forceinline__ void bif_outflow(const A& a, long t, long member = 0)
+__device__ __forceinline__ void bif_outflow(const A& a, long t)
 {
     k_bif_outflow_cell<REAL, STO>(
         a.bifurcation_catchment_idx_ptr, a.bifurcation_downstream_idx_ptr,
@@ -170,14 +168,7 @@ __device__ __forceinline__ void bif_outflow(const A& a, long t, long member = 0)
         a.bifurcation_cross_section_depth_ptr, a.river_depth_ptr, a.river_height_ptr,
         a.catchment_elevation_ptr, a.river_storage_ptr, a.flood_storage_ptr,
         a.outgoing_storage_ptr, a.gravity, a.time_step_ptr, a.num_bifurcation_levels,
-        cmf_bifurcation_closed<HAS_RESERVOIR>(a, t), t,
-        [&](long index) {
-            return hf_halo_load(a.halo, 0, a.river_depth_ptr, index, member, index, 0);
-        },
-        [&](long index) {
-            return hf_halo_load(a.halo, 1, a.river_storage_ptr, index, member, index, 0)
-                + hf_halo_load(a.halo, 2, a.flood_storage_ptr, index, member, index, 0);
-        });
+        cmf_bifurcation_closed<HAS_RESERVOIR>(a, t), t);
 }
 
 // Ensemble members offset their slices, then run the bodies above.
@@ -209,5 +200,5 @@ __device__ __forceinline__ void bif_outflow_members(A a, long t, long member)
     if (a.batched_bifurcation_elevation) a.bifurcation_elevation_ptr += level_offset;
     if (a.batched_river_height) a.river_height_ptr += member_offset;
     if (a.batched_catchment_elevation) a.catchment_elevation_ptr += member_offset;
-    bif_outflow<REAL, STO, HAS_RESERVOIR>(a, t, member);
+    bif_outflow<REAL, STO, HAS_RESERVOIR>(a, t);
 }

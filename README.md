@@ -70,10 +70,10 @@ conda activate CMF
 #### 2a. NVIDIA CUDA example
 
 Choose the build for your GPU from the official [PyTorch installation guide](https://pytorch.org/get-started/locally/). The command below is an NVIDIA CUDA example; AMD ROCm and macOS MPS use different builds.
-For CUDA 13.2, you may use:
+For PyTorch 2.15 with CUDA 13.4 and a compatible NVIDIA driver, use:
 
 ```shell
-pip install torch --index-url https://download.pytorch.org/whl/cu132
+pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cu134
 ```
 
 > **Note:** On supported CUDA and ROCm installations, PyTorch may install Triton automatically. Verify that `import triton` works when using the Triton backend. For native Windows, use [triton-windows](https://github.com/triton-lang/triton-windows); on macOS, use the Metal backend without Triton. `torchvision` and `torchaudio` are **NOT** required.

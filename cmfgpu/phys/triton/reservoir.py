@@ -8,7 +8,6 @@
 Reservoir outflow Triton kernels.
 """
 
-import numpy as np
 import triton
 import triton.language as tl
 from hydroforge.kernels import triton_math as hm
@@ -16,21 +15,13 @@ from hydroforge.kernels import triton_math as hm
 from cmfgpu.phys.triton.outflow import outgoing_flows_inline
 
 
-from cmfgpu import config as _constants
-
-RESERVOIR_RELEASE_EXPONENT = tl.constexpr(
-    float(np.float32(_constants.RESERVOIR_RELEASE_EXPONENT))
-)
-
-
 @triton.jit
-def reservoir_release_inline(
-    dam_volume, river_flood_storage, reservoir_inflow, time_step,
+def yamazaki_funato_release_inline(
+    dam_volume, reservoir_inflow,
     conservation_volume, emergency_volume, adjustment_volume,
-    normal_outflow, adjustment_outflow, flood_control_outflow,
+    normal_outflow, adjustment_outflow, flood_control_outflow, release_exponent,
 ):
-    """Yamazaki & Funato reservoir release for the dam volume
-    DamVol, then its flow limiter against DamVol and REAL(P2RIVSTO+P2FLDSTO).
+    """Yamazaki & Funato reservoir release for the dam volume DamVol.
     The nested selections follow the CUDA if/else-if regime chain."""
     # Case 1: water use, up to the conservation volume.
     water_use = normal_outflow * hm.sqrt(hm.divide(dam_volume, conservation_volume))
@@ -41,7 +32,7 @@ def reservoir_release_inline(
     )
     # Case 3: flood control, up to the emergency volume.
     frac3 = hm.divide(dam_volume - adjustment_volume, emergency_volume - adjustment_volume)
-    controlled = adjustment_outflow + hm.exp(RESERVOIR_RELEASE_EXPONENT * hm.log(frac3)) * (
+    controlled = adjustment_outflow + hm.exp(hm.constant(release_exponent, frac3) * hm.log(frac3)) * (
         flood_control_outflow - adjustment_outflow
     )
     flood_period = reservoir_inflow >= flood_control_outflow
@@ -52,7 +43,7 @@ def reservoir_release_inline(
     # Case 4: emergency operation.
     emergency = tl.where(flood_period, reservoir_inflow, flood_control_outflow)
 
-    reservoir_outflow = tl.where(
+    return tl.where(
         dam_volume <= conservation_volume, water_use,
         tl.where(
             dam_volume <= adjustment_volume, water_excess,
@@ -60,12 +51,60 @@ def reservoir_release_inline(
         ),
     )
 
-    # Flow limiter: the minimum first, so a negative storage releases nothing.
-    reservoir_outflow = tl.minimum(
-        tl.minimum(reservoir_outflow, hm.divide(dam_volume, time_step)),
+
+@triton.jit
+def h22_release_inline(
+    dam_volume, reservoir_inflow,
+    normal_volume, conservation_volume, emergency_volume,
+    normal_outflow, flood_control_outflow, flood_inflow_share,
+):
+    """Hanazaki et al. (2022) release (CaMa-Flood v4 LDAMH22) for DamVol,
+    with the regime order of the CUDA if/else-if chain."""
+    half_normal = normal_outflow * 0.5
+    # Case 1: water use, up to the normal volume.
+    water_use = normal_outflow * hm.divide(dam_volume, conservation_volume)
+    # Outside floods: storage-dependent supply up to the emergency volume.
+    frac = hm.divide(dam_volume - normal_volume, emergency_volume - normal_volume)
+    supply = half_normal + frac * frac * (flood_control_outflow - normal_outflow)
+    flood_period = flood_control_outflow <= reservoir_inflow
+    # Case 2: water supply, up to the conservation volume.
+    water_supply = tl.where(
+        flood_period,
+        half_normal + hm.divide(
+            dam_volume - normal_volume, conservation_volume - normal_volume,
+        ) * (flood_control_outflow - normal_outflow),
+        supply,
+    )
+    # Case 3: flood control below the emergency volume.
+    flood_control = tl.where(
+        flood_period,
+        flood_control_outflow + hm.divide(
+            flood_inflow_share * (dam_volume - conservation_volume),
+            emergency_volume - conservation_volume,
+        ) * (reservoir_inflow - flood_control_outflow),
+        supply,
+    )
+    # Case 4: emergency operation.
+    emergency = tl.maximum(reservoir_inflow, flood_control_outflow)
+
+    return tl.where(
+        dam_volume <= normal_volume, water_use,
+        tl.where(
+            dam_volume <= conservation_volume, water_supply,
+            tl.where(dam_volume < emergency_volume, flood_control, emergency),
+        ),
+    )
+
+
+@triton.jit
+def limit_release_inline(release, dam_volume, river_flood_storage, time_step):
+    """Flow limiter against DamVol and REAL(P2RIVSTO+P2FLDSTO): the minimum
+    first, so a negative storage releases nothing."""
+    release = tl.minimum(
+        tl.minimum(release, hm.divide(dam_volume, time_step)),
         hm.divide(river_flood_storage, time_step),
     )
-    return hm.at_least(reservoir_outflow, 0.0)
+    return hm.at_least(release, 0.0)
 
 
 @triton.jit
@@ -90,6 +129,8 @@ def compute_reservoir_outflow_kernel(
     effective_normal_outflow_ptr,                     # *f32  normal outflow
     adjustment_outflow_ptr,                 # *f32  adjustment outflow
     flood_control_outflow_ptr,              # *f32  flood control outflow
+    normal_volume_ptr,                      # *f32  H22 normal volume (HAS_H22)
+    flood_inflow_share_ptr,                 # *f32  H22 share of flood inflow (HAS_H22)
 
     # Other catchment-level arrays
     runoff_ptr,                             # *f32  runoff (catchment-indexed)
@@ -98,6 +139,9 @@ def compute_reservoir_outflow_kernel(
     time_step_ptr,                              # f32   scalar time step
     num_reservoirs,                         # i32   total number of reservoirs
     HAS_LEVEE: tl.constexpr,                # levee-protected storage present
+    release_exponent: tl.constexpr,
+    HAS_YF: tl.constexpr,
+    HAS_H22: tl.constexpr,                  # uniform Hanazaki (2022) release choice
     BLOCK_SIZE: tl.constexpr,               # block size
 ):
     pid = tl.program_id(0)
@@ -147,15 +191,28 @@ def compute_reservoir_outflow_kernel(
     # Reservoir parameters (reservoir-indexed)
     conservation_volume = tl.load(conservation_volume_ptr + offs, mask=mask, other=0.0)
     emergency_volume = tl.load(emergency_volume_ptr + offs, mask=mask, other=0.0)
-    adjustment_volume = tl.load(adjustment_volume_ptr + offs, mask=mask, other=0.0)
     normal_outflow = tl.load(effective_normal_outflow_ptr + offs, mask=mask, other=0.0)
-    adjustment_outflow = tl.load(adjustment_outflow_ptr + offs, mask=mask, other=0.0)
     flood_control_outflow = tl.load(flood_control_outflow_ptr + offs, mask=mask, other=0.0)
 
-    reservoir_outflow = reservoir_release_inline(
-        dam_volume, river_flood_storage, reservoir_inflow, time_step,
-        conservation_volume, emergency_volume, adjustment_volume,
-        normal_outflow, adjustment_outflow, flood_control_outflow,
+    if HAS_H22:
+        reservoir_outflow = h22_release_inline(
+            dam_volume, reservoir_inflow,
+            tl.load(normal_volume_ptr + offs, mask=mask, other=0.0),
+            conservation_volume, emergency_volume,
+            normal_outflow,
+            flood_control_outflow,
+            tl.load(flood_inflow_share_ptr + offs, mask=mask, other=0.0),
+        )
+    else:
+        adjustment_volume = tl.load(adjustment_volume_ptr + offs, mask=mask, other=0.0)
+        adjustment_outflow = tl.load(adjustment_outflow_ptr + offs, mask=mask, other=0.0)
+        reservoir_outflow = yamazaki_funato_release_inline(
+            dam_volume, reservoir_inflow,
+            conservation_volume, emergency_volume, adjustment_volume,
+            normal_outflow, adjustment_outflow, flood_control_outflow, release_exponent,
+        )
+    reservoir_outflow = limit_release_inline(
+        reservoir_outflow, dam_volume, river_flood_storage, time_step,
     )
 
     # ================================================================== #
@@ -184,12 +241,17 @@ def compute_reservoir_outflow_batched_kernel(
     effective_normal_outflow_ptr,
     adjustment_outflow_ptr,
     flood_control_outflow_ptr,
+    normal_volume_ptr,
+    flood_inflow_share_ptr,
     runoff_ptr,
     outgoing_storage_ptr,
     time_step_ptr,
     num_reservoirs: tl.constexpr,
     num_catchments: tl.constexpr,
     HAS_LEVEE: tl.constexpr,
+    release_exponent: tl.constexpr,
+    HAS_YF: tl.constexpr,
+    HAS_H22: tl.constexpr,
     ensemble_size: tl.constexpr,
     batched_runoff: tl.constexpr,
     batched_conservation_volume: tl.constexpr,
@@ -198,6 +260,8 @@ def compute_reservoir_outflow_batched_kernel(
     batched_effective_normal_outflow: tl.constexpr,
     batched_adjustment_outflow: tl.constexpr,
     batched_flood_control_outflow: tl.constexpr,
+    batched_normal_volume: tl.constexpr,
+    batched_flood_inflow_share: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -260,18 +324,9 @@ def compute_reservoir_outflow_batched_kernel(
         emergency_volume_ptr + (idx if batched_emergency_volume else reservoir_idx),
         mask=mask, other=0.0,
     )
-    adjustment_volume = tl.load(
-        adjustment_volume_ptr + (idx if batched_adjustment_volume else reservoir_idx),
-        mask=mask, other=0.0,
-    )
     normal_outflow = tl.load(
         effective_normal_outflow_ptr
         + (idx if batched_effective_normal_outflow else reservoir_idx),
-        mask=mask, other=0.0,
-    )
-    adjustment_outflow = tl.load(
-        adjustment_outflow_ptr
-        + (idx if batched_adjustment_outflow else reservoir_idx),
         mask=mask, other=0.0,
     )
     flood_control_outflow = tl.load(
@@ -280,10 +335,39 @@ def compute_reservoir_outflow_batched_kernel(
         mask=mask, other=0.0,
     )
 
-    reservoir_outflow = reservoir_release_inline(
-        dam_volume, river_flood_storage, reservoir_inflow, time_step,
-        conservation_volume, emergency_volume, adjustment_volume,
-        normal_outflow, adjustment_outflow, flood_control_outflow,
+    if HAS_H22:
+        reservoir_outflow = h22_release_inline(
+            dam_volume, reservoir_inflow,
+            tl.load(
+                normal_volume_ptr + (idx if batched_normal_volume else reservoir_idx),
+                mask=mask, other=0.0,
+            ),
+            conservation_volume, emergency_volume,
+            normal_outflow,
+            flood_control_outflow,
+            tl.load(
+                flood_inflow_share_ptr
+                + (idx if batched_flood_inflow_share else reservoir_idx),
+                mask=mask, other=0.0,
+            ),
+        )
+    else:
+        adjustment_volume = tl.load(
+            adjustment_volume_ptr + (idx if batched_adjustment_volume else reservoir_idx),
+            mask=mask, other=0.0,
+        )
+        adjustment_outflow = tl.load(
+            adjustment_outflow_ptr
+            + (idx if batched_adjustment_outflow else reservoir_idx),
+            mask=mask, other=0.0,
+        )
+        reservoir_outflow = yamazaki_funato_release_inline(
+            dam_volume, reservoir_inflow,
+            conservation_volume, emergency_volume, adjustment_volume,
+            normal_outflow, adjustment_outflow, flood_control_outflow, release_exponent,
+        )
+    reservoir_outflow = limit_release_inline(
+        reservoir_outflow, dam_volume, river_flood_storage, time_step,
     )
 
     tl.store(

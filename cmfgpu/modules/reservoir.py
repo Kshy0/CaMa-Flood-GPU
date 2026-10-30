@@ -14,6 +14,7 @@ from functools import cached_property
 from typing import ClassVar, Literal, Self
 
 import torch
+from hydroforge.contracts import opt
 from hydroforge.model import (
     AbstractModule,
     CoordinateField,
@@ -21,6 +22,7 @@ from hydroforge.model import (
     ReferenceIndexField,
     TensorField,
     computed_tensor_field,
+    kernel_field,
     module_ref,
 )
 from pydantic import computed_field, model_validator
@@ -137,6 +139,13 @@ class ReservoirModule(AbstractModule):
         gt=0,
     )
 
+    reservoir_upstream_area: torch.Tensor | None = ReservoirField(
+        description="Drainage area upstream of the dam; required by the Hanazaki (2022) scheme",
+        units="m2",
+        gt=0,
+        depends_on=opt("reservoir.release_scheme") == "hanazaki_2022",
+    )
+
     # ------------------------------------------------------------------ #
     # Computed tensor fields
     # ------------------------------------------------------------------ #
@@ -206,41 +215,88 @@ class ReservoirModule(AbstractModule):
         description="Flood control storage capacity, derived from emergency and conservation volumes",
         units="m3",
     )
-    @cached_property
     def flood_volume(self) -> torch.Tensor:
-        """FldVol = (EmeVol - ConVol) / 0.95, inverse of EmeVol = ConVol + FldVol * 0.95"""
+        """Invert the configured emergency-volume fraction of the flood pool."""
         excess = self.emergency_volume - self.conservation_volume
-        return excess / excess.new_tensor(0.95)
+        fraction = self.options.value("reservoir.flood_volume_fraction")
+        return excess / excess.new_tensor(fraction)
 
     @computed_reservoir_field(
-        description="Volume threshold triggering regulation: AdjVol = ConVol + FldVol * 0.1",
+        description="Regulation threshold above conservation, using the configured flood-pool fraction",
         units="m3",
+        depends_on=opt("reservoir.release_scheme") == "yamazaki_funato",
     )
-    @cached_property
-    def adjustment_volume(self) -> torch.Tensor:
-        tenth = torch.tensor(0.1, dtype=torch.float32).item()
-        return self.conservation_volume + self.flood_volume * tenth
+    def adjustment_volume(self) -> torch.Tensor | None:
+        fraction = torch.tensor(
+            self.options.value("reservoir.adjustment_volume_fraction"), dtype=torch.float32
+        ).item()
+        return self.conservation_volume + self.flood_volume * fraction
 
     @computed_reservoir_field(
-        description="Effective normal outflow after Yamazaki & Funato modification. Qn = min(Qn, Qsto) * 1.5 where Qsto = (ConVol*0.7 + Vyr/4) / (180 days)",
+        description="Normal release: raw Qn for H22, storage-limited supply for Yamazaki & Funato",
         units="m3 s-1",
     )
-    @cached_property
     def effective_normal_outflow(self) -> torch.Tensor:
-        normal_outflow = self.normal_outflow
-        annual_inflow = normal_outflow * (365.0 * 24 * 60 * 60)
-        seven_tenths = torch.tensor(0.7, dtype=torch.float32).item()
-        dry_storage = self.conservation_volume * seven_tenths + annual_inflow / 4.0
-        dry_outflow = dry_storage / dry_storage.new_tensor(180.0 * 24 * 60 * 60)
-        return torch.minimum(normal_outflow, dry_outflow) * 1.5
+        if self.uses_h22:
+            return self.normal_outflow
+        else:
+            normal_outflow = self.normal_outflow
+            annual_inflow = normal_outflow * (365.0 * 24 * 60 * 60)
+            fraction = torch.tensor(
+                self.options.value("reservoir.dry_storage_fraction"), dtype=torch.float32
+            ).item()
+            dry_storage = (
+                self.conservation_volume * fraction
+                + annual_inflow * self.options.value("reservoir.dry_inflow_fraction")
+            )
+            dry_days = self.options.value("reservoir.dry_season_days")
+            dry_outflow = dry_storage / dry_storage.new_tensor(dry_days * 24 * 60 * 60)
+            factor = self.options.value("reservoir.normal_outflow_factor")
+            return torch.minimum(normal_outflow, dry_outflow) * factor
 
     @computed_reservoir_field(
         description="Regulated outflow rate: Qa = (modified_Qn + Qf) * 0.5",
         units="m3 s-1",
+        depends_on=opt("reservoir.release_scheme") == "yamazaki_funato",
     )
-    @cached_property
-    def adjustment_outflow(self) -> torch.Tensor:
+    def adjustment_outflow(self) -> torch.Tensor | None:
         return (self.effective_normal_outflow + self.flood_control_outflow) * 0.5
+
+    @kernel_field
+    def uses_h22(self) -> bool:
+        """Uniform construction-time release choice, consumed by kernel specs."""
+        return self.options.option_code("reservoir.release_scheme") == 1
+
+    @kernel_field
+    def uses_yamazaki_funato(self) -> bool:
+        return self.options.option_code("reservoir.release_scheme") == 0
+
+    @kernel_field
+    def release_exponent(self) -> float:
+        return self.options.value("reservoir.release_exponent")
+
+    @computed_reservoir_field(
+        description="Hanazaki (2022) normal volume as a configured conservation-volume fraction",
+        units="m3",
+        depends_on=opt("reservoir.release_scheme") == "hanazaki_2022",
+    )
+    def normal_volume(self) -> torch.Tensor | None:
+        return self.conservation_volume * self.options.value("reservoir.normal_volume_fraction")
+
+    @computed_reservoir_field(
+        description="Hanazaki (2022) flood-inflow share using the configured flood-storage depth",
+        depends_on=opt("reservoir.release_scheme") == "hanazaki_2022",
+    )
+    def flood_inflow_share(self) -> torch.Tensor | None:
+        # CaMa-Flood v4 stores FldVol/area in R_VolUpa(NDAM) instead of
+        # R_VolUpa(IDAM), so every dam but the last reads an unset ratio; this
+        # is the per-dam ratio of Hanazaki et al. (2022).
+        area = self.reservoir_upstream_area
+        depth = self.flood_volume / area
+        threshold = torch.tensor(
+            self.options.value("reservoir.flood_storage_depth"), dtype=torch.float32
+        ).item()
+        return torch.clamp(1 - depth / threshold, min=0)
 
     def fill_dams(self) -> None:
         """Fill cold-start reservoirs to conservation volume when below it,
@@ -272,11 +328,12 @@ class ReservoirModule(AbstractModule):
             raise ValueError("Emergency volume must exceed conservation volume")
         if torch.any(self.emergency_volume > self.reservoir_capacity):
             raise ValueError("Emergency volume exceeds reservoir capacity")
-        adjustment = self.adjustment_volume
-        if torch.any(
-            ~torch.isfinite(adjustment)
-            | (adjustment <= self.conservation_volume)
-            | (adjustment >= self.emergency_volume)
-        ).item():
-            raise ValueError("Adjustment volume must remain strictly between conservation and emergency")
+        if self.uses_yamazaki_funato:
+            adjustment = self.adjustment_volume
+            if torch.any(
+                ~torch.isfinite(adjustment)
+                | (adjustment <= self.conservation_volume)
+                | (adjustment >= self.emergency_volume)
+            ).item():
+                raise ValueError("Adjustment volume must remain strictly between conservation and emergency")
         return self

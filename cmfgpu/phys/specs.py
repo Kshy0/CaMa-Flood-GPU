@@ -6,12 +6,15 @@ from hydroforge.kernels import (
     KernelWorkspace,
     constant,
     module_enabled,
+    module_flag,
     output_requested,
 )
 
 HAS_BIFURCATION = module_enabled("bifurcation")
 HAS_LEVEE = module_enabled("levee")
 HAS_RESERVOIR = module_enabled("reservoir")
+HAS_H22 = module_flag("reservoir", "uses_h22")
+HAS_YF = module_flag("reservoir", "uses_yamazaki_funato")
 HAS_SEA_LEVEL = module_enabled("sea_level")
 HAS_INFLOW = module_enabled("inflow")
 HAS_TOTAL_STORAGE_OUTPUT = output_requested("base", "total_storage")
@@ -213,12 +216,17 @@ RESERVOIR_OUTFLOW = KernelSpec(
         "effective_normal_outflow_ptr": "read",
         "adjustment_outflow_ptr": "read",
         "flood_control_outflow_ptr": "read",
+        "normal_volume_ptr": "read",
+        "flood_inflow_share_ptr": "read",
         "runoff_ptr": "read",
         "outgoing_storage_ptr": "atomic_add",
         "time_step_ptr": substep_field("dt"),
         "num_reservoirs": "int32",
         "num_catchments": "index",
         "HAS_LEVEE": HAS_LEVEE,
+        "HAS_H22": HAS_H22,
+        "HAS_YF": HAS_YF,
+        "release_exponent": constant("precision"),
         "ensemble_size": "index",
         **dict.fromkeys(
             (
@@ -229,11 +237,26 @@ RESERVOIR_OUTFLOW = KernelSpec(
                 "batched_effective_normal_outflow",
                 "batched_adjustment_outflow",
                 "batched_flood_control_outflow",
+                "batched_normal_volume",
+                "batched_flood_inflow_share",
             ),
             constant("bool"),
         ),
     },
-    optional={"protected_storage_ptr": "HAS_LEVEE"},
+    optional={
+        "protected_storage_ptr": "HAS_LEVEE",
+        "adjustment_volume_ptr": "HAS_YF",
+        "adjustment_outflow_ptr": "HAS_YF",
+        "normal_volume_ptr": "HAS_H22",
+        "flood_inflow_share_ptr": "HAS_H22",
+    },
+    optional_values={
+        "release_exponent": ("HAS_YF", 0.0),
+        "batched_adjustment_volume": ("HAS_YF", False),
+        "batched_adjustment_outflow": ("HAS_YF", False),
+        "batched_normal_volume": ("HAS_H22", False),
+        "batched_flood_inflow_share": ("HAS_H22", False),
+    },
     contributes=("outgoing_storage_ptr",),
 )
 
@@ -309,7 +332,6 @@ FLOOD_STAGE = KernelSpec(
         "total_storage_ptr": None,
     },
     optional_values={"num_inflow_gauges": ("HAS_INFLOW", 0)},
-    publishes=("river_depth_ptr", "river_storage_ptr", "flood_storage_ptr"),
 )
 
 INITIAL_FLOOD_STAGE = KernelSpec(
@@ -406,7 +428,6 @@ FLOOD_STAGE_LOG = KernelSpec(
         "total_storage_ptr": None,
     },
     block_sizes={"metal": 256},
-    publishes=("river_depth_ptr", "river_storage_ptr", "flood_storage_ptr"),
 )
 
 LEVEE_STAGE = KernelSpec(
@@ -604,26 +625,20 @@ _ROUTING_OPTIONAL = {
 }
 
 
-def _metal(spec: KernelSpec) -> dict:
-    """The parameters of ``spec`` without the halo argument: Metal kernels
-    run on one rank and declare no neighbourhoods."""
-    return {k: v for k, v in spec.parameters.items() if k != "halo"}
-
-
 METAL_OUTFLOW = KernelSpec(
     **{
-        **OUTFLOW.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **OUTFLOW.model_dump(exclude={"halo", "contributes"}),
         "workspace": {"unlimited_outflow_ptr": _UNLIMITED_FLOW},
-        "parameters": {**_metal(OUTFLOW), "unlimited_outflow_ptr": "write"},
+        "parameters": {**OUTFLOW.parameters, "unlimited_outflow_ptr": "write"},
         "optional": {**OUTFLOW.optional, "unlimited_outflow_ptr": None},
     }
 )
 METAL_RESERVOIR_OUTFLOW = KernelSpec(
     **{
-        **RESERVOIR_OUTFLOW.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **RESERVOIR_OUTFLOW.model_dump(exclude={"halo", "contributes"}),
         "workspace": {"unlimited_outflow_ptr": _UNLIMITED_FLOW},
         "parameters": {
-            **_metal(RESERVOIR_OUTFLOW),
+            **RESERVOIR_OUTFLOW.parameters,
             "unlimited_outflow_ptr": "write",
         },
         "optional": {**RESERVOIR_OUTFLOW.optional, "unlimited_outflow_ptr": None},
@@ -631,10 +646,10 @@ METAL_RESERVOIR_OUTFLOW = KernelSpec(
 )
 METAL_INFLOW = KernelSpec(
     **{
-        **INFLOW.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **INFLOW.model_dump(exclude={"halo", "contributes"}),
         "workspace": {**_ROUTING_WORKSPACE, "unlimited_outflow_ptr": _UNLIMITED_FLOW},
         "parameters": {
-            **_metal(INFLOW),
+            **INFLOW.parameters,
             **_ROUTING_PARAMETERS,
             "unlimited_outflow_ptr": "read",
             "outgoing_storage_ptr": "read_write",
@@ -652,10 +667,10 @@ METAL_INFLOW = KernelSpec(
 )
 METAL_BIFURCATION_OUTFLOW = KernelSpec(
     **{
-        **BIFURCATION_OUTFLOW.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **BIFURCATION_OUTFLOW.model_dump(exclude={"halo", "contributes"}),
         "workspace": {"bifurcation_path_flow_ptr": _PATH_FLOW},
         "parameters": {
-            **_metal(BIFURCATION_OUTFLOW),
+            **BIFURCATION_OUTFLOW.parameters,
             "bifurcation_path_flow_ptr": "write",
         },
         "optional": {**BIFURCATION_OUTFLOW.optional, "bifurcation_path_flow_ptr": None},
@@ -663,10 +678,10 @@ METAL_BIFURCATION_OUTFLOW = KernelSpec(
 )
 METAL_BIFURCATION_INFLOW = KernelSpec(
     **{
-        **BIFURCATION_INFLOW.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **BIFURCATION_INFLOW.model_dump(exclude={"halo", "contributes"}),
         "workspace": {"bifurcation_path_flow_ptr": _PATH_FLOW},
         "parameters": {
-            **_metal(BIFURCATION_INFLOW),
+            **BIFURCATION_INFLOW.parameters,
             "bifurcation_path_flow_ptr": "write",
         },
         "optional": {**BIFURCATION_INFLOW.optional, "bifurcation_path_flow_ptr": None},
@@ -674,10 +689,10 @@ METAL_BIFURCATION_INFLOW = KernelSpec(
 )
 METAL_LEVEE_BIFURCATION_OUTFLOW = KernelSpec(
     **{
-        **LEVEE_BIFURCATION_OUTFLOW.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **LEVEE_BIFURCATION_OUTFLOW.model_dump(exclude={"halo", "contributes"}),
         "workspace": {"bifurcation_path_flow_ptr": _PATH_FLOW},
         "parameters": {
-            **_metal(LEVEE_BIFURCATION_OUTFLOW),
+            **LEVEE_BIFURCATION_OUTFLOW.parameters,
             "bifurcation_path_flow_ptr": "write",
         },
         "optional": {
@@ -702,9 +717,9 @@ _METAL_STAGE_OPTIONAL = {
 }
 METAL_FLOOD_STAGE = KernelSpec(
     **{
-        **FLOOD_STAGE.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **FLOOD_STAGE.model_dump(exclude={"halo", "contributes"}),
         "workspace": _ROUTING_WORKSPACE,
-        "parameters": {**_metal(FLOOD_STAGE), **_METAL_STAGE_PARAMETERS},
+        "parameters": {**FLOOD_STAGE.parameters, **_METAL_STAGE_PARAMETERS},
         "optional": {**FLOOD_STAGE.optional, **_METAL_STAGE_OPTIONAL},
         "optional_values": {
             **FLOOD_STAGE.optional_values,
@@ -714,9 +729,9 @@ METAL_FLOOD_STAGE = KernelSpec(
 )
 METAL_FLOOD_STAGE_LOG = KernelSpec(
     **{
-        **FLOOD_STAGE_LOG.model_dump(exclude={"halo", "publishes", "contributes"}),
+        **FLOOD_STAGE_LOG.model_dump(exclude={"halo", "contributes"}),
         "workspace": _ROUTING_WORKSPACE,
-        "parameters": {**_metal(FLOOD_STAGE_LOG), **_METAL_STAGE_PARAMETERS},
+        "parameters": {**FLOOD_STAGE_LOG.parameters, **_METAL_STAGE_PARAMETERS},
         "optional": {**FLOOD_STAGE_LOG.optional, **_METAL_STAGE_OPTIONAL},
         "optional_values": {
             **FLOOD_STAGE_LOG.optional_values,
