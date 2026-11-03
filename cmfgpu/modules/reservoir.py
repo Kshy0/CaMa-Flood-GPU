@@ -10,7 +10,6 @@ Reservoir module for CaMa-Flood-GPU using TensorField / computed_tensor_field he
 
 from __future__ import annotations
 
-from functools import cached_property
 from typing import ClassVar, Literal, Self
 
 import torch
@@ -21,11 +20,12 @@ from hydroforge.model import (
     ReferenceField,
     ReferenceIndexField,
     TensorField,
+    computed_field,
     computed_tensor_field,
     kernel_field,
     module_ref,
 )
-from pydantic import computed_field, model_validator
+from pydantic import model_validator
 
 from cmfgpu.modules.base import BaseModule
 
@@ -150,7 +150,6 @@ class ReservoirModule(AbstractModule):
     # Computed tensor fields
     # ------------------------------------------------------------------ #
     @computed_field(description="Total number of reservoirs")
-    @cached_property
     def num_reservoirs(self) -> int:
         return self.reservoir_catchment_id.shape[0]
 

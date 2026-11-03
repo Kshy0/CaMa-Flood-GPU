@@ -205,7 +205,6 @@ class LogModule(AbstractModule):
         description="Running sum of storage before routing step",
         units="km3",
     )
-    @cached_property
     def total_storage_pre_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -217,7 +216,6 @@ class LogModule(AbstractModule):
         description="Running sum of storage after routing step",
         units="km3",
     )
-    @cached_property
     def total_storage_next_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -229,7 +227,6 @@ class LogModule(AbstractModule):
         description="Running sum of new storage",
         units="km3",
     )
-    @cached_property
     def total_storage_new_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -241,7 +238,6 @@ class LogModule(AbstractModule):
         description="Running sum of inflow errors",
         units="km3",
     )
-    @cached_property
     def total_inflow_error_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -253,7 +249,6 @@ class LogModule(AbstractModule):
         description="Running sum of inflow",
         units="km3",
     )
-    @cached_property
     def total_inflow_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -265,7 +260,6 @@ class LogModule(AbstractModule):
         description="Running sum of outflow",
         units="km3",
     )
-    @cached_property
     def total_outflow_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -277,7 +271,6 @@ class LogModule(AbstractModule):
         description="Running sum of storage stage",
         units="km3",
     )
-    @cached_property
     def total_storage_stage_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -289,7 +282,6 @@ class LogModule(AbstractModule):
         description="Running sum of stage error",
         units="km3",
     )
-    @cached_property
     def total_stage_error_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -301,7 +293,6 @@ class LogModule(AbstractModule):
         description="Running sum of river storage",
         units="km3",
     )
-    @cached_property
     def river_storage_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -313,7 +304,6 @@ class LogModule(AbstractModule):
         description="Running sum of flood storage",
         units="km3",
     )
-    @cached_property
     def flood_storage_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,
@@ -325,7 +315,6 @@ class LogModule(AbstractModule):
         description="Running sum of flood area — area scaled by 1e-9 for logging",
         units="1e9 m2",
     )
-    @cached_property
     def flood_area_sum(self) -> torch.Tensor:
         return torch.zeros(
             self.log_buffer_size,

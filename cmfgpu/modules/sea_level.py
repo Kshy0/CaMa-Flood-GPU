@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-from functools import cached_property
 from typing import ClassVar, Self
 
 import torch
@@ -15,9 +14,10 @@ from hydroforge.model import (
     CoordinateField,
     ReferenceIndexField,
     TensorField,
+    computed_field,
     module_ref,
 )
-from pydantic import computed_field, model_validator
+from pydantic import model_validator
 
 from cmfgpu.modules.base import BaseModule
 
@@ -45,7 +45,6 @@ class SeaLevelModule(AbstractModule):
     )
 
     @computed_field(description="Number of prescribed water-level boundaries")
-    @cached_property
     def num_sea_level_boundaries(self) -> int:
         return self.sea_level_catchment_id.shape[0]
 

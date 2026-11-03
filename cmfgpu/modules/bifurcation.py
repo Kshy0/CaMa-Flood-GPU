@@ -11,7 +11,6 @@ for concise tensor metadata.
 
 from __future__ import annotations
 
-from functools import cached_property
 from typing import ClassVar, Literal, Self
 
 import torch
@@ -22,10 +21,11 @@ from hydroforge.model import (
     ReferenceIndexField,
     SelectionField,
     TensorField,
+    computed_field,
     computed_tensor_field,
     module_ref,
 )
-from pydantic import computed_field, model_validator
+from pydantic import model_validator
 
 from cmfgpu.config import DISABLED_BIFURCATION_ELEVATION
 from cmfgpu.modules.base import BaseModule
@@ -191,7 +191,6 @@ class BifurcationModule(AbstractModule):
         output="disabled",
         halo=True,
     )
-    @cached_property
     def global_bifurcation_outflow(self) -> torch.Tensor:
         return torch.zeros_like(
             self.base.river_outflow,
@@ -207,7 +206,6 @@ class BifurcationModule(AbstractModule):
         output="disabled",
         halo=True,
     )
-    @cached_property
     def limit_rate(self) -> torch.Tensor:
         return torch.zeros_like(self.base.river_outflow)
 
@@ -215,19 +213,16 @@ class BifurcationModule(AbstractModule):
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
     @computed_field(description="Number of paths saved in output")
-    @cached_property
     def num_output_bifurcation_paths(self) -> int:
         if self.output_bifurcation_path_id is None:
             return self.num_bifurcation_paths
         return self.output_bifurcation_path_id.shape[0]
 
     @computed_field(description="Total number of bifurcation paths")
-    @cached_property
     def num_bifurcation_paths(self) -> int:
         return self.bifurcation_path_id.shape[0]
 
     @computed_field(description="Number of levels in each bifurcation path")
-    @cached_property
     def num_bifurcation_levels(self) -> int:
         return self.bifurcation_width.shape[-1]
 

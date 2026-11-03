@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-from functools import cached_property
 from typing import ClassVar, Literal, Self
 
 import torch
@@ -15,9 +14,10 @@ from hydroforge.model import (
     CoordinateField,
     ReferenceIndexField,
     TensorField,
+    computed_field,
     module_ref,
 )
-from pydantic import computed_field, model_validator
+from pydantic import model_validator
 
 from cmfgpu.modules.base import BaseModule
 
@@ -59,7 +59,6 @@ class InflowModule(AbstractModule):
     )
 
     @computed_field(description="Number of inflow injection gauges")
-    @cached_property
     def num_inflow_gauges(self) -> int:
         return self.inflow_catchment_id.shape[0]
 

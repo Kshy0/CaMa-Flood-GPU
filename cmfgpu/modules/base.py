@@ -11,7 +11,6 @@ helpers for concise tensor metadata.
 
 from __future__ import annotations
 
-from functools import cached_property
 from typing import ClassVar, Literal, Self
 
 import torch
@@ -22,10 +21,11 @@ from hydroforge.model import (
     ReferenceIndexField,
     SelectionField,
     TensorField,
+    computed_field,
     computed_tensor_field,
     kernel_field,
 )
-from pydantic import computed_field, model_validator
+from pydantic import model_validator
 
 from cmfgpu.phys.flood_stage import flood_stage
 
@@ -288,7 +288,6 @@ class BaseModule(AbstractModule):
     # Computed scalar dimensions
     # ------------------------------------------------------------------ #
     @computed_field(description="Catchments this rank owns (the kernel extent)")
-    @cached_property
     def num_catchments(self) -> int:
         # Halo ghost rows, when the basin is split, follow the owned rows.
         return self.owned_rows("catchment_id")
@@ -296,14 +295,12 @@ class BaseModule(AbstractModule):
     @computed_field(
         description="Number of catchments that will have their output saved"
     )
-    @cached_property
     def num_output_catchments(self) -> int:
         return self.output_catchment_id.shape[0]
 
     @computed_field(
         description="Number of flood levels represented in the lookup tables"
     )
-    @cached_property
     def num_flood_levels(self) -> int:
         return self.flood_depth_table.shape[-1]
 
@@ -321,7 +318,6 @@ class BaseModule(AbstractModule):
         output_only=True,
         after_init=True,
     )
-    @cached_property
     def total_storage(self) -> torch.Tensor | None:
         total = self.river_storage + self.flood_storage
         if self.protected_storage is not None:
@@ -349,7 +345,6 @@ class BaseModule(AbstractModule):
         category="state",
         halo=True,
     )
-    @cached_property
     def river_depth(self) -> torch.Tensor:
         return self._stage_buffer()
 
@@ -358,7 +353,6 @@ class BaseModule(AbstractModule):
         units="m",
         category="state",
     )
-    @cached_property
     def flood_depth(self) -> torch.Tensor:
         return self._stage_buffer()
 
@@ -367,7 +361,6 @@ class BaseModule(AbstractModule):
         units="1",
         category="state",
     )
-    @cached_property
     def flood_fraction(self) -> torch.Tensor:
         return self._stage_buffer()
 
@@ -377,7 +370,6 @@ class BaseModule(AbstractModule):
         category="state",
         depends_on="levee",
     )
-    @cached_property
     def protected_depth(self) -> torch.Tensor | None:
         return self._stage_buffer()
 
@@ -394,7 +386,6 @@ class BaseModule(AbstractModule):
         dtype="hpfloat",
         halo=True,
     )
-    @cached_property
     def outgoing_storage(self) -> torch.Tensor:
         return torch.zeros_like(
             self.river_outflow,
@@ -407,7 +398,6 @@ class BaseModule(AbstractModule):
         category="virtual",
         expr="river_depth + catchment_elevation - river_height",
     )
-    @cached_property
     def water_surface_elevation(self) -> torch.Tensor | None:
         return None
 
@@ -418,7 +408,6 @@ class BaseModule(AbstractModule):
         dtype="hpfloat",
         halo=True,
     )
-    @cached_property
     def river_inflow(self) -> torch.Tensor:
         return torch.zeros_like(
             self.river_outflow,
@@ -431,7 +420,6 @@ class BaseModule(AbstractModule):
         category="virtual",
         expr="flood_fraction * catchment_area",
     )
-    @cached_property
     def flood_area(self) -> torch.Tensor | None:
         return None
 
@@ -442,7 +430,6 @@ class BaseModule(AbstractModule):
         dtype="hpfloat",
         halo=True,
     )
-    @cached_property
     def flood_inflow(self) -> torch.Tensor:
         return torch.zeros_like(
             self.river_outflow,
@@ -455,7 +442,6 @@ class BaseModule(AbstractModule):
         category="virtual",
         expr="river_outflow + flood_outflow",
     )
-    @cached_property
     def total_outflow(self) -> torch.Tensor | None:
         return None
 

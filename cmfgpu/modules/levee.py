@@ -10,7 +10,6 @@ Levee module definitions for CaMa-Flood-GPU.
 
 from __future__ import annotations
 
-from functools import cached_property
 from typing import ClassVar, Literal, Self
 
 import torch
@@ -20,10 +19,11 @@ from hydroforge.model import (
     ReferenceField,
     ReferenceIndexField,
     TensorField,
+    computed_field,
     computed_tensor_field,
     module_ref,
 )
-from pydantic import computed_field, model_validator
+from pydantic import model_validator
 
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.phys.flood_stage import levee_stage
@@ -123,7 +123,6 @@ class LeveeModule(AbstractModule):
     # Computed tensors (levee-aligned)
     # ------------------------------------------------------------------ #
     @computed_field(description="Total number of levees")
-    @cached_property
     def num_levees(self) -> int:
         return self.levee_catchment_id.shape[0]
 
@@ -217,7 +216,6 @@ class LeveeModule(AbstractModule):
     @computed_levee_field(
         description="Levee base height above river bed", units="m", category="derived_param"
     )
-    @cached_property
     def levee_base_height(self) -> torch.Tensor:
         # Derived during construction: keep a NaN fraction (rejected by the
         # validator) out of the table gather.
@@ -288,7 +286,6 @@ class LeveeModule(AbstractModule):
         return base_storage + (distance + width) * (crown - self.levee_base_height) * length
 
     @computed_levee_field(description="River bankfull storage at levees", units="m3", output="disabled")
-    @cached_property
     def levee_river_max_storage(self) -> torch.Tensor:
         length, width, height = (
             self.gather_tensor(
@@ -304,23 +301,19 @@ class LeveeModule(AbstractModule):
         return storage
 
     @computed_levee_field(description="Storage at the levee base", units="m3", output="disabled")
-    @cached_property
     def levee_base_storage(self) -> torch.Tensor:
         return self._profile_storage(self.levee_base_height)
 
     @computed_levee_field(description="River-side storage at the levee crown", units="m3", output="disabled")
-    @cached_property
     def levee_top_storage(self) -> torch.Tensor:
         return self._storage_to_crown(self.levee_base_storage)
 
     @computed_levee_field(description="Unprotected profile storage at the crown", units="m3", output="disabled")
-    @cached_property
     def levee_fill_storage(self) -> torch.Tensor:
         crown = torch.maximum(self.levee_crown_height, self.levee_base_height)
         return self._profile_storage(crown)
 
     @computed_levee_field(description="Crown storage observed inside the levee-layer search", units="m3", output="disabled")
-    @cached_property
     def levee_layer_top_storage(self) -> torch.Tensor:
         return self._storage_to_crown(
             self._profile_storage(self.levee_base_height, at_levee_layer=True),
