@@ -171,7 +171,7 @@ long num_catchments = *args.num_catchments;
         updated_flood_outflow *= limit;
     }
 
-    if (HAS_RESERVOIR && args.is_dam_upstream_ptr[catchment] != 0) {
+    if (HAS_RESERVOIR && args.is_dam_upstream_ptr[batched_is_dam_upstream ? (long)i : catchment] != 0) {
         float downstream_elevation =
             args.catchment_elevation_ptr[downstream_elevation_idx];
         float bed_slope = max(

@@ -21,9 +21,31 @@ HAS_TOTAL_STORAGE_OUTPUT = output_requested("base", "total_storage")
 
 STAGE_HALO = {"river_depth_ptr": 1, "river_storage_ptr": 1, "flood_storage_ptr": 1}
 
+# Sub-step scratch read across ranks: model-owned workspaces exchanged like
+# halo fields, never output, checkpointed or assigned. Outgoing storage is
+# summed from atomic adds and zeroed by the flood stage; the bifurcation
+# outflow total and the storage-availability limit are rewritten each sub-step.
+_SCRATCH_SHAPE = ("ensemble_size", "num_catchments")
+OUTGOING_STORAGE = KernelWorkspace(
+    key="cmfgpu.outgoing_storage", dtype="hpfloat", shape=_SCRATCH_SHAPE, halo=True
+)
+GLOBAL_BIFURCATION_OUTFLOW = KernelWorkspace(
+    key="cmfgpu.global_bifurcation_outflow",
+    dtype="hpfloat",
+    shape=_SCRATCH_SHAPE,
+    halo=True,
+)
+LIMIT_RATE = KernelWorkspace(
+    key="cmfgpu.limit_rate", dtype="float", shape=_SCRATCH_SHAPE, halo=True
+)
+
 OUTFLOW = KernelSpec(
     name="compute_outflow",
     size="num_catchments",
+    workspace={
+        "outgoing_storage_ptr": OUTGOING_STORAGE,
+        "global_bifurcation_outflow_ptr": GLOBAL_BIFURCATION_OUTFLOW,
+    },
     parameters={
         "downstream_idx_ptr": "read",
         "river_inflow_ptr": "write",
@@ -53,6 +75,7 @@ OUTFLOW = KernelSpec(
         "HAS_BIFURCATION": HAS_BIFURCATION,
         "HAS_LEVEE": HAS_LEVEE,
         "is_dam_upstream_ptr": "read",
+        "batched_is_dam_upstream": constant("bool"),
         "HAS_RESERVOIR": HAS_RESERVOIR,
         "min_kinematic_slope": constant("precision"),
         "sea_surface_elevation_ptr": "read",
@@ -90,6 +113,7 @@ OUTFLOW = KernelSpec(
 INFLOW = KernelSpec(
     name="compute_inflow",
     size="num_catchments",
+    workspace={"outgoing_storage_ptr": OUTGOING_STORAGE, "limit_rate_ptr": LIMIT_RATE},
     parameters={
         "downstream_idx_ptr": "read",
         "river_outflow_ptr": "read_write",
@@ -124,6 +148,7 @@ ADAPTIVE_TIME = KernelSpec(
         "river_depth_ptr": "read",
         "downstream_distance_ptr": "read",
         "is_dam_related_ptr": "read",
+        "batched_is_dam_related": constant("bool"),
         "max_sub_steps_ptr": "atomic_max",
         "outer_time_step_ptr": step_field("step_seconds"),
         "adaptive_time_factor": "precision",
@@ -140,6 +165,7 @@ ADAPTIVE_TIME = KernelSpec(
 BIFURCATION_OUTFLOW = KernelSpec(
     name="compute_bifurcation_outflow",
     size="num_bifurcation_paths",
+    workspace={"outgoing_storage_ptr": OUTGOING_STORAGE},
     parameters={
         "bifurcation_catchment_idx_ptr": "read",
         "bifurcation_downstream_idx_ptr": "read",
@@ -162,6 +188,7 @@ BIFURCATION_OUTFLOW = KernelSpec(
         "ensemble_size": "index",
         "num_catchments": "index",
         "is_dam_related_ptr": "read",
+        "batched_is_dam_related": constant("bool"),
         "HAS_RESERVOIR": HAS_RESERVOIR,
         **dict.fromkeys(
             (
@@ -183,6 +210,10 @@ BIFURCATION_OUTFLOW = KernelSpec(
 BIFURCATION_INFLOW = KernelSpec(
     name="compute_bifurcation_inflow",
     size="num_bifurcation_paths",
+    workspace={
+        "global_bifurcation_outflow_ptr": GLOBAL_BIFURCATION_OUTFLOW,
+        "limit_rate_ptr": LIMIT_RATE,
+    },
     parameters={
         "bifurcation_catchment_idx_ptr": "read",
         "bifurcation_downstream_idx_ptr": "read",
@@ -201,8 +232,11 @@ BIFURCATION_INFLOW = KernelSpec(
 RESERVOIR_OUTFLOW = KernelSpec(
     name="compute_reservoir_outflow",
     size="num_reservoirs",
+    workspace={"outgoing_storage_ptr": OUTGOING_STORAGE},
     parameters={
         "reservoir_catchment_idx_ptr": "read",
+        "reservoir_enabled_ptr": "read",
+        "batched_reservoir_enabled": constant("bool"),
         "downstream_idx_ptr": "read",
         "reservoir_total_inflow_ptr": "read_write",
         "river_outflow_ptr": "read_write",
@@ -265,6 +299,8 @@ DAM_FILL = KernelSpec(
     size="num_reservoirs",
     parameters={
         "reservoir_catchment_idx_ptr": "read",
+        "reservoir_enabled_ptr": "read",
+        "batched_reservoir_enabled": constant("bool"),
         "conservation_volume_ptr": "read",
         "river_storage_ptr": "read_write",
         "flood_storage_ptr": "read_write",
@@ -278,6 +314,10 @@ DAM_FILL = KernelSpec(
 FLOOD_STAGE = KernelSpec(
     name="compute_flood_stage",
     size="num_catchments",
+    workspace={
+        "outgoing_storage_ptr": OUTGOING_STORAGE,
+        "global_bifurcation_outflow_ptr": GLOBAL_BIFURCATION_OUTFLOW,
+    },
     parameters={
         "river_inflow_ptr": "read",
         "flood_inflow_ptr": "read",
@@ -374,6 +414,10 @@ INITIAL_FLOOD_STAGE = KernelSpec(
 FLOOD_STAGE_LOG = KernelSpec(
     name="compute_flood_stage_log",
     size="num_catchments",
+    workspace={
+        "outgoing_storage_ptr": OUTGOING_STORAGE,
+        "global_bifurcation_outflow_ptr": GLOBAL_BIFURCATION_OUTFLOW,
+    },
     parameters={
         "river_inflow_ptr": "read",
         "flood_inflow_ptr": "read",
@@ -515,6 +559,7 @@ LEVEE_STAGE_LOG = KernelSpec(
 LEVEE_BIFURCATION_OUTFLOW = KernelSpec(
     name="compute_levee_bifurcation_outflow",
     size="num_bifurcation_paths",
+    workspace={"outgoing_storage_ptr": OUTGOING_STORAGE},
     parameters={
         "bifurcation_catchment_idx_ptr": "read",
         "bifurcation_downstream_idx_ptr": "read",
@@ -540,6 +585,7 @@ LEVEE_BIFURCATION_OUTFLOW = KernelSpec(
         "ensemble_size": "index",
         "num_catchments": "index",
         "is_dam_related_ptr": "read",
+        "batched_is_dam_related": constant("bool"),
         "HAS_RESERVOIR": HAS_RESERVOIR,
         **dict.fromkeys(
             (
@@ -628,7 +674,7 @@ _ROUTING_OPTIONAL = {
 METAL_OUTFLOW = KernelSpec(
     **{
         **OUTFLOW.model_dump(exclude={"halo", "contributes"}),
-        "workspace": {"unlimited_outflow_ptr": _UNLIMITED_FLOW},
+        "workspace": {**OUTFLOW.workspace, "unlimited_outflow_ptr": _UNLIMITED_FLOW},
         "parameters": {**OUTFLOW.parameters, "unlimited_outflow_ptr": "write"},
         "optional": {**OUTFLOW.optional, "unlimited_outflow_ptr": None},
     }
@@ -636,7 +682,10 @@ METAL_OUTFLOW = KernelSpec(
 METAL_RESERVOIR_OUTFLOW = KernelSpec(
     **{
         **RESERVOIR_OUTFLOW.model_dump(exclude={"halo", "contributes"}),
-        "workspace": {"unlimited_outflow_ptr": _UNLIMITED_FLOW},
+        "workspace": {
+            **RESERVOIR_OUTFLOW.workspace,
+            "unlimited_outflow_ptr": _UNLIMITED_FLOW,
+        },
         "parameters": {
             **RESERVOIR_OUTFLOW.parameters,
             "unlimited_outflow_ptr": "write",
@@ -647,7 +696,11 @@ METAL_RESERVOIR_OUTFLOW = KernelSpec(
 METAL_INFLOW = KernelSpec(
     **{
         **INFLOW.model_dump(exclude={"halo", "contributes"}),
-        "workspace": {**_ROUTING_WORKSPACE, "unlimited_outflow_ptr": _UNLIMITED_FLOW},
+        "workspace": {
+            **INFLOW.workspace,
+            **_ROUTING_WORKSPACE,
+            "unlimited_outflow_ptr": _UNLIMITED_FLOW,
+        },
         "parameters": {
             **INFLOW.parameters,
             **_ROUTING_PARAMETERS,
@@ -668,7 +721,10 @@ METAL_INFLOW = KernelSpec(
 METAL_BIFURCATION_OUTFLOW = KernelSpec(
     **{
         **BIFURCATION_OUTFLOW.model_dump(exclude={"halo", "contributes"}),
-        "workspace": {"bifurcation_path_flow_ptr": _PATH_FLOW},
+        "workspace": {
+            **BIFURCATION_OUTFLOW.workspace,
+            "bifurcation_path_flow_ptr": _PATH_FLOW,
+        },
         "parameters": {
             **BIFURCATION_OUTFLOW.parameters,
             "bifurcation_path_flow_ptr": "write",
@@ -679,7 +735,10 @@ METAL_BIFURCATION_OUTFLOW = KernelSpec(
 METAL_BIFURCATION_INFLOW = KernelSpec(
     **{
         **BIFURCATION_INFLOW.model_dump(exclude={"halo", "contributes"}),
-        "workspace": {"bifurcation_path_flow_ptr": _PATH_FLOW},
+        "workspace": {
+            **BIFURCATION_INFLOW.workspace,
+            "bifurcation_path_flow_ptr": _PATH_FLOW,
+        },
         "parameters": {
             **BIFURCATION_INFLOW.parameters,
             "bifurcation_path_flow_ptr": "write",
@@ -690,7 +749,10 @@ METAL_BIFURCATION_INFLOW = KernelSpec(
 METAL_LEVEE_BIFURCATION_OUTFLOW = KernelSpec(
     **{
         **LEVEE_BIFURCATION_OUTFLOW.model_dump(exclude={"halo", "contributes"}),
-        "workspace": {"bifurcation_path_flow_ptr": _PATH_FLOW},
+        "workspace": {
+            **LEVEE_BIFURCATION_OUTFLOW.workspace,
+            "bifurcation_path_flow_ptr": _PATH_FLOW,
+        },
         "parameters": {
             **LEVEE_BIFURCATION_OUTFLOW.parameters,
             "bifurcation_path_flow_ptr": "write",
@@ -718,7 +780,7 @@ _METAL_STAGE_OPTIONAL = {
 METAL_FLOOD_STAGE = KernelSpec(
     **{
         **FLOOD_STAGE.model_dump(exclude={"halo", "contributes"}),
-        "workspace": _ROUTING_WORKSPACE,
+        "workspace": {**FLOOD_STAGE.workspace, **_ROUTING_WORKSPACE},
         "parameters": {**FLOOD_STAGE.parameters, **_METAL_STAGE_PARAMETERS},
         "optional": {**FLOOD_STAGE.optional, **_METAL_STAGE_OPTIONAL},
         "optional_values": {
@@ -730,7 +792,7 @@ METAL_FLOOD_STAGE = KernelSpec(
 METAL_FLOOD_STAGE_LOG = KernelSpec(
     **{
         **FLOOD_STAGE_LOG.model_dump(exclude={"halo", "contributes"}),
-        "workspace": _ROUTING_WORKSPACE,
+        "workspace": {**FLOOD_STAGE_LOG.workspace, **_ROUTING_WORKSPACE},
         "parameters": {**FLOOD_STAGE_LOG.parameters, **_METAL_STAGE_PARAMETERS},
         "optional": {**FLOOD_STAGE_LOG.optional, **_METAL_STAGE_OPTIONAL},
         "optional_values": {

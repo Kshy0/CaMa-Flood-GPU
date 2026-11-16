@@ -14,7 +14,7 @@
 
         bool skip = false;
         if (HAS_RESERVOIR) {
-            skip = args.is_dam_related_ptr[catchment] != 0;
+            skip = args.is_dam_related_ptr[batched_is_dam_related ? (long)i : catchment] != 0;
         }
 
         long distance_offset = batched_downstream_distance

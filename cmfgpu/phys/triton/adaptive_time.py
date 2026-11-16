@@ -60,6 +60,7 @@ def compute_adaptive_time_step_batched_kernel(
     gravity: tl.constexpr ,                                # f32 scalar gravity acceleration
     num_catchments: tl.constexpr,           # total number of elements
     ensemble_size: tl.constexpr,
+    batched_is_dam_related: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                # block size
     # Batch flags
     batched_downstream_distance: tl.constexpr,
@@ -76,7 +77,7 @@ def compute_adaptive_time_step_batched_kernel(
     
     # Skip dam-related cells from the CFL calculation.
     if HAS_RESERVOIR:
-        is_dam = tl.load(is_dam_related_ptr + offs, mask=mask, other=False)
+        is_dam = tl.load(is_dam_related_ptr + (member_index * num_catchments if batched_is_dam_related else 0) + offs, mask=mask, other=False)
         mask = mask & (~is_dam)
 
     member_offset = member_index * num_catchments

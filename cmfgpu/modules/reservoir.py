@@ -104,6 +104,12 @@ class ReservoirModule(AbstractModule):
     # ------------------------------------------------------------------ #
     # Physical properties
     # ------------------------------------------------------------------ #
+    reservoir_enabled: torch.Tensor = ReservoirField(
+        description="Whether the reservoir is commissioned and regulates flow",
+        dtype="bool",
+        default=True,
+    )
+
     reservoir_capacity: torch.Tensor = ReservoirField(
         description="Maximum storage capacity",
         units="m3",
@@ -156,7 +162,7 @@ class ReservoirModule(AbstractModule):
     reservoir_catchment_idx = ReferenceIndexField("reservoir_catchment_id")
 
     @computed_tensor_field(
-        description="Boolean mask for reservoir catchments",
+        description="Mask of candidate reservoir catchments, including uncommissioned dams",
         shape=("base.num_catchments",),
         dtype="bool",
         dim_coords="base.catchment_id",
@@ -172,30 +178,44 @@ class ReservoirModule(AbstractModule):
         return mask
 
     @computed_tensor_field(
-        description="Mask for reservoir cells and their immediate upstream cells",
-        shape=("base.num_catchments",),
-        dtype="bool",
-        dim_coords="base.catchment_id",
-        category="topology",
+        description="Mask of commissioned reservoir catchments",
+        shape=("base.num_catchments",), dtype="bool",
+        dim_coords="base.catchment_id", category="derived_param",
     )
-    def is_dam_related(self) -> torch.Tensor:
-        downstream_is_dam = self.is_reservoir[self.base.downstream_idx]
-        idx = torch.arange(
-            self.base.catchment_id.shape[0], device=self.base.catchment_id.device
+    def is_active_reservoir(self) -> torch.Tensor:
+        enabled = self.reservoir_enabled
+        mask = torch.zeros(
+            (*enabled.shape[:-1], self.base.catchment_id.shape[0]),
+            dtype=torch.bool, device=enabled.device,
         )
-        not_mouth = self.base.downstream_idx != idx
-        upstream = (~self.is_reservoir) & not_mouth & downstream_is_dam
-        return self.is_reservoir | upstream
+        mask[..., self.reservoir_catchment_idx] = enabled
+        return mask
 
     @computed_tensor_field(
-        description="Mask for immediate upstream-of-reservoir cells",
+        description="Mask for active reservoir cells and their immediate upstream cells",
         shape=("base.num_catchments",),
         dtype="bool",
         dim_coords="base.catchment_id",
-        category="topology",
+        category="derived_param",
+    )
+    def is_dam_related(self) -> torch.Tensor:
+        downstream_is_dam = self.is_active_reservoir[..., self.base.downstream_idx]
+        idx = torch.arange(
+            self.base.catchment_id.shape[0], device=self.base.downstream_idx.device
+        )
+        not_mouth = self.base.downstream_idx != idx
+        upstream = (~self.is_active_reservoir) & not_mouth & downstream_is_dam
+        return self.is_active_reservoir | upstream
+
+    @computed_tensor_field(
+        description="Mask for immediate upstream-of-active-reservoir cells",
+        shape=("base.num_catchments",),
+        dtype="bool",
+        dim_coords="base.catchment_id",
+        category="derived_param",
     )
     def is_dam_upstream(self) -> torch.Tensor:
-        return self.is_dam_related & ~self.is_reservoir
+        return self.is_dam_related & ~self.is_active_reservoir
 
     reservoir_total_inflow: torch.Tensor = TensorField(
         description="Accumulated reservoir total inflow from upstream",
@@ -305,7 +325,7 @@ class ReservoirModule(AbstractModule):
         river = base.river_storage[..., idx]
         flood = base.flood_storage[..., idx]
         conservation = self.conservation_volume.to(river.dtype)
-        fill = (river + flood) < conservation
+        fill = self.reservoir_enabled & ((river + flood) < conservation)
         base.river_storage[..., idx] = torch.where(fill, conservation, river)
         base.flood_storage[..., idx] = torch.where(fill, torch.zeros_like(flood), flood)
         count = int(fill.sum().item())

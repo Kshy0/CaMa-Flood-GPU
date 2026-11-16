@@ -373,25 +373,6 @@ class BaseModule(AbstractModule):
     def protected_depth(self) -> torch.Tensor | None:
         return self._stage_buffer()
 
-    # ---------------- Hidden / intermediate states ------------------- #
-    @computed_base_field(
-        description=(
-            "Sub-step sum of the flows leaving each catchment, including flow "
-            "reversed from its upstream cells; times the time step it is CaMa-Flood's "
-            "outgoing volume P2STOOUT. Can not be saved, as it is a temporary state"
-        ),
-        units="m3 s-1",
-        output="disabled",
-        category="state",
-        dtype="hpfloat",
-        halo=True,
-    )
-    def outgoing_storage(self) -> torch.Tensor:
-        return torch.zeros_like(
-            self.river_outflow,
-            dtype=self.get_expected_dtype("outgoing_storage"),
-        )
-
     @computed_base_field(
         description="Water-surface elevation (above mean sea level)",
         units="m",

@@ -421,6 +421,7 @@ def compute_outflow_batched_kernel(
     time_step_ptr,                              # f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     ensemble_size: tl.constexpr,                             # number of members
+    batched_is_dam_upstream: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                # block size
     
     # Batch flags
@@ -630,7 +631,7 @@ def compute_outflow_batched_kernel(
     # Match the shared kernel's kinematic-wave override at dam-upstream cells.
     if HAS_RESERVOIR:
         is_dam_up = tl.load(
-            is_dam_upstream_ptr + catchment_idx, mask=mask, other=0,
+            is_dam_upstream_ptr + (member_offset if batched_is_dam_upstream else 0) + catchment_idx, mask=mask, other=0,
         ) != 0
         downstream_elevation = tl.load(
             catchment_elevation_ptr

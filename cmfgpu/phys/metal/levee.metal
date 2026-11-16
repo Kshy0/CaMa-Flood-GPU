@@ -545,7 +545,7 @@ long num_levees = *args.num_levees;
         batched_bifurcation_elevation,
         batched_river_height,
         batched_catchment_elevation,
-        args.is_dam_related_ptr,
+        args.is_dam_related_ptr + (batched_is_dam_related ? ((long)i / *args.num_bifurcation_paths) * (*args.num_catchments) : 0),
         HAS_RESERVOIR);
 #ifdef HF_HP_ENABLED
     args.bifurcation_path_flow_ptr[i] = total_outflow;

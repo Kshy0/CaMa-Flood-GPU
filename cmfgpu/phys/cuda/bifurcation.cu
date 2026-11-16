@@ -186,6 +186,9 @@ template <typename REAL, typename STO, bool HAS_RESERVOIR, class A>
 __device__ __forceinline__ void bif_outflow_members(A a, long t, long member)
 {
     const long member_offset = member * a.num_catchments;
+    if constexpr (HAS_RESERVOIR) {
+        if (a.batched_is_dam_related) a.is_dam_related_ptr += member_offset;
+    }
     const long path_offset = member * a.num_bifurcation_paths;
     const long level_offset = path_offset * a.num_bifurcation_levels;
     a.bifurcation_outflow_ptr += level_offset;

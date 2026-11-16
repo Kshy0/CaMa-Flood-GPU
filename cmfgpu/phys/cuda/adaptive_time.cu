@@ -60,6 +60,9 @@ template <typename REAL, bool HAS_RESERVOIR, class A>
 __device__ __forceinline__ void adaptive_time_members(A a, long t, long member)
 {
     const long member_offset = member * a.num_catchments;
+    if constexpr (HAS_RESERVOIR) {
+        if (a.batched_is_dam_related) a.is_dam_related_ptr += member_offset;
+    }
     a.river_depth_ptr += member_offset;
     if (a.batched_downstream_distance) a.downstream_distance_ptr += member_offset;
     adaptive_time<REAL, HAS_RESERVOIR>(a, t);

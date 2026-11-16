@@ -697,6 +697,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     ensemble_size: tl.constexpr,
+    batched_is_dam_related: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,                    # Block size
     num_catchments: tl.constexpr,
     # Batch flags
@@ -731,8 +732,8 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     # Reservoir operation closes paths whose upstream or downstream cell is dam-related.
     if HAS_RESERVOIR:
         bifurcation_closed = (
-            tl.load(is_dam_related_ptr + bifurcation_catchment_idx, mask=mask, other=0) != 0
-        ) | (tl.load(is_dam_related_ptr + bifurcation_downstream_idx, mask=mask, other=0) != 0)
+            tl.load(is_dam_related_ptr + (member_offset_catchments if batched_is_dam_related else 0) + bifurcation_catchment_idx, mask=mask, other=0) != 0
+        ) | (tl.load(is_dam_related_ptr + (member_offset_catchments if batched_is_dam_related else 0) + bifurcation_downstream_idx, mask=mask, other=0) != 0)
     
     # Load bifurcation properties
     bifurcation_length = tl.load(bifurcation_length_ptr + (member_offset_paths if batched_bifurcation_length else 0) + offs, mask=mask, other=0.0)

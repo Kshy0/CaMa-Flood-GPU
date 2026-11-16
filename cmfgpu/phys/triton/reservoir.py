@@ -109,6 +109,7 @@ def limit_release_inline(release, dam_volume, river_flood_storage, time_step):
 
 @triton.jit
 def compute_reservoir_outflow_kernel(
+    reservoir_enabled_ptr,                 # *bool commissioned reservoir
     reservoir_catchment_idx_ptr,            # *i32  reservoir → catchment index
     downstream_idx_ptr,                     # *i32  catchment-level downstream index
 
@@ -153,6 +154,9 @@ def compute_reservoir_outflow_kernel(
     catchment_idx = tl.load(reservoir_catchment_idx_ptr + offs, mask=mask, other=0)
     downstream_idx = tl.load(downstream_idx_ptr + catchment_idx, mask=mask, other=0)
     is_river_mouth = downstream_idx == catchment_idx
+    total_inflow = tl.load(reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0)
+    tl.store(reservoir_total_inflow_ptr + catchment_idx, 0.0, mask=mask)
+    mask = mask & tl.load(reservoir_enabled_ptr + offs, mask=mask, other=False)
 
     # ================================================================== #
     # 1. Undo the main outflow kernel's outgoing_storage contribution
@@ -177,17 +181,10 @@ def compute_reservoir_outflow_kernel(
         storage += tl.load(protected_storage_ptr + catchment_idx, mask=mask, other=0.0)
     dam_volume = hm.to_compute(storage, old_river_outflow)
 
-    total_inflow = tl.load(reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0)
     runoff = tl.load(runoff_ptr + catchment_idx, mask=mask, other=0.0)
     reservoir_inflow = hm.to_compute(
         total_inflow + runoff.to(total_inflow.dtype), old_river_outflow,
     )
-    # Zero the accumulator for next sub-step
-    tl.store(
-        reservoir_total_inflow_ptr + catchment_idx,
-        tl.zeros_like(total_inflow), mask=mask,
-    )
-
     # Reservoir parameters (reservoir-indexed)
     conservation_volume = tl.load(conservation_volume_ptr + offs, mask=mask, other=0.0)
     emergency_volume = tl.load(emergency_volume_ptr + offs, mask=mask, other=0.0)
@@ -228,6 +225,7 @@ def compute_reservoir_outflow_kernel(
 @triton.jit
 def compute_reservoir_outflow_batched_kernel(
     reservoir_catchment_idx_ptr,
+    reservoir_enabled_ptr,
     downstream_idx_ptr,
     reservoir_total_inflow_ptr,
     river_outflow_ptr,
@@ -253,6 +251,7 @@ def compute_reservoir_outflow_batched_kernel(
     HAS_YF: tl.constexpr,
     HAS_H22: tl.constexpr,
     ensemble_size: tl.constexpr,
+    batched_reservoir_enabled: tl.constexpr,
     batched_runoff: tl.constexpr,
     batched_conservation_volume: tl.constexpr,
     batched_emergency_volume: tl.constexpr,
@@ -281,6 +280,12 @@ def compute_reservoir_outflow_batched_kernel(
     is_river_mouth = local_downstream == local_catchment
     catchment_idx = member_offset + local_catchment
     downstream_idx = member_offset + local_downstream
+    total_inflow = tl.load(reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0)
+    tl.store(reservoir_total_inflow_ptr + catchment_idx, 0.0, mask=mask)
+    mask = mask & tl.load(
+        reservoir_enabled_ptr + (idx if batched_reservoir_enabled else reservoir_idx),
+        mask=mask, other=False,
+    )
 
     old_river_outflow = tl.load(
         river_outflow_ptr + catchment_idx, mask=mask, other=0.0,
@@ -301,17 +306,10 @@ def compute_reservoir_outflow_batched_kernel(
     if HAS_LEVEE:
         storage += tl.load(protected_storage_ptr + catchment_idx, mask=mask, other=0.0)
     dam_volume = hm.to_compute(storage, old_river_outflow)
-    total_inflow = tl.load(
-        reservoir_total_inflow_ptr + catchment_idx, mask=mask, other=0.0,
-    )
     runoff_idx = catchment_idx if batched_runoff else local_catchment
     runoff = tl.load(runoff_ptr + runoff_idx, mask=mask, other=0.0)
     reservoir_inflow = hm.to_compute(
         total_inflow + runoff.to(total_inflow.dtype), old_river_outflow,
-    )
-    tl.store(
-        reservoir_total_inflow_ptr + catchment_idx,
-        tl.zeros_like(total_inflow), mask=mask,
     )
 
     # ``idx`` is this member's reservoir in a parameter with a member axis.
@@ -396,13 +394,14 @@ def fill_dam_cells_inline(
 
 @triton.jit
 def fill_dam_storage_kernel(
-    reservoir_catchment_idx_ptr, conservation_volume_ptr,
+    reservoir_catchment_idx_ptr, reservoir_enabled_ptr, conservation_volume_ptr,
     river_storage_ptr, flood_storage_ptr,
     num_reservoirs,
     BLOCK_SIZE: tl.constexpr,
 ):
     reservoir = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = reservoir < num_reservoirs
+    mask = mask & tl.load(reservoir_enabled_ptr + reservoir, mask=mask, other=False)
     cell = tl.load(reservoir_catchment_idx_ptr + reservoir, mask=mask, other=0)
     fill_dam_cells_inline(
         cell, reservoir, mask, conservation_volume_ptr, river_storage_ptr, flood_storage_ptr,
@@ -411,18 +410,23 @@ def fill_dam_storage_kernel(
 
 @triton.jit
 def fill_dam_storage_batched_kernel(
-    reservoir_catchment_idx_ptr, conservation_volume_ptr,
+    reservoir_catchment_idx_ptr, reservoir_enabled_ptr, conservation_volume_ptr,
     river_storage_ptr, flood_storage_ptr,
     num_reservoirs: tl.constexpr,
     num_catchments: tl.constexpr,
     ensemble_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     batched_conservation_volume: tl.constexpr,
+    batched_reservoir_enabled: tl.constexpr,
 ):
     # One lane per dam and member.
     idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = idx < num_reservoirs * ensemble_size
     reservoir = idx % num_reservoirs
+    mask = mask & tl.load(
+        reservoir_enabled_ptr + (idx if batched_reservoir_enabled else reservoir),
+        mask=mask, other=False,
+    )
     member_offset = (idx // num_reservoirs) * num_catchments
     cell = member_offset + tl.load(reservoir_catchment_idx_ptr + reservoir, mask=mask, other=0)
     fill_dam_cells_inline(

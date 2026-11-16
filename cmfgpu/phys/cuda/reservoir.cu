@@ -65,6 +65,7 @@ __device__ __forceinline__ REAL h22_release(
 template <typename REAL, typename STO, bool HAS_LEVEE, bool HAS_H22>
 __device__ __forceinline__ void k_reservoir_outflow_cell(
     const int* __restrict__ reservoir_catchment_idx,
+    const bool* __restrict__ reservoir_enabled,
     const int* __restrict__ downstream_idx,
     STO* __restrict__ reservoir_total_inflow,
     REAL* __restrict__ river_outflow, REAL* __restrict__ flood_outflow,
@@ -81,6 +82,11 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     REAL time_step = __ldg(time_step_ptr);
 
     int ci = reservoir_catchment_idx[t];
+    // Keep the previous-substep inflow cache fresh even before commissioning.
+    if (!reservoir_enabled[t]) {
+        reservoir_total_inflow[ci] = (STO)0;
+        return;
+    }
     int di = downstream_idx[ci];
     bool is_river_mouth = (di == ci);
 
@@ -132,7 +138,8 @@ template <typename REAL, typename STO, bool HAS_LEVEE, bool HAS_H22, class A>
 __device__ __forceinline__ void reservoir_outflow(const A& a, long t)
 {
     k_reservoir_outflow_cell<REAL, STO, HAS_LEVEE, HAS_H22>(
-        a.reservoir_catchment_idx_ptr, a.downstream_idx_ptr, a.reservoir_total_inflow_ptr,
+        a.reservoir_catchment_idx_ptr, a.reservoir_enabled_ptr,
+        a.downstream_idx_ptr, a.reservoir_total_inflow_ptr,
         a.river_outflow_ptr, a.flood_outflow_ptr, a.river_storage_ptr, a.flood_storage_ptr,
         cmf_optional<HAS_LEVEE>(a.protected_storage_ptr), a.conservation_volume_ptr,
         a.emergency_volume_ptr, cmf_optional<!HAS_H22>(a.adjustment_volume_ptr), a.effective_normal_outflow_ptr,
@@ -157,6 +164,7 @@ __device__ __forceinline__ void reservoir_outflow_members(A a, long t, long memb
     a.outgoing_storage_ptr += member_offset;
     if (a.batched_runoff) a.runoff_ptr += member_offset;
     const long reservoir_offset = member * a.num_reservoirs;
+    if (a.batched_reservoir_enabled) a.reservoir_enabled_ptr += reservoir_offset;
     if (a.batched_conservation_volume) a.conservation_volume_ptr += reservoir_offset;
     if (a.batched_emergency_volume) a.emergency_volume_ptr += reservoir_offset;
     if (a.batched_effective_normal_outflow) a.effective_normal_outflow_ptr += reservoir_offset;
@@ -177,6 +185,7 @@ __device__ __forceinline__ void reservoir_outflow_members(A a, long t, long memb
 template <typename REAL, typename STO, class A>
 __device__ __forceinline__ void dam_fill(const A& a, long t)
 {
+    if (!a.reservoir_enabled_ptr[t]) return;
     const int ci = a.reservoir_catchment_idx_ptr[t];
     const STO conservation = (STO)__ldg(a.conservation_volume_ptr + t);
     if (a.river_storage_ptr[ci] + a.flood_storage_ptr[ci] < conservation) {
@@ -188,6 +197,8 @@ __device__ __forceinline__ void dam_fill(const A& a, long t)
 template <typename REAL, typename STO, class A>
 __device__ __forceinline__ void dam_fill_members(A a, long t, long member)
 {
+    if (a.batched_reservoir_enabled)
+        a.reservoir_enabled_ptr += member * a.num_reservoirs;
     a.river_storage_ptr += member * a.num_catchments;
     a.flood_storage_ptr += member * a.num_catchments;
     if (a.batched_conservation_volume)

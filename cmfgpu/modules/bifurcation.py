@@ -5,7 +5,7 @@
 #
 
 """
-Bifurcation module for CaMa-Flood-GPU using TensorField / computed_tensor_field
+Bifurcation module for CaMa-Flood-GPU using TensorField
 for concise tensor metadata.
 """
 
@@ -22,7 +22,6 @@ from hydroforge.model import (
     SelectionField,
     TensorField,
     computed_field,
-    computed_tensor_field,
     module_ref,
 )
 from pydantic import model_validator
@@ -47,28 +46,6 @@ def BifurcationField(
         dim_coords=dim_coords,
         category=category,
         mode=mode,
-        **kwargs,
-    )
-
-
-def computed_bifurcation_field(
-    description: str,
-    shape: tuple[str, ...] = ("num_bifurcation_paths",),
-    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    dim_coords: str | None = "bifurcation_path_id",
-    category: Literal[
-        "topology", "derived_param", "state", "virtual"
-    ] = "derived_param",
-    expr: str | None = None,
-    **kwargs,
-):
-    return computed_tensor_field(
-        description=description,
-        shape=shape,
-        dtype=dtype,
-        dim_coords=dim_coords,
-        category=category,
-        expr=expr,
         **kwargs,
     )
 
@@ -180,34 +157,6 @@ class BifurcationModule(AbstractModule):
     bifurcation_downstream_idx = ReferenceIndexField(
         "bifurcation_downstream_id",
     )
-
-    @computed_bifurcation_field(
-        description="Total outflow via all bifurcation paths",
-        units="m3 s-1",
-        shape=("base.num_catchments",),
-        dtype="hpfloat",
-        dim_coords="base.catchment_id",
-        category="state",
-        output="disabled",
-        halo=True,
-    )
-    def global_bifurcation_outflow(self) -> torch.Tensor:
-        return torch.zeros_like(
-            self.base.river_outflow,
-            dtype=self.get_expected_dtype("global_bifurcation_outflow"),
-        )
-
-    @computed_bifurcation_field(
-        description="Dimensionless storage-availability multiplier limiting bifurcation discharge",
-        units="1",
-        shape=("base.num_catchments",),
-        dim_coords="base.catchment_id",
-        category="state",
-        output="disabled",
-        halo=True,
-    )
-    def limit_rate(self) -> torch.Tensor:
-        return torch.zeros_like(self.base.river_outflow)
 
     # ------------------------------------------------------------------ #
     # Computed scalar dimensions

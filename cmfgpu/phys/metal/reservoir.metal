@@ -6,6 +6,11 @@
     long member_offset = member_index * num_catchments;
 
     int local_catchment = args.reservoir_catchment_idx_ptr[reservoir_idx];
+    long enabled_idx = batched_reservoir_enabled ? (long)i : reservoir_idx;
+    if (!args.reservoir_enabled_ptr[enabled_idx]) {
+        args.reservoir_total_inflow_ptr[member_offset + local_catchment] = cmf_storage(0.0f);
+        return;
+    }
     int local_downstream = args.downstream_idx_ptr[local_catchment];
     bool is_river_mouth = local_downstream == local_catchment;
     long catchment = member_offset + local_catchment;
@@ -145,6 +150,7 @@ long num_reservoirs = *args.num_reservoirs;
     // it, with an empty floodplain.
     long reservoir_idx = (long)i % num_reservoirs;
     long member_index = (long)i / num_reservoirs;
+    if (!args.reservoir_enabled_ptr[batched_reservoir_enabled ? (long)i : reservoir_idx]) return;
     long catchment = member_index * num_catchments
         + args.reservoir_catchment_idx_ptr[reservoir_idx];
     cmf_storage conservation = cmf_storage(args.conservation_volume_ptr[

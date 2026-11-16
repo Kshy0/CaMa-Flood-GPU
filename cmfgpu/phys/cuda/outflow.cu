@@ -271,6 +271,9 @@ template <typename REAL, typename STO, bool HAS_BIFURCATION, bool HAS_LEVEE,
 __device__ __forceinline__ void outflow_members(A a, long t, long member)
 {
     const long member_offset = member * a.num_catchments;
+    if constexpr (HAS_RESERVOIR) {
+        if (a.batched_is_dam_upstream) a.is_dam_upstream_ptr += member_offset;
+    }
     a.river_inflow_ptr += member_offset;
     a.river_outflow_ptr += member_offset;
     a.river_depth_ptr += member_offset;
