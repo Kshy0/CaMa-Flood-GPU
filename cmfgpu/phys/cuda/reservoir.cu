@@ -20,6 +20,7 @@ __device__ __forceinline__ REAL yamazaki_funato_release(
     REAL dam_volume, REAL inflow, REAL cons, REAL adj, REAL emerg,
     REAL n_out, REAL a_out, REAL fc_out, REAL release_exponent)
 {
+    if (dam_volume <= (REAL)0.0) return (REAL)0.0;
     if (dam_volume <= cons) return n_out * sqrt(dam_volume / cons);
     if (dam_volume <= adj) {
         REAL frac2 = (dam_volume - cons) / (adj - cons);
@@ -93,11 +94,14 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     // Undo exactly the outflow kernel's outgoing flows of this cell.
     REAL old_r = river_outflow[ci];
     REAL old_f = flood_outflow[ci];
-    cmf_atomic_add(outgoing_storage + ci,
-                   -(STO)(fmax(old_r, (REAL)0.0) + fmax(old_f, (REAL)0.0)));
-    if (!is_river_mouth)
-        cmf_atomic_add(outgoing_storage + di,
-                       -((STO)fmax(-old_r, (REAL)0.0) + (STO)fmax(-old_f, (REAL)0.0)));
+    STO old_pos = (STO)(fmax(old_r, (REAL)0.0) + fmax(old_f, (REAL)0.0));
+    if (old_pos != (STO)0)
+        cmf_atomic_add(outgoing_storage + ci, -old_pos);
+    if (!is_river_mouth) {
+        STO old_neg = (STO)fmax(-old_r, (REAL)0.0) + (STO)fmax(-old_f, (REAL)0.0);
+        if (old_neg != (STO)0)
+            cmf_atomic_add(outgoing_storage + di, -old_neg);
+    }
 
     STO storage = river_storage[ci] + flood_storage[ci];
     REAL river_flood_storage = (REAL)storage;
@@ -129,7 +133,8 @@ __device__ __forceinline__ void k_reservoir_outflow_cell(
     flood_outflow[ci] = (REAL)0.0;
 
     // The release is non-negative, so it only leaves this cell.
-    cmf_atomic_add(outgoing_storage + ci, (STO)ro);
+    if (ro != (REAL)0.0)
+        cmf_atomic_add(outgoing_storage + ci, (STO)ro);
 }
 
 // Generated-entry body over the canonical values ``a`` of

@@ -168,19 +168,13 @@ class LogModule(AbstractModule):
         if not self._log_initialized:
             self.write_header(log_path)
             self._log_initialized = True
-        with log_path.open("a") as f:
-            f.write(
-                f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {self._num_steps}\n"
-            )
-
         num_steps = self._num_steps
-        time_strs = np.array(
-            [t.strftime("%Y-%m-%d %H:%M") for t in self._times[:num_steps]], dtype=str
+        time_strs = [t.strftime("%Y-%m-%d %H:%M") for t in self._times[:num_steps]]
+        stacked = (
+            torch.stack([getattr(self, field)[:num_steps] for field in self.log_vars])
+            .cpu()
+            .numpy()
         )
-        data_arrays = {
-            field: getattr(self, field).cpu().numpy()[:num_steps]
-            for field in self.log_vars
-        }
         fmt = (
             ["%-18s"]
             + ["%16.6g"] * 3
@@ -190,12 +184,14 @@ class LogModule(AbstractModule):
             + ["%16.6g"] * 3
         )
         fmt.extend(column_format for _header, column_format in self.extra_log_columns())
+        lines = [
+            f"Time Step: {self._time_step:.4f} seconds    Number of Steps: {num_steps}\n"
+        ]
+        for i in range(num_steps):
+            row = [time_strs[i], *stacked[:, i]]
+            lines.append("".join(f_ % v for f_, v in zip(fmt, row, strict=True)) + "\n")
         with log_path.open("a") as f:
-            for i in range(num_steps):
-                row = [time_strs[i]] + [
-                    data_arrays[field][i] for field in self.log_vars
-                ]
-                f.write("".join(f_ % v for f_, v in zip(fmt, row, strict=True)) + "\n")
+            f.writelines(lines)
         self.clear_buffers()
 
     # ------------------------------------------------------------------ #

@@ -20,8 +20,10 @@ __device__ __forceinline__ void k_bif_inflow_cell(
         outflow[li] = upd;
     }
     REAL net = (raw_sum >= (REAL)0) ? raw_sum * lr_c : raw_sum * lr_d;
-    cmf_atomic_add(global_bif_outflow + ci, (STO)net);
-    cmf_atomic_add(global_bif_outflow + di, (STO)(-net));
+    if (net != (REAL)0) {
+        cmf_atomic_add(global_bif_outflow + ci, (STO)net);
+        cmf_atomic_add(global_bif_outflow + di, (STO)(-net));
+    }
 }
 
 // Generated-entry body over the canonical values ``a`` of
@@ -149,11 +151,11 @@ __device__ __forceinline__ void k_bif_outflow_cell(
         }
     }
 
-    REAL pos = fmax(sum_out, (REAL)0);
-    REAL neg = fmin(sum_out, (REAL)0);
     // P2STOOUT flows, multiplied by the step in compute_inflow.
-    cmf_atomic_add(outgoing_storage + ci, (STO)pos);
-    cmf_atomic_add(outgoing_storage + di, (STO)(-neg));
+    if (sum_out > (REAL)0)
+        cmf_atomic_add(outgoing_storage + ci, (STO)sum_out);
+    else if (sum_out < (REAL)0)
+        cmf_atomic_add(outgoing_storage + di, (STO)(-sum_out));
 }
 
 // Generated-entry body over the canonical values ``a`` of

@@ -297,7 +297,7 @@ class LeveeModule(AbstractModule):
         storage = length * width * height
         # All five arrays have a member slice, including shared geometry.
         if self.ensemble_size is not None:
-            storage = storage.expand(self.ensemble_size, self.num_levees)
+            storage = storage.expand(self.ensemble_size, self.num_levees).contiguous()
         return storage
 
     @computed_levee_field(description="Storage at the levee base", units="m3", output="disabled")

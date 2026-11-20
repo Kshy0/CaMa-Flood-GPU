@@ -354,7 +354,7 @@ class BaseModule(AbstractModule):
         category="state",
     )
     def flood_depth(self) -> torch.Tensor:
-        return self._stage_buffer()
+        return torch.zeros_like(self.river_outflow, dtype=self.precision)
 
     @computed_base_field(
         description="Fraction of catchment area that is flooded",
@@ -362,7 +362,7 @@ class BaseModule(AbstractModule):
         category="state",
     )
     def flood_fraction(self) -> torch.Tensor:
-        return self._stage_buffer()
+        return torch.zeros_like(self.river_outflow, dtype=self.precision)
 
     @computed_base_field(
         description="Current water depth on the protected side relative to river bed",
@@ -371,7 +371,7 @@ class BaseModule(AbstractModule):
         depends_on="levee",
     )
     def protected_depth(self) -> torch.Tensor | None:
-        return self._stage_buffer()
+        return torch.zeros_like(self.river_outflow, dtype=self.precision)
 
     @computed_base_field(
         description="Water-surface elevation (above mean sea level)",
@@ -391,7 +391,7 @@ class BaseModule(AbstractModule):
     )
     def river_inflow(self) -> torch.Tensor:
         return torch.zeros_like(
-            self.river_outflow,
+            self.river_storage,
             dtype=self.get_expected_dtype("river_inflow"),
         )
 
@@ -413,7 +413,7 @@ class BaseModule(AbstractModule):
     )
     def flood_inflow(self) -> torch.Tensor:
         return torch.zeros_like(
-            self.river_outflow,
+            self.river_storage,
             dtype=self.get_expected_dtype("flood_inflow"),
         )
 

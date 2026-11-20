@@ -86,7 +86,7 @@ class CaMaFlood(AbstractModel):
     def initialize_model_state(self) -> None:
         if (
             self.reservoir is not None
-            and "reservoir.reservoir_total_inflow" in self.missing_inputs
+            and "base.river_storage" in self.missing_inputs
         ):
             fill_dam_storage()
         compute_initial_flood_stage()

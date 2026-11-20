@@ -40,12 +40,15 @@ __device__ __forceinline__ void k_inflow_cell(
 
     bool is_river_mouth = (dn == (int)t);
     if (!is_river_mouth) {
-        cmf_atomic_add(river_inflow + dn, (STO)upd_r_out);
-        cmf_atomic_add(flood_inflow + dn, (STO)upd_f_out);
+        if (upd_r_out != (REAL)0.0)
+            cmf_atomic_add(river_inflow + dn, (STO)upd_r_out);
+        if (upd_f_out != (REAL)0.0)
+            cmf_atomic_add(flood_inflow + dn, (STO)upd_f_out);
         if (has_reservoir) {
             bool is_downstream_res = is_reservoir && (is_reservoir[dn] != 0);
-            if (is_downstream_res)
-                cmf_atomic_add(reservoir_total_inflow + dn, (STO)upd_r_out + (STO)upd_f_out);
+            STO res_in = (STO)upd_r_out + (STO)upd_f_out;
+            if (is_downstream_res && res_in != (STO)0)
+                cmf_atomic_add(reservoir_total_inflow + dn, res_in);
         }
     }
 }
@@ -147,7 +150,8 @@ __device__ __forceinline__ void k_outflow_cell(
     REAL upd_f_cs_dep = fmax(flood_surface - c_elv, (REAL)0.0);
     REAL f_sifd = fmax(sqrt(upd_f_cs_dep * f_cs_dep), (REAL)1e-6);
 
-    REAL upd_f_cs_area = fmax(fs / r_len - f_dep * r_wid, (REAL)0.0);
+    REAL fs_over_len = fs / r_len;
+    REAL upd_f_cs_area = fmax(fs_over_len - f_dep * r_wid, (REAL)0.0);
 
     REAL r_cs_area = upd_r_cs_dep * r_wid;
     bool river_condition = (r_sifd > (REAL)1e-5) && (r_cs_area > (REAL)1e-5);
@@ -187,8 +191,7 @@ __device__ __forceinline__ void k_outflow_cell(
     }
 
     if constexpr (!BASE_ONLY) {
-        if (has_reservoir &&
-            (sizeof(REAL) == sizeof(float) || (is_dam_upstream && is_dam_upstream[t]))) {
+        if (has_reservoir && is_dam_upstream && is_dam_upstream[t]) {
             REAL bed_slope = (c_elv - c_elv_dn) / dn_dist;
             bed_slope = fmax(bed_slope, min_kinematic_slope);
             REAL kin_riv_vel = ((REAL)1.0 / r_man) * sqrt(bed_slope) * cbrt(r_dep * r_dep);
@@ -197,12 +200,10 @@ __device__ __forceinline__ void k_outflow_cell(
             REAL kin_riv = fmin(r_wid * r_dep * kin_riv_vel, rs / time_step);
             REAL bed_slope_f = fmin(bed_slope, (REAL)CMF_ROUTING_SLOPE_LIMIT);
             REAL kin_fld_vel = ((REAL)1.0 / f_man) * sqrt(bed_slope_f) * cbrt(f_dep * f_dep);
-            REAL kin_fld_area = fmax(fs / r_len - f_dep * r_wid, (REAL)0.0);
+            REAL kin_fld_area = upd_f_cs_area;
             REAL kin_fld = fmin(kin_fld_area * kin_fld_vel, fs / time_step);
-            if (is_dam_upstream && is_dam_upstream[t]) {
-                upd_r_out = kin_riv;
-                upd_f_out = kin_fld;
-            }
+            upd_r_out = kin_riv;
+            upd_f_out = kin_fld;
         }
     }
 
@@ -211,7 +212,7 @@ __device__ __forceinline__ void k_outflow_cell(
     river_cross_section_depth[t] = upd_r_cs_dep;
     flood_cross_section_depth[t] = upd_f_cs_dep;
     // Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
-    flood_cross_section_area[t] = fmax(fs / r_len - fmax(r_dep - r_hgt, (REAL)0.0) * r_wid, (REAL)0.0);
+    flood_cross_section_area[t] = fmax(fs_over_len - fmax(r_dep - r_hgt, (REAL)0.0) * r_wid, (REAL)0.0);
 
     river_inflow[t] = (STO)0;
     flood_inflow[t] = (STO)0;
@@ -219,11 +220,14 @@ __device__ __forceinline__ void k_outflow_cell(
 
     // P2STOOUT includes positive flows from this cell and reversed flows
     // into its downstream cell.
-    cmf_atomic_add(outgoing_storage + t,
-                   (STO)(fmax(upd_r_out, (REAL)0.0) + fmax(upd_f_out, (REAL)0.0)));
-    if (!is_river_mouth)
-        cmf_atomic_add(outgoing_storage + dn,
-                       (STO)fmax(-upd_r_out, (REAL)0.0) + (STO)fmax(-upd_f_out, (REAL)0.0));
+    STO pos_out = (STO)(fmax(upd_r_out, (REAL)0.0) + fmax(upd_f_out, (REAL)0.0));
+    if (pos_out != (STO)0)
+        cmf_atomic_add(outgoing_storage + t, pos_out);
+    if (!is_river_mouth) {
+        STO neg_out = (STO)fmax(-upd_r_out, (REAL)0.0) + (STO)fmax(-upd_f_out, (REAL)0.0);
+        if (neg_out != (STO)0)
+            cmf_atomic_add(outgoing_storage + dn, neg_out);
+    }
 }
 
 // Generated-entry body over the canonical values ``a`` of compute_outflow.

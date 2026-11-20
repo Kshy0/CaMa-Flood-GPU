@@ -97,6 +97,7 @@ __device__ __forceinline__ void k_levee_stage_cell(
         const bool case4 = total_sto >= levee_base_sto && total_sto >= s_top && !(total_sto < levee_fill_sto);
 
         int ilev = (int)(l_frac * (REAL)num_flood_levels);
+        if (ilev >= num_flood_levels) ilev = num_flood_levels - 1;
         REAL dsto_fil_B = (REAL)0.0;
         REAL dwth_fil_B = (REAL)0.0;
         REAL ddph_fil_B = (REAL)0.0;
@@ -307,7 +308,10 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
     REAL ts_d = (REAL)(
         river_storage[di] + flood_storage[di] + protected_storage[di]);
 
+    constexpr int MAX_REGISTER_LEVELS = 8;
     REAL sum_out = (REAL)0.0;
+    REAL upd[MAX_REGISTER_LEVELS];
+    const bool fits = (num_levels <= MAX_REGISTER_LEVELS);
     for (int lv = 0; lv < num_levels; ++lv) {
         long level_idx = t * (long)num_levels + lv;
         REAL current_max_wse = (lv == 0) ? max_wse : max_pwse;
@@ -338,7 +342,8 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
 
         sum_out += upd_out;
         cs_depth[level_idx] = upd_csd;
-        outflow[level_idx] = upd_out;
+        if (fits) upd[lv] = upd_out;
+        else outflow[level_idx] = upd_out;
     }
 
     // CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
@@ -348,16 +353,22 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
             (REAL)CMF_BACKFLOW_STORAGE_FRACTION * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step), (REAL)1.0);
     }
     sum_out *= limit_rate;
-    for (int lv = 0; lv < num_levels; ++lv) {
-        long level_idx = t * (long)num_levels + lv;
-        outflow[level_idx] = outflow[level_idx] * limit_rate;
+    if (fits) {
+        for (int lv = 0; lv < num_levels; ++lv) {
+            outflow[t * (long)num_levels + lv] = upd[lv] * limit_rate;
+        }
+    } else if (limit_rate < (REAL)1.0) {
+        for (int lv = 0; lv < num_levels; ++lv) {
+            long level_idx = t * (long)num_levels + lv;
+            outflow[level_idx] = outflow[level_idx] * limit_rate;
+        }
     }
 
-    REAL pos = fmax(sum_out, (REAL)0.0);
-    REAL neg = fmin(sum_out, (REAL)0.0);
     // P2STOOUT flows, multiplied by the step in compute_inflow.
-    cmf_atomic_add(outgoing_storage + ci, (STO)pos);
-    cmf_atomic_add(outgoing_storage + di, (STO)(-neg));
+    if (sum_out > (REAL)0.0)
+        cmf_atomic_add(outgoing_storage + ci, (STO)sum_out);
+    else if (sum_out < (REAL)0.0)
+        cmf_atomic_add(outgoing_storage + di, (STO)(-sum_out));
 }
 
 // Generated-entry body over the canonical values ``a`` of

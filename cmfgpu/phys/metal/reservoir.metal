@@ -1,6 +1,7 @@
 // HYDROFORGE METAL KERNEL BODY: compute_reservoir_outflow
     long num_reservoirs = *args.num_reservoirs;
     long num_catchments = *args.num_catchments;
+    if ((long)i >= num_reservoirs * (*args.ensemble_size)) return;
     long reservoir_idx = (long)i % num_reservoirs;
     long member_index = (long)i / num_reservoirs;
     long member_offset = member_index * num_catchments;
