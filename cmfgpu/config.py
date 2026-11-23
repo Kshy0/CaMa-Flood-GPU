@@ -110,3 +110,32 @@ class CaMaOptions(OptionsConfig):
         le=1.0,
         allow_inf_nan=False,
     )
+
+
+class DownscaleOptions(OptionsConfig):
+    """Immutable physical and post-processing settings for high-resolution flood downscaling."""
+
+    permanent_water_depth: float = option(
+        default=0.1,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Minimum water depth enforced on permanent river-channel pixels",
+    )
+    permanent_water_duration: float = option(
+        default=999.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Minimum inundation duration enforced on permanent river-channel pixels",
+    )
+    protected_depth_offset: float = option(
+        default=0.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Additive depth offset applied to flooded levee-protected pixels",
+    )
+    duration_depth_interval: float = option(
+        default=0.05,
+        gt=0.0,
+        allow_inf_nan=False,
+        description="Depth bin interval for coarse inundation-duration lookup tables",
+    )

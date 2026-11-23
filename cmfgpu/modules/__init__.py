@@ -7,6 +7,12 @@
 from cmfgpu.modules.adaptive_time import AdaptiveTimeModule
 from cmfgpu.modules.base import BaseModule
 from cmfgpu.modules.bifurcation import BifurcationModule
+from cmfgpu.modules.downscale import (
+    DownscaleBaseModule,
+    DownscaleDurationModule,
+    DownscaleLeveeModule,
+    DownscaleTributaryModule,
+)
 from cmfgpu.modules.inflow import InflowModule
 from cmfgpu.modules.levee import LeveeModule
 from cmfgpu.modules.log import LogModule
@@ -15,11 +21,15 @@ from cmfgpu.modules.sea_level import SeaLevelModule
 
 __all__ = [
     "AdaptiveTimeModule",
+    "BaseModule",
     "BifurcationModule",
+    "DownscaleBaseModule",
+    "DownscaleDurationModule",
+    "DownscaleLeveeModule",
+    "DownscaleTributaryModule",
     "InflowModule",
     "LeveeModule",
     "LogModule",
-    "BaseModule",
     "ReservoirModule",
     "SeaLevelModule",
 ]

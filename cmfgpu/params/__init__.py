@@ -5,6 +5,7 @@
 #
 
 from cmfgpu.params.allocation.hires_map import HiResMap
+from cmfgpu.params.downscale_map import DownscaleMap, scatter_pixels_to_raster
 from cmfgpu.params.estimate_dam_params import (
     compute_dam_discharge_from_timeseries,
     estimate_dam_params,
@@ -22,6 +23,7 @@ from cmfgpu.params.export_bin import (
 from cmfgpu.params.merit_map import MERITMap
 
 __all__ = [
+    "DownscaleMap",
     "HiResMap",
     "MERITMap",
     "accumulate_discharge",
@@ -32,4 +34,5 @@ __all__ = [
     "export_inpmat",
     "export_map_params",
     "export_to_cama_bin",
+    "scatter_pixels_to_raster",
 ]

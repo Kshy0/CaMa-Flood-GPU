@@ -5,5 +5,6 @@
 #
 
 from cmfgpu.models.cama_flood_model import CaMaFlood
+from cmfgpu.models.downscale_model import CaMaDownscale
 
-__all__ = ["CaMaFlood"]
+__all__ = ["CaMaDownscale", "CaMaFlood"]

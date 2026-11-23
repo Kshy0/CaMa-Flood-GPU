@@ -33,6 +33,7 @@ _SOURCES = {
         ("bifurcation", _SUBNORMAL_OPTIONS),
         ("reservoir", PHYSICAL_CONSTANT_FLAGS),
         ("levee", _SUBNORMAL_OPTIONS),
+        ("downscale", PHYSICAL_CONSTANT_FLAGS),
     )
 }
 _REAL_STO = "{river_depth_ptr}, {river_storage_ptr}"
@@ -101,5 +102,22 @@ LEVEE_STAGE_LOG = _kernel(
 )
 LEVEE_BIFURCATION_OUTFLOW = _kernel(
     "levee", "levee_bif_outflow", _REAL_STO + ", {HAS_RESERVOIR}"
+)
+DOWNSCALE_FLOOD_DEPTH = _kernel(
+    "downscale",
+    "downscale_flood_depth",
+    "{pixel_flood_depth_ptr}, {HAS_LEVEE}, {HAS_TRIBUTARY}",
+)
+DOWNSCALE_TRIBUTARY_DEPTH = _kernel(
+    "downscale", "downscale_tributary_depth", "{pixel_flood_depth_ptr}"
+)
+DOWNSCALE_BACKWATER_DEPTH = _kernel(
+    "downscale", "downscale_backwater_depth", "{pixel_flood_depth_ptr}"
+)
+DOWNSCALE_PERMANENT_WATER = _kernel(
+    "downscale", "downscale_permanent_water", "{pixel_flood_depth_ptr}"
+)
+DOWNSCALE_FLOOD_DURATION = _kernel(
+    "downscale", "downscale_flood_duration", "{pixel_flood_duration_ptr}"
 )
 __all__ = []

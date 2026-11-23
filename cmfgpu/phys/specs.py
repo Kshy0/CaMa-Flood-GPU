@@ -17,6 +17,7 @@ HAS_H22 = module_flag("reservoir", "uses_h22")
 HAS_YF = module_flag("reservoir", "uses_yamazaki_funato")
 HAS_SEA_LEVEL = module_enabled("sea_level")
 HAS_INFLOW = module_enabled("inflow")
+HAS_TRIBUTARY = module_enabled("tributary")
 HAS_TOTAL_STORAGE_OUTPUT = output_requested("base", "total_storage")
 
 STAGE_HALO = {"river_depth_ptr": 1, "river_storage_ptr": 1, "flood_storage_ptr": 1}
@@ -800,4 +801,148 @@ METAL_FLOOD_STAGE_LOG = KernelSpec(
             "num_bifurcation_paths": ("HAS_BIFURCATION", 0),
         },
     }
+)
+
+_TRIBUTARY_CSR_WORKSPACE = {
+    "tributary_edge_start_ptr": KernelWorkspace(
+        key="cmfgpu.downscale.tributary_edge_start",
+        dtype="int32",
+        shape=("num_tributary_pixels",),
+        initialize="csr_offsets",
+        source="tributary_target_idx",
+        target_count="num_tributary_pixels",
+        module="tributary",
+    ),
+    "tributary_edge_order_ptr": KernelWorkspace(
+        key="cmfgpu.downscale.tributary_edge_order",
+        dtype="int32",
+        shape=("num_tributary_links",),
+        initialize="csr_order",
+        source="tributary_target_idx",
+        target_count="num_tributary_pixels",
+        module="tributary",
+    ),
+}
+
+DOWNSCALE_FLOOD_DEPTH = KernelSpec(
+    name="compute_downscale_flood_depth",
+    size="num_pixels",
+    parameters={
+        "pixel_catchment_idx_ptr": "read",
+        "pixel_flood_diff_ptr": "read",
+        "pixel_is_permanent_water_ptr": "read",
+        "flood_depth_ptr": "read",
+        "protected_depth_ptr": "read",
+        "pixel_is_protected_ptr": "read",
+        "pixel_flood_depth_ptr": "write",
+        "permanent_water_depth": "precision",
+        "protected_depth_offset": "precision",
+        "num_pixels": "index",
+        "num_catchments": "index",
+        "ensemble_size": "index",
+        "HAS_LEVEE": HAS_LEVEE,
+        "HAS_TRIBUTARY": HAS_TRIBUTARY,
+        **dict.fromkeys(
+            (
+                "batched_flood_depth",
+                "batched_protected_depth",
+                "batched_pixel_flood_diff",
+                "batched_pixel_is_permanent_water",
+                "batched_pixel_is_protected",
+            ),
+            constant("bool"),
+        ),
+    },
+    optional={
+        "protected_depth_ptr": "HAS_LEVEE",
+        "pixel_is_protected_ptr": "HAS_LEVEE",
+    },
+)
+
+DOWNSCALE_TRIBUTARY_DEPTH = KernelSpec(
+    name="compute_downscale_tributary_depth",
+    size="num_tributary_pixels",
+    workspace=_TRIBUTARY_CSR_WORKSPACE,
+    parameters={
+        "tributary_pixel_idx_ptr": "read",
+        "pixel_catchment_idx_ptr": "read",
+        "tributary_edge_start_ptr": "read",
+        "tributary_edge_order_ptr": "read",
+        "tributary_upstream_pixel_idx_ptr": "read",
+        "tributary_downstream_pixel_idx_ptr": "read",
+        "tributary_chain_step_ptr": "read",
+        "tributary_chain_length_ptr": "read",
+        "pixel_flood_depth_ptr": "read_write",
+        "catchment_tributary_modified_ptr": "atomic_max",
+        "num_tributary_pixels": "index",
+        "num_tributary_links": "index",
+        "num_pixels": "index",
+        "num_catchments": "index",
+        "ensemble_size": "index",
+        "batched_tributary_chain_step": constant("bool"),
+        "batched_tributary_chain_length": constant("bool"),
+    },
+    optional={
+        "tributary_edge_start_ptr": None,
+        "tributary_edge_order_ptr": None,
+    },
+)
+
+DOWNSCALE_BACKWATER_DEPTH = KernelSpec(
+    name="compute_downscale_backwater_depth",
+    size="num_backwater_pixels",
+    parameters={
+        "backwater_pixel_idx_ptr": "read",
+        "backwater_target_pixel_idx_ptr": "read",
+        "pixel_catchment_idx_ptr": "read",
+        "pixel_flood_diff_ptr": "read",
+        "backwater_floor_elevation_ptr": "read",
+        "catchment_tributary_modified_ptr": "read",
+        "pixel_flood_depth_ptr": "read_write",
+        "num_backwater_pixels": "index",
+        "num_pixels": "index",
+        "num_catchments": "index",
+        "ensemble_size": "index",
+        "batched_pixel_flood_diff": constant("bool"),
+        "batched_backwater_floor_elevation": constant("bool"),
+    },
+)
+
+DOWNSCALE_PERMANENT_WATER = KernelSpec(
+    name="compute_downscale_permanent_water",
+    size="num_pixels",
+    parameters={
+        "pixel_is_permanent_water_ptr": "read",
+        "pixel_flood_depth_ptr": "read_write",
+        "permanent_water_depth": "precision",
+        "num_pixels": "index",
+        "ensemble_size": "index",
+        "batched_pixel_is_permanent_water": constant("bool"),
+    },
+)
+
+DOWNSCALE_FLOOD_DURATION = KernelSpec(
+    name="compute_downscale_flood_duration",
+    size="num_pixels",
+    parameters={
+        "pixel_catchment_idx_ptr": "read",
+        "pixel_flood_diff_ptr": "read",
+        "pixel_is_permanent_water_ptr": "read",
+        "flood_duration_table_ptr": "read",
+        "pixel_flood_duration_ptr": "write",
+        "duration_depth_interval": "precision",
+        "permanent_water_duration": "precision",
+        "num_pixels": "index",
+        "num_catchments": "index",
+        "num_duration_bins": constant("int32"),
+        "ensemble_size": "index",
+        **dict.fromkeys(
+            (
+                "batched_flood_duration_table",
+                "batched_pixel_flood_diff",
+                "batched_pixel_is_permanent_water",
+            ),
+            constant("bool"),
+        ),
+    },
 )
