@@ -104,7 +104,7 @@ pip install git+https://github.com/Kshy0/hydroforge.git
 pip install -e .
 ```
 
-This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `scipy`, and others.
+This command installs the `cmfgpu` package in editable mode, along with its required dependencies such as `netCDF4`, `numba`, and others.
 
 ---
 

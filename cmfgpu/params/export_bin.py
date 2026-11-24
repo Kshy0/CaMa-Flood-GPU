@@ -57,7 +57,6 @@ from pathlib import Path
 
 import numpy as np
 from netCDF4 import Dataset
-from scipy.sparse import csr_matrix
 
 from cmfgpu.params.utils import _require_unmasked_array
 
@@ -1084,15 +1083,9 @@ def export_inpmat(
 
     print(f"    NPZ: {matrix_shape[0]} catchments, grid {nxin}×{nyin}")
 
-    # Rebuild the sparse matrix
-    full_sparse = csr_matrix(
-        (sparse_data, sparse_indices, sparse_indptr),
-        shape=matrix_shape,
-    )
-
     # INPN is the actual maximum number of contributing runoff cells per
     # catchment, so the inpmat has no zero-padding columns and no truncation.
-    inpn = int(np.diff(full_sparse.indptr).max())
+    inpn = int(np.diff(sparse_indptr).max())
     if inpn > 100:
         raise ValueError(
             f"INPN={inpn} exceeds 100; this is unexpectedly large and "
@@ -1176,12 +1169,12 @@ def export_inpmat(
     # entry carries its source row, so the destination cell and the within-row
     # slot can both be derived for every entry at once.
     row_of_entry = np.repeat(
-        np.arange(full_sparse.shape[0], dtype=np.int64),
-        np.diff(full_sparse.indptr),
+        np.arange(int(matrix_shape[0]), dtype=np.int64),
+        np.diff(sparse_indptr),
     )
     # Rank of each entry inside its row reproduces the loop's ``[:n_entries]``
     # write order; INPN is the longest row, so the rank always fits.
-    slot = np.arange(full_sparse.nnz, dtype=np.int64) - full_sparse.indptr[row_of_entry]
+    slot = np.arange(len(sparse_data), dtype=np.int64) - sparse_indptr[row_of_entry]
 
     entry_cid = npz_catchment_ids.astype(np.int64)[row_of_entry]
     keep = entry_cid <= max_nc_cid
@@ -1198,7 +1191,7 @@ def export_inpmat(
 
     sel = np.flatnonzero(keep)
     dst_x, dst_y, dst_slot = entry_ix[sel], entry_iy[sel], slot[sel]
-    col_indices = full_sparse.indices[sel]
+    col_indices = sparse_indices[sel]
 
     # Convert flattened column index → (ixin, iyin)
     # Column convention: col = iyin * nxin + ixin
@@ -1206,7 +1199,7 @@ def export_inpmat(
     #       (NXIN × NYIN), NOT the map grid — they stay unchanged.
     INPX[dst_x, dst_y, dst_slot] = (col_indices % nxin).astype("i4") + 1
     INPY[dst_x, dst_y, dst_slot] = (col_indices // nxin).astype("i4") + 1
-    INPA[dst_x, dst_y, dst_slot] = full_sparse.data[sel].astype("<f4")
+    INPA[dst_x, dst_y, dst_slot] = sparse_data[sel].astype("<f4")
 
     # --- Write inpmat binary (fixed-size records, RECL = 4*out_nx*out_ny) ---
     inpmat_path = out_dir / inpmat_name
