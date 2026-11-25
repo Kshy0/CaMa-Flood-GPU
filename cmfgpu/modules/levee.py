@@ -75,7 +75,10 @@ class LeveeModule(AbstractModule):
     """Container for levee-related tensors."""
 
     module_name: ClassVar[str] = "levee"
-    description: ClassVar[str] = "Levee protection module with protected storage states"
+    description: ClassVar[str] = (
+        "Levee protection parameters and stage thresholds (protected storage "
+        "and depth states live on base)"
+    )
     base = module_ref(BaseModule)
 
     # ------------------------------------------------------------------ #
@@ -103,8 +106,8 @@ class LeveeModule(AbstractModule):
     # ------------------------------------------------------------------ #
     levee_crown_height: torch.Tensor = LeveeField(
         description=(
-            "Levee crown height above river bed; a crown below the "
-            "levee base height is raised to it"
+            "Levee crown height above river bankfull (catchment_elevation); "
+            "clamped to at least levee_base_height when used"
         ),
         units="m",
         category="param",
@@ -120,7 +123,7 @@ class LeveeModule(AbstractModule):
     )
 
     # ------------------------------------------------------------------ #
-    # Computed tensors (levee-aligned)
+    # Computed scalars, topology, and derived parameters
     # ------------------------------------------------------------------ #
     @computed_field(description="Total number of levees")
     def num_levees(self) -> int:
@@ -166,9 +169,9 @@ class LeveeModule(AbstractModule):
 
         frac = position - lower
 
-        # Map virtual indices 0..N to table indices -1..N-1
+        # Map virtual indices 0..M to table indices -1..M-1 (M = num_flood_levels)
         # Virtual index 0 -> 0.0 value
-        # Virtual index k (>0) -> table[:, k-1]
+        # Virtual index k (>0) -> rows[..., k-1]
 
         # Lower value
         lower_idx_table = lower - 1
@@ -214,7 +217,9 @@ class LeveeModule(AbstractModule):
         return (lower_val + frac * (upper_val - lower_val)).contiguous()
 
     @computed_levee_field(
-        description="Levee base height above river bed", units="m", category="derived_param"
+        description="Levee base height above river bankfull (catchment_elevation)",
+        units="m",
+        category="derived_param",
     )
     def levee_base_height(self) -> torch.Tensor:
         # Derived during construction: keep a NaN fraction (rejected by the
@@ -230,8 +235,10 @@ class LeveeModule(AbstractModule):
     ) -> torch.Tensor:
         """Integrate the flood profile in the stage formula's original order.
 
-        The layer-search threshold observes the base storage inside the loop,
-        before the extrapolation used by the final base storage.
+        With ``at_levee_layer=True``, the layer-search threshold captures the
+        running base storage at the levee layer inside the loop, before
+        subsequent layers or the post-loop extrapolation used by the final
+        base storage.
         """
         length, width, area, table = (
             self.gather_tensor(
@@ -295,7 +302,9 @@ class LeveeModule(AbstractModule):
             for name in ("river_length", "river_width", "river_height")
         )
         storage = length * width * height
-        # All five arrays have a member slice, including shared geometry.
+        # Expand to (ensemble_size, num_levees) even for shared geometry so all
+        # five derived levee-threshold storage arrays carry a member axis for
+        # per-member kernel indexing.
         if self.ensemble_size is not None:
             storage = storage.expand(self.ensemble_size, self.num_levees).contiguous()
         return storage

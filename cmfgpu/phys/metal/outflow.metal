@@ -9,31 +9,33 @@ inline cmf_storage outgoing_demand_inline(long cell, long member, long n, int pa
     device const float* bifurcation_path_flow_ptr,
     device const float* unlimited_outflow_ptr) {
     long offset = member * n;
-    cmf_storage outgoing = cmf_storage(max(unlimited_outflow_ptr[2 * (offset + cell)], 0.0f)
-        + max(unlimited_outflow_ptr[2 * (offset + cell) + 1], 0.0f));
+    device const float2* uflow = reinterpret_cast<device const float2*>(unlimited_outflow_ptr);
+    float2 own = uflow[offset + cell];
+    cmf_storage outgoing = cmf_storage(max(own.x, 0.0f) + max(own.y, 0.0f));
     int end = cell + 1 < n ? routing_edge_start_ptr[cell + 1] : int(n);
     for (int edge = routing_edge_start_ptr[cell]; edge < end; ++edge) {
         int source = routing_edge_source_ptr[edge];
         if (source == int(cell)) continue;
-        outgoing = outgoing + cmf_storage(max(-unlimited_outflow_ptr[2 * (offset + source)], 0.0f))
-            + cmf_storage(max(-unlimited_outflow_ptr[2 * (offset + source) + 1], 0.0f));
+        float2 src = uflow[offset + source];
+        if (src.x < 0.0f) outgoing = outgoing + (-src.x);
+        if (src.y < 0.0f) outgoing = outgoing + (-src.y);
     }
     if (has_bifurcation) {
-
         long path_offset = member * paths;
         int last = cell + 1 < n ? bifurcation_catchment_start_ptr[cell + 1] : paths;
         for (int edge = bifurcation_catchment_start_ptr[cell]; edge < last; ++edge) {
             int path = bifurcation_catchment_path_ptr[edge];
-            outgoing = outgoing + cmf_storage(max(bifurcation_path_flow_ptr[path_offset + path], 0.0f));
+            float bf = bifurcation_path_flow_ptr[path_offset + path];
+            if (bf > 0.0f) outgoing = outgoing + bf;
         }
         last = cell + 1 < n ? bifurcation_downstream_start_ptr[cell + 1] : paths;
         for (int edge = bifurcation_downstream_start_ptr[cell]; edge < last; ++edge) {
             int path = bifurcation_downstream_path_ptr[edge];
-            outgoing = outgoing + cmf_storage(-min(bifurcation_path_flow_ptr[path_offset + path], 0.0f));
+            float bf = bifurcation_path_flow_ptr[path_offset + path];
+            if (bf < 0.0f) outgoing = outgoing + (-bf);
         }
     }
     return outgoing;
-
 }
 #endif
 
@@ -43,8 +45,8 @@ long num_catchments = *args.num_catchments;
     long total = num_catchments * ensemble_size;
     if ((long)i >= total) return;
 
-    long catchment = (long)i % num_catchments;
-    long member = (long)i / num_catchments;
+    long catchment, member;
+    cmf_decompose_index(i, num_catchments, ensemble_size, catchment, member);
     long member_offset = member * num_catchments;
     long cell = member_offset + catchment;
     int downstream = args.downstream_idx_ptr[catchment];
@@ -55,14 +57,20 @@ long num_catchments = *args.num_catchments;
 
     float river_outflow = args.river_outflow_ptr[cell];
     float river_depth = args.river_depth_ptr[cell];
-    float river_storage = args.river_storage_ptr[cell];
+    cmf_storage river_storage_hp = args.river_storage_ptr[cell];
     float flood_outflow = args.flood_outflow_ptr[cell];
     float flood_depth = args.flood_depth_ptr[cell];
-    float flood_storage = args.flood_storage_ptr[cell];
-    float protected_storage = 0.0f;
+    cmf_storage flood_storage_hp = args.flood_storage_ptr[cell];
+    float flood_storage = float(flood_storage_hp);
+    cmf_storage total_storage_hp = (flood_storage == 0.0f)
+        ? river_storage_hp : (river_storage_hp + flood_storage_hp);
     if (HAS_LEVEE) {
-        protected_storage = args.protected_storage_ptr[cell];
+        cmf_storage protected_storage_hp = args.protected_storage_ptr[cell];
+        if (float(protected_storage_hp) != 0.0f) {
+            total_storage_hp = total_storage_hp + protected_storage_hp;
+        }
     }
+    float total_storage = float(total_storage_hp);
     float river_xs_depth = args.river_cross_section_depth_ptr[cell];
     float flood_xs_depth = args.flood_cross_section_depth_ptr[cell];
     float flood_xs_area = args.flood_cross_section_area_ptr[cell];
@@ -86,8 +94,6 @@ long num_catchments = *args.num_catchments;
 
     float river_elevation = catchment_elevation - river_height;
     float water_surface = river_depth + river_elevation;
-    float total_storage = float(args.river_storage_ptr[cell] + args.flood_storage_ptr[cell]
-        + (HAS_LEVEE ? args.protected_storage_ptr[cell] : cmf_storage(0.0f)));
 
     long downstream_height_idx = batched_river_height
         ? downstream_cell : (long)downstream;
@@ -111,87 +117,92 @@ long num_catchments = *args.num_catchments;
     }
     float maximum_surface = max(water_surface, effective_downstream_surface);
     float river_slope =
-        (water_surface - effective_downstream_surface) / downstream_distance;
+        cmf_div(water_surface - effective_downstream_surface, downstream_distance);
     float flood_slope = clamp(river_slope, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
 
     // The mouth boundary controls slope; its cross-section uses local depth.
     float updated_river_xs = is_mouth
         ? river_depth : maximum_surface - river_elevation;
     float river_flow_depth =
-        max(sqrt(updated_river_xs * river_xs_depth), 1e-6f);
+        max(cmf_sqrt(updated_river_xs * river_xs_depth), 1e-6f);
     float flood_cross_section_surface = is_mouth
         ? water_surface : maximum_surface;
     float updated_flood_xs =
         max(flood_cross_section_surface - catchment_elevation, 0.0f);
-    float flood_flow_depth =
-        max(sqrt(updated_flood_xs * flood_xs_depth), 1e-6f);
-    float updated_flood_area = max(
-        flood_storage / river_length - flood_depth * river_width, 0.0f);
+    float flood_flow_depth = updated_flood_xs > 0.0f
+        ? max(cmf_sqrt(updated_flood_xs * flood_xs_depth), 1e-6f) : 1e-6f;
+    float flood_area_base = flood_storage != 0.0f
+        ? cmf_div(flood_storage, river_length) : 0.0f;
+    // HF-UPSTREAM-FIX[CMF-01]: Do not double-subtract above-channel area from floodplain cross-section
+    //   upstream: CaMa-Flood v4.31 cmf_calc_outflw_mod.F90:95,152 (and damout:488) subtracts D2FLDDPH*D2RIVWTH from P2FLDSTO/L even though P2FLDSTO already excludes above-channel storage.
+    //   fix: Use max(flood_storage / river_length, 0) directly as floodplain cross-sectional area.
+    float updated_flood_area = max(flood_area_base, 0.0f);
 
     float river_xs_area = updated_river_xs * river_width;
     bool river_active = river_flow_depth > 1e-5f && river_xs_area > 1e-5f;
-    float unit_river_outflow = river_outflow / river_width;
-    float river_numerator = river_width * (
-        unit_river_outflow
-        + gravity * time_step * river_flow_depth * river_slope);
-    float river_denominator = 1.0f
-        + gravity * time_step * river_manning * river_manning
-        * abs(unit_river_outflow) * pow(river_flow_depth, -7.0f / 3.0f);
-    float updated_river_outflow = river_active
-        ? river_numerator / river_denominator : 0.0f;
+    float updated_river_outflow = 0.0f;
+    if (river_active) {
+        float unit_river_outflow = cmf_div(river_outflow, river_width);
+        float river_numerator = river_width * (
+            unit_river_outflow
+            + gravity * time_step * river_flow_depth * river_slope);
+        float river_denominator = 1.0f
+            + gravity * time_step * river_manning * river_manning
+            * fabs(unit_river_outflow) * cmf_inv_d73(river_flow_depth);
+        updated_river_outflow = cmf_div(river_numerator, river_denominator);
+    }
 
     bool flood_active =
         flood_flow_depth > 1e-5f && updated_flood_area > 1e-5f;
     float updated_flood_outflow = 0.0f;
     if (flood_active) {
         float implicit_area = max(
-            sqrt(updated_flood_area * max(flood_xs_area, 1e-6f)), 1e-6f);
+            cmf_sqrt(updated_flood_area * max(flood_xs_area, 1e-6f)), 1e-6f);
         float flood_numerator = flood_outflow
             + gravity * time_step * implicit_area * flood_slope;
         float flood_denominator = 1.0f
-            + gravity * time_step * flood_manning * flood_manning
-            * abs(flood_outflow) * pow(flood_flow_depth, -4.0f / 3.0f)
-            / implicit_area;
-        updated_flood_outflow = flood_numerator / flood_denominator;
+            + cmf_div(
+                gravity * time_step * flood_manning * flood_manning
+                * fabs(flood_outflow) * cmf_inv_d43(flood_flow_depth),
+                implicit_area);
+        updated_flood_outflow = cmf_div(flood_numerator, flood_denominator);
     }
 
     // Floodplain flow only moves with the river flow (rivout*fldout > 0).
     if (!(updated_river_outflow * updated_flood_outflow > 0.0f)) {
         updated_flood_outflow = 0.0f;
     }
-    // v4.23 storage-change limiter on every non-mouth cell: flow towards the
-    // upstream cell removes at most 5% of the storage per step.
+    // v4.23 storage-change limiter on every non-mouth cell: reverse flow from
+    // downstream into this cell is capped at 5% of this cell's storage per step.
     if (!is_mouth) {
         float backflow = max(
             (-updated_river_outflow - updated_flood_outflow) * time_step,
             CMF_OUTGOING_VOLUME_FLOOR);
         float limit = min(
-            CMF_BACKFLOW_STORAGE_FRACTION * total_storage / backflow, 1.0f);
+            cmf_div(CMF_BACKFLOW_STORAGE_FRACTION * total_storage, backflow), 1.0f);
         updated_river_outflow *= limit;
         updated_flood_outflow *= limit;
     }
 
     if (HAS_RESERVOIR && args.is_dam_upstream_ptr[batched_is_dam_upstream ? (long)i : catchment] != 0) {
+        float river_storage = float(river_storage_hp);
         float downstream_elevation =
             args.catchment_elevation_ptr[downstream_elevation_idx];
         float bed_slope = max(
-            (catchment_elevation - downstream_elevation)
-                / downstream_distance,
+            cmf_div(catchment_elevation - downstream_elevation, downstream_distance),
             min_kinematic_slope);
         // CaMa bounds the kinematic flows by the storage only (MIN), so a
         // negative storage (negative runoff) gives a negative flow.
-        float river_velocity = (1.0f / river_manning) * sqrt(bed_slope)
-            * pow(river_depth * river_depth, 1.0f / 3.0f);
+        float river_velocity = cmf_div(1.0f, river_manning) * cmf_sqrt(bed_slope)
+            * cmf_cbrt(river_depth * river_depth);
         updated_river_outflow = min(
-            river_width * river_depth * river_velocity, river_storage / time_step);
+            river_width * river_depth * river_velocity, cmf_div(river_storage, time_step));
 
-        float flood_velocity = (1.0f / flood_manning)
-            * sqrt(min(bed_slope, CMF_ROUTING_SLOPE_LIMIT))
-            * pow(flood_depth * flood_depth, 1.0f / 3.0f);
-        float flood_area = max(
-            flood_storage / river_length - flood_depth * river_width, 0.0f);
+        float flood_velocity = cmf_div(1.0f, flood_manning)
+            * cmf_sqrt(min(bed_slope, CMF_ROUTING_SLOPE_LIMIT))
+            * cmf_cbrt(flood_depth * flood_depth);
         updated_flood_outflow = min(
-            flood_area * flood_velocity, flood_storage / time_step);
+            updated_flood_area * flood_velocity, cmf_div(flood_storage, time_step));
     }
 
     args.river_outflow_ptr[cell] = updated_river_outflow;
@@ -202,29 +213,32 @@ long num_catchments = *args.num_catchments;
 #endif
     args.river_cross_section_depth_ptr[cell] = updated_river_xs;
     args.flood_cross_section_depth_ptr[cell] = updated_flood_xs;
-    // Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
-    args.flood_cross_section_area_ptr[cell] = max(flood_storage / river_length
-        - max(river_depth - river_height, 0.0f) * river_width, 0.0f);
+    args.flood_cross_section_area_ptr[cell] = updated_flood_area;
+    // Under HF_HP_ENABLED, compute_flood_stage overwrites river_inflow /
+    // flood_inflow directly from CSR routing and never reads the workspace
+    // global_bifurcation_outflow or outgoing_storage buffers.
+#ifndef HF_HP_ENABLED
     args.river_inflow_ptr[cell] = 0.0f;
     args.flood_inflow_ptr[cell] = 0.0f;
     if (HAS_BIFURCATION) {
         args.global_bifurcation_outflow_ptr[cell] = 0.0f;
     }
 
-    // P2STOOUT flows: the cell's own positive flows, and the flow reversed
-    // into its downstream cell; compute_inflow multiplies by the step.
-#ifndef HF_HP_ENABLED
-    atomic_fetch_add_explicit(
-        args.outgoing_storage_ptr + cell,
-        max(updated_river_outflow, 0.0f) + max(updated_flood_outflow, 0.0f),
-        memory_order_relaxed);
-    if (!is_mouth) {
+    // P2STOOUT flows: the cell's own positive outflows, and the reversed flow
+    // out of its downstream cell; compute_inflow multiplies by the step.
+    float own_out = max(updated_river_outflow, 0.0f) + max(updated_flood_outflow, 0.0f);
+    if (own_out != 0.0f) {
         atomic_fetch_add_explicit(
-            args.outgoing_storage_ptr + downstream_cell,
-            max(-updated_river_outflow, 0.0f) + max(-updated_flood_outflow, 0.0f),
-            memory_order_relaxed);
+            args.outgoing_storage_ptr + cell, own_out, memory_order_relaxed);
     }
-
+    if (!is_mouth) {
+        float rev_out = max(-updated_river_outflow, 0.0f) + max(-updated_flood_outflow, 0.0f);
+        if (rev_out != 0.0f) {
+            atomic_fetch_add_explicit(
+                args.outgoing_storage_ptr + downstream_cell,
+                rev_out, memory_order_relaxed);
+        }
+    }
 #endif
 
 // HYDROFORGE METAL KERNEL BODY: compute_inflow
@@ -233,8 +247,9 @@ long num_catchments = *args.num_catchments;
     long total = num_catchments * ensemble_size;
     if ((long)i >= total) return;
 
-    long catchment = (long)i % num_catchments;
-    long member_offset = ((long)i / num_catchments) * num_catchments;
+    long catchment, member;
+    cmf_decompose_index(i, num_catchments, ensemble_size, catchment, member);
+    long member_offset = member * num_catchments;
     long cell = member_offset + catchment;
 
     float river_outflow = args.river_outflow_ptr[cell];
@@ -246,9 +261,9 @@ long num_catchments = *args.num_catchments;
     int downstream = args.downstream_idx_ptr[catchment];
     long downstream_cell = member_offset + (long)downstream;
 #ifdef HF_HP_ENABLED
-    // Both demands use the preceding dispatch's immutable flow snapshot.
+    // Demand uses the preceding dispatch's immutable flow snapshot.
     cmf_storage local_outgoing = outgoing_demand_inline(
-        catchment, (long)i / num_catchments, num_catchments,
+        catchment, member, num_catchments,
         int(*args.num_bifurcation_paths), HAS_BIFURCATION,
         args.routing_edge_start_ptr,
         args.routing_edge_source_ptr,
@@ -258,11 +273,23 @@ long num_catchments = *args.num_catchments;
         args.bifurcation_downstream_path_ptr,
         args.bifurcation_path_flow_ptr,
         args.unlimited_outflow_ptr);
-    // Forward flow uses only the local rate. Mouths reuse their own demand.
-    cmf_storage downstream_outgoing = local_outgoing;
-    if (river_outflow <= 0.0f && downstream != (int)catchment) {
-        downstream_outgoing = outgoing_demand_inline(
-            downstream, (long)i / num_catchments, num_catchments,
+#else
+    cmf_storage local_outgoing = args.outgoing_storage_ptr[cell];
+#endif
+    cmf_storage river_sto = args.river_storage_ptr[cell];
+    cmf_storage flood_sto = args.flood_storage_ptr[cell];
+    cmf_storage available_storage = (float(flood_sto) == 0.0f)
+        ? river_sto : (river_sto + flood_sto);
+    float local_out_vol = (float(local_outgoing) == 0.0f)
+        ? 0.0f : float(local_outgoing * time_step);
+    float local_limit = min(cmf_div(float(available_storage), max(
+        local_out_vol, CMF_OUTGOING_VOLUME_FLOOR)), 1.0f);
+
+    float rate = local_limit;
+    if (river_outflow <= 0.0f && (river_outflow != 0.0f || flood_outflow != 0.0f) && downstream != (int)catchment) {
+#ifdef HF_HP_ENABLED
+        cmf_storage downstream_outgoing = outgoing_demand_inline(
+            downstream, member, num_catchments,
             int(*args.num_bifurcation_paths), HAS_BIFURCATION,
             args.routing_edge_start_ptr,
             args.routing_edge_source_ptr,
@@ -272,25 +299,19 @@ long num_catchments = *args.num_catchments;
             args.bifurcation_downstream_path_ptr,
             args.bifurcation_path_flow_ptr,
             args.unlimited_outflow_ptr);
-    }
-    args.outgoing_storage_ptr[cell] = local_outgoing;
 #else
-    cmf_storage local_outgoing = args.outgoing_storage_ptr[cell];
-    cmf_storage downstream_outgoing = args.outgoing_storage_ptr[downstream_cell];
+        cmf_storage downstream_outgoing = args.outgoing_storage_ptr[downstream_cell];
 #endif
-    cmf_storage available_storage =
-        args.river_storage_ptr[cell] + args.flood_storage_ptr[cell];
-    float local_limit = min(float(available_storage) / max(
-        float(local_outgoing * cmf_storage(time_step)), CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
+        cmf_storage dn_river_sto = args.river_storage_ptr[downstream_cell];
+        cmf_storage dn_flood_sto = args.flood_storage_ptr[downstream_cell];
+        cmf_storage downstream_available = (float(dn_flood_sto) == 0.0f)
+            ? dn_river_sto : (dn_river_sto + dn_flood_sto);
+        float dn_out_vol = (float(downstream_outgoing) == 0.0f)
+            ? 0.0f : float(downstream_outgoing * time_step);
+        rate = min(cmf_div(float(downstream_available), max(
+            dn_out_vol, CMF_OUTGOING_VOLUME_FLOOR)), 1.0f);
+    }
 
-    cmf_storage downstream_available =
-        args.river_storage_ptr[downstream_cell]
-        + args.flood_storage_ptr[downstream_cell];
-    float downstream_limit = min(float(downstream_available) / max(
-        float(downstream_outgoing * cmf_storage(time_step)),
-        CMF_OUTGOING_VOLUME_FLOOR), 1.0f);
-
-    float rate = river_outflow > 0.0f ? local_limit : downstream_limit;
     float updated_river = river_outflow * rate;
     float updated_flood = flood_outflow * rate;
 
@@ -302,16 +323,23 @@ long num_catchments = *args.num_catchments;
 
 #ifndef HF_HP_ENABLED
     if (downstream != (int)catchment) {
-        atomic_fetch_add_explicit(
-            args.river_inflow_ptr + downstream_cell,
-            updated_river, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            args.flood_inflow_ptr + downstream_cell,
-            updated_flood, memory_order_relaxed);
-        if (HAS_RESERVOIR && args.is_reservoir_ptr[downstream] != 0) {
+        if (updated_river != 0.0f) {
             atomic_fetch_add_explicit(
-                args.reservoir_total_inflow_ptr + downstream_cell,
-                updated_river + updated_flood, memory_order_relaxed);
+                args.river_inflow_ptr + downstream_cell,
+                updated_river, memory_order_relaxed);
+        }
+        if (updated_flood != 0.0f) {
+            atomic_fetch_add_explicit(
+                args.flood_inflow_ptr + downstream_cell,
+                updated_flood, memory_order_relaxed);
+        }
+        if (HAS_RESERVOIR && args.is_reservoir_ptr[downstream] != 0) {
+            float res_in = updated_river + updated_flood;
+            if (res_in != 0.0f) {
+                atomic_fetch_add_explicit(
+                    args.reservoir_total_inflow_ptr + downstream_cell,
+                    res_in, memory_order_relaxed);
+            }
         }
     }
 

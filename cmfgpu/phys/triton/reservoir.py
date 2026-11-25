@@ -5,7 +5,7 @@
 #
 
 """
-Reservoir outflow Triton kernels.
+Reservoir outflow and initial dam-storage fill Triton kernels.
 """
 
 import triton
@@ -24,7 +24,11 @@ def yamazaki_funato_release_inline(
     """Yamazaki & Funato reservoir release for the dam volume DamVol.
     The nested selections follow the CUDA if/else-if regime chain."""
     # Case 1: water use, up to the conservation volume.
-    water_use = normal_outflow * hm.sqrt(hm.divide(dam_volume, conservation_volume))
+    water_use = tl.where(
+        dam_volume <= 0.0,
+        0.0,
+        normal_outflow * hm.sqrt(hm.divide(tl.maximum(dam_volume, 0.0), conservation_volume)),
+    )
     # Case 2: water excess, up to the adjustment volume.
     frac2 = hm.divide(dam_volume - conservation_volume, adjustment_volume - conservation_volume)
     water_excess = normal_outflow + hm.exp(3.0 * hm.log(frac2)) * (
@@ -137,7 +141,7 @@ def compute_reservoir_outflow_kernel(
     runoff_ptr,                             # *f32  runoff (catchment-indexed)
     outgoing_storage_ptr,                   # *f64  outgoing storage (catchment-indexed, in/out)
 
-    time_step_ptr,                              # f32   scalar time step
+    time_step_ptr,                              # *f32  scalar time step
     num_reservoirs,                         # i32   total number of reservoirs
     HAS_LEVEE: tl.constexpr,                # levee-protected storage present
     release_exponent: tl.constexpr,

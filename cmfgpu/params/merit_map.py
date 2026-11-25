@@ -1023,13 +1023,13 @@ class MERITMap(BaseModel):
 
         self.river_length = _read_2d_map("rivlen.bin")
 
-        # River height (optional — will be estimated by update_river_params if missing)
+        # River height (optional — will be estimated by estimate_river_geometry if missing)
         rivhgt_path = self.map_dir / "rivhgt.bin"
         if rivhgt_path.exists():
             self.river_height = _read_2d_map("rivhgt.bin")
             print("Loaded river_height from rivhgt.bin")
 
-        # River width (optional — will be estimated by update_river_params if missing)
+        # River width (optional — will be estimated by estimate_river_geometry if missing)
         rivwth_path = self.map_dir / "rivwth_gwdlr.bin"
         if rivwth_path.exists():
             self.river_width = _read_2d_map("rivwth_gwdlr.bin")
@@ -1250,7 +1250,7 @@ class MERITMap(BaseModel):
                 "river_length": {"units": "m", "long_name": "River channel length"},
                 "catchment_elevation": {
                     "units": "m",
-                    "long_name": "Mean catchment elevation",
+                    "long_name": "River bankfull (channel-top) elevation",
                 },
                 "catchment_area": {"units": "m2", "long_name": "Catchment area"},
                 "upstream_area": {
@@ -1324,7 +1324,7 @@ class MERITMap(BaseModel):
                 },
                 "levee_crown_height": {"units": "m", "long_name": "Levee crown height"},
                 "levee_fraction": {
-                    "long_name": "Levee-protected fraction of floodplain"
+                    "long_name": "Unprotected floodplain fraction between river and levee"
                 },
             }
 

@@ -4,8 +4,8 @@
     long total = num_pixels * ensemble_size;
     if ((long)i >= total) return;
 
-    long p = (long)i % num_pixels;
-    long member = (long)i / num_pixels;
+    long p, member;
+    cmf_decompose_index(i, num_pixels, ensemble_size, p, member);
     long cat_off = member * *args.num_catchments;
     long pix_off = member * num_pixels;
 
@@ -49,8 +49,8 @@
     long total = num_trib * ensemble_size;
     if ((long)i >= total) return;
 
-    long t = (long)i % num_trib;
-    long member = (long)i / num_trib;
+    long t, member;
+    cmf_decompose_index(i, num_trib, ensemble_size, t, member);
     long cat_off = member * *args.num_catchments;
     long pix_off = member * *args.num_pixels;
     long link_off = member * *args.num_tributary_links;
@@ -94,8 +94,8 @@
     long total = num_bw * ensemble_size;
     if ((long)i >= total) return;
 
-    long b = (long)i % num_bw;
-    long member = (long)i / num_bw;
+    long b, member;
+    cmf_decompose_index(i, num_bw, ensemble_size, b, member);
     long cat_off = member * *args.num_catchments;
     long pix_off = member * *args.num_pixels;
     long bw_off = member * num_bw;
@@ -120,7 +120,9 @@
     long total = num_pixels * ensemble_size;
     if ((long)i >= total) return;
 
-    long p = (long)i % num_pixels;
+    long p, member;
+    cmf_decompose_index(i, num_pixels, ensemble_size, p, member);
+    (void)member;
     float perm_depth = *args.permanent_water_depth;
     long perm_idx = batched_pixel_is_permanent_water ? (long)i : p;
     if (perm_depth > 0.0f && args.pixel_is_permanent_water_ptr[perm_idx] != 0) {
@@ -133,8 +135,8 @@
     long total = num_pixels * ensemble_size;
     if ((long)i >= total) return;
 
-    long p = (long)i % num_pixels;
-    long member = (long)i / num_pixels;
+    long p, member;
+    cmf_decompose_index(i, num_pixels, ensemble_size, p, member);
     long cat_off = member * *args.num_catchments;
     long pix_off = member * num_pixels;
 

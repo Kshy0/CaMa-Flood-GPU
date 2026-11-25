@@ -45,9 +45,9 @@ static inline LeveeStageResult levee_stage_inline(
 
     levee_crown_height = max(levee_crown_height, levee_base_height);
     float width_increment =
-        (catchment_area / river_length) / (float)num_flood_levels;
+        cmf_div(cmf_div(catchment_area, river_length), (float)num_flood_levels);
     float levee_distance =
-        levee_fraction * (catchment_area / river_length);
+        levee_fraction * cmf_div(catchment_area, river_length);
     float current_storage = maximum_river_storage;
     float previous_height = 0.0f;
     float previous_width = river_width;
@@ -74,7 +74,7 @@ static inline LeveeStageResult levee_stage_inline(
         float storage_increment =
             river_length * middle_width * height_increment;
         float next_storage = current_storage + storage_increment;
-        float gradient = height_increment / width_increment;
+        float gradient = cmf_div(height_increment, width_increment);
 
         if (case3 && level >= levee_level && !found_case3) {
             float wedge_storage = (levee_distance + river_width)
@@ -111,12 +111,12 @@ static inline LeveeStageResult levee_stage_inline(
         // Case 2, river side below the crown, protected side dry.
         float added_storage = total_storage - levee_base_storage;
         result.flood_depth = levee_base_height
-            + added_storage
-                / (levee_distance + river_width) / river_length;
+            + cmf_div(cmf_div(added_storage,
+                (levee_distance + river_width)), river_length);
         result.river_storage = maximum_river_storage
             + river_length * river_width * result.flood_depth;
-        result.river_depth = float(result.river_storage)
-            / river_length / river_width;
+        result.river_depth = cmf_div(cmf_div(
+            float(result.river_storage), river_length), river_width);
         result.flood_storage = max(
             total_storage_hp - result.river_storage, cmf_storage(0.0f));
         result.flood_fraction = levee_fraction;
@@ -124,19 +124,19 @@ static inline LeveeStageResult levee_stage_inline(
         // Case 3, river side at the crown, protected side filling.
         float added_storage = total_storage - case3_storage;
         if (found_case3) {
-            float added_width = -case3_width + sqrt(
+            float added_width = -case3_width + cmf_sqrt(
                 case3_width * case3_width
-                + 2.0f * added_storage / river_length / case3_gradient);
+                + cmf_div(cmf_div(2.0f * added_storage, river_length), case3_gradient));
             float added_depth = added_width * case3_gradient;
             result.protected_depth =
                 levee_base_height + case3_depth + added_depth;
             result.flood_fraction = clamp(
-                (case3_width + levee_distance)
-                    / (width_increment * (float)num_flood_levels),
+                cmf_div(case3_width + levee_distance,
+                    width_increment * (float)num_flood_levels),
                 0.0f, 1.0f);
         } else {
             float added_depth =
-                added_storage / case3_width / river_length;
+                cmf_div(cmf_div(added_storage, case3_width), river_length);
             result.protected_depth =
                 levee_base_height + case3_depth + added_depth;
             result.flood_fraction = 1.0f;
@@ -144,8 +144,8 @@ static inline LeveeStageResult levee_stage_inline(
         result.flood_depth = levee_crown_height;
         result.river_storage = maximum_river_storage
             + river_length * river_width * result.flood_depth;
-        result.river_depth = float(result.river_storage)
-            / river_length / river_width;
+        result.river_depth = cmf_div(cmf_div(
+            float(result.river_storage), river_length), river_width);
         result.flood_storage = max(
             cmf_storage(top_storage) - result.river_storage, cmf_storage(0.0f));
         result.protected_storage = max(
@@ -156,15 +156,16 @@ static inline LeveeStageResult levee_stage_inline(
         // unclamped default-stage flood fraction.
         float added_width = 0.0f;
         if (found_case4) {
-            added_width = -case4_width + sqrt(
+            added_width = -case4_width + cmf_sqrt(
                 case4_width * case4_width
-                + 2.0f * (total_storage - case4_storage) / river_length
-                    / case4_gradient);
+                + cmf_div(cmf_div(2.0f * (total_storage - case4_storage),
+                    river_length), case4_gradient));
         } else {
             case4_width = previous_width;
         }
-        result.flood_fraction = (-river_width + case4_width + added_width)
-            / (width_increment * (float)num_flood_levels);
+        result.flood_fraction = cmf_div(
+            -river_width + case4_width + added_width,
+            width_increment * (float)num_flood_levels);
         float added_storage = (flood_depth - levee_crown_height)
             * (levee_distance + river_width) * river_length;
         result.flood_storage = max(
@@ -196,57 +197,64 @@ static inline BifurcationLevelResult bifurcation_level_inline(
     BifurcationLevelResult result;
     result.cross_section_depth = max(
         maximum_water_surface - elevation, 0.0f);
-    float implicit_flow_depth = sqrt(
-        result.cross_section_depth * previous_cross_section_depth);
-    float flow_depth = semi_implicit_depth
-        ? (implicit_flow_depth <= 0.0f
-            ? result.cross_section_depth : implicit_flow_depth)
-        : result.cross_section_depth;
+    float flow_depth = 0.0f;
+    if (result.cross_section_depth > 0.0f) {
+        if (semi_implicit_depth) {
+            float implicit_flow_depth = cmf_sqrt(
+                result.cross_section_depth * previous_cross_section_depth);
+            flow_depth = implicit_flow_depth <= 0.0f
+                ? result.cross_section_depth : implicit_flow_depth;
+        } else {
+            flow_depth = result.cross_section_depth;
+        }
+    }
     result.outflow = 0.0f;
     if (flow_depth > 1e-5f) {
-        float unit_outflow = previous_outflow / width;
+        float unit_outflow = cmf_div(previous_outflow, width);
         float numerator = width * (
             unit_outflow + gravity * time_step * flow_depth * slope);
         float denominator = 1.0f
             + gravity * time_step * manning * manning
-                * fabs(unit_outflow) * pow(flow_depth, -7.0f / 3.0f);
-        result.outflow = numerator / denominator;
+                * fabs(unit_outflow) * cmf_inv_d73(flow_depth);
+        result.outflow = cmf_div(numerator, denominator);
     }
     return result;
 }
 
-// Fold one per-levee value across the threadgroup and issue a single atomic;
-// see the identical helper in storage.metal.  Every thread must call this
-// (threadgroup barriers); ``scratch`` is reusable on return.
-static inline void cmf_block_atomic_add(
-    threadgroup float* scratch,
-    uint lid,
+// Batched hardware SIMD-group reduction for levee water-balance counters.
+template <uint N, uint M>
+static inline void cmf_block_atomic_add_batch(
+    threadgroup float (&partials)[N][M],
+    uint simd_lane,
+    uint simd_group,
+    uint simd_width,
     uint group_threads,
-    float value,
-    device atomic_float* destination
+    thread const float (&values)[N],
+    thread device atomic_float* const (&destinations)[N]
 ) {
-    scratch[lid] = value;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // dispatchThreads permits a short final threadgroup; fold odd tail lanes.
-    for (uint active_threads = group_threads; active_threads > 1;
-            active_threads = (active_threads + 1) / 2) {
-        uint next_active = (active_threads + 1) / 2;
-        uint pair = lid + next_active;
-        if (pair < active_threads) {
-            scratch[lid] += scratch[pair];
+    for (uint c = 0; c < N; ++c) {
+        float sg = simd_sum(values[c]);
+        if (simd_lane == 0) {
+            partials[c][simd_group] = sg;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (lid == 0 && scratch[0] != 0.0f) {
-        atomic_fetch_add_explicit(
-            destination, scratch[0], memory_order_relaxed);
-    }
-    // Ensure the reduction is consumed before the caller reuses ``scratch``.
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        uint num_simd = (group_threads + simd_width - 1) / simd_width;
+        for (uint c = 0; c < N; ++c) {
+            float v = (simd_lane < num_simd) ? partials[c][simd_lane] : 0.0f;
+            float sum = simd_sum(v);
+            if (simd_lane == 0 && sum != 0.0f) {
+                atomic_fetch_add_explicit(
+                    destinations[c], sum, memory_order_relaxed);
+            }
+        }
+    }
 }
 
 static inline float levee_bifurcation_outflow_inline(
-    uint i,
+    long path,
+    long member,
     device const int* bifurcation_catchment_idx_ptr,
     device const int* bifurcation_downstream_idx_ptr,
     device const float* bifurcation_manning_ptr,
@@ -267,7 +275,6 @@ static inline float levee_bifurcation_outflow_inline(
     device const float* time_step_ptr,
     long num_bifurcation_paths,
     int num_bifurcation_levels,
-    long ensemble_size,
     long num_catchments,
     bool batched_bifurcation_manning,
     bool batched_bifurcation_width,
@@ -279,11 +286,6 @@ static inline float levee_bifurcation_outflow_inline(
     bool has_reservoir
 ) {
     long num_paths = num_bifurcation_paths;
-    long total = num_paths * ensemble_size;
-    if ((long)i >= total) return 0.0f;
-
-    long path = (long)i % num_paths;
-    long member = (long)i / num_paths;
     long path_offset = member * num_paths;
     long catchment_offset = member * num_catchments;
     long level_offset = path_offset * (long)num_bifurcation_levels;
@@ -328,7 +330,7 @@ static inline float levee_bifurcation_outflow_inline(
     float maximum_protected_surface = max(
         protected_surface, downstream_protected_surface);
     float slope = clamp(
-        (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
+        cmf_div(water_surface - downstream_surface, length), -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
     float time_step = time_step_ptr[0];
 
     long manning_offset = batched_bifurcation_manning ? level_offset : 0;
@@ -356,24 +358,29 @@ static inline float levee_bifurcation_outflow_inline(
         total_outflow += result.outflow;
     }
 
-    float available_storage = min(
-        river_storage_ptr[catchment_cell]
-            + flood_storage_ptr[catchment_cell]
-            + protected_storage_ptr[catchment_cell],
-        river_storage_ptr[downstream_cell]
-            + flood_storage_ptr[downstream_cell]
-            + protected_storage_ptr[downstream_cell]);
     // CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
-    float limit = 1.0f;
     if (total_outflow != 0.0f) {
-        limit = min(
-            CMF_BACKFLOW_STORAGE_FRACTION * available_storage / (fabs(total_outflow) * time_step),
+        cmf_storage c_tot = river_storage_ptr[catchment_cell];
+        cmf_storage c_f = flood_storage_ptr[catchment_cell];
+        if (float(c_f) != 0.0f) c_tot = c_tot + c_f;
+        cmf_storage c_p = protected_storage_ptr[catchment_cell];
+        if (float(c_p) != 0.0f) c_tot = c_tot + c_p;
+        cmf_storage d_tot = river_storage_ptr[downstream_cell];
+        cmf_storage d_f = flood_storage_ptr[downstream_cell];
+        if (float(d_f) != 0.0f) d_tot = d_tot + d_f;
+        cmf_storage d_p = protected_storage_ptr[downstream_cell];
+        if (float(d_p) != 0.0f) d_tot = d_tot + d_p;
+        float available_storage = float(min(c_tot, d_tot));
+        float limit = min(
+            cmf_div(CMF_BACKFLOW_STORAGE_FRACTION * available_storage, fabs(total_outflow) * time_step),
             1.0f);
-    }
-    total_outflow *= limit;
-    for (int level = 0; level < num_bifurcation_levels; ++level) {
-        long state_level = level_offset + path_level + level;
-        bifurcation_outflow_ptr[state_level] *= limit;
+        if (limit < 1.0f) {
+            total_outflow *= limit;
+            for (int level = 0; level < num_bifurcation_levels; ++level) {
+                long state_level = level_offset + path_level + level;
+                bifurcation_outflow_ptr[state_level] *= limit;
+            }
+        }
     }
 
     return total_outflow;
@@ -385,8 +392,8 @@ long num_levees = *args.num_levees;
     long total = num_levees * ensemble_size;
     if ((long)i >= total) return;
 
-    long levee = (long)i % num_levees;
-    long member = (long)i / num_levees;
+    long levee, member;
+    cmf_decompose_index(i, num_levees, ensemble_size, levee, member);
     long levee_offset = member * num_levees;
     long catchment_offset = member * *args.num_catchments;
     int local_catchment = args.levee_catchment_idx_ptr[levee];
@@ -441,7 +448,7 @@ long num_levees = *args.num_levees;
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_stage_log
 long num_levees = *args.num_levees;
-    threadgroup float log_scratch[HF_BLOCK_SIZE];
+    threadgroup float log_partials[5][HF_BLOCK_SIZE / 8];
 
     // Out-of-range lanes contribute 0 so every thread reaches the barriers.
     bool active_lane = (long)i < num_levees;
@@ -499,24 +506,34 @@ long num_levees = *args.num_levees;
 
     }  // active_lane
 
-    // One atomic per counter per threadgroup, reusing a single scratch buffer.
-    long group_start = (long)i - (long)lid;
-    uint group_threads = (uint)min((long)tpg, num_levees - group_start);
-    cmf_block_atomic_add(log_scratch, lid, group_threads, log_storage_stage,
-        args.total_storage_stage_sum_ptr + current_step);
-    cmf_block_atomic_add(log_scratch, lid, group_threads, log_river_storage,
-        args.river_storage_sum_ptr + current_step);
-    cmf_block_atomic_add(log_scratch, lid, group_threads, log_flood_storage,
-        args.flood_storage_sum_ptr + current_step);
-    cmf_block_atomic_add(log_scratch, lid, group_threads, log_flood_area,
-        args.flood_area_sum_ptr + current_step);
-    cmf_block_atomic_add(log_scratch, lid, group_threads, log_stage_error,
-        args.total_stage_error_sum_ptr + current_step);
+    // One atomic per counter per threadgroup via batched hardware simd_sum.
+    float log_vals[5] = {
+        log_storage_stage, log_river_storage, log_flood_storage,
+        log_flood_area, log_stage_error
+    };
+    device atomic_float* const log_dests[5] = {
+        args.total_storage_stage_sum_ptr + current_step,
+        args.river_storage_sum_ptr + current_step,
+        args.flood_storage_sum_ptr + current_step,
+        args.flood_area_sum_ptr + current_step,
+        args.total_stage_error_sum_ptr + current_step
+    };
+    // dispatchThreads permits a short final threadgroup: count only grid lanes.
+    uint group_threads = (uint)min((long)tpg, num_levees - ((long)i - (long)lid));
+    cmf_block_atomic_add_batch(
+        log_partials, simd_lane, simd_group, simd_width, group_threads,
+        log_vals, log_dests);
 
 // HYDROFORGE METAL KERNEL BODY: compute_levee_bifurcation_outflow
-    if ((long)i >= *args.num_bifurcation_paths * *args.ensemble_size) return;
+    long num_paths = *args.num_bifurcation_paths;
+    long ensemble_size = *args.ensemble_size;
+    if ((long)i >= num_paths * ensemble_size) return;
+    long path, member;
+    cmf_decompose_index(i, num_paths, ensemble_size, path, member);
+    long num_catchments = *args.num_catchments;
     float total_outflow = levee_bifurcation_outflow_inline(
-        i,
+        path,
+        member,
         args.bifurcation_catchment_idx_ptr,
         args.bifurcation_downstream_idx_ptr,
         args.bifurcation_manning_ptr,
@@ -535,30 +552,31 @@ long num_levees = *args.num_levees;
         args.protected_storage_ptr,
         *args.gravity,
         args.time_step_ptr,
-        *args.num_bifurcation_paths,
+        num_paths,
         num_bifurcation_levels,
-        *args.ensemble_size,
-        *args.num_catchments,
+        num_catchments,
         batched_bifurcation_manning,
         batched_bifurcation_width,
         batched_bifurcation_length,
         batched_bifurcation_elevation,
         batched_river_height,
         batched_catchment_elevation,
-        args.is_dam_related_ptr + (batched_is_dam_related ? ((long)i / *args.num_bifurcation_paths) * (*args.num_catchments) : 0),
+        args.is_dam_related_ptr + (batched_is_dam_related ? member * num_catchments : 0),
         HAS_RESERVOIR);
 #ifdef HF_HP_ENABLED
     args.bifurcation_path_flow_ptr[i] = total_outflow;
 #else
-    long path = (long)i % *args.num_bifurcation_paths;
-    long catchment_offset = ((long)i / *args.num_bifurcation_paths) * *args.num_catchments;
-    long catchment_cell = catchment_offset + args.bifurcation_catchment_idx_ptr[path];
-    long downstream_cell = catchment_offset + args.bifurcation_downstream_idx_ptr[path];
+    long catchment_offset = member * num_catchments;
     // P2STOOUT flows, multiplied by the step in compute_inflow.
-    atomic_fetch_add_explicit(
-        args.outgoing_storage_ptr + catchment_cell,
-        max(total_outflow, 0.0f), memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        args.outgoing_storage_ptr + downstream_cell,
-        -min(total_outflow, 0.0f), memory_order_relaxed);
+    if (total_outflow > 0.0f) {
+        long catchment_cell = catchment_offset + args.bifurcation_catchment_idx_ptr[path];
+        atomic_fetch_add_explicit(
+            args.outgoing_storage_ptr + catchment_cell,
+            total_outflow, memory_order_relaxed);
+    } else if (total_outflow < 0.0f) {
+        long downstream_cell = catchment_offset + args.bifurcation_downstream_idx_ptr[path];
+        atomic_fetch_add_explicit(
+            args.outgoing_storage_ptr + downstream_cell,
+            -total_outflow, memory_order_relaxed);
+    }
 #endif

@@ -23,14 +23,26 @@ __device__ __forceinline__ void k_inflow_cell(
     REAL r_out = river_outflow[t];
     REAL f_out = flood_outflow[t];
     STO step = (STO)__ldg(time_step_ptr);
-    REAL limit_rate = cmf_supply_rate<REAL>(
-        outgoing_storage[t], river_storage[t] + flood_storage[t], step);
+    STO r_sto = river_storage[t];
+    STO f_sto = flood_storage[t];
+    STO avail = cmf_is_zero_sto(f_sto) ? r_sto : (r_sto + f_sto);
+    STO local_out = outgoing_storage[t];
+    REAL limit_rate = cmf_is_zero_sto(local_out)
+        ? fmin((REAL)avail / (REAL)CMF_OUTGOING_VOLUME_FLOOR, (REAL)1.0)
+        : cmf_supply_rate<REAL>(local_out, avail, step);
 
     int dn = downstream_idx[t];
-    REAL limit_rate_dn = cmf_supply_rate<REAL>(
-        outgoing_storage[dn], river_storage[dn] + flood_storage[dn], step);
+    REAL rate = limit_rate;
+    if (r_out <= (REAL)0.0 && (r_out != (REAL)0.0 || f_out != (REAL)0.0) && dn != (int)t) {
+        STO dn_r = river_storage[dn];
+        STO dn_f = flood_storage[dn];
+        STO dn_avail = cmf_is_zero_sto(dn_f) ? dn_r : (dn_r + dn_f);
+        STO dn_out = outgoing_storage[dn];
+        rate = cmf_is_zero_sto(dn_out)
+            ? fmin((REAL)dn_avail / (REAL)CMF_OUTGOING_VOLUME_FLOOR, (REAL)1.0)
+            : cmf_supply_rate<REAL>(dn_out, dn_avail, step);
+    }
 
-    REAL rate = (r_out > (REAL)0.0) ? limit_rate : limit_rate_dn;
     REAL upd_r_out = r_out * rate;
     REAL upd_f_out = f_out * rate;
 
@@ -116,10 +128,15 @@ __device__ __forceinline__ void k_outflow_cell(
     REAL f_cs_dep = __ldg(flood_cross_section_depth + t);
     REAL f_cs_area = __ldg(flood_cross_section_area + t);
 
-    REAL rs = (REAL)river_storage[t];
-    REAL fs = (REAL)flood_storage[t];
-    STO storage_sum = river_storage[t] + flood_storage[t];
-    if (has_levee) storage_sum += protected_storage[t];
+    STO r_sto_hp = river_storage[t];
+    STO f_sto_hp = flood_storage[t];
+    REAL rs = (REAL)r_sto_hp;
+    REAL fs = (REAL)f_sto_hp;
+    STO storage_sum = cmf_is_zero_sto(f_sto_hp) ? r_sto_hp : (r_sto_hp + f_sto_hp);
+    if (has_levee) {
+        STO p_sto_hp = protected_storage[t];
+        if (!cmf_is_zero_sto(p_sto_hp)) storage_sum += p_sto_hp;
+    }
     REAL total_storage = (REAL)storage_sum;
 
     REAL river_elevation = c_elv - r_hgt;
@@ -150,8 +167,10 @@ __device__ __forceinline__ void k_outflow_cell(
     REAL upd_f_cs_dep = fmax(flood_surface - c_elv, (REAL)0.0);
     REAL f_sifd = fmax(sqrt(upd_f_cs_dep * f_cs_dep), (REAL)1e-6);
 
-    REAL fs_over_len = fs / r_len;
-    REAL upd_f_cs_area = fmax(fs_over_len - f_dep * r_wid, (REAL)0.0);
+    // HF-UPSTREAM-FIX[CMF-01]: Do not double-subtract above-channel area from floodplain cross-section
+    //   upstream: CaMa-Flood v4.31 cmf_calc_outflw_mod.F90:95,152 (and damout:488) subtracts D2FLDDPH*D2RIVWTH from P2FLDSTO/L even though P2FLDSTO already excludes above-channel storage.
+    //   fix: Use max(flood_storage / river_length, 0) directly as floodplain cross-sectional area.
+    REAL upd_f_cs_area = fmax(fs / r_len, (REAL)0.0);
 
     REAL r_cs_area = upd_r_cs_dep * r_wid;
     bool river_condition = (r_sifd > (REAL)1e-5) && (r_cs_area > (REAL)1e-5);
@@ -160,7 +179,7 @@ __device__ __forceinline__ void k_outflow_cell(
         REAL unit_r_out = r_out / r_wid;
         REAL num_r = r_wid * (unit_r_out + gravity * time_step * r_sifd * river_slope);
         REAL den_r = (REAL)1.0 + gravity * time_step * (r_man * r_man) * fabs(unit_r_out)
-                      * ((REAL)1.0 / (r_sifd * r_sifd * cbrt(r_sifd)));
+                      * cmf_inv_d73(r_sifd);
         upd_r_out = num_r / den_r;
     }
     upd_r_out = river_condition ? upd_r_out : (REAL)0.0;
@@ -173,14 +192,14 @@ __device__ __forceinline__ void k_outflow_cell(
         REAL f_imp_area = fmax(sqrt(upd_f_cs_area * fmax(f_cs_area, (REAL)1e-6)), (REAL)1e-6);
         REAL num_f = f_out + gravity * time_step * f_imp_area * flood_slope;
         REAL den_f = (REAL)1.0 + gravity * time_step * (f_man * f_man) * fabs(f_out)
-                      * ((REAL)1.0 / (f_sifd * cbrt(f_sifd))) / f_imp_area;
+                      * cmf_inv_d43(f_sifd) / f_imp_area;
         upd_f_out = num_f / den_f;
     }
 
     // Floodplain flow only moves with the river flow (rivout*fldout > 0).
     if (!(upd_r_out * upd_f_out > (REAL)0.0)) upd_f_out = (REAL)0.0;
-    // v4.23 storage-change limiter on every non-mouth cell: flow towards the
-    // upstream cell removes at most 5% of the storage per step.
+    // v4.23 storage-change limiter on every non-mouth cell: reverse flow from
+    // downstream into this cell is capped at 5% of this cell's storage per step.
     if (!is_river_mouth) {
         REAL backflow = fmax((-upd_r_out - upd_f_out) * time_step,
                              (REAL)(float)CMF_OUTGOING_VOLUME_FLOOR);
@@ -194,12 +213,12 @@ __device__ __forceinline__ void k_outflow_cell(
         if (has_reservoir && is_dam_upstream && is_dam_upstream[t]) {
             REAL bed_slope = (c_elv - c_elv_dn) / dn_dist;
             bed_slope = fmax(bed_slope, min_kinematic_slope);
-            REAL kin_riv_vel = ((REAL)1.0 / r_man) * sqrt(bed_slope) * cbrt(r_dep * r_dep);
+            REAL kin_riv_vel = ((REAL)1.0 / r_man) * sqrt(bed_slope) * cmf_pow23(r_dep);
             // CaMa bounds the kinematic flows by the storage only (MIN), so a
             // negative storage (negative runoff) gives a negative flow.
             REAL kin_riv = fmin(r_wid * r_dep * kin_riv_vel, rs / time_step);
             REAL bed_slope_f = fmin(bed_slope, (REAL)CMF_ROUTING_SLOPE_LIMIT);
-            REAL kin_fld_vel = ((REAL)1.0 / f_man) * sqrt(bed_slope_f) * cbrt(f_dep * f_dep);
+            REAL kin_fld_vel = ((REAL)1.0 / f_man) * sqrt(bed_slope_f) * cmf_pow23(f_dep);
             REAL kin_fld_area = upd_f_cs_area;
             REAL kin_fld = fmin(kin_fld_area * kin_fld_vel, fs / time_step);
             upd_r_out = kin_riv;
@@ -211,15 +230,14 @@ __device__ __forceinline__ void k_outflow_cell(
     flood_outflow[t] = upd_f_out;
     river_cross_section_depth[t] = upd_r_cs_dep;
     flood_cross_section_depth[t] = upd_f_cs_dep;
-    // Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
-    flood_cross_section_area[t] = fmax(fs_over_len - fmax(r_dep - r_hgt, (REAL)0.0) * r_wid, (REAL)0.0);
+    flood_cross_section_area[t] = upd_f_cs_area;
 
     river_inflow[t] = (STO)0;
     flood_inflow[t] = (STO)0;
     if (has_bifurcation) global_bifurcation_outflow[t] = (STO)0;
 
-    // P2STOOUT includes positive flows from this cell and reversed flows
-    // into its downstream cell.
+    // P2STOOUT includes positive flows out of this cell and reversed flows
+    // out of its downstream cell (accumulated into the downstream cell's slot).
     STO pos_out = (STO)(fmax(upd_r_out, (REAL)0.0) + fmax(upd_f_out, (REAL)0.0));
     if (pos_out != (STO)0)
         cmf_atomic_add(outgoing_storage + t, pos_out);

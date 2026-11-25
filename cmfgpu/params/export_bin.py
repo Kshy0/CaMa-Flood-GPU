@@ -368,15 +368,15 @@ def _write_bifprm(
                 basin_up = missing_int
                 basin_dn = missing_int
 
-            # --- Write 2-line record ---
-            # Line 1: ix iy jx jy length elevtn depth width1 ...
+            # --- Write single-line record ---
+            # Columns: ix iy jx jy length elevtn depth width1 ...
             parts = [f"{ix:8d}", f"{iy:8d}", f"{jx:8d}", f"{jy:8d}"]
             parts.append(f"{length_val:12.2f}")
             parts.append(f"{elev_val:12.2f}")
             parts.append(f"{depth_val:12.2f}")
             for w in widths:
                 parts.append(f"{float(w):12.2f}")
-            # Line 2 continuation: lat lon basin_up basin_dn
+            # Trailing columns: lat lon basin_up basin_dn
             parts.append(f"{lat_val:10.3f}")
             parts.append(f"{lon_val:10.3f}")
             parts.append(f"{basin_up:8d}")
@@ -1035,7 +1035,7 @@ def export_inpmat(
     Parameters
     ----------
     npz_path : path-like
-        Input ``.npz`` file produced by ``generate_runoff_mapping_table()``.
+        Input ``.npz`` file produced by ``hydroforge.data.datasets.generate_mapping_table()``.
     nc_path : path-like
         ``parameters.nc`` (used for grid dimensions and catchment coordinates).
     out_dir : path-like

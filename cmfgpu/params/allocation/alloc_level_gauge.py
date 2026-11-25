@@ -36,7 +36,7 @@ def allocate_all_level_gauges(
     gauge_ids: np.ndarray,
     gauge_lats: np.ndarray,
     gauge_lons: np.ndarray,
-    gauge_areas: np.ndarray,  # m²
+    gauge_areas: np.ndarray,  # km²
     upa1m: np.ndarray,
     ctx1m: np.ndarray,
     cty1m: np.ndarray,

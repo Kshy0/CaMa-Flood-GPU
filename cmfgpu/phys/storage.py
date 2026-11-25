@@ -2,7 +2,7 @@
 # Copyright (c) 2025 Shengyu Kang (Wuhan University)
 # Licensed under the Apache License, Version 2.0
 
-"""Registered flood-stage implementations."""
+"""Registered flood-stage and high-resolution downscaling kernel implementations."""
 
 from hydroforge.kernels import BackendRegistry, TritonKernel
 from cmfgpu.phys import cuda, metal

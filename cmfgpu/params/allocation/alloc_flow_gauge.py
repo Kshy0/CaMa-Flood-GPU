@@ -35,7 +35,7 @@ def allocate_all_gauges(
     gauge_ids: np.ndarray,  # (N,) int64
     gauge_lats: np.ndarray,  # (N,) float64
     gauge_lons: np.ndarray,  # (N,) float64
-    gauge_areas: np.ndarray,  # (N,) float64, upstream area in m² (same unit as upa1m)
+    gauge_areas: np.ndarray,  # (N,) float64, upstream area in km² (same unit as upa1m)
     upa1m: np.ndarray,  # (nx, ny) float32
     ctx1m: np.ndarray,  # (nx, ny) int16, 0-based
     cty1m: np.ndarray,
@@ -83,7 +83,7 @@ def allocate_all_gauges(
     for g in range(N):
         lat0 = gauge_lats[g]
         lon0 = gauge_lons[g]
-        area0 = gauge_areas[g]  # in m² (same as upa1m)
+        area0 = gauge_areas[g]  # in km² (same as upa1m)
 
         # Domain check (in degrees, low-res)
         east = west + nXX * gsize

@@ -4,12 +4,11 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""Triton kernels for levee-aware flood stage calculations."""
+"""Triton kernels for levee-aware flood stage and bifurcation outflow calculations."""
 
 import triton
 import triton.language as tl
 from hydroforge.kernels import triton_math as hm
-
 
 from cmfgpu import config as _constants
 
@@ -354,7 +353,7 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_outflow_ptr,                    # *f32: Bifurcation outflow (in/out)
     bifurcation_width_ptr,                      # *f32: Bifurcation width
     bifurcation_length_ptr,                     # *f32: Bifurcation length
-    bifurcation_elevation_ptr,                  # *f32: Bifurcation length
+    bifurcation_elevation_ptr,                  # *f32: Bifurcation elevation
     bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
     river_depth_ptr,                            # *f32: River depth
     protected_depth_ptr,                        # *f32: Protected depth
@@ -366,7 +365,7 @@ def compute_levee_bifurcation_outflow_kernel(
     protected_storage_ptr,                      # *f64: Protected storage
     outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
-    time_step_ptr,                                  # f32: Time step
+    time_step_ptr,                                  # *f32: Time step pointer
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     BLOCK_SIZE: tl.constexpr,                   # Block size
@@ -441,19 +440,6 @@ def compute_levee_bifurcation_outflow_kernel(
     bifurcation_slope = hm.divide(bifurcation_water_surface_elevation - bifurcation_water_surface_elevation_downstream, bifurcation_length)
     bifurcation_slope = hm.clamp(bifurcation_slope, -ROUTING_SLOPE_LIMIT, ROUTING_SLOPE_LIMIT)
 
-    # Storage change limiter calculation
-    bifurcation_total_storage = hm.to_compute(
-        tl.load(river_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
-        + tl.load(flood_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0)
-        + tl.load(protected_storage_ptr + bifurcation_catchment_idx, mask=mask, other=0.0),
-        bifurcation_length,
-    )
-    bifurcation_total_storage_downstream = hm.to_compute(
-        tl.load(river_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
-        + tl.load(flood_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0)
-        + tl.load(protected_storage_ptr + bifurcation_downstream_idx, mask=mask, other=0.0),
-        bifurcation_length,
-    )
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     for level in tl.static_range(num_bifurcation_levels):
@@ -467,20 +453,12 @@ def compute_levee_bifurcation_outflow_kernel(
                 bifurcation_closed, DISABLED_BIFURCATION_ELEVATION, bifurcation_elevation
             )
         
-        # Calculate bifurcation cross-section depth
-        # Level 0: River channel (use river WSE)
-        # Level > 0: Overland (use protected WSE)
-        
         if level == 0:
             current_max_wse = max_bifurcation_water_surface_elevation
         else:
             current_max_wse = max_bifurcation_protected_water_surface_elevation
 
         updated_bifurcation_cross_section_depth = tl.maximum(current_max_wse - bifurcation_elevation, 0.0)
-        
-        # Calculate semi-implicit flow depth for bifurcation
-        # Level 0: Semi-implicit
-        # Level > 0: Explicit (no semi-implicit)
         
         if level == 0:
             semi_implicit_depth = hm.sqrt(
@@ -495,42 +473,60 @@ def compute_levee_bifurcation_outflow_kernel(
         else:
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth
         
-        bifurcation_width = tl.load(bifurcation_width_ptr + level_idx, mask=mask, other=0.0)
-        bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask, other=0.0)
-
-        unit_bifurcation_outflow = hm.divide(bifurcation_outflow, bifurcation_width)
-
-        numerator = bifurcation_width * (
-            unit_bifurcation_outflow + gravity * time_step 
-            * bifurcation_semi_implicit_flow_depth * bifurcation_slope
-        )
-        denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * hm.divide(1.0, bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * hm.cbrt(bifurcation_semi_implicit_flow_depth))
-        
-        updated_bifurcation_outflow = hm.divide(numerator, denominator)
         bifurcation_condition = bifurcation_semi_implicit_flow_depth > hm.constant(1e-5, bifurcation_semi_implicit_flow_depth)
-        updated_bifurcation_outflow = tl.where(bifurcation_condition, updated_bifurcation_outflow, 0.0)
+        updated_bifurcation_outflow = tl.zeros_like(bifurcation_length)
+        if tl.sum((mask & bifurcation_condition).to(tl.int32), 0) > 0:
+            bifurcation_width = tl.load(bifurcation_width_ptr + level_idx, mask=mask, other=1.0)
+            bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask, other=0.0)
+
+            unit_bifurcation_outflow = hm.divide(bifurcation_outflow, bifurcation_width)
+
+            numerator = bifurcation_width * (
+                unit_bifurcation_outflow + gravity * time_step 
+                * bifurcation_semi_implicit_flow_depth * bifurcation_slope
+            )
+            denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
+                        * hm.divide(1.0, bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * hm.cbrt(bifurcation_semi_implicit_flow_depth))
+            
+            updated_bifurcation_outflow = tl.where(
+                bifurcation_condition, hm.divide(numerator, denominator), 0.0
+            )
         sum_bifurcation_outflow += updated_bifurcation_outflow
         tl.store(bifurcation_cross_section_depth_ptr + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
         tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
     # CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
-    limit_rate = tl.where(
-        sum_bifurcation_outflow != 0.0,
-        hm.at_most(hm.divide(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream), tl.abs(sum_bifurcation_outflow) * time_step), 1.0),
-        hm.constant(1.0, sum_bifurcation_outflow),
-    )
-    sum_bifurcation_outflow *= limit_rate
-    for level in tl.static_range(num_bifurcation_levels):
-        level_idx = offs * num_bifurcation_levels + level
-        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask)
-        updated_bifurcation_outflow *= limit_rate
-        tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
+    active_path = mask & (sum_bifurcation_outflow != 0.0)
+    if tl.sum(active_path.to(tl.int32), 0) > 0:
+        bifurcation_total_storage = hm.to_compute(
+            tl.load(river_storage_ptr + bifurcation_catchment_idx, mask=active_path, other=0.0)
+            + tl.load(flood_storage_ptr + bifurcation_catchment_idx, mask=active_path, other=0.0)
+            + tl.load(protected_storage_ptr + bifurcation_catchment_idx, mask=active_path, other=0.0),
+            bifurcation_length,
+        )
+        bifurcation_total_storage_downstream = hm.to_compute(
+            tl.load(river_storage_ptr + bifurcation_downstream_idx, mask=active_path, other=0.0)
+            + tl.load(flood_storage_ptr + bifurcation_downstream_idx, mask=active_path, other=0.0)
+            + tl.load(protected_storage_ptr + bifurcation_downstream_idx, mask=active_path, other=0.0),
+            bifurcation_length,
+        )
+        limit_rate = tl.where(
+            active_path,
+            hm.at_most(hm.divide(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream), tl.abs(sum_bifurcation_outflow) * time_step), 1.0),
+            hm.constant(1.0, sum_bifurcation_outflow),
+        )
+        sum_bifurcation_outflow *= limit_rate
+        if tl.sum((active_path & (limit_rate < 1.0)).to(tl.int32), 0) > 0:
+            for level in tl.static_range(num_bifurcation_levels):
+                level_idx = offs * num_bifurcation_levels + level
+                updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + level_idx, mask=mask)
+                updated_bifurcation_outflow *= limit_rate
+                tl.store(bifurcation_outflow_ptr + level_idx, updated_bifurcation_outflow, mask=mask)
 
-    # P2STOOUT flows, multiplied by the step in compute_inflow.
-    pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
-    neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + bifurcation_catchment_idx, pos_flow, mask=mask, sem="relaxed")
-    tl.atomic_add(outgoing_storage_ptr + bifurcation_downstream_idx, -neg_flow, mask=mask, sem="relaxed")
+        # P2STOOUT flows, multiplied by the step in compute_inflow.
+        pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
+        neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
+        tl.atomic_add(outgoing_storage_ptr + bifurcation_catchment_idx, pos_flow, mask=mask & (pos_flow > 0.0), sem="relaxed")
+        tl.atomic_add(outgoing_storage_ptr + bifurcation_downstream_idx, -neg_flow, mask=mask & (neg_flow < 0.0), sem="relaxed")
 
 
 @triton.jit
@@ -681,7 +677,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_outflow_ptr,                    # *f32: Bifurcation outflow (in/out)
     bifurcation_width_ptr,                      # *f32: Bifurcation width
     bifurcation_length_ptr,                     # *f32: Bifurcation length
-    bifurcation_elevation_ptr,                  # *f32: Bifurcation length
+    bifurcation_elevation_ptr,                  # *f32: Bifurcation elevation
     bifurcation_cross_section_depth_ptr,   # *f32: Bifurcation cross-section depth
     river_depth_ptr,                            # *f32: River depth
     protected_depth_ptr,                        # *f32: Protected depth
@@ -693,7 +689,7 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     protected_storage_ptr,                      # *f64: Protected storage
     outgoing_storage_ptr,                       # *f64: Outgoing storage (in/out)
     gravity: tl.constexpr,                      # f32: Gravity constant
-    time_step_ptr,                                  # f32: Time step
+    time_step_ptr,                                  # *f32: Time step pointer
     num_bifurcation_paths: tl.constexpr,        # Total number of bifurcation paths
     num_bifurcation_levels: tl.constexpr,       # int: Number of bifurcation levels    
     ensemble_size: tl.constexpr,
@@ -800,19 +796,6 @@ def compute_levee_bifurcation_outflow_batched_kernel(
     bifurcation_slope = hm.divide(bifurcation_water_surface_elevation - bifurcation_water_surface_elevation_downstream, bifurcation_length)
     bifurcation_slope = hm.clamp(bifurcation_slope, -ROUTING_SLOPE_LIMIT, ROUTING_SLOPE_LIMIT)
 
-    # Storage change limiter calculation
-    bifurcation_total_storage = hm.to_compute(
-        tl.load(river_storage_ptr + catchment_cell, mask=mask, other=0.0)
-        + tl.load(flood_storage_ptr + catchment_cell, mask=mask, other=0.0)
-        + tl.load(protected_storage_ptr + catchment_cell, mask=mask, other=0.0),
-        bifurcation_length,
-    )
-    bifurcation_total_storage_downstream = hm.to_compute(
-        tl.load(river_storage_ptr + downstream_cell, mask=mask, other=0.0)
-        + tl.load(flood_storage_ptr + downstream_cell, mask=mask, other=0.0)
-        + tl.load(protected_storage_ptr + downstream_cell, mask=mask, other=0.0),
-        bifurcation_length,
-    )
     sum_bifurcation_outflow = tl.zeros_like(bifurcation_length)
 
     # Base offsets for level-dependent arrays
@@ -831,20 +814,12 @@ def compute_levee_bifurcation_outflow_batched_kernel(
                 bifurcation_closed, DISABLED_BIFURCATION_ELEVATION, bifurcation_elevation
             )
         
-        # Calculate bifurcation cross-section depth
-        # Level 0: River channel (use river WSE)
-        # Level > 0: Overland (use protected WSE)
-        
         if level == 0:
             current_max_wse = max_bifurcation_water_surface_elevation
         else:
             current_max_wse = max_bifurcation_protected_water_surface_elevation
 
         updated_bifurcation_cross_section_depth = tl.maximum(current_max_wse - bifurcation_elevation, 0.0)
-        
-        # Calculate semi-implicit flow depth for bifurcation
-        # Level 0: Semi-implicit
-        # Level > 0: Explicit (no semi-implicit)
         
         if level == 0:
             semi_implicit_depth = hm.sqrt(
@@ -859,39 +834,57 @@ def compute_levee_bifurcation_outflow_batched_kernel(
         else:
             bifurcation_semi_implicit_flow_depth = updated_bifurcation_cross_section_depth
         
-        bifurcation_width = tl.load(bifurcation_width_ptr + width_base + level_idx, mask=mask, other=0.0)
-        bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
-
-        unit_bifurcation_outflow = hm.divide(bifurcation_outflow, bifurcation_width)
-
-        numerator = bifurcation_width * (
-            unit_bifurcation_outflow + gravity * time_step 
-            * bifurcation_semi_implicit_flow_depth * bifurcation_slope
-        )
-        denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
-                    * hm.divide(1.0, bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * hm.cbrt(bifurcation_semi_implicit_flow_depth))
-        
-        updated_bifurcation_outflow = hm.divide(numerator, denominator)
         bifurcation_condition = bifurcation_semi_implicit_flow_depth > hm.constant(1e-5, bifurcation_semi_implicit_flow_depth)
-        updated_bifurcation_outflow = tl.where(bifurcation_condition, updated_bifurcation_outflow, 0.0)
+        updated_bifurcation_outflow = tl.zeros_like(bifurcation_length)
+        if tl.sum((mask & bifurcation_condition).to(tl.int32), 0) > 0:
+            bifurcation_width = tl.load(bifurcation_width_ptr + width_base + level_idx, mask=mask, other=1.0)
+            bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask, other=0.0)
+
+            unit_bifurcation_outflow = hm.divide(bifurcation_outflow, bifurcation_width)
+
+            numerator = bifurcation_width * (
+                unit_bifurcation_outflow + gravity * time_step 
+                * bifurcation_semi_implicit_flow_depth * bifurcation_slope
+            )
+            denominator = 1.0 + gravity * time_step * (bifurcation_manning * bifurcation_manning) * tl.abs(unit_bifurcation_outflow) \
+                        * hm.divide(1.0, bifurcation_semi_implicit_flow_depth * bifurcation_semi_implicit_flow_depth * hm.cbrt(bifurcation_semi_implicit_flow_depth))
+            
+            updated_bifurcation_outflow = tl.where(
+                bifurcation_condition, hm.divide(numerator, denominator), 0.0
+            )
         sum_bifurcation_outflow += updated_bifurcation_outflow
         tl.store(bifurcation_cross_section_depth_ptr + member_offset_levels + level_idx, updated_bifurcation_cross_section_depth, mask=mask)
         tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
     # CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
-    limit_rate = tl.where(
-        sum_bifurcation_outflow != 0.0,
-        hm.at_most(hm.divide(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream), tl.abs(sum_bifurcation_outflow) * time_step), 1.0),
-        hm.constant(1.0, sum_bifurcation_outflow),
-    )
-    sum_bifurcation_outflow *= limit_rate
-    for level in tl.static_range(num_bifurcation_levels):
-        level_idx = offs * num_bifurcation_levels + level
-        updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask)
-        updated_bifurcation_outflow *= limit_rate
-        tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
+    active_path = mask & (sum_bifurcation_outflow != 0.0)
+    if tl.sum(active_path.to(tl.int32), 0) > 0:
+        bifurcation_total_storage = hm.to_compute(
+            tl.load(river_storage_ptr + catchment_cell, mask=active_path, other=0.0)
+            + tl.load(flood_storage_ptr + catchment_cell, mask=active_path, other=0.0)
+            + tl.load(protected_storage_ptr + catchment_cell, mask=active_path, other=0.0),
+            bifurcation_length,
+        )
+        bifurcation_total_storage_downstream = hm.to_compute(
+            tl.load(river_storage_ptr + downstream_cell, mask=active_path, other=0.0)
+            + tl.load(flood_storage_ptr + downstream_cell, mask=active_path, other=0.0)
+            + tl.load(protected_storage_ptr + downstream_cell, mask=active_path, other=0.0),
+            bifurcation_length,
+        )
+        limit_rate = tl.where(
+            active_path,
+            hm.at_most(hm.divide(BACKFLOW_STORAGE_FRACTION * tl.minimum(bifurcation_total_storage, bifurcation_total_storage_downstream), tl.abs(sum_bifurcation_outflow) * time_step), 1.0),
+            hm.constant(1.0, sum_bifurcation_outflow),
+        )
+        sum_bifurcation_outflow *= limit_rate
+        if tl.sum((active_path & (limit_rate < 1.0)).to(tl.int32), 0) > 0:
+            for level in tl.static_range(num_bifurcation_levels):
+                level_idx = offs * num_bifurcation_levels + level
+                updated_bifurcation_outflow = tl.load(bifurcation_outflow_ptr + member_offset_levels + level_idx, mask=mask)
+                updated_bifurcation_outflow *= limit_rate
+                tl.store(bifurcation_outflow_ptr + member_offset_levels + level_idx, updated_bifurcation_outflow, mask=mask)
 
-    # P2STOOUT flows, multiplied by the step in compute_inflow.
-    pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
-    neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
-    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_catchment_idx, pos_flow, mask=mask, sem="relaxed")
-    tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_downstream_idx, -neg_flow, mask=mask, sem="relaxed")
+        # P2STOOUT flows, multiplied by the step in compute_inflow.
+        pos_flow = tl.maximum(sum_bifurcation_outflow, 0.0)
+        neg_flow = tl.minimum(sum_bifurcation_outflow, 0.0)
+        tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_catchment_idx, pos_flow, mask=mask & (pos_flow > 0.0), sem="relaxed")
+        tl.atomic_add(outgoing_storage_ptr + member_offset_catchments + bifurcation_downstream_idx, -neg_flow, mask=mask & (neg_flow < 0.0), sem="relaxed")

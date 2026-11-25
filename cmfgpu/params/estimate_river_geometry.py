@@ -496,7 +496,8 @@ def estimate_river_geometry(
         Must contain ``catchment_id`` and the variable *clm_var*.
     parameter_nc : path
         ``parameters.nc`` produced by :class:`MERITMap`.  Must contain
-        ``catchment_id``, ``downstream_id``, ``river_width``, ``river_height``.
+        ``catchment_id``, ``downstream_id``, ``catchment_elevation``, ``river_length``
+        (``river_width`` and ``river_height`` are created or updated in place).
         If the file also contains ``satellite_width``, the power-law width
         is automatically fused with satellite data via
         :func:`_fuse_satellite_width`.

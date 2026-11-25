@@ -18,26 +18,29 @@ static inline BifurcationLevelResult bifurcation_level_inline(
     BifurcationLevelResult result;
     result.cross_section_depth = max(
         maximum_water_surface - elevation, 0.0f);
-    float flow_depth = semi_implicit_depth
-        ? max(
-            sqrt(result.cross_section_depth * previous_cross_section_depth),
-            sqrt(result.cross_section_depth * 0.01f))
-        : result.cross_section_depth;
+    float flow_depth = 0.0f;
+    if (result.cross_section_depth > 0.0f) {
+        flow_depth = semi_implicit_depth
+            ? max(
+                cmf_sqrt(result.cross_section_depth * previous_cross_section_depth),
+                cmf_sqrt(result.cross_section_depth * 0.01f))
+            : result.cross_section_depth;
+    }
     result.outflow = 0.0f;
     if (flow_depth > 1e-5f) {
-        float unit_outflow = previous_outflow / width;
+        float unit_outflow = cmf_div(previous_outflow, width);
         float numerator = width * (
             unit_outflow + gravity * time_step * flow_depth * slope);
         float denominator = 1.0f
             + gravity * time_step * manning * manning
-                * fabs(unit_outflow) * pow(flow_depth, -7.0f / 3.0f);
-        result.outflow = numerator / denominator;
+                * fabs(unit_outflow) * cmf_inv_d73(flow_depth);
+        result.outflow = cmf_div(numerator, denominator);
     }
     return result;
 }
 
 
-static inline float bifurcation_outflow_inline(uint i,
+static inline float bifurcation_outflow_inline(long path, long member,
     device const int* bifurcation_catchment_idx_ptr,
     device const int* bifurcation_downstream_idx_ptr,
     device const float* bifurcation_manning_ptr,
@@ -55,7 +58,6 @@ static inline float bifurcation_outflow_inline(uint i,
     device const float* time_step_ptr,
     long num_bifurcation_paths,
     int num_bifurcation_levels,
-    long ensemble_size,
     long num_catchments,
     bool batched_bifurcation_manning,
     bool batched_bifurcation_width,
@@ -65,12 +67,7 @@ static inline float bifurcation_outflow_inline(uint i,
     bool batched_catchment_elevation,
     device const uchar* is_dam_related_ptr,
     bool has_reservoir) {
-long num_paths = num_bifurcation_paths;
-    long total = num_paths * ensemble_size;
-
-
-    long path = (long)i % num_paths;
-    long member = (long)i / num_paths;
+    long num_paths = num_bifurcation_paths;
     long path_offset = member * num_paths;
     long catchment_offset = member * num_catchments;
     long level_offset = path_offset * (long)num_bifurcation_levels;
@@ -100,7 +97,7 @@ long num_paths = num_bifurcation_paths;
            - river_height_ptr[downstream_height_idx]);
     float maximum_surface = max(water_surface, downstream_surface);
     float slope = clamp(
-        (water_surface - downstream_surface) / length, -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
+        cmf_div(water_surface - downstream_surface, length), -CMF_ROUTING_SLOPE_LIMIT, CMF_ROUTING_SLOPE_LIMIT);
     float time_step = time_step_ptr[0];
 
     long manning_offset = batched_bifurcation_manning ? level_offset : 0;
@@ -128,41 +125,38 @@ long num_paths = num_bifurcation_paths;
         total_outflow += result.outflow;
     }
 
-    float available_storage = float(min(
-        river_storage_ptr[catchment_cell]
-            + flood_storage_ptr[catchment_cell],
-        river_storage_ptr[downstream_cell]
-            + flood_storage_ptr[downstream_cell]));
     // v4.23 storage-change limiter; a path whose levels sum to zero is left as is.
-    float limit = total_outflow != 0.0f
-        ? min(CMF_BACKFLOW_STORAGE_FRACTION * available_storage
-              / (fabs(total_outflow) * time_step), 1.0f)
-        : 1.0f;
-    total_outflow *= limit;
-    for (int level = 0; level < num_bifurcation_levels; ++level) {
-        long state_level = level_offset + path_level + level;
-        bifurcation_outflow_ptr[state_level] *= limit;
+    if (total_outflow != 0.0f) {
+        cmf_storage c_r = river_storage_ptr[catchment_cell];
+        cmf_storage c_f = flood_storage_ptr[catchment_cell];
+        cmf_storage c_tot = (float(c_f) == 0.0f) ? c_r : (c_r + c_f);
+        cmf_storage d_r = river_storage_ptr[downstream_cell];
+        cmf_storage d_f = flood_storage_ptr[downstream_cell];
+        cmf_storage d_tot = (float(d_f) == 0.0f) ? d_r : (d_r + d_f);
+        float available_storage = float(min(c_tot, d_tot));
+        float limit = min(cmf_div(CMF_BACKFLOW_STORAGE_FRACTION * available_storage,
+            fabs(total_outflow) * time_step), 1.0f);
+        if (limit < 1.0f) {
+            total_outflow *= limit;
+            for (int level = 0; level < num_bifurcation_levels; ++level) {
+                long state_level = level_offset + path_level + level;
+                bifurcation_outflow_ptr[state_level] *= limit;
+            }
+        }
     }
-
 
     return total_outflow;
 }
 
-static inline float bifurcation_inflow_inline(uint i,
+static inline float bifurcation_inflow_inline(long path, long member,
     device const int* bifurcation_catchment_idx_ptr,
     device const int* bifurcation_downstream_idx_ptr,
     device const float* limit_rate_ptr,
     device float* bifurcation_outflow_ptr,
     long num_bifurcation_paths,
     int num_bifurcation_levels,
-    long ensemble_size,
     long num_catchments) {
-long num_paths = num_bifurcation_paths;
-    long total = num_paths * ensemble_size;
-
-
-    long path = (long)i % num_paths;
-    long member = (long)i / num_paths;
+    long num_paths = num_bifurcation_paths;
     long catchment_offset = member * num_catchments;
     long level_offset =
         member * num_paths * (long)num_bifurcation_levels;
@@ -179,8 +173,10 @@ long num_paths = num_bifurcation_paths;
         long item = path * (long)num_bifurcation_levels + level;
         float outflow = bifurcation_outflow_ptr[level_offset + item];
         raw_sum += outflow;
-        outflow *= outflow >= 0.0f ? local_limit : downstream_limit;
-        bifurcation_outflow_ptr[level_offset + item] = outflow;
+        float rate = outflow >= 0.0f ? local_limit : downstream_limit;
+        if (rate != 1.0f) {
+            bifurcation_outflow_ptr[level_offset + item] = outflow * rate;
+        }
     }
 
     float net = raw_sum >= 0.0f
@@ -190,8 +186,13 @@ long num_paths = num_bifurcation_paths;
 }
 
 // HYDROFORGE METAL KERNEL BODY: compute_bifurcation_outflow
-if ((long)i >= *args.num_bifurcation_paths * *args.ensemble_size) return;
-float flow = bifurcation_outflow_inline(i,
+long num_paths = *args.num_bifurcation_paths;
+long ensemble_size = *args.ensemble_size;
+if ((long)i >= num_paths * ensemble_size) return;
+long path, member;
+cmf_decompose_index(i, num_paths, ensemble_size, path, member);
+long num_catchments = *args.num_catchments;
+float flow = bifurcation_outflow_inline(path, member,
     args.bifurcation_catchment_idx_ptr,
     args.bifurcation_downstream_idx_ptr,
     args.bifurcation_manning_ptr,
@@ -207,43 +208,49 @@ float flow = bifurcation_outflow_inline(i,
     args.flood_storage_ptr,
     *args.gravity,
     args.time_step_ptr,
-    *args.num_bifurcation_paths,
+    num_paths,
     num_bifurcation_levels,
-    *args.ensemble_size,
-    *args.num_catchments,
+    num_catchments,
     batched_bifurcation_manning,
     batched_bifurcation_width,
     batched_bifurcation_length,
     batched_bifurcation_elevation,
     batched_river_height,
     batched_catchment_elevation,
-    args.is_dam_related_ptr + (batched_is_dam_related ? ((long)i / *args.num_bifurcation_paths) * (*args.num_catchments) : 0),
+    args.is_dam_related_ptr + (batched_is_dam_related ? member * num_catchments : 0),
     HAS_RESERVOIR);
 #ifdef HF_HP_ENABLED
 args.bifurcation_path_flow_ptr[i] = flow;
 #else
-long path = (long)i % *args.num_bifurcation_paths;
-long offset = ((long)i / *args.num_bifurcation_paths) * *args.num_catchments;
-atomic_fetch_add_explicit(args.outgoing_storage_ptr + offset + args.bifurcation_catchment_idx_ptr[path], max(flow, 0.0f), memory_order_relaxed);
-atomic_fetch_add_explicit(args.outgoing_storage_ptr + offset + args.bifurcation_downstream_idx_ptr[path], -min(flow, 0.0f), memory_order_relaxed);
+long offset = member * num_catchments;
+if (flow > 0.0f) {
+    atomic_fetch_add_explicit(args.outgoing_storage_ptr + offset + args.bifurcation_catchment_idx_ptr[path], flow, memory_order_relaxed);
+} else if (flow < 0.0f) {
+    atomic_fetch_add_explicit(args.outgoing_storage_ptr + offset + args.bifurcation_downstream_idx_ptr[path], -flow, memory_order_relaxed);
+}
 #endif
 
 // HYDROFORGE METAL KERNEL BODY: compute_bifurcation_inflow
-if ((long)i >= *args.num_bifurcation_paths * *args.ensemble_size) return;
-float flow = bifurcation_inflow_inline(i,
+long num_paths = *args.num_bifurcation_paths;
+long ensemble_size = *args.ensemble_size;
+if ((long)i >= num_paths * ensemble_size) return;
+long path, member;
+cmf_decompose_index(i, num_paths, ensemble_size, path, member);
+long num_catchments = *args.num_catchments;
+float flow = bifurcation_inflow_inline(path, member,
     args.bifurcation_catchment_idx_ptr,
     args.bifurcation_downstream_idx_ptr,
     args.limit_rate_ptr,
     args.bifurcation_outflow_ptr,
-    *args.num_bifurcation_paths,
+    num_paths,
     num_bifurcation_levels,
-    *args.ensemble_size,
-    *args.num_catchments);
+    num_catchments);
 #ifdef HF_HP_ENABLED
 args.bifurcation_path_flow_ptr[i] = flow;
 #else
-long path = (long)i % *args.num_bifurcation_paths;
-long offset = ((long)i / *args.num_bifurcation_paths) * *args.num_catchments;
-atomic_fetch_add_explicit(args.global_bifurcation_outflow_ptr + offset + args.bifurcation_catchment_idx_ptr[path], flow, memory_order_relaxed);
-atomic_fetch_add_explicit(args.global_bifurcation_outflow_ptr + offset + args.bifurcation_downstream_idx_ptr[path], -flow, memory_order_relaxed);
+if (flow != 0.0f) {
+    long offset = member * num_catchments;
+    atomic_fetch_add_explicit(args.global_bifurcation_outflow_ptr + offset + args.bifurcation_catchment_idx_ptr[path], flow, memory_order_relaxed);
+    atomic_fetch_add_explicit(args.global_bifurcation_outflow_ptr + offset + args.bifurcation_downstream_idx_ptr[path], -flow, memory_order_relaxed);
+}
 #endif

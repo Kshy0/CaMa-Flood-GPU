@@ -8,6 +8,7 @@ import numpy as np
 import triton
 import triton.language as tl
 from hydroforge.kernels import triton_math as hm
+
 from cmfgpu import config as _constants
 
 BACKFLOW_STORAGE_FRACTION = tl.constexpr(_constants.BACKFLOW_STORAGE_FRACTION)
@@ -19,7 +20,7 @@ ROUTING_SLOPE_LIMIT = tl.constexpr(_constants.ROUTING_SLOPE_LIMIT)
 @triton.jit
 def outgoing_flows_inline(river_outflow, flood_outflow, storage_dtype):
     """P2STOOUT flows of CALC_INFLOW_LSPAMAT: the cell's own positive
-    flows, and the flow reversed into its downstream cell."""
+    outflows, and the reversed flow out of its downstream cell."""
     own_flow = (
         tl.maximum(river_outflow, 0.0) + tl.maximum(flood_outflow, 0.0)
     ).to(storage_dtype)
@@ -74,7 +75,7 @@ def compute_outflow_kernel(
     global_bifurcation_outflow_ptr,          # *f64 global bifurcation outflow (turn to zero)
     outgoing_storage_ptr,                   # *f64 output for storage (fused part)
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
-    time_step_ptr,                              # f32 scalar time step
+    time_step_ptr,                              # *f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     BLOCK_SIZE: tl.constexpr,               # block size
     HAS_BIFURCATION: tl.constexpr = True,   # whether bifurcation module is active
@@ -193,15 +194,13 @@ def compute_outflow_kernel(
     )
 
     #----------------------------------------------------------------------
-    # (6) Current flood area (approximate) & semi-implicit effective area
+    # (6) Current flood area (approximate)
     #----------------------------------------------------------------------
-    updated_flood_cross_section_area = tl.maximum(
-        hm.divide(flood_storage, river_length) - flood_depth * river_width,
-        0.0
-    )
-    flood_implicit_area = hm.at_least(hm.sqrt(
-        updated_flood_cross_section_area * hm.at_least(flood_cross_section_area, 1e-6)
-    ), 1e-6)
+    flood_area_base = hm.divide(flood_storage, river_length)
+    # HF-UPSTREAM-FIX[CMF-01]: Do not double-subtract above-channel area from floodplain cross-section
+    #   upstream: CaMa-Flood v4.31 cmf_calc_outflw_mod.F90:95,152 (and damout:488) subtracts D2FLDDPH*D2RIVWTH from P2FLDSTO/L even though P2FLDSTO already excludes above-channel storage.
+    #   fix: Use max(flood_storage / river_length, 0) directly as floodplain cross-sectional area.
+    updated_flood_cross_section_area = tl.maximum(flood_area_base, 0.0)
 
     #----------------------------------------------------------------------
     # (7) Update river outflow
@@ -218,7 +217,7 @@ def compute_outflow_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use libdevice.pow() for power calculation
+    # Use hm.cbrt() instead of pow() for fractional depth power
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
                       * hm.divide(1.0, river_semi_implicit_flow_depth * river_semi_implicit_flow_depth * hm.cbrt(river_semi_implicit_flow_depth))
 
@@ -226,21 +225,23 @@ def compute_outflow_kernel(
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
 
     #----------------------------------------------------------------------
-    # (8) Update flood outflow
+    # (8) Update flood outflow (skip block when no lane is flooded)
     #----------------------------------------------------------------------
     flood_condition = (flood_semi_implicit_flow_depth > flow_threshold) & (updated_flood_cross_section_area > flow_threshold)
-
-    numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
-    
-    # Use libdevice.pow() for power calculation
-    denominator_flood = 1.0 + hm.divide(
-        gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow)
-        * hm.divide(1.0, flood_semi_implicit_flow_depth * hm.cbrt(flood_semi_implicit_flow_depth)),
-        flood_implicit_area,
-    )
-                      
-    updated_flood_outflow = hm.divide(numerator_flood, denominator_flood)
-    updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
+    updated_flood_outflow = tl.zeros_like(flood_outflow)
+    if tl.sum((mask & flood_condition).to(tl.int32), 0) > 0:
+        flood_implicit_area = hm.at_least(hm.sqrt(
+            updated_flood_cross_section_area * hm.at_least(flood_cross_section_area, 1e-6)
+        ), 1e-6)
+        numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
+        denominator_flood = 1.0 + hm.divide(
+            gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow)
+            * hm.divide(1.0, flood_semi_implicit_flow_depth * hm.cbrt(flood_semi_implicit_flow_depth)),
+            flood_implicit_area,
+        )
+        updated_flood_outflow = tl.where(
+            flood_condition, hm.divide(numerator_flood, denominator_flood), 0.0
+        )
 
     #----------------------------------------------------------------------
     # (9) Flood-direction mask and storage-change limiter
@@ -248,8 +249,8 @@ def compute_outflow_kernel(
     # Floodplain flow only moves with the river flow (rivout*fldout > 0).
     same_direction = (updated_river_outflow * updated_flood_outflow) > 0.0
     updated_flood_outflow = tl.where(same_direction, updated_flood_outflow, 0.0)
-    # v4.23 storage-change limiter on every non-mouth cell: flow towards the
-    # upstream cell removes at most 5% of the storage per step.
+    # v4.23 storage-change limiter on every non-mouth cell: reverse flow from
+    # downstream into this cell is capped at 5% of this cell's storage per step.
     backflow = hm.at_least(
         (-updated_river_outflow - updated_flood_outflow) * time_step,
         BACKFLOW_VOLUME_FLOOR,
@@ -269,7 +270,7 @@ def compute_outflow_kernel(
             is_dam_upstream_ptr + offs, mask=mask, other=0,
         ) != 0
         # Bed slope
-        bed_slope = hm.divide(catchment_elevation - tl.load(catchment_elevation_ptr + downstream_idx, mask=mask, other=0.0), downstream_distance)
+        bed_slope = hm.divide(catchment_elevation - catchment_elevation_downstream, downstream_distance)
         bed_slope = hm.at_least(bed_slope, min_kinematic_slope)
         # River kinematic: Q = W * n^{-1} * S^{0.5} * d^{5/3}
         kin_riv_vel = hm.divide(1.0, river_manning) * hm.sqrt(bed_slope) * hm.cbrt(river_depth * river_depth)
@@ -279,8 +280,7 @@ def compute_outflow_kernel(
         # Flood kinematic: slope clamped to 0.005
         bed_slope_f = hm.at_most(bed_slope, ROUTING_SLOPE_LIMIT)
         kin_fld_vel = hm.divide(1.0, flood_manning) * hm.sqrt(bed_slope_f) * hm.cbrt(flood_depth * flood_depth)
-        kin_fld_area = tl.maximum(hm.divide(flood_storage, river_length) - flood_depth * river_width, 0.0)
-        kin_fld = tl.minimum(kin_fld_area * kin_fld_vel, hm.divide(flood_storage, time_step))
+        kin_fld = tl.minimum(updated_flood_cross_section_area * kin_fld_vel, hm.divide(flood_storage, time_step))
         # Override
         updated_river_outflow = tl.where(is_dam_up, kin_riv, updated_river_outflow)
         updated_flood_outflow = tl.where(is_dam_up, kin_fld, updated_flood_outflow)
@@ -292,13 +292,7 @@ def compute_outflow_kernel(
     tl.store(flood_outflow_ptr + offs, updated_flood_outflow, mask=mask)
     tl.store(river_cross_section_depth_ptr + offs, updated_river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_ptr + offs, updated_flood_cross_section_depth, mask=mask)
-    # Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
-    previous_flood_area = tl.maximum(
-        hm.divide(flood_storage, river_length)
-        - tl.maximum(river_depth - river_height, 0.0) * river_width,
-        0.0,
-    )
-    tl.store(flood_cross_section_area_ptr + offs, previous_flood_area, mask=mask)
+    tl.store(flood_cross_section_area_ptr + offs, updated_flood_cross_section_area, mask=mask)
     
     tl.store(river_inflow_ptr + offs, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + offs, 0.0, mask=mask)
@@ -312,8 +306,13 @@ def compute_outflow_kernel(
         updated_river_outflow, updated_flood_outflow,
         outgoing_storage_ptr.dtype.element_ty,
     )
-    tl.atomic_add(outgoing_storage_ptr + offs, own_flow, mask=mask, sem="relaxed")
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx, reversed_flow, mask=mask & ~is_river_mouth, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + offs, own_flow, mask=mask & (own_flow != 0.0), sem="relaxed")
+    tl.atomic_add(
+        outgoing_storage_ptr + downstream_idx,
+        reversed_flow,
+        mask=mask & (~is_river_mouth) & (reversed_flow != 0.0),
+        sem="relaxed",
+    )
     
 
 
@@ -355,13 +354,18 @@ def compute_inflow_kernel(
         step, river_outflow,
     )
     downstream_idx   = tl.load(downstream_idx_ptr        + offs, mask=mask, other=0)
-    limit_rate_downstream = supply_rate_inline(
-        tl.load(outgoing_storage_ptr + downstream_idx, mask=mask, other=0.0),
-        tl.load(river_storage_ptr + downstream_idx, mask=mask, other=0.0)
-        + tl.load(flood_storage_ptr + downstream_idx, mask=mask, other=0.0),
-        step, river_outflow,
-    )
-    rate = tl.where(river_outflow > 0.0, limit_rate, limit_rate_downstream)
+    is_river_mouth = downstream_idx == offs
+    not_mouth = mask & (~is_river_mouth)
+    need_dn = not_mouth & (river_outflow <= 0.0) & ((river_outflow != 0.0) | (flood_outflow != 0.0))
+    rate = limit_rate
+    if tl.sum(need_dn.to(tl.int32), 0) > 0:
+        limit_rate_downstream = supply_rate_inline(
+            tl.load(outgoing_storage_ptr + downstream_idx, mask=need_dn, other=0.0),
+            tl.load(river_storage_ptr + downstream_idx, mask=need_dn, other=0.0)
+            + tl.load(flood_storage_ptr + downstream_idx, mask=need_dn, other=0.0),
+            step, river_outflow,
+        )
+        rate = tl.where(need_dn, limit_rate_downstream, limit_rate)
     updated_river_outflow = river_outflow * rate
     updated_flood_outflow = flood_outflow * rate
 
@@ -372,17 +376,15 @@ def compute_inflow_kernel(
         tl.store(limit_rate_ptr + offs, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
-    is_river_mouth = downstream_idx == offs
-    not_mouth = mask & (~is_river_mouth)
-    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=not_mouth, sem="relaxed")
-    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=not_mouth, sem="relaxed")
+    tl.atomic_add(river_inflow_ptr + downstream_idx, updated_river_outflow, mask=not_mouth & (updated_river_outflow != 0.0), sem="relaxed")
+    tl.atomic_add(flood_inflow_ptr + downstream_idx, updated_flood_outflow, mask=not_mouth & (updated_flood_outflow != 0.0), sem="relaxed")
 
     # -------- Accumulate reservoir inflow --------
     if HAS_RESERVOIR:
         is_downstream_res = tl.load(is_reservoir_ptr + downstream_idx, mask=not_mouth, other=0) != 0
         reservoir_dtype = reservoir_total_inflow_ptr.dtype.element_ty
         total_outflow = updated_river_outflow.to(reservoir_dtype) + updated_flood_outflow.to(reservoir_dtype)
-        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx, total_outflow, mask=not_mouth & is_downstream_res, sem="relaxed")
+        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx, total_outflow, mask=not_mouth & is_downstream_res & (total_outflow != 0.0), sem="relaxed")
 
 
 @triton.jit
@@ -418,7 +420,7 @@ def compute_outflow_batched_kernel(
     global_bifurcation_outflow_ptr,          # *f64 global bifurcation outflow (turn to zero)
     outgoing_storage_ptr,                   # *f64 output for storage (fused part)
     gravity: tl.constexpr,                  # f32 scalar gravity acceleration
-    time_step_ptr,                              # f32 scalar time step
+    time_step_ptr,                              # *f32 scalar time step
     num_catchments: tl.constexpr,           # total number of elements
     ensemble_size: tl.constexpr,                             # number of members
     batched_is_dam_upstream: tl.constexpr,
@@ -561,15 +563,13 @@ def compute_outflow_batched_kernel(
     )
 
     #----------------------------------------------------------------------
-    # (6) Current flood area (approximate) & semi-implicit effective area
+    # (6) Current flood area (approximate)
     #----------------------------------------------------------------------
-    updated_flood_cross_section_area = tl.maximum(
-        hm.divide(flood_storage, river_length) - flood_depth * river_width,
-        0.0
-    )
-    flood_implicit_area = hm.at_least(hm.sqrt(
-        updated_flood_cross_section_area * hm.at_least(flood_cross_section_area, 1e-6)
-    ), 1e-6)
+    flood_area_base = hm.divide(flood_storage, river_length)
+    # HF-UPSTREAM-FIX[CMF-01]: Do not double-subtract above-channel area from floodplain cross-section
+    #   upstream: CaMa-Flood v4.31 cmf_calc_outflw_mod.F90:95,152 (and damout:488) subtracts D2FLDDPH*D2RIVWTH from P2FLDSTO/L even though P2FLDSTO already excludes above-channel storage.
+    #   fix: Use max(flood_storage / river_length, 0) directly as floodplain cross-sectional area.
+    updated_flood_cross_section_area = tl.maximum(flood_area_base, 0.0)
 
     #----------------------------------------------------------------------
     # (7) Update river outflow
@@ -586,7 +586,7 @@ def compute_outflow_batched_kernel(
         * river_semi_implicit_flow_depth * river_slope
     )
     
-    # Use libdevice.pow() for power calculation
+    # Use hm.cbrt() instead of pow() for fractional depth power
     denominator_river = 1.0 + gravity * time_step * (river_manning * river_manning) * tl.abs(unit_river_outflow) \
                       * hm.divide(1.0, river_semi_implicit_flow_depth * river_semi_implicit_flow_depth * hm.cbrt(river_semi_implicit_flow_depth))
 
@@ -594,21 +594,23 @@ def compute_outflow_batched_kernel(
     updated_river_outflow = tl.where(river_condition, updated_river_outflow, 0.0)
 
     #----------------------------------------------------------------------
-    # (8) Update flood outflow
+    # (8) Update flood outflow (skip block when no lane is flooded)
     #----------------------------------------------------------------------
     flood_condition = (flood_semi_implicit_flow_depth > flow_threshold) & (updated_flood_cross_section_area > flow_threshold)
-
-    numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
-    
-    # Use libdevice.pow() for power calculation
-    denominator_flood = 1.0 + hm.divide(
-        gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow)
-        * hm.divide(1.0, flood_semi_implicit_flow_depth * hm.cbrt(flood_semi_implicit_flow_depth)),
-        flood_implicit_area,
-    )
-                      
-    updated_flood_outflow = hm.divide(numerator_flood, denominator_flood)
-    updated_flood_outflow = tl.where(flood_condition, updated_flood_outflow, 0.0)
+    updated_flood_outflow = tl.zeros_like(flood_outflow)
+    if tl.sum((mask & flood_condition).to(tl.int32), 0) > 0:
+        flood_implicit_area = hm.at_least(hm.sqrt(
+            updated_flood_cross_section_area * hm.at_least(flood_cross_section_area, 1e-6)
+        ), 1e-6)
+        numerator_flood = flood_outflow + gravity * time_step * flood_implicit_area * flood_slope
+        denominator_flood = 1.0 + hm.divide(
+            gravity * time_step * (flood_manning * flood_manning) * tl.abs(flood_outflow)
+            * hm.divide(1.0, flood_semi_implicit_flow_depth * hm.cbrt(flood_semi_implicit_flow_depth)),
+            flood_implicit_area,
+        )
+        updated_flood_outflow = tl.where(
+            flood_condition, hm.divide(numerator_flood, denominator_flood), 0.0
+        )
 
     #----------------------------------------------------------------------
     # (9) Flood-direction mask and storage-change limiter
@@ -616,8 +618,8 @@ def compute_outflow_batched_kernel(
     # Floodplain flow only moves with the river flow (rivout*fldout > 0).
     same_direction = (updated_river_outflow * updated_flood_outflow) > 0.0
     updated_flood_outflow = tl.where(same_direction, updated_flood_outflow, 0.0)
-    # v4.23 storage-change limiter on every non-mouth cell: flow towards the
-    # upstream cell removes at most 5% of the storage per step.
+    # v4.23 storage-change limiter on every non-mouth cell: reverse flow from
+    # downstream into this cell is capped at 5% of this cell's storage per step.
     backflow = hm.at_least(
         (-updated_river_outflow - updated_flood_outflow) * time_step,
         BACKFLOW_VOLUME_FLOOR,
@@ -633,21 +635,13 @@ def compute_outflow_batched_kernel(
         is_dam_up = tl.load(
             is_dam_upstream_ptr + (member_offset if batched_is_dam_upstream else 0) + catchment_idx, mask=mask, other=0,
         ) != 0
-        downstream_elevation = tl.load(
-            catchment_elevation_ptr
-            + (downstream_idx_global if batched_catchment_elevation else downstream_idx),
-            mask=mask, other=0.0,
-        )
-        bed_slope = hm.divide(catchment_elevation - downstream_elevation, downstream_distance)
+        bed_slope = hm.divide(catchment_elevation - catchment_elevation_downstream, downstream_distance)
         bed_slope = hm.at_least(bed_slope, min_kinematic_slope)
         kin_riv_vel = hm.divide(1.0, river_manning) * hm.sqrt(bed_slope) * hm.cbrt(river_depth * river_depth)
         kin_riv = tl.minimum(river_width * river_depth * kin_riv_vel, hm.divide(river_storage, time_step))
         bed_slope_f = hm.at_most(bed_slope, ROUTING_SLOPE_LIMIT)
         kin_fld_vel = hm.divide(1.0, flood_manning) * hm.sqrt(bed_slope_f) * hm.cbrt(flood_depth * flood_depth)
-        kin_fld_area = tl.maximum(
-            hm.divide(flood_storage, river_length) - flood_depth * river_width, 0.0,
-        )
-        kin_fld = tl.minimum(kin_fld_area * kin_fld_vel, hm.divide(flood_storage, time_step))
+        kin_fld = tl.minimum(updated_flood_cross_section_area * kin_fld_vel, hm.divide(flood_storage, time_step))
         updated_river_outflow = tl.where(is_dam_up, kin_riv, updated_river_outflow)
         updated_flood_outflow = tl.where(is_dam_up, kin_fld, updated_flood_outflow)
 
@@ -658,13 +652,7 @@ def compute_outflow_batched_kernel(
     tl.store(flood_outflow_ptr + idx, updated_flood_outflow, mask=mask)
     tl.store(river_cross_section_depth_ptr + idx, updated_river_cross_section_depth, mask=mask)
     tl.store(flood_cross_section_depth_ptr + idx, updated_flood_cross_section_depth, mask=mask)
-    # Next step's DARE_pr uses D2FLDDPH_PRE = max(D2RIVDPH_PRE - D2RIVHGT, 0).
-    previous_flood_area = tl.maximum(
-        hm.divide(flood_storage, river_length)
-        - tl.maximum(river_depth - river_height, 0.0) * river_width,
-        0.0,
-    )
-    tl.store(flood_cross_section_area_ptr + idx, previous_flood_area, mask=mask)
+    tl.store(flood_cross_section_area_ptr + idx, updated_flood_cross_section_area, mask=mask)
     
     tl.store(river_inflow_ptr + idx, 0.0, mask=mask)
     tl.store(flood_inflow_ptr + idx, 0.0, mask=mask)
@@ -678,8 +666,13 @@ def compute_outflow_batched_kernel(
         updated_river_outflow, updated_flood_outflow,
         outgoing_storage_ptr.dtype.element_ty,
     )
-    tl.atomic_add(outgoing_storage_ptr + idx, own_flow, mask=mask, sem="relaxed")
-    tl.atomic_add(outgoing_storage_ptr + downstream_idx_global, reversed_flow, mask=mask & ~is_river_mouth, sem="relaxed")
+    tl.atomic_add(outgoing_storage_ptr + idx, own_flow, mask=mask & (own_flow != 0.0), sem="relaxed")
+    tl.atomic_add(
+        outgoing_storage_ptr + downstream_idx_global,
+        reversed_flow,
+        mask=mask & (~is_river_mouth) & (reversed_flow != 0.0),
+        sem="relaxed",
+    )
 
 
 @triton.jit
@@ -724,13 +717,18 @@ def compute_inflow_batched_kernel(
     downstream_idx   = tl.load(downstream_idx_ptr        + catchment_idx, mask=mask, other=0)
     member_offset = (idx // num_catchments) * num_catchments
     downstream_idx_global = member_offset + downstream_idx
-    limit_rate_downstream = supply_rate_inline(
-        tl.load(outgoing_storage_ptr + downstream_idx_global, mask=mask, other=0.0),
-        tl.load(river_storage_ptr + downstream_idx_global, mask=mask, other=0.0)
-        + tl.load(flood_storage_ptr + downstream_idx_global, mask=mask, other=0.0),
-        step, river_outflow,
-    )
-    rate = tl.where(river_outflow > 0.0, limit_rate, limit_rate_downstream)
+    is_river_mouth = downstream_idx == catchment_idx
+    not_mouth = mask & (~is_river_mouth)
+    need_dn = not_mouth & (river_outflow <= 0.0) & ((river_outflow != 0.0) | (flood_outflow != 0.0))
+    rate = limit_rate
+    if tl.sum(need_dn.to(tl.int32), 0) > 0:
+        limit_rate_downstream = supply_rate_inline(
+            tl.load(outgoing_storage_ptr + downstream_idx_global, mask=need_dn, other=0.0),
+            tl.load(river_storage_ptr + downstream_idx_global, mask=need_dn, other=0.0)
+            + tl.load(flood_storage_ptr + downstream_idx_global, mask=need_dn, other=0.0),
+            step, river_outflow,
+        )
+        rate = tl.where(need_dn, limit_rate_downstream, limit_rate)
     updated_river_outflow = river_outflow * rate
     updated_flood_outflow = flood_outflow * rate
 
@@ -741,14 +739,12 @@ def compute_inflow_batched_kernel(
         tl.store(limit_rate_ptr + idx, limit_rate, mask=mask)
 
     # -------- Accumulate inflows --------
-    is_river_mouth = downstream_idx == catchment_idx
-    not_mouth = mask & (~is_river_mouth)
-    tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=not_mouth, sem="relaxed")
-    tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=not_mouth, sem="relaxed")
+    tl.atomic_add(river_inflow_ptr + downstream_idx_global, updated_river_outflow, mask=not_mouth & (updated_river_outflow != 0.0), sem="relaxed")
+    tl.atomic_add(flood_inflow_ptr + downstream_idx_global, updated_flood_outflow, mask=not_mouth & (updated_flood_outflow != 0.0), sem="relaxed")
 
     # -------- Accumulate reservoir inflow --------
     if HAS_RESERVOIR:
         is_downstream_res = tl.load(is_reservoir_ptr + downstream_idx, mask=not_mouth, other=0) != 0
         reservoir_dtype = reservoir_total_inflow_ptr.dtype.element_ty
         total_outflow = updated_river_outflow.to(reservoir_dtype) + updated_flood_outflow.to(reservoir_dtype)
-        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx_global, total_outflow, mask=not_mouth & is_downstream_res, sem="relaxed")
+        tl.atomic_add(reservoir_total_inflow_ptr + downstream_idx_global, total_outflow, mask=not_mouth & is_downstream_res & (total_outflow != 0.0), sem="relaxed")

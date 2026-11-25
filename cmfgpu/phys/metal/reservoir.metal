@@ -1,9 +1,10 @@
 // HYDROFORGE METAL KERNEL BODY: compute_reservoir_outflow
     long num_reservoirs = *args.num_reservoirs;
     long num_catchments = *args.num_catchments;
-    if ((long)i >= num_reservoirs * (*args.ensemble_size)) return;
-    long reservoir_idx = (long)i % num_reservoirs;
-    long member_index = (long)i / num_reservoirs;
+    long ensemble_size = *args.ensemble_size;
+    if ((long)i >= num_reservoirs * ensemble_size) return;
+    long reservoir_idx, member_index;
+    cmf_decompose_index(i, num_reservoirs, ensemble_size, reservoir_idx, member_index);
     long member_offset = member_index * num_catchments;
 
     int local_catchment = args.reservoir_catchment_idx_ptr[reservoir_idx];
@@ -37,16 +38,19 @@
     }
 
 #endif
-    cmf_storage storage = args.river_storage_ptr[catchment]
-        + args.flood_storage_ptr[catchment];
+    cmf_storage storage = args.river_storage_ptr[catchment];
+    cmf_storage f_sto = args.flood_storage_ptr[catchment];
+    if (float(f_sto) != 0.0f) storage = storage + f_sto;
     float river_flood_storage = float(storage);
     if (HAS_LEVEE) {
-        storage = storage + args.protected_storage_ptr[catchment];
+        cmf_storage p_sto = args.protected_storage_ptr[catchment];
+        if (float(p_sto) != 0.0f) storage = storage + p_sto;
     }
     float dam_volume = float(storage);
     long runoff_idx = batched_runoff ? catchment : local_catchment;
-    float reservoir_inflow = float(args.reservoir_total_inflow_ptr[catchment]
-        + cmf_storage(args.runoff_ptr[runoff_idx]));
+    float runoff_val = args.runoff_ptr[runoff_idx];
+    cmf_storage res_inflow_hp = args.reservoir_total_inflow_ptr[catchment];
+    float reservoir_inflow = float(runoff_val == 0.0f ? res_inflow_hp : (res_inflow_hp + runoff_val));
     args.reservoir_total_inflow_ptr[catchment] = 0.0f;
 
     long member_reservoir = member_index * num_reservoirs + reservoir_idx;
@@ -59,7 +63,7 @@
     float flood_control_outflow = args.flood_control_outflow_ptr[
         batched_flood_control_outflow ? member_reservoir : reservoir_idx];
 
-    float reservoir_outflow;
+    float reservoir_outflow = 0.0f;
     if (HAS_H22) {
         // Hanazaki et al. (2022), CaMa-Flood v4 LDAMH22.
         float normal_volume = args.normal_volume_ptr[
@@ -90,12 +94,14 @@
         } else {
             reservoir_outflow = max(reservoir_inflow, flood_control_outflow);
         }
-    } else {
+    } else if (HAS_YF) {
         float adjustment_volume = args.adjustment_volume_ptr[
             batched_adjustment_volume ? member_reservoir : reservoir_idx];
         float adjustment_outflow = args.adjustment_outflow_ptr[
             batched_adjustment_outflow ? member_reservoir : reservoir_idx];
-        if (dam_volume <= conservation_volume) {
+        if (dam_volume <= 0.0f) {
+            reservoir_outflow = 0.0f;
+        } else if (dam_volume <= conservation_volume) {
             reservoir_outflow = normal_outflow
                 * sqrt(dam_volume / conservation_volume);
         } else if (dam_volume <= adjustment_volume) {
@@ -145,12 +151,13 @@
 // HYDROFORGE METAL KERNEL BODY: fill_dam_storage
 long num_reservoirs = *args.num_reservoirs;
     long num_catchments = *args.num_catchments;
-    if ((long)i >= num_reservoirs * (*args.ensemble_size)) return;
+    long ensemble_size = *args.ensemble_size;
+    if ((long)i >= num_reservoirs * ensemble_size) return;
 
     // CMF_DAMOUT_INIT: a dam below its conservation volume starts full to
     // it, with an empty floodplain.
-    long reservoir_idx = (long)i % num_reservoirs;
-    long member_index = (long)i / num_reservoirs;
+    long reservoir_idx, member_index;
+    cmf_decompose_index(i, num_reservoirs, ensemble_size, reservoir_idx, member_index);
     if (!args.reservoir_enabled_ptr[batched_reservoir_enabled ? (long)i : reservoir_idx]) return;
     long catchment = member_index * num_catchments
         + args.reservoir_catchment_idx_ptr[reservoir_idx];

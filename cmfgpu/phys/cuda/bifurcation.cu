@@ -12,12 +12,15 @@ __device__ __forceinline__ void k_bif_inflow_cell(
     REAL lr_d = __ldg(limit_rate + di);
 
     REAL raw_sum = (REAL)0;
+    const bool limited = (lr_c != (REAL)1) || (lr_d != (REAL)1);
     for (int lv = 0; lv < num_levels; ++lv) {
         long li = t * (long)num_levels + lv;
         REAL o = outflow[li];
         raw_sum += o;
-        REAL upd = (o >= (REAL)0) ? o * lr_c : o * lr_d;
-        outflow[li] = upd;
+        if (limited) {
+            REAL upd = (o >= (REAL)0) ? o * lr_c : o * lr_d;
+            outflow[li] = upd;
+        }
     }
     REAL net = (raw_sum >= (REAL)0) ? raw_sum * lr_c : raw_sum * lr_d;
     if (net != (REAL)0) {
@@ -36,9 +39,6 @@ __device__ __forceinline__ void bif_inflow(const A& a, long t)
         a.bifurcation_outflow_ptr, a.global_bifurcation_outflow_ptr,
         a.num_bifurcation_levels, t);
 }
-
-template <typename REAL>
-__device__ __forceinline__ REAL pow73(REAL x) { return x * x * cbrt(x); }
 
 template <typename REAL, typename STO>
 __device__ __forceinline__ void k_bif_outflow_cell(
@@ -70,9 +70,6 @@ __device__ __forceinline__ void k_bif_outflow_cell(
     REAL slope = (wse_c - wse_d) / blen;
     slope = fmin(fmax(slope, (REAL)-CMF_ROUTING_SLOPE_LIMIT), (REAL)CMF_ROUTING_SLOPE_LIMIT);
 
-    REAL ts_c = (REAL)(river_storage[ci] + flood_storage[ci]);
-    REAL ts_d = (REAL)(river_storage[di] + flood_storage[di]);
-
     // Carry the per-level updated flows in registers so each level is stored
     // exactly once, instead of storing then re-loading them for the limiter.
     // CaMa bifurcation maps use NPTHLEV <= 5; the generic path below keeps
@@ -92,15 +89,17 @@ __device__ __forceinline__ void k_bif_outflow_cell(
                 REAL csd = __ldg(cs_depth + li);
                 REAL elv = closed ? (REAL)CMF_DISABLED_BIFURCATION_ELEVATION : __ldg(elevation + li);
                 REAL upd_csd = fmax(max_wse - elv, (REAL)0);
-                REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
-                if (sifd > (REAL)1e-5) {
-                    REAL w = __ldg(width + li);
-                    REAL o = outflow[li];
-                    REAL unit_o = o / w;
-                    REAL num = w * (unit_o + gravity * time_step * sifd * slope);
-                    REAL den = (REAL)1 + gravity * time_step * (man * man)
-                        * fabs(unit_o) * ((REAL)1 / pow73(sifd));
-                    upd_o = num / den;
+                if (upd_csd > (REAL)0) {
+                    REAL sifd = sqrt(upd_csd * fmax(csd, (REAL)0.01));
+                    if (sifd > (REAL)1e-5) {
+                        REAL w = __ldg(width + li);
+                        REAL o = outflow[li];
+                        REAL unit_o = o / w;
+                        REAL num = w * (unit_o + gravity * time_step * sifd * slope);
+                        REAL den = (REAL)1 + gravity * time_step * (man * man)
+                            * fabs(unit_o) * cmf_inv_d73(sifd);
+                        upd_o = num / den;
+                    }
                 }
                 sum_out += upd_o;
                 cs_depth[li] = upd_csd;
@@ -114,17 +113,18 @@ __device__ __forceinline__ void k_bif_outflow_cell(
             REAL csd = __ldg(cs_depth + li);
             REAL elv = closed ? (REAL)CMF_DISABLED_BIFURCATION_ELEVATION : __ldg(elevation + li);
             REAL upd_csd = fmax(max_wse - elv, (REAL)0);
-            REAL sifd = fmax(sqrt(upd_csd * csd), sqrt(upd_csd * (REAL)0.01));
-            bool flow_condition = sifd > (REAL)1e-5;
             REAL upd_o = (REAL)0;
-            if (flow_condition) {
-                REAL w = __ldg(width + li);
-                REAL o = outflow[li];
-                REAL unit_o = o / w;
-                REAL num = w * (unit_o + gravity * time_step * sifd * slope);
-                REAL den = (REAL)1 + gravity * time_step * (man * man)
-                    * fabs(unit_o) * ((REAL)1 / pow73(sifd));
-                upd_o = num / den;
+            if (upd_csd > (REAL)0) {
+                REAL sifd = sqrt(upd_csd * fmax(csd, (REAL)0.01));
+                if (sifd > (REAL)1e-5) {
+                    REAL w = __ldg(width + li);
+                    REAL o = outflow[li];
+                    REAL unit_o = o / w;
+                    REAL num = w * (unit_o + gravity * time_step * sifd * slope);
+                    REAL den = (REAL)1 + gravity * time_step * (man * man)
+                        * fabs(unit_o) * cmf_inv_d73(sifd);
+                    upd_o = num / den;
+                }
             }
             sum_out += upd_o;
             cs_depth[li] = upd_csd;
@@ -132,10 +132,17 @@ __device__ __forceinline__ void k_bif_outflow_cell(
         }
     }
 
-    // v4.23 storage-change limiter; a path whose levels sum to zero is left as is.
-    REAL limit_rate = (sum_out != (REAL)0)
-        ? fmin((REAL)CMF_BACKFLOW_STORAGE_FRACTION * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step), (REAL)1)
-        : (REAL)1;
+    // v4.23 storage-change limiter; load storages only for active paths.
+    REAL limit_rate = (REAL)1;
+    if (sum_out != (REAL)0) {
+        STO cr = river_storage[ci], cf = flood_storage[ci];
+        STO dr = river_storage[di], df = flood_storage[di];
+        REAL ts_c = (REAL)(cmf_is_zero_sto(cf) ? cr : (cr + cf));
+        REAL ts_d = (REAL)(cmf_is_zero_sto(df) ? dr : (dr + df));
+        limit_rate = fmin(
+            (REAL)CMF_BACKFLOW_STORAGE_FRACTION * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step),
+            (REAL)1);
+    }
     sum_out *= limit_rate;
     if (fits) {
 #pragma unroll
@@ -144,7 +151,7 @@ __device__ __forceinline__ void k_bif_outflow_cell(
                 outflow[t * (long)num_levels + lv] = upd[lv] * limit_rate;
             }
         }
-    } else {
+    } else if (limit_rate < (REAL)1) {
         for (int lv = 0; lv < num_levels; ++lv) {
             long li = t * (long)num_levels + lv;
             outflow[li] = outflow[li] * limit_rate;

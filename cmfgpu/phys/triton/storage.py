@@ -14,6 +14,9 @@ def update_storage_inline(
     river_storage, flood_storage, protected_storage,
     river_inflow, flood_inflow, river_outflow, flood_outflow,
     bifurcation_outflow, runoff, inflow, flood_fraction, time_step,
+    HAS_BIFURCATION: tl.constexpr,
+    HAS_INFLOW: tl.constexpr,
+    HAS_LEVEE: tl.constexpr,
 ):
     """CALC_STONXT; returns PSTOALL, the total storage the stage splits.
 
@@ -30,14 +33,20 @@ def update_storage_inline(
     flood = (
         flood + (flood_inflow * time_step).to(storage_dtype)
         - (flood_outflow * time_step).to(storage_dtype)
-        - (bifurcation_outflow * time_step).to(storage_dtype)
     )
+    if HAS_BIFURCATION:
+        flood = flood - (bifurcation_outflow * time_step).to(storage_dtype)
     river = tl.where(flood < 0.0, tl.maximum(river + flood, 0.0), river)
     flood = tl.maximum(flood, 0.0)
-    river_runoff = runoff * (1.0 - flood_fraction) * time_step + inflow * time_step
+    river_runoff = runoff * (1.0 - flood_fraction) * time_step
+    if HAS_INFLOW:
+        river_runoff = river_runoff + inflow * time_step
     river = river + river_runoff.to(storage_dtype)
     flood = flood + (runoff * flood_fraction * time_step).to(storage_dtype)
-    return river + flood + protected_storage
+    total = river + flood
+    if HAS_LEVEE:
+        total = total + protected_storage
+    return total
 
 
 # -----------------------------------------------------------------------------
@@ -46,15 +55,15 @@ def update_storage_inline(
 @triton.jit
 def compute_flood_stage_kernel(
     # Storage update pointers
-    river_inflow_ptr,            # *f64: River inflow (in/out, return to zero)
-    flood_inflow_ptr,            # *f64: Flood inflow  (in/out, return to zero)
+    river_inflow_ptr,            # *f64: River inflow (in)
+    flood_inflow_ptr,            # *f64: Flood inflow (in)
     river_outflow_ptr,           # *f32: River outflow
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
     inflow_ptr,                  # *f32: Compact prescribed inflow
     catchment_inflow_idx_ptr,    # *i32: Catchment -> inflow gauge index
-    time_step_ptr,                   # f32: Time step
+    time_step_ptr,                   # *f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
     river_storage_ptr,           # *f64: River storage (in/out)
@@ -64,7 +73,7 @@ def compute_flood_stage_kernel(
     river_depth_ptr,             # *f32: River depth (out)
     flood_depth_ptr,             # *f32: Flood depth (out)
     protected_depth_ptr,         # *f32: Protected depth (out)
-    flood_fraction_ptr,          # *f32: Flood fraction (out)
+    flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
     flood_depth_table_ptr,       # *f32: Lookup table - flood depth
@@ -119,7 +128,7 @@ def compute_flood_stage_kernel(
         river_inflow, flood_inflow, river_outflow, flood_outflow,
         global_bifurcation_outflow if HAS_BIFURCATION else tl.zeros_like(river_outflow),
         runoff, inflow, tl.load(flood_fraction_ptr + offs, mask=mask, other=0.0),
-        time_step,
+        time_step, HAS_BIFURCATION, HAS_INFLOW, HAS_LEVEE,
     )
 
     total_storage = hm.to_compute(total_storage_hp, river_outflow)
@@ -135,11 +144,17 @@ def compute_flood_stage_kernel(
     catchment_width = hm.divide(catchment_area, river_length)
     width_increment = hm.divide(catchment_width, num_flood_levels)
 
-    # Determine flood level by scanning the storage table
-    if num_catchments < 1024 or tl.sum(
-        (mask & (stage_total > river_max_storage)).to(tl.int32), 0
-    ) > 0:
-        level = tl.where(stage_total > river_max_storage, 0, -1)
+    # Determine flood level by scanning the storage table in FP32 (monotone
+    # under round-to-nearest-even); any exact FP32 tie across all 11 levels
+    # triggers one single post-loop FP64 tie-breaker pass (bit-exact, 0 in-loop barriers).
+    is_wet = total_storage > river_max_storage
+    if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+        any_tie = mask & (total_storage == river_max_storage)
+        any_work = mask & (is_wet | any_tie)
+    else:
+        any_work = mask & is_wet
+    if num_catchments < 1024 or tl.sum(any_work.to(tl.int32), 0) > 0:
+        level = tl.where(is_wet, 0, -1)
     
         S_accum = river_max_storage
         prev_H = 0.0
@@ -157,7 +172,9 @@ def compute_flood_stage_kernel(
         
             next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
         
-            is_above = stage_total > S_curr
+            is_above = total_storage > S_curr
+            if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+                any_tie = any_tie | (mask & (total_storage == S_curr))
             level += tl.where(is_above, 1, 0)
             prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
             prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
@@ -165,6 +182,29 @@ def compute_flood_stage_kernel(
             S_accum = S_curr
             prev_H = H_curr
             prev_W = W_curr
+
+        if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+            if tl.sum(any_tie.to(tl.int32), 0) > 0:
+                level = tl.where(stage_total > river_max_storage, 0, -1)
+                S_accum = river_max_storage
+                prev_H = 0.0
+                prev_W = river_width
+                prev_total_storage = river_max_storage
+                prev_flood_depth = 0.0
+                next_flood_depth = 0.0
+                for i in tl.static_range(num_flood_levels):
+                    H_curr = tl.load(flood_depth_table_ptr + offs * num_flood_levels + i, mask=mask)
+                    W_curr = river_width + (i + 1) * width_increment
+                    dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+                    S_curr = S_accum + dS
+                    next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+                    is_above = stage_total > S_curr
+                    level += tl.where(is_above, 1, 0)
+                    prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+                    prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+                    S_accum = S_curr
+                    prev_H = H_curr
+                    prev_W = W_curr
 
         no_flood_cond = level < 0
         level = tl.maximum(level, 0)
@@ -190,7 +230,7 @@ def compute_flood_stage_kernel(
         )
 
         river_capacity = river_max_storage + river_length * river_width * flood_depth
-        river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+        river_capacity_hp = river_capacity.to(total_storage_hp.dtype)
         if not HAS_LEVEE:
             river_capacity_hp = tl.minimum(river_capacity_hp, total_storage_hp)
         river_storage_final_hp = tl.where(
@@ -210,9 +250,7 @@ def compute_flood_stage_kernel(
 
     else:
         river_storage_final_hp = total_storage_hp
-        river_storage_final = hm.to_compute(
-            total_storage_hp, river_outflow,
-        )
+        river_storage_final = total_storage
         river_depth = tl.maximum(hm.divide(hm.divide(river_storage_final, river_length), river_width), 0.0)
         flood_depth = tl.zeros_like(river_width)
         flood_fraction = tl.zeros_like(river_width)
@@ -241,24 +279,24 @@ def compute_flood_stage_kernel(
 @triton.jit
 def compute_flood_stage_log_kernel(
     # Storage update pointers
-    river_inflow_ptr,            # *f64: River inflow (in/out, return to zero)
-    flood_inflow_ptr,            # *f64: Flood inflow  (in/out, return to zero)
+    river_inflow_ptr,            # *f64: River inflow (in)
+    flood_inflow_ptr,            # *f64: Flood inflow (in)
     river_outflow_ptr,           # *f32: River outflow
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr,  # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
     inflow_ptr,
     catchment_inflow_idx_ptr,
-    time_step_ptr,                   # f32: Time step
+    time_step_ptr,                   # *f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
     river_storage_ptr,           # *f64: River storage (in/out)
     flood_storage_ptr,           # *f64: Flood storage (in/out)
     protected_storage_ptr,       # *f64: Protected storage (in/out)
     total_storage_ptr,           # *f64: Final total storage (optional out)
-    river_depth_ptr,             # *f32: River depth (in/out)
-    flood_depth_ptr,             # *f32: Flood depth (in/out)
-    protected_depth_ptr,         # *f32: Protected depth (in/out)
+    river_depth_ptr,             # *f32: River depth (out)
+    flood_depth_ptr,             # *f32: Flood depth (out)
+    protected_depth_ptr,         # *f32: Protected depth (out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
@@ -339,7 +377,7 @@ def compute_flood_stage_log_kernel(
         river_inflow, flood_inflow, river_outflow, flood_outflow,
         global_bifurcation_outflow if HAS_BIFURCATION else tl.zeros_like(river_outflow),
         runoff, inflow, tl.load(flood_fraction_ptr + offs, mask=mask, other=0.0),
-        time_step,
+        time_step, HAS_BIFURCATION, HAS_INFLOW, HAS_LEVEE,
     )
     tl.atomic_add(total_storage_next_sum_ptr + current_step, tl.sum(tl.where(mask, total_storage_hp, 0)) * 1e-9)
     tl.atomic_add(total_storage_new_sum_ptr + current_step, tl.sum(tl.where(mask, total_storage_hp, 0)) * 1e-9)
@@ -362,11 +400,15 @@ def compute_flood_stage_log_kernel(
     catchment_width = hm.divide(catchment_area, river_length)
     width_increment = hm.divide(catchment_width, num_flood_levels)
 
-    # Determine flood level by scanning the storage table
-    if num_catchments < 1024 or tl.sum(
-        (mask & (stage_total > river_max_storage)).to(tl.int32), 0
-    ) > 0:
-        level = tl.where(stage_total > river_max_storage, 0, -1)
+    # Determine flood level by scanning the storage table in FP32 with single FP64 tie-breaker.
+    is_wet = total_storage > river_max_storage
+    if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+        any_tie = mask & (total_storage == river_max_storage)
+        any_work = mask & (is_wet | any_tie)
+    else:
+        any_work = mask & is_wet
+    if num_catchments < 1024 or tl.sum(any_work.to(tl.int32), 0) > 0:
+        level = tl.where(is_wet, 0, -1)
     
         S_accum = river_max_storage
         prev_H = 0.0
@@ -388,7 +430,9 @@ def compute_flood_stage_log_kernel(
         
             next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
         
-            is_above = stage_total > S_curr
+            is_above = total_storage > S_curr
+            if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+                any_tie = any_tie | (mask & (total_storage == S_curr))
             level += tl.where(is_above, 1, 0)
             prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
             prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
@@ -396,6 +440,33 @@ def compute_flood_stage_log_kernel(
             S_accum = S_curr
             prev_H = H_curr
             prev_W = W_curr
+
+        if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+            if tl.sum(any_tie.to(tl.int32), 0) > 0:
+                level = tl.where(stage_total > river_max_storage, 0, -1)
+                S_accum = river_max_storage
+                prev_H = 0.0
+                prev_W = river_width
+                prev_total_storage = river_max_storage
+                prev_flood_depth = 0.0
+                next_flood_depth = 0.0
+                for i in tl.static_range(num_flood_levels):
+                    H_curr = tl.load(
+                        flood_depth_table_ptr + offs * num_flood_levels + i,
+                        mask=mask,
+                        other=0.0,
+                    )
+                    W_curr = river_width + (i + 1) * width_increment
+                    dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+                    S_curr = S_accum + dS
+                    next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+                    is_above = stage_total > S_curr
+                    level += tl.where(is_above, 1, 0)
+                    prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+                    prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+                    S_accum = S_curr
+                    prev_H = H_curr
+                    prev_W = W_curr
 
         no_flood_cond = level < 0
         level = tl.maximum(level, 0)
@@ -421,7 +492,7 @@ def compute_flood_stage_log_kernel(
         )
 
         river_capacity = river_max_storage + river_length * river_width * flood_depth
-        river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+        river_capacity_hp = river_capacity.to(total_storage_hp.dtype)
         if not HAS_LEVEE:
             river_capacity_hp = tl.minimum(river_capacity_hp, total_storage_hp)
         river_storage_final_hp = tl.where(
@@ -440,9 +511,7 @@ def compute_flood_stage_log_kernel(
 
     else:
         river_storage_final_hp = total_storage_hp
-        river_storage_final = hm.to_compute(
-            total_storage_hp, river_outflow,
-        )
+        river_storage_final = total_storage
         river_depth = tl.maximum(hm.divide(hm.divide(river_storage_final, river_length), river_width), 0.0)
         flood_depth = tl.zeros_like(river_width)
         flood_fraction = tl.zeros_like(river_width)
@@ -487,24 +556,24 @@ def compute_flood_stage_log_kernel(
 @triton.jit
 def compute_flood_stage_batched_kernel(
     # Storage update pointers
-    river_inflow_ptr,            # *f64: River inflow (in/out, return to zero)
-    flood_inflow_ptr,            # *f64: Flood inflow  (in/out, return to zero)
+    river_inflow_ptr,            # *f64: River inflow (in)
+    flood_inflow_ptr,            # *f64: Flood inflow (in)
     river_outflow_ptr,           # *f32: River outflow
     flood_outflow_ptr,           # *f32: Flood outflow
     global_bifurcation_outflow_ptr, # *f64: Global bifurcation outflow
     runoff_ptr,                  # *f32: External runoff
     inflow_ptr,
     catchment_inflow_idx_ptr,
-    time_step_ptr,                   # f32: Time step
+    time_step_ptr,                   # *f32: Time step
     # Storage and output pointers
     outgoing_storage_ptr,           # *f64: outgoing storage (out, return to zero)
     river_storage_ptr,           # *f64: River storage (in/out)
     flood_storage_ptr,           # *f64: Flood storage (in/out)
     protected_storage_ptr,       # *f64: Protected storage (in/out)
     total_storage_ptr,           # *f64: Final total storage (optional out)
-    river_depth_ptr,             # *f32: River depth (in/out)
-    flood_depth_ptr,             # *f32: Flood depth (in/out)
-    protected_depth_ptr,         # *f32: Protected depth (in/out)
+    river_depth_ptr,             # *f32: River depth (out)
+    flood_depth_ptr,             # *f32: Flood depth (out)
+    protected_depth_ptr,         # *f32: Protected depth (out)
     flood_fraction_ptr,          # *f32: Flood fraction (in/out)
     # Reference/lookup table pointers
     river_height_ptr,            # *f32: River height
@@ -600,7 +669,7 @@ def compute_flood_stage_batched_kernel(
             river_inflow, flood_inflow, river_outflow, flood_outflow,
             global_bifurcation_outflow if HAS_BIFURCATION else tl.zeros_like(river_outflow),
             runoff, inflow, tl.load(flood_fraction_ptr + idx, mask=mask, other=0.0),
-            time_step,
+            time_step, HAS_BIFURCATION, HAS_INFLOW, HAS_LEVEE,
         )
         total_storage = hm.to_compute(
             total_storage_hp, river_outflow,
@@ -625,10 +694,14 @@ def compute_flood_stage_batched_kernel(
         else:
             width_increment = width_increment_shared
 
-        if num_catchments < 1024 or tl.sum(
-            (mask & (stage_total > river_max_storage)).to(tl.int32), 0
-        ) > 0:
-            level = tl.where(stage_total > river_max_storage, 0, -1)
+        is_wet = total_storage > river_max_storage
+        if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+            any_tie = mask & (total_storage == river_max_storage)
+            any_work = mask & (is_wet | any_tie)
+        else:
+            any_work = mask & is_wet
+        if num_catchments < 1024 or tl.sum(any_work.to(tl.int32), 0) > 0:
+            level = tl.where(is_wet, 0, -1)
 
             S_accum = river_max_storage
             prev_H = 0.0
@@ -653,7 +726,9 @@ def compute_flood_stage_batched_kernel(
 
                 next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
 
-                is_above = stage_total > S_curr
+                is_above = total_storage > S_curr
+                if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+                    any_tie = any_tie | (mask & (total_storage == S_curr))
                 level += tl.where(is_above, 1, 0)
                 prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
                 prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
@@ -661,6 +736,29 @@ def compute_flood_stage_batched_kernel(
                 S_accum = S_curr
                 prev_H = H_curr
                 prev_W = W_curr
+
+            if not HAS_LEVEE and stage_total.dtype != total_storage.dtype:
+                if tl.sum(any_tie.to(tl.int32), 0) > 0:
+                    level = tl.where(stage_total > river_max_storage, 0, -1)
+                    S_accum = river_max_storage
+                    prev_H = 0.0
+                    prev_W = river_width
+                    prev_total_storage = river_max_storage
+                    prev_flood_depth = 0.0
+                    next_flood_depth = 0.0
+                    for i in tl.static_range(num_flood_levels):
+                        H_curr = tl.load(flood_depth_table_ptr + table_base_offset + offs * num_flood_levels + i, mask=mask)
+                        W_curr = river_width + (i + 1) * width_increment
+                        dS = river_length * 0.5 * (prev_W + W_curr) * (H_curr - prev_H)
+                        S_curr = S_accum + dS
+                        next_flood_depth = tl.where(level == i, H_curr, next_flood_depth)
+                        is_above = stage_total > S_curr
+                        level += tl.where(is_above, 1, 0)
+                        prev_total_storage = tl.where(is_above, S_curr, prev_total_storage)
+                        prev_flood_depth = tl.where(is_above, H_curr, prev_flood_depth)
+                        S_accum = S_curr
+                        prev_H = H_curr
+                        prev_W = W_curr
 
             no_flood_cond = level < 0
             level = tl.maximum(level, 0)
@@ -688,7 +786,7 @@ def compute_flood_stage_batched_kernel(
             river_capacity = (
                 river_max_storage + river_length * river_width * flood_depth
             )
-            river_capacity_hp = tl.zeros_like(total_storage_hp) + river_capacity
+            river_capacity_hp = river_capacity.to(total_storage_hp.dtype)
             if not HAS_LEVEE:
                 river_capacity_hp = tl.minimum(river_capacity_hp, total_storage_hp)
             river_storage_final_hp = tl.where(
@@ -707,9 +805,7 @@ def compute_flood_stage_batched_kernel(
 
         else:
             river_storage_final_hp = total_storage_hp
-            river_storage_final = hm.to_compute(
-                total_storage_hp, river_outflow,
-            )
+            river_storage_final = total_storage
             river_depth = tl.maximum(hm.divide(hm.divide(river_storage_final, river_length), river_width), 0.0)
             flood_depth = tl.zeros_like(river_width)
             flood_fraction = tl.zeros_like(river_width)

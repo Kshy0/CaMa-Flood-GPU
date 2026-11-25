@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 // http://www.apache.org/licenses/LICENSE-2.0
 //
-// CUDA backend for the reservoir outflow kernel.
+// CUDA backend for the reservoir outflow and initial dam-storage fill kernels.
 //
 // One thread per reservoir.  Undoes the main outflow kernel's outgoing-storage
 // scatter, recomputes the regulated release (4 storage regimes of the

@@ -7,8 +7,9 @@
 //
 // The CFL sub-step count is monotonic with respect to the per-cell dt:
 //   n(dt) = floor(outer_time_step/dt - 0.01) + 1
-// decreases as dt increases, so a per-thread atomicMax over n_i gives the
-// global maximum sub-step count without a separate reduction.
+// decreases as dt increases, so a block-reduced atomicMax
+// (cmf_block_atomic_max) over n_i gives the global maximum sub-step count
+// in one kernel launch.
 
 #include "block_reduce.cuh"
 #include "canonical.cuh"

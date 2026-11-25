@@ -149,7 +149,7 @@ class BaseModule(AbstractModule):
     # Catchment properties
     # --------------------------------------------------------------------- #
     catchment_elevation: torch.Tensor = BaseField(
-        description="Mean ground elevation (above mean sea level)",
+        description="River bankfull (channel-top) elevation above mean sea level",
         units="m",
         category="param",
     )
@@ -365,7 +365,7 @@ class BaseModule(AbstractModule):
         return torch.zeros_like(self.river_outflow, dtype=self.precision)
 
     @computed_base_field(
-        description="Current water depth on the protected side relative to river bed",
+        description="Current water depth on the protected side above river bankfull",
         units="m",
         category="state",
         depends_on="levee",
@@ -416,6 +416,18 @@ class BaseModule(AbstractModule):
             self.river_storage,
             dtype=self.get_expected_dtype("flood_inflow"),
         )
+
+    @computed_base_field(
+        description="River velocity from the routed discharge and its cross-section",
+        units="m s-1",
+        category="virtual",
+        expr=(
+            "where(river_width * river_cross_section_depth > 1e-5, "
+            "river_outflow / maximum(river_width * river_cross_section_depth, 1e-5), 0.0)"
+        ),
+    )
+    def river_velocity(self) -> torch.Tensor | None:
+        return None
 
     @computed_base_field(
         description="Total outflow from catchment (river + flood)",

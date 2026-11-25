@@ -406,7 +406,7 @@ def merge_basins_bifurcation_thresholds(
       STEP 1 — merge river-channel bifurcations (wth[0]>0),
                forward path scan, forward chain resolution.
       STEP 2 — merge ALL bifurcation paths (including overland),
-               reverse path scan, reverse chain resolution.
+               forward path scan, reverse chain resolution.
     Both steps iterate until convergence.
     Size thresholds prevent creating basins larger than ``rate * total_grid``.
 
@@ -547,7 +547,7 @@ def read_bifori(
       - Keep widths only for the first keepN levels
       - Elevation table: level 0 -> pelv - dph (if width>0); other levels -> pelv + ilev - 1 (if width>0); else 1e20
     Returns:
-      (keepN, pth_upst, pth_down, p_len, wth_keep, elv)
+      (pth_upst, pth_down, p_len, wth_keep, elv)
     Note:
       up/down indices are 0-based; wth/elv have shape (npath_kept, keepN)
     """

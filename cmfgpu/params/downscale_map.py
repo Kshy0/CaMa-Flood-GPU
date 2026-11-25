@@ -65,7 +65,7 @@ def _build_tributary_and_backwater_tables(
 
     Arrays ``catm_xx``, ``catm_yy``, ``down_x``, ``down_y``, ``flddif`` have
     Fortran-aligned shape ``(mx, my)`` over the buffered window.
-    ``pixel_flat_to_compact`` maps flat ``ix * my + iy`` (or ``-1``) to the
+    ``pixel_flat_to_compact`` maps flat ``iy * mx + ix`` (or ``-1``) to the
     0-based index in ``pixel_id`` (and stores ``pixel_id`` lookup).
     """
     mx, my = catm_xx.shape

@@ -260,9 +260,6 @@ __device__ __forceinline__ void levee_stage(const A& a, long t)
         balance.current_step_ptr, a.num_levees, a.num_flood_levels, t);
 }
 
-template <typename REAL>
-__device__ __forceinline__ REAL pow73(REAL x) { return x * x * cbrt(x); }
-
 template <typename REAL, typename STO>
 __device__ __forceinline__ void k_levee_bif_outflow_cell(
     const int* __restrict__ cat_idx, const int* __restrict__ dn_idx,
@@ -303,11 +300,6 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
     REAL slope = (wse_c - wse_d) / blen;
     slope = fmin(fmax(slope, (REAL)-CMF_ROUTING_SLOPE_LIMIT), (REAL)CMF_ROUTING_SLOPE_LIMIT);
 
-    REAL ts_c = (REAL)(
-        river_storage[ci] + flood_storage[ci] + protected_storage[ci]);
-    REAL ts_d = (REAL)(
-        river_storage[di] + flood_storage[di] + protected_storage[di]);
-
     constexpr int MAX_REGISTER_LEVELS = 8;
     REAL sum_out = (REAL)0.0;
     REAL upd[MAX_REGISTER_LEVELS];
@@ -336,7 +328,7 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
             REAL unit_o = o / w;
             REAL num = w * (unit_o + gravity * time_step * semi_depth * slope);
             REAL den = (REAL)1.0 + gravity * time_step * (man * man) * fabs(unit_o)
-                * ((REAL)1.0 / pow73(semi_depth));
+                * cmf_inv_d73(semi_depth);
             upd_out = num / den;
         }
 
@@ -349,8 +341,14 @@ __device__ __forceinline__ void k_levee_bif_outflow_cell(
     // CaMa-Flood LEVEE_OPT_PTHOUT limits a path only when its flow sum is non-zero.
     REAL limit_rate = (REAL)1.0;
     if (sum_out != (REAL)0.0) {
+        STO cr = river_storage[ci], cf = flood_storage[ci], cp = protected_storage[ci];
+        STO c_tot = cmf_is_zero_sto(cf) ? cr : (cr + cf);
+        if (!cmf_is_zero_sto(cp)) c_tot += cp;
+        STO dr = river_storage[di], df = flood_storage[di], dp = protected_storage[di];
+        STO d_tot = cmf_is_zero_sto(df) ? dr : (dr + df);
+        if (!cmf_is_zero_sto(dp)) d_tot += dp;
         limit_rate = fmin(
-            (REAL)CMF_BACKFLOW_STORAGE_FRACTION * fmin(ts_c, ts_d) / (fabs(sum_out) * time_step), (REAL)1.0);
+            (REAL)CMF_BACKFLOW_STORAGE_FRACTION * fmin((REAL)c_tot, (REAL)d_tot) / (fabs(sum_out) * time_step), (REAL)1.0);
     }
     sum_out *= limit_rate;
     if (fits) {
