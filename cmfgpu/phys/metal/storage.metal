@@ -210,7 +210,7 @@ static inline void cmf_block_atomic_add_batch(
     uint simd_width,
     uint group_threads,
     thread const float (&values)[N],
-    thread device atomic_float* const (&destinations)[N]
+    device atomic_float* const thread (&destinations)[N]
 ) {
     for (uint c = 0; c < N; ++c) {
         float sg = simd_sum(values[c]);
